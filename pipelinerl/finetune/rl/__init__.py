@@ -348,13 +348,6 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
     reward_std_arr = reward_std_per_group[inverse_inds]
     avg_tokens_arr = avg_tokens_per_group[inverse_inds]
 
-    advantages_col: list[list[float]] = []
-    group_tokens_col: list[list[float]] = []
-    old_logprobs_col: list[list[float]] = []
-    ref_logprobs_col: list[list[float]] = []
-    overflow_col: list[list[float]] = []
-    example_weight_col: list[list[float]] = []
-
     for idx, example in enumerate(processed_items):
         advantages = calculate_advantage(
             {
@@ -363,88 +356,53 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
                 "reward_std": float(reward_std_arr[idx]),
             }
         )
-        advantages_col.append(advantages)
+        example["advantages"] = advantages
 
-        group_tokens = [float(avg_tokens_arr[idx])] * len(example["input_ids"])
-        group_tokens_col.append(group_tokens)
+        # Group-level average token count (replicated per token)
+        example["group_tokens"] = [float(avg_tokens_arr[idx])] * len(example["input_ids"])
 
+        # Pad log-prob arrays so they align with input length: zeros for prompt
         full_len = len(example["input_ids"])
         old_logs = example["old_logprobs"]
         ref_logs = example["ref_logprobs"]
-        old_logprobs_col.append([0.0] * (full_len - len(old_logs)) + old_logs)
-        ref_logprobs_col.append([0.0] * (full_len - len(ref_logs)) + ref_logs)
+        example["old_logprobs"] = [0.0] * (full_len - len(old_logs)) + old_logs
+        example["ref_logprobs"] = [0.0] * (full_len - len(ref_logs)) + ref_logs
 
+        # Overflow & example weight
         has_eos = eos_token_id in example["input_ids"]
-        overflow_flags = [0.0 if has_eos else 1.0] * full_len
-        overflow_col.append(overflow_flags)
+        example["overflow"] = [0.0 if has_eos else 1.0] * full_len
 
         if config.overlong_filtering and not has_eos:
-            weights = [0.0] * full_len
+            example["example_weight"] = [0.0] * full_len
         else:
-            weights = [1.0] * full_len
-        example_weight_col.append(weights)
+            example["example_weight"] = [1.0] * full_len
 
-    updated_ds = Dataset.from_list(processed_items)
-
-    def _replace(col_name: str, data: list):
-        if col_name in updated_ds.column_names:
-            updated = updated_ds.remove_columns(col_name)
-        else:
-            updated = updated_ds
-        return updated.add_column(col_name, data)
-
-    updated_ds = _replace("advantages", advantages_col)
-    updated_ds = _replace("group_tokens", group_tokens_col)
-    updated_ds = _replace("old_logprobs", old_logprobs_col)
-    updated_ds = _replace("ref_logprobs", ref_logprobs_col)
-    updated_ds = _replace("overflow", overflow_col)
-    updated_ds = _replace("example_weight", example_weight_col)
-
-    rewards_list_col = [ex["rewards"] for ex in processed_items]
-    updated_ds = _replace("rewards", rewards_list_col)
-
-    return updated_ds
+    return Dataset.from_list(processed_items)
 
 
 def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
     """
-    Assigns example weights to the dataset based on the reward column.
-
-    Args:
-        dataset (Dataset): The input dataset containing rewards.
-        config (RLConfig): Configuration object containing RL training parameters
-
-    Returns:
-        Dataset: The updated dataset with the assigned example weights.
+    Ensure ``example_weight`` and ``overflow`` columns exist. If they are
+    already present the dataset is returned unchanged; otherwise the
+    columns are created in a single pass without using pandas.
     """
     if "example_weight" in dataset.column_names and "overflow" in dataset.column_names:
-        return dataset  # already computed in update_rewards_and_advantages
+        return dataset
 
-    example_weight_col: list[list[float]] = []
-    overflow_col: list[list[float]] = []
-
+    processed: list[dict] = []
     for item in dataset:
-        has_eos = eos_token_id in item["input_ids"]
+        ex = item.copy()
+        has_eos = eos_token_id in ex["input_ids"]
+        full_len = len(ex["input_ids"])
 
-        overflow_flags = [0.0 if has_eos else 1.0] * len(item["input_ids"])
-        overflow_col.append(overflow_flags)
-
+        ex["overflow"] = [0.0 if has_eos else 1.0] * full_len
         if config.overlong_filtering and not has_eos:
-            weights = [0.0] * len(item["input_ids"])
+            ex["example_weight"] = [0.0] * full_len
         else:
-            weights = [1.0] * len(item["input_ids"])
-        example_weight_col.append(weights)
+            ex["example_weight"] = [1.0] * full_len
+        processed.append(ex)
 
-    # Helper to replace / add columns
-    def _replace(ds: Dataset, name: str, col: list):
-        if name in ds.column_names:
-            ds = ds.remove_columns(name)
-        return ds.add_column(name, col)
-
-    dataset = _replace(dataset, "example_weight", example_weight_col)
-    dataset = _replace(dataset, "overflow", overflow_col)
-
-    return dataset
+    return Dataset.from_list(processed)
 
 
 def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
