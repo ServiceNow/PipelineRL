@@ -358,17 +358,14 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
         )
         example["advantages"] = advantages
 
-        # Group-level average token count (replicated per token)
         example["group_tokens"] = [float(avg_tokens_arr[idx])] * len(example["input_ids"])
 
-        # Pad log-prob arrays so they align with input length: zeros for prompt
         full_len = len(example["input_ids"])
         old_logs = example["old_logprobs"]
         ref_logs = example["ref_logprobs"]
         example["old_logprobs"] = [0.0] * (full_len - len(old_logs)) + old_logs
         example["ref_logprobs"] = [0.0] * (full_len - len(ref_logs)) + ref_logs
 
-        # Overflow & example weight
         has_eos = eos_token_id in example["input_ids"]
         example["overflow"] = [0.0 if has_eos else 1.0] * full_len
 
