@@ -6,7 +6,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
@@ -33,6 +32,8 @@ RL_DATA_COLUMNS = [
     "advantages",
     "old_logprobs",
     "ref_logprobs",
+    "overflow",
+    "group_tokens",
 ]
 
 
@@ -282,7 +283,7 @@ def rl_step(
     return final_loss, stats
 
 
-def update_rewards_and_advantages(dataset: Dataset, config: RLConfig) -> Dataset:
+def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
     """
     Updates the advantages column in the given dataset based on reward statistics.
 
@@ -293,32 +294,116 @@ def update_rewards_and_advantages(dataset: Dataset, config: RLConfig) -> Dataset
         Dataset: The updated dataset with the updated advantages column.
 
     """
-    df = dataset.to_pandas()
+    processed_items: list[dict] = []
+    group_ids: list[int] = []
+    rewards_scalar: list[float] = []
+    token_lens: list[int] = []
 
-    if config.reward_minus_kl_coef > 0:
-        logger.info("Updating Reward with Implicit KL")
-        calculate_rewards_with_implicit_kl_ = partial(
-            calculate_rewards_with_implicit_kl, reward_minus_kl_coef=config.reward_minus_kl_coef
+    for item in dataset:
+        example = item.copy()
+
+        if "old_logprobs" not in example:
+            example["old_logprobs"] = example.get("logprobs", [])
+        if "ref_logprobs" not in example:
+            example["ref_logprobs"] = example.get("ref_logprobs", [])
+
+        reward_scalar = float(example.get("reward", 0.0))
+        rewards_list = example.get("rewards", [reward_scalar] * len(example["input_ids"]))
+
+        if config.reward_minus_kl_coef > 0:
+            item_for_kl = {
+                "rewards": rewards_list,
+                "old_logprobs": example["old_logprobs"],
+                "ref_logprobs": example["ref_logprobs"],
+            }
+            rewards_list = calculate_rewards_with_implicit_kl(
+                item_for_kl, reward_minus_kl_coef=config.reward_minus_kl_coef
+            )
+            reward_scalar = float(np.mean(rewards_list)) if rewards_list else 0.0
+
+        example["rewards"] = rewards_list
+        example["reward"] = reward_scalar
+
+        processed_items.append(example)
+        group_ids.append(example["group_id"])
+        rewards_scalar.append(reward_scalar)
+        token_lens.append(len(example["input_ids"]))
+
+    group_ids_np = np.asarray(group_ids)
+    rewards_np = np.asarray(rewards_scalar, dtype=np.float32)
+    token_lens_np = np.asarray(token_lens, dtype=np.float32)
+
+    _, inverse_inds = np.unique(group_ids_np, return_inverse=True)
+    counts = np.bincount(inverse_inds)
+    reward_sum = np.bincount(inverse_inds, weights=rewards_np)
+    reward_sq_sum = np.bincount(inverse_inds, weights=rewards_np ** 2)
+    token_sum = np.bincount(inverse_inds, weights=token_lens_np)
+
+    reward_mean_per_group = reward_sum / np.maximum(counts, 1)
+    reward_var_per_group = reward_sq_sum / np.maximum(counts, 1) - reward_mean_per_group ** 2
+    reward_std_per_group = np.sqrt(np.maximum(0.0, reward_var_per_group))
+    avg_tokens_per_group = token_sum / np.maximum(counts, 1)
+
+    reward_mean_arr = reward_mean_per_group[inverse_inds]
+    reward_std_arr = reward_std_per_group[inverse_inds]
+    avg_tokens_arr = avg_tokens_per_group[inverse_inds]
+
+    advantages_col: list[list[float]] = []
+    group_tokens_col: list[list[float]] = []
+    old_logprobs_col: list[list[float]] = []
+    ref_logprobs_col: list[list[float]] = []
+    overflow_col: list[list[float]] = []
+    example_weight_col: list[list[float]] = []
+
+    for idx, example in enumerate(processed_items):
+        advantages = calculate_advantage(
+            {
+                "rewards": example["rewards"],
+                "reward_mean": float(reward_mean_arr[idx]),
+                "reward_std": float(reward_std_arr[idx]),
+            }
         )
-        df["rewards"] = df.apply(calculate_rewards_with_implicit_kl_, axis=1)
-        df["reward"] = df["rewards"].apply(lambda x: np.mean(x))
+        advantages_col.append(advantages)
 
-    # Group by group_id and compute mean and std of reward
-    grouped = df.groupby("group_id")["reward"].agg(["mean", "std", "count"]).reset_index()
+        group_tokens = [float(avg_tokens_arr[idx])] * len(example["input_ids"])
+        group_tokens_col.append(group_tokens)
 
-    # Rename columns for clarity
-    grouped.columns = ["group_id", "reward_mean", "reward_std", "count"]
+        full_len = len(example["input_ids"])
+        old_logs = example["old_logprobs"]
+        ref_logs = example["ref_logprobs"]
+        old_logprobs_col.append([0.0] * (full_len - len(old_logs)) + old_logs)
+        ref_logprobs_col.append([0.0] * (full_len - len(ref_logs)) + ref_logs)
 
-    # Merge the computed statistics back to the original dataset
-    df_with_stats = pd.merge(df, grouped, on="group_id", how="left")
+        has_eos = eos_token_id in example["input_ids"]
+        overflow_flags = [0.0 if has_eos else 1.0] * full_len
+        overflow_col.append(overflow_flags)
 
-    df_with_stats["advantages"] = df_with_stats.apply(calculate_advantage, axis=1)
+        if config.overlong_filtering and not has_eos:
+            weights = [0.0] * full_len
+        else:
+            weights = [1.0] * full_len
+        example_weight_col.append(weights)
 
-    # replace advantages entry
-    dataset = replace_dataset_column(dataset, "advantages", df_with_stats["advantages"].tolist())
+    updated_ds = Dataset.from_list(processed_items)
 
-    # Convert back to a Hugging Face Dataset
-    return dataset
+    def _replace(col_name: str, data: list):
+        if col_name in updated_ds.column_names:
+            updated = updated_ds.remove_columns(col_name)
+        else:
+            updated = updated_ds
+        return updated.add_column(col_name, data)
+
+    updated_ds = _replace("advantages", advantages_col)
+    updated_ds = _replace("group_tokens", group_tokens_col)
+    updated_ds = _replace("old_logprobs", old_logprobs_col)
+    updated_ds = _replace("ref_logprobs", ref_logprobs_col)
+    updated_ds = _replace("overflow", overflow_col)
+    updated_ds = _replace("example_weight", example_weight_col)
+
+    rewards_list_col = [ex["rewards"] for ex in processed_items]
+    updated_ds = _replace("rewards", rewards_list_col)
+
+    return updated_ds
 
 
 def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
@@ -332,16 +417,33 @@ def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig
     Returns:
         Dataset: The updated dataset with the assigned example weights.
     """
-    df = dataset.to_pandas()
+    if "example_weight" in dataset.column_names and "overflow" in dataset.column_names:
+        return dataset  # already computed in update_rewards_and_advantages
 
-    def compute_weight(row):
-        if eos_token_id not in row["input_ids"] and config.overlong_filtering:
-            return [0.0] * len(row["example_weight"])
+    example_weight_col: list[list[float]] = []
+    overflow_col: list[list[float]] = []
+
+    for item in dataset:
+        has_eos = eos_token_id in item["input_ids"]
+
+        overflow_flags = [0.0 if has_eos else 1.0] * len(item["input_ids"])
+        overflow_col.append(overflow_flags)
+
+        if config.overlong_filtering and not has_eos:
+            weights = [0.0] * len(item["input_ids"])
         else:
-            return [1.0] * len(row["example_weight"])
+            weights = [1.0] * len(item["input_ids"])
+        example_weight_col.append(weights)
 
-    df["example_weight"] = df.apply(compute_weight, axis=1)
-    dataset = replace_dataset_column(dataset, "example_weight", df["example_weight"].tolist())
+    # Helper to replace / add columns
+    def _replace(ds: Dataset, name: str, col: list):
+        if name in ds.column_names:
+            ds = ds.remove_columns(name)
+        return ds.add_column(name, col)
+
+    dataset = _replace(dataset, "example_weight", example_weight_col)
+    dataset = _replace(dataset, "overflow", overflow_col)
+
     return dataset
 
 
@@ -361,7 +463,7 @@ def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> D
 
     logger.debug("Populate RL Data")
 
-    dataset = update_rewards_and_advantages(dataset, config)
+    dataset = update_rewards_and_advantages(dataset, eos_token_id, config)
     dataset = assign_example_weights(dataset, eos_token_id, config)
 
     logger.debug("Finish Populate RL Data")
@@ -382,9 +484,12 @@ def prepare_rl_fields(
         old_logprobs
     ), f"Target tokens: {len(target_tokens)}, old logprobs: {len(old_logprobs)}"
 
-    encoding["rewards"] = [reward] * len(encoding["labels"])
-    encoding["advantages"] = [0.0] * len(encoding["labels"])  # place holder
-    encoding["old_logprobs"] = [0] * (len(encoding["labels"]) - len(old_logprobs)) + old_logprobs
-    encoding["ref_logprobs"] = [0] * (len(encoding["labels"]) - len(ref_logprobs)) + ref_logprobs
-    encoding["example_weight"] = [0] * len(encoding["labels"]) # place holder
+    full_len = len(encoding["labels"])
+    encoding["rewards"] = [reward] * full_len
+    encoding["advantages"] = [0.0] * full_len
+    encoding["old_logprobs"] = [0.0] * (full_len - len(old_logprobs)) + old_logprobs
+    encoding["ref_logprobs"] = [0.0] * (full_len - len(ref_logprobs)) + ref_logprobs
+    encoding["overflow"] = [0.0] * full_len
+    encoding["group_tokens"] = [0.0] * full_len
+    encoding["example_weight"] = [0.0] * full_len
     return encoding

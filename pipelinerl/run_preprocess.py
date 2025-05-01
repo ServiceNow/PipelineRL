@@ -128,7 +128,7 @@ def preprocess_dataset(
     preprocess = partial(
         preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True
     )
-    columns = ["input_ids", "labels", "attention_mask"] + RL_DATA_COLUMNS
+    columns = ["input_ids", "labels", "attention_mask", "group_id"] + RL_DATA_COLUMNS
     logger.debug(f"Instantiated preprocess function hash {Hasher.hash(preprocess)}")
 
     data = replace_oov_tokens_with_the(data, tokenizer)
@@ -173,8 +173,9 @@ def run_dataset_loader(
                     buffer.append(entry)
                     if len(buffer) == chunk_size:
                         break
+
                 if not _check_group_sizes(buffer, check_group_size):
-                    raise ValueError(f"Invalid group sizes in data")
+                    raise ValueError("Invalid group sizes in data")
                 try:
                     raw_chunk_queue.put_nowait(buffer)
                 except queue.Full:
