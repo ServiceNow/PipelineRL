@@ -299,22 +299,15 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
     rewards_scalar: list[float] = []
     token_lens: list[int] = []
 
-    for item in dataset:
-        example = item.copy()
-
-        if "old_logprobs" not in example:
-            example["old_logprobs"] = example.get("logprobs", [])
-        if "ref_logprobs" not in example:
-            example["ref_logprobs"] = example.get("ref_logprobs", [])
-
+    for example in dataset:
         reward_scalar = float(example.get("reward", 0.0))
         rewards_list = example.get("rewards", [reward_scalar] * len(example["input_ids"]))
 
         if config.reward_minus_kl_coef > 0:
             item_for_kl = {
                 "rewards": rewards_list,
-                "old_logprobs": example["old_logprobs"],
-                "ref_logprobs": example["ref_logprobs"],
+                "old_logprobs": example.get("old_logprobs", []),
+                "ref_logprobs": example.get("ref_logprobs", []),
             }
             rewards_list = calculate_rewards_with_implicit_kl(
                 item_for_kl, reward_minus_kl_coef=config.reward_minus_kl_coef
@@ -387,8 +380,7 @@ def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig
         return dataset
 
     processed: list[dict] = []
-    for item in dataset:
-        ex = item.copy()
+    for ex in dataset:
         has_eos = eos_token_id in ex["input_ids"]
         full_len = len(ex["input_ids"])
 
