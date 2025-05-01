@@ -295,32 +295,33 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
 
     """
     processed_items: list[dict] = []
-    group_ids: list[int] = []
-    rewards_scalar: list[float] = []
-    token_lens: list[int] = []
 
-    for example in dataset:
-        reward_scalar = float(example.get("reward", 0.0))
-        rewards_list = example.get("rewards", [reward_scalar] * len(example["input_ids"]))
+    group_ids      = []
+    rewards_scalar = []
+    token_lens     = []
+
+    for ex in dataset:
+        scalar_reward = float(ex.get("reward", 0.0))
+        per_token_rewards = ex.get("rewards", [scalar_reward] * len(ex["input_ids"]))
 
         if config.reward_minus_kl_coef > 0:
-            item_for_kl = {
-                "rewards": rewards_list,
-                "old_logprobs": example.get("old_logprobs", []),
-                "ref_logprobs": example.get("ref_logprobs", []),
-            }
-            rewards_list = calculate_rewards_with_implicit_kl(
-                item_for_kl, reward_minus_kl_coef=config.reward_minus_kl_coef
+            per_token_rewards = calculate_rewards_with_implicit_kl(
+                {
+                    "rewards": per_token_rewards,
+                    "old_logprobs": ex.get("old_logprobs", []),
+                    "ref_logprobs": ex.get("ref_logprobs", []),
+                },
+                reward_minus_kl_coef=config.reward_minus_kl_coef,
             )
-            reward_scalar = float(np.mean(rewards_list)) if rewards_list else 0.0
+            scalar_reward = float(np.mean(per_token_rewards)) if per_token_rewards else 0.0
 
-        example["rewards"] = rewards_list
-        example["reward"] = reward_scalar
+        ex["rewards"] = per_token_rewards
+        ex["reward"] = scalar_reward
 
-        processed_items.append(example)
-        group_ids.append(example["group_id"])
-        rewards_scalar.append(reward_scalar)
-        token_lens.append(len(example["input_ids"]))
+        processed_items.append(ex)
+        group_ids.append(ex["group_id"])
+        rewards_scalar.append(scalar_reward)
+        token_lens.append(len(ex["input_ids"]))
 
     group_ids_np = np.asarray(group_ids)
     rewards_np = np.asarray(rewards_scalar, dtype=np.float32)
@@ -372,9 +373,14 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
 
 def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
     """
-    Ensure ``example_weight`` and ``overflow`` columns exist. If they are
-    already present the dataset is returned unchanged; otherwise the
-    columns are created in a single pass without using pandas.
+    Populates a dataset with reinforcement learning specific data columns.
+
+    Args:
+        dataset (Dataset): The input dataset containing rewards.
+        config (RLConfig): Configuration object containing RL training parameters
+
+    Returns:
+        Dataset: The updated dataset with the assigned example weights.
     """
     if "example_weight" in dataset.column_names and "overflow" in dataset.column_names:
         return dataset
