@@ -125,34 +125,48 @@ def preprocess_dataset(
     seq_length: int,
     rl_config: RLConfig,
 ) -> Dataset:
-    preprocess = partial(
-        preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True
-    )
-    columns = ["input_ids", "labels", "attention_mask", "group_id"] + RL_DATA_COLUMNS
-    logger.debug(f"Instantiated preprocess function hash {Hasher.hash(preprocess)}")
-
     data = replace_oov_tokens_with_the(data, tokenizer)
-    
-    # inplace update of the traces with ref logprobs
+
     if llm is not None:
         batch_annotate_traces_with_ref_logprobs(llm, data)
     else:
         for entry in data:
             entry["ref_logprobs"] = entry["logprobs"]
 
+    # these fields were previously produced by preprocess_fn
+    for entry in data:
+        entry["attention_mask"] = [1] * len(entry["input_ids"])
+        entry.setdefault("reward", 0.0)
+
     dataset = Dataset.from_list(data)
-    logger.debug(f"Raw data part size: {dataset.num_rows}")
-    logger.debug(f"Raw data part fingerprint: {dataset._fingerprint}")
-    dataset = dataset.map(preprocess, keep_in_memory=True, load_from_cache_file=False)
+
+    # restrict columns (faster writing to Arrow)
+    columns = [
+        "input_ids",
+        "labels",
+        "attention_mask",
+        "group_id",
+        "reward",
+        "logprobs",  # this will be padded on populate_rl_data
+        "old_logprobs",
+        "ref_logprobs",
+    ]
     dataset = dataset.with_format(columns=columns)
+
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
-    dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+
+    dataset = populate_rl_data(
+        dataset=dataset,
+        eos_token_id=tokenizer.eos_token_id,
+        config=rl_config,
+    )
+
     dataset = dataset.add_column(
-        "model_version", 
-        [entry["metadata"]["model_version"] for entry in data]
-    ) # type: ignore
-    logger.debug(f"Preprocessed data part fingerprint: {dataset._fingerprint}")
+        "model_version",
+        [entry["metadata"]["model_version"] for entry in data],
+    )  # type: ignore
+
     return dataset
 
 
