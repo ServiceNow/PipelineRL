@@ -370,9 +370,9 @@ def _finalise_rl_columns(
         L = len(inp_ids_arr)
         
         # Look up group stats online
-        g_mean = group_lookup["mean"][group_idx]
-        g_std = group_lookup["std"][group_idx]
-        g_tok = group_lookup["avg_tok"][group_idx]
+        g_mean = float(group_lookup["mean"][group_idx])
+        g_std = float(group_lookup["std"][group_idx])
+        g_tok = float(group_lookup["avg_tok"][group_idx])
         
         # Compute advantages in-place
         adv = ((r_tok_arr - g_mean) / (g_std + 1e-4)).tolist()
