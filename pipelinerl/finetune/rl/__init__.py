@@ -378,16 +378,16 @@ def _finalise_rl_columns(
     
     batch_group_indices = group_ids[indices]
     
-    for i, (old_lp, ref_lp, group_idx) in enumerate(zip(
+    for i, (old_lp, ref_lp, group_id) in enumerate(zip(
         batch["old_logprobs"],
         batch["ref_logprobs"],
         batch_group_indices,
     )):
         L = seq_lengths[i]
         
-        g_mean = float(group_lookup["mean"][group_idx])
-        g_std = float(group_lookup["std"][group_idx])
-        g_tok = float(group_lookup["avg_tok"][group_idx])
+        g_mean = float(group_lookup["mean"][group_id])
+        g_std = float(group_lookup["std"][group_id])
+        g_tok = float(group_lookup["avg_tok"][group_id])
         
         r_tok_arr = rewards_arrays[i]
         adv = ((r_tok_arr - g_mean) / (g_std + 1e-4)).tolist()
