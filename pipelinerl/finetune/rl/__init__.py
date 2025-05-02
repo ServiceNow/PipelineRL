@@ -300,29 +300,33 @@ def _prepare_reward_columns(batch: dict[str, list], config: RLConfig) -> dict[st
     """
     rewards_out = []
     scalar_out = []
-
+    
+    if "rewards" not in batch and "reward" not in batch:
+        raise ValueError("Missing both 'rewards' and 'reward' columns for RL preprocessing")
+    
+    seq_lengths = [len(ids) for ids in batch["input_ids"]]
+    
     reward_minus_kl_coef = config.reward_minus_kl_coef
     
-    if reward_minus_kl_coef > 0:
-        old_lp_arrays = [np.asarray(lp, dtype=np.float32) for lp in batch["old_logprobs"]]
-        ref_lp_arrays = [np.asarray(lp, dtype=np.float32) for lp in batch["ref_logprobs"]]
-    
-    for i, inp_ids in enumerate(batch["input_ids"]):
+    for i, seq_len in enumerate(seq_lengths):
         if "rewards" in batch and len(batch["rewards"][i]) > 0:
             r_tok = batch["rewards"][i]
         else:
-            # Expect a scalar reward; raise if it is missing
-            if "reward" not in batch:
-                raise ValueError("Missing 'reward' column for RL preprocessing")
-            seq_len = len(inp_ids)
             scalar = float(batch["reward"][i])
             r_tok = [scalar] * seq_len
         
         if reward_minus_kl_coef > 0:
-            old_lp = old_lp_arrays[i]
-            ref_lp = ref_lp_arrays[i]
-            log_ratio = ref_lp - old_lp
+            old_lp = batch["old_logprobs"][i]
+            ref_lp = batch["ref_logprobs"][i]
+            
+            if len(old_lp) != len(ref_lp):
+                raise ValueError(f"old_logprobs length {len(old_lp)} doesn't match ref_logprobs length {len(ref_lp)}")
+            
+            old_lp_arr = np.asarray(old_lp, dtype=np.float32)
+            ref_lp_arr = np.asarray(ref_lp, dtype=np.float32)
+            log_ratio = ref_lp_arr - old_lp_arr
             kl = (np.exp(log_ratio) - log_ratio - 1).sum()
+            
             r_tok = [float(r - reward_minus_kl_coef * kl) for r in r_tok]
         
         rewards_out.append(r_tok)
@@ -357,27 +361,26 @@ def _finalise_rl_columns(
     """
     out_adv, out_gt, out_ov, out_w = [], [], [], []
     
-    # pre-compute arrays for vectorized operations for faster lookups
-    inp_ids_arrays = [np.asarray(ids, dtype=np.int32) for ids in batch["input_ids"]]
+    # Pre-compute only what's needed without full array conversions
+    seq_lengths = [len(ids) for ids in batch["input_ids"]]
+    has_eos_list = [(eos_token_id in ids) for ids in batch["input_ids"]]
+    
     rewards_arrays = [np.asarray(r, dtype=np.float32) for r in batch["rewards"]]
     
     batch_group_indices = group_ids[indices]
     
-    for i, (inp_ids_arr, r_tok_arr, old_lp, ref_lp, group_idx) in enumerate(zip(
-        inp_ids_arrays,
-        rewards_arrays,
+    for i, (old_lp, ref_lp, group_idx) in enumerate(zip(
         batch["old_logprobs"],
         batch["ref_logprobs"],
         batch_group_indices,
     )):
-        L = len(inp_ids_arr)
+        L = seq_lengths[i]
         
-        # Look up group stats online
         g_mean = float(group_lookup["mean"][group_idx])
         g_std = float(group_lookup["std"][group_idx])
         g_tok = float(group_lookup["avg_tok"][group_idx])
         
-        # Compute advantages in-place
+        r_tok_arr = rewards_arrays[i]
         adv = ((r_tok_arr - g_mean) / (g_std + 1e-4)).tolist()
         
         gt = [g_tok] * L
@@ -387,7 +390,7 @@ def _finalise_rl_columns(
             old_lp = [0.0] * pad_len + old_lp
             ref_lp = [0.0] * pad_len + ref_lp
         
-        has_eos = (inp_ids_arr == eos_token_id).any()
+        has_eos = has_eos_list[i]
         ov = [0.0 if has_eos else 1.0] * L
         w = [0.0] * L if (config.overlong_filtering and not has_eos) else [1.0] * L
         
