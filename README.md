@@ -3,7 +3,7 @@ Pipeline RL
 
 <p align="center">
   <a href="https://huggingface.co/blog/ServiceNow/pipelinerl/" target="_blank">
-    <img src="https://img.shields.io/badge/📝%20Read%20our%20Blog%20Post-4B32C3?style=for-the-badge" alt="Blog Post" width="300">
+    <img src="https://img.shields.io/badge/📝%20Blog%20Post-4B32C3?style=for-the-badge" alt="Blog Post" width="300">
   </a>
 </p>
 
