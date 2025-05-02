@@ -262,7 +262,7 @@ class ActorLoop:
         assert self.trainer_state.propagated_weight_version is not None
 
         last_trainer_version = self.trainer_state.propagated_weight_version
-        max_lag = self.cfg.finetune.max_lag if is_training else None
+        max_lag = self.cfg.max_lag if is_training else None
         if max_lag is not None:
             total_batch_size = self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
             total_update_size = math.ceil(self.cfg.finetune.weight_update_interval / total_batch_size) * total_batch_size
@@ -272,10 +272,10 @@ class ActorLoop:
                     f" Actor chunk size {self.cfg.actor.chunk_size} ideally should divide total batch size {total_batch_size}"
                 )
             chunks_per_update = math.ceil(total_update_size / self.cfg.actor.chunk_size)
-            lag_chunks = math.ceil(self.cfg.finetune.max_lag / self.cfg.actor.chunk_size)
+            lag_chunks = math.ceil(max_lag / self.cfg.actor.chunk_size)
             logger.info(f"Sync RL mode on, can submit {chunks_per_update} chunks for each update,"
                         f" that makes {chunks_per_update * self.cfg.actor.chunk_size} samples per update")
-            logger.info(f"Max lag is {self.cfg.finetune.max_lag} samples, that makes {lag_chunks} additional starting chunks")
+            logger.info(f"Max lag is {max_lag} samples, that makes {lag_chunks} additional starting chunks")
             can_submit_before_update = lag_chunks + chunks_per_update
         else:
             chunks_per_update = None

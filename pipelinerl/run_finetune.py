@@ -97,6 +97,7 @@ def run_sample_loader(data_stream: SingleStreamSpec, sample_queue: Queue[Dict | 
                 for data_item in stream_reader.read():
                     if pop_old_data:
                         if sample_queue.full():
+                            logger.info(f"Sample queue is full, popping old data")
                             sample_queue.get()
                         sample_queue.put_nowait(data_item)
                     else:
@@ -624,7 +625,6 @@ def rl_finetuning_worker(
     intermediate_root_dir = output_dir / "intermediate"
     training_state_dir = output_dir / "training_state"
 
-    rl_config = RLConfig(**args.rl)
     final_train_steps = calculate_train_steps(args, args.interrupt_train_steps)
     if training_metrics.completed_steps == final_train_steps:
         logger.info("Training is already completed")
@@ -648,6 +648,9 @@ def rl_finetuning_worker(
     micro_batches_size = []
     target_samples_per_worker = samples_per_worker_per_step
     target_samples = samples_per_step
+    rl_config = RLConfig(**args.rl)
+    # samples_per_step will be used to normalize the loss
+    rl_config.batch_size = samples_per_step
     while training_metrics.completed_steps < final_train_steps:
         # We include time waiting for data in the step time
         if first_pass:
@@ -751,7 +754,7 @@ def rl_finetuning_worker(
 
                 training_metrics.lr = optimizer.param_groups[0]["lr"]
 
-            backward(loss / samples_per_step, is_final_micro_batch=do_optimizer_step) 
+            backward(loss, is_final_micro_batch=do_optimizer_step) 
 
         if not is_sentinel_batch:
             passes_took.append(time.time() - time_before_pass)

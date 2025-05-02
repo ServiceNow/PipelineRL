@@ -102,3 +102,4 @@ rl:
   algo: reinforce
   temperature: 1.0
   entropy_bonus: 0.0
+  overlong_filtering: false

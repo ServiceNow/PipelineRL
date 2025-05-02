@@ -39,7 +39,8 @@ def create_sentinel_batch(device, tokenizer=None, model_version=0) -> VersionedT
         "advantages": torch.tensor(dummy_values, dtype=torch.float).reshape(1, -1),
         "ref_logprobs": torch.tensor(dummy_values, dtype=torch.float).reshape(1, -1),
         "old_logprobs": torch.tensor(dummy_values, dtype=torch.float).reshape(1, -1),
-        "example_weight": torch.tensor(dummy_values, dtype=torch.float).reshape(1, -1),
+        "group_tokens": torch.tensor(dummy_values, dtype=torch.float).reshape(1, -1),
+        "overflow": torch.tensor(dummy_values, dtype=torch.float).reshape(1, -1),
     }
     
     sentinel_batch = {k: (v.to(get_accelerator().device) if isinstance(v, torch.Tensor) else v)

@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 RL_DATA_COLUMNS = [
     "reward",
-    "example_weight",
+    "overflow",
+    "group_tokens",
     "rewards",
     "advantages",
     "old_logprobs",
@@ -44,6 +45,7 @@ class RLConfig(BaseModel):
         description="Use advantages instead of rewards to compute the loss",
     )
     epsilon: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
+    batch_size: int = Field(default=0, description="Batch size is required for normalization")
     reward_minus_kl_coef: float = Field(
         default=0.0,
         # https://arxiv.org/abs/2402.14740
@@ -73,13 +75,13 @@ class RLConfig(BaseModel):
         default=10,
         description="Clamp the log ratio ref new value",
     )
-    aggregate_loss: Literal["mean", "sum"] = Field(
-        default="sum",
-        description="How to aggregate the loss within a batch (when batch size is 1, there is no difference)",
-    )
     overlong_filtering: bool = Field(
         default=False,
         description="Filter out sequence that do not have eos_token_id"
+    )
+    group_normalization: bool = Field(
+        default=False,
+        description="Divide the weight of each sequence by the (average) number of tokens in the group"
     )
     temperature: float = Field(
         default=1.0,
@@ -194,7 +196,19 @@ def rl_step(
     advantages = batch.pop("advantages")[:, 1:]
     ref_logprobs = batch["ref_logprobs"][:, 1:]
     old_logprobs = batch["old_logprobs"][:, 1:]
-    examples_weights = batch["example_weight"][:, 1:]
+    group_tokens = batch["group_tokens"][:, 1:]
+    overflow = batch["overflow"][:, 1:]
+
+    if config.group_normalization:
+        tokens_weights = torch.ones_like(group_tokens) / group_tokens
+    else:
+        tokens_weights = torch.ones_like(group_tokens) / config.batch_size 
+    
+    if config.overlong_filtering:
+        # filter out sequences that do not have eos_token_id
+        overflow = torch.tensor(overflow, device=overflow.device)
+        tokens_weights = tokens_weights * (1 - overflow)
+    
     assert new_logprobs.shape == ref_logprobs.shape
 
     log_ratio_new_old = new_logprobs - old_logprobs
@@ -239,15 +253,10 @@ def rl_step(
 
     # combine loss components
     loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
-    assert loss.shape == examples_weights.shape, f"Loss shape {loss.shape} does not match example weights shape {examples_weights.shape}"
-    loss = loss * examples_weights  # 1 x (BxL) x 1
+    assert loss.shape == tokens_weights.shape, f"Loss shape {loss.shape} does not match example weights shape {tokens_weights.shape}"
+    loss = loss * tokens_weights  # 1 x (BxL) x 1
 
-    if config.aggregate_loss == "mean":
-        final_loss = -mean_sum(loss, masks_shifted, segments)
-    elif config.aggregate_loss == "sum":
-        final_loss = -sum_sum(loss, masks_shifted, segments)
-    else:
-        raise ValueError(f"{config.aggregate_loss} is not defined")
+    final_loss = -sum_sum(loss, masks_shifted, segments)
 
     # ensure loss is valid
     assert torch.isfinite(final_loss), f"Non-finite loss detected: {final_loss}"
@@ -279,7 +288,7 @@ def rl_step(
         "clamp_log_ratio_ref_new_indicator": mean_sum(clamp_log_ratio_ref_new_indicators, masks_shifted, segments).item(),
         "clamp_log_ratio_new_old_indicator": mean_sum(clamp_log_ratio_new_old_indicators, masks_shifted, segments).item(),
         "num_nans": torch.isnan(loss).sum().item(),
-        "example_weight": mean_sum(examples_weights, masks_shifted, segments).item(),
+        "token_weight": mean_sum(tokens_weights, masks_shifted, segments).item(),
         "kl_coef": num_sequences * kl_coef,
         "entropy_bonus_coef": num_sequences * entropy_bonus_coef,
     }
@@ -522,4 +531,5 @@ def prepare_rl_fields(
     encoding["overflow"] = [0.0] * full_len
     encoding["group_tokens"] = [0.0] * full_len
     encoding["example_weight"] = [0.0] * full_len
+
     return encoding
