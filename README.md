@@ -1,7 +1,11 @@
 Pipeline RL
 =================
 
-[![Github](https://img.shields.io/badge/Blog%20Post-000000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
+<p align="center">
+  <a href="https://huggingface.co/blog/ServiceNow/pipelinerl/" target="_blank">
+    <img src="https://img.shields.io/badge/📝%20Read%20our%20Blog%20Post-4B32C3?style=for-the-badge" alt="Blog Post" width="300">
+  </a>
+</p>
 
 A scalable asynchronous reinforcement learning implementation with in-flight weight updates. Designed to maximize GPU utilization while staying as on-policy as possible.
 
