@@ -22,6 +22,7 @@ finetune:
     clamp_log_ratio_ref_new_value: 5
     temperature: ${...llm.parameters.temperature}
     aggregate_loss: sum
+    rl_num_proc: 4
   train_batch_size: 1
   gradient_accumulation_passes: 4096
   gradient_checkpointing: true

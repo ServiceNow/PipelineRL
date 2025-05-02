@@ -85,6 +85,10 @@ class RLConfig(BaseModel):
         default=1.0,
         description="Temperature for the training log probs",
     )
+    rl_num_proc: int = Field(
+        default=8,
+        description="Number of processes to use for dataset map operations",
+    )
 
 def make_rl_data_callback(args, current_dir, rl_config, model):
     if rl_config:
@@ -283,100 +287,227 @@ def rl_step(
     return final_loss, stats
 
 
+def _prepare_reward_columns(batch: dict[str, list], config: RLConfig) -> dict[str, list]:
+    """
+    First pass: compute per-example rewards and scalar rewards.
+    
+    Args:
+        batch: dict-of-lists (HF 'batched' format)
+        config: RLConfig instance
+    
+    Returns:
+        batch with updated/added reward columns
+    """
+    rewards_out = []
+    scalar_out = []
+
+    reward_minus_kl_coef = config.reward_minus_kl_coef
+    
+    # Pre-convert arrays for KL calculation if needed
+    if reward_minus_kl_coef > 0:
+        old_lp_arrays = [np.asarray(lp, dtype=np.float32) for lp in batch["old_logprobs"]]
+        ref_lp_arrays = [np.asarray(lp, dtype=np.float32) for lp in batch["ref_logprobs"]]
+    
+    for i, inp_ids in enumerate(batch["input_ids"]):
+        # Get or initialize rewards
+        if "rewards" in batch and len(batch["rewards"][i]) > 0:
+            r_tok = batch["rewards"][i]
+        else:
+            seq_len = len(inp_ids)
+            scalar = batch.get("reward", [0.0])[i] if "reward" in batch else 0.0
+            r_tok = [scalar] * seq_len
+        
+        # Apply KL adjustment if needed
+        if reward_minus_kl_coef > 0:
+            old_lp = old_lp_arrays[i]
+            ref_lp = ref_lp_arrays[i]
+            log_ratio = ref_lp - old_lp
+            kl = (np.exp(log_ratio) - log_ratio - 1).sum()
+            r_tok = [r - reward_minus_kl_coef * kl for r in r_tok]
+        
+        rewards_out.append(r_tok)
+        scalar_out.append(float(np.mean(r_tok)))
+
+    batch["rewards"] = rewards_out
+    batch["reward"] = scalar_out
+    return batch
+
+
+def _finalise_rl_columns(
+        batch: dict[str, list],
+        indices: list[int],
+        group_lookup: dict[str, np.ndarray],
+        group_ids: np.ndarray,
+        config: RLConfig,
+        eos_token_id: int
+    ) -> dict[str, list]:
+    """
+    Second pass: compute advantages and other per-token columns.
+    
+    Args:
+        batch: dict-of-lists (HF 'batched' format)
+        indices: indices provided by datasets.map with_indices=True
+        group_lookup: dict with group-level stats (mean, std, avg_tok)
+        group_ids: array with mapping from dataset indices to group indices
+        config (RLConfig): Configuration for RL training
+        eos_token_id: Token ID for end of sequence
+    
+    Returns:
+        batch with all RL columns populated
+    """
+    out_adv, out_gt, out_ov, out_w = [], [], [], []
+    
+    # pre-compute arrays for vectorized operations for faster lookups
+    inp_ids_arrays = [np.asarray(ids, dtype=np.int32) for ids in batch["input_ids"]]
+    rewards_arrays = [np.asarray(r, dtype=np.float32) for r in batch["rewards"]]
+    
+    batch_group_indices = group_ids[indices]
+    
+    for i, (inp_ids_arr, r_tok_arr, old_lp, ref_lp, group_idx) in enumerate(zip(
+        inp_ids_arrays,
+        rewards_arrays,
+        batch["old_logprobs"],
+        batch["ref_logprobs"],
+        batch_group_indices,
+    )):
+        L = len(inp_ids_arr)
+        
+        # Look up group stats online
+        g_mean = group_lookup["mean"][group_idx]
+        g_std = group_lookup["std"][group_idx]
+        g_tok = group_lookup["avg_tok"][group_idx]
+        
+        # Compute advantages in-place
+        adv = ((r_tok_arr - g_mean) / (g_std + 1e-4)).tolist()
+        
+        gt = [float(g_tok)] * L
+        
+        pad_len = L - len(old_lp)
+        if pad_len > 0:
+            old_lp = [0.0] * pad_len + old_lp
+            ref_lp = [0.0] * pad_len + ref_lp
+        
+        has_eos = (inp_ids_arr == eos_token_id).any()
+        ov = [0.0 if has_eos else 1.0] * L
+        w = [0.0] * L if (config.overlong_filtering and not has_eos) else [1.0] * L
+        
+        out_adv.append(adv)
+        out_gt.append(gt)
+        out_ov.append(ov)
+        out_w.append(w)
+        batch["old_logprobs"][i] = old_lp
+        batch["ref_logprobs"][i] = ref_lp
+
+    batch["advantages"] = out_adv
+    batch["group_tokens"] = out_gt
+    batch["overflow"] = out_ov
+    batch["example_weight"] = out_w
+    return batch
+
+
 def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
     """
     Updates the advantages column in the given dataset based on reward statistics.
+    Uses vectorized operations and parallel processing where possible.
 
     Args:
         dataset (Dataset): The input dataset containing rewards and placeholder advantages.
+        eos_token_id (int): Token ID for end of sequence
+        config (RLConfig): Configuration for RL training
 
     Returns:
         Dataset: The updated dataset with the updated advantages column.
-
     """
-    processed_items: list[dict] = []
+    logger.info("Computing rewards (pass 1/2)")
+    _NUM_PROC = max(1, min(config.rl_num_proc, (os.cpu_count() or 1)))
 
-    group_ids      = []
-    rewards_scalar = []
-    token_lens     = []
+    dataset = dataset.map(
+        partial(_prepare_reward_columns, config=config),
+        batched=True,
+        num_proc=_NUM_PROC,
+        writer_batch_size=1000,
+        desc="prepare rewards",
+    )
 
-    for ex in dataset:
-        scalar_reward = float(ex.get("reward", 0.0))
-        per_token_rewards = ex.get("rewards", [scalar_reward] * len(ex["input_ids"]))
+    logger.info("Computing group statistics")
+    group_ids_raw = np.asarray(dataset["group_id"])
+    scalar_r = np.asarray(dataset["reward"], dtype=np.float32)
+    token_lens = np.array([len(x) for x in dataset["input_ids"]], dtype=np.float32)
 
-        if config.reward_minus_kl_coef > 0:
-            per_token_rewards = calculate_rewards_with_implicit_kl(
-                {
-                    "rewards": per_token_rewards,
-                    "old_logprobs": ex.get("old_logprobs", []),
-                    "ref_logprobs": ex.get("ref_logprobs", []),
-                },
-                reward_minus_kl_coef=config.reward_minus_kl_coef,
-            )
-            scalar_reward = float(np.mean(per_token_rewards)) if per_token_rewards else 0.0
+    _, group_indices = np.unique(group_ids_raw, return_inverse=True)
+    
+    counts = np.bincount(group_indices)
+    reward_sum = np.bincount(group_indices, weights=scalar_r)
+    reward_sq_sum = np.bincount(group_indices, weights=scalar_r**2)
+    token_sum = np.bincount(group_indices, weights=token_lens)
 
-        ex["rewards"] = per_token_rewards
-        ex["reward"] = scalar_reward
+    group_means = reward_sum / counts.clip(1)
+    group_vars = reward_sq_sum / counts.clip(1) - group_means**2
+    group_stds = np.sqrt(np.maximum(0.0, group_vars))
+    group_avg_tokens = token_sum / counts.clip(1)
 
-        processed_items.append(ex)
-        group_ids.append(ex["group_id"])
-        rewards_scalar.append(scalar_reward)
-        token_lens.append(len(ex["input_ids"]))
+    logger.info("Computing advantages and final RL columns (pass 2/2)")
+    
+    # Create a lookup dict with group-level stats
+    group_lookup = {
+        "mean": group_means,
+        "std": group_stds,
+        "avg_tok": group_avg_tokens
+    }
+    
+    dataset = dataset.map(
+        partial(_finalise_rl_columns, 
+                group_lookup=group_lookup, 
+                group_ids=group_indices,
+                config=config, 
+                eos_token_id=eos_token_id),
+        batched=True,
+        with_indices=True,
+        num_proc=_NUM_PROC,
+        writer_batch_size=1000,
+        desc="finalise RL columns",
+    )
 
-    group_ids_np = np.asarray(group_ids)
-    rewards_np = np.asarray(rewards_scalar, dtype=np.float32)
-    token_lens_np = np.asarray(token_lens, dtype=np.float32)
+    return dataset
 
-    _, inverse_inds = np.unique(group_ids_np, return_inverse=True)
-    counts = np.bincount(inverse_inds)
-    reward_sum = np.bincount(inverse_inds, weights=rewards_np)
-    reward_sq_sum = np.bincount(inverse_inds, weights=rewards_np ** 2)
-    token_sum = np.bincount(inverse_inds, weights=token_lens_np)
 
-    reward_mean_per_group = reward_sum / np.maximum(counts, 1)
-    reward_var_per_group = reward_sq_sum / np.maximum(counts, 1) - reward_mean_per_group ** 2
-    reward_std_per_group = np.sqrt(np.maximum(0.0, reward_var_per_group))
-    avg_tokens_per_group = token_sum / np.maximum(counts, 1)
-
-    reward_mean_arr = reward_mean_per_group[inverse_inds]
-    reward_std_arr = reward_std_per_group[inverse_inds]
-    avg_tokens_arr = avg_tokens_per_group[inverse_inds]
-
-    for idx, example in enumerate(processed_items):
-        advantages = calculate_advantage(
-            {
-                "rewards": example["rewards"],
-                "reward_mean": float(reward_mean_arr[idx]),
-                "reward_std": float(reward_std_arr[idx]),
-            }
-        )
-        example["advantages"] = advantages
-
-        example["group_tokens"] = [float(avg_tokens_arr[idx])] * len(example["input_ids"])
-
-        full_len = len(example["input_ids"])
-        old_logs = example["old_logprobs"]
-        ref_logs = example["ref_logprobs"]
-        example["old_logprobs"] = [0.0] * (full_len - len(old_logs)) + old_logs
-        example["ref_logprobs"] = [0.0] * (full_len - len(ref_logs)) + ref_logs
-
-        has_eos = eos_token_id in example["input_ids"]
-        example["overflow"] = [0.0 if has_eos else 1.0] * full_len
-
+def _assign_weights_fn(batch: dict[str, list], eos_token_id: int, config: RLConfig) -> dict[str, list]:
+    """
+    Batched function for assigning example weights.
+    
+    Args:
+        batch: dict-of-lists (HF 'batched' format)
+        eos_token_id: Token ID for end of sequence
+        config: RLConfig instance
+    
+    Returns:
+        batch with overflow and example_weight columns
+    """
+    overflow_out = []
+    weights_out = []
+    
+    for inp_ids in batch["input_ids"]:
+        has_eos = eos_token_id in inp_ids
+        full_len = len(inp_ids)
+        
+        overflow_out.append([0.0 if has_eos else 1.0] * full_len)
         if config.overlong_filtering and not has_eos:
-            example["example_weight"] = [0.0] * full_len
+            weights_out.append([0.0] * full_len)
         else:
-            example["example_weight"] = [1.0] * full_len
-
-    return Dataset.from_list(processed_items)
+            weights_out.append([1.0] * full_len)
+    
+    batch["overflow"] = overflow_out
+    batch["example_weight"] = weights_out
+    return batch
 
 
 def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
     """
-    Populates a dataset with reinforcement learning specific data columns.
+    Populates a dataset with example weights and overflow flags.
 
     Args:
         dataset (Dataset): The input dataset containing rewards.
+        eos_token_id (int): Token ID for end of sequence
         config (RLConfig): Configuration object containing RL training parameters
 
     Returns:
@@ -384,20 +515,16 @@ def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig
     """
     if "example_weight" in dataset.column_names and "overflow" in dataset.column_names:
         return dataset
-
-    processed: list[dict] = []
-    for ex in dataset:
-        has_eos = eos_token_id in ex["input_ids"]
-        full_len = len(ex["input_ids"])
-
-        ex["overflow"] = [0.0 if has_eos else 1.0] * full_len
-        if config.overlong_filtering and not has_eos:
-            ex["example_weight"] = [0.0] * full_len
-        else:
-            ex["example_weight"] = [1.0] * full_len
-        processed.append(ex)
-
-    return Dataset.from_list(processed)
+    
+    _NUM_PROC = max(1, min(config.rl_num_proc, (os.cpu_count() or 1)))
+    
+    return dataset.map(
+        partial(_assign_weights_fn, eos_token_id=eos_token_id, config=config),
+        batched=True,
+        num_proc=_NUM_PROC,
+        writer_batch_size=1000,
+        desc="assign weights",
+    )
 
 
 def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
