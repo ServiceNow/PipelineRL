@@ -311,8 +311,11 @@ def _prepare_reward_columns(batch: dict[str, list], config: RLConfig) -> dict[st
         if "rewards" in batch and len(batch["rewards"][i]) > 0:
             r_tok = batch["rewards"][i]
         else:
+            # Expect a scalar reward; raise if it is missing
+            if "reward" not in batch:
+                raise ValueError("Missing 'reward' column for RL preprocessing")
             seq_len = len(inp_ids)
-            scalar = float(batch.get("reward", [0.0])[i]) if "reward" in batch else 0.0
+            scalar = float(batch["reward"][i])
             r_tok = [scalar] * seq_len
         
         if reward_minus_kl_coef > 0:
@@ -439,10 +442,13 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
     reward_sq_sum = np.bincount(group_indices, weights=scalar_r**2)
     token_sum = np.bincount(group_indices, weights=token_lens)
 
-    group_means = (reward_sum / counts.clip(1)).astype(np.float32)
-    group_vars = (reward_sq_sum / counts.clip(1) - group_means**2).astype(np.float32)
+    if (counts == 0).any():
+        raise ValueError("Encountered empty group when computing RL statistics")
+
+    group_means = (reward_sum / counts).astype(np.float32)
+    group_vars = (reward_sq_sum / counts - group_means**2).astype(np.float32)
     group_stds = np.sqrt(np.maximum(0.0, group_vars)).astype(np.float32)
-    group_avg_tokens = (token_sum / counts.clip(1)).astype(np.float32)
+    group_avg_tokens = (token_sum / counts).astype(np.float32)
 
     logger.info("Computing advantages and final columns (pass 2/2)")
     
@@ -469,64 +475,6 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
     return dataset
 
 
-def _assign_weights_fn(batch: dict[str, list], eos_token_id: int, config: RLConfig) -> dict[str, list]:
-    """
-    Batched function for assigning example weights.
-    
-    Args:
-        batch: dict-of-lists (HF 'batched' format)
-        eos_token_id: Token ID for end of sequence
-        config: RLConfig instance
-    
-    Returns:
-        batch with overflow and example_weight columns
-    """
-    overflow_out = []
-    weights_out = []
-    
-    inp_ids_arrays = [np.asarray(ids, dtype=np.int32) for ids in batch["input_ids"]]
-    
-    for i, inp_ids_arr in enumerate(inp_ids_arrays):
-        full_len = len(inp_ids_arr)
-        has_eos = (inp_ids_arr == eos_token_id).any()
-        
-        overflow_out.append([0.0 if has_eos else 1.0] * full_len)
-        if config.overlong_filtering and not has_eos:
-            weights_out.append([0.0] * full_len)
-        else:
-            weights_out.append([1.0] * full_len)
-    
-    batch["overflow"] = overflow_out
-    batch["example_weight"] = weights_out
-    return batch
-
-
-def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
-    """
-    Populates a dataset with example weights and overflow flags.
-
-    Args:
-        dataset (Dataset): The input dataset containing rewards.
-        eos_token_id (int): Token ID for end of sequence
-        config (RLConfig): Configuration object containing RL training parameters
-
-    Returns:
-        Dataset: The updated dataset with the assigned example weights.
-    """
-    if "example_weight" in dataset.column_names and "overflow" in dataset.column_names:
-        return dataset
-    
-    _NUM_PROC = max(1, min(config.rl_num_proc, (os.cpu_count() or 1)))
-    
-    return dataset.map(
-        partial(_assign_weights_fn, eos_token_id=eos_token_id, config=config),
-        batched=True,
-        num_proc=_NUM_PROC,
-        writer_batch_size=1000,
-        desc="assign weights",
-    )
-
-
 def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
     """
     Populates a dataset with reinforcement learning specific data columns.
@@ -544,7 +492,6 @@ def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> D
     logger.debug("Populate RL Data")
 
     dataset = update_rewards_and_advantages(dataset, eos_token_id, config)
-    dataset = assign_example_weights(dataset, eos_token_id, config)
 
     logger.debug("Finish Populate RL Data")
     return dataset
