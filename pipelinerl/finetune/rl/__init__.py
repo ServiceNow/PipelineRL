@@ -303,27 +303,24 @@ def _prepare_reward_columns(batch: dict[str, list], config: RLConfig) -> dict[st
 
     reward_minus_kl_coef = config.reward_minus_kl_coef
     
-    # Pre-convert arrays for KL calculation if needed
     if reward_minus_kl_coef > 0:
         old_lp_arrays = [np.asarray(lp, dtype=np.float32) for lp in batch["old_logprobs"]]
         ref_lp_arrays = [np.asarray(lp, dtype=np.float32) for lp in batch["ref_logprobs"]]
     
     for i, inp_ids in enumerate(batch["input_ids"]):
-        # Get or initialize rewards
         if "rewards" in batch and len(batch["rewards"][i]) > 0:
             r_tok = batch["rewards"][i]
         else:
             seq_len = len(inp_ids)
-            scalar = batch.get("reward", [0.0])[i] if "reward" in batch else 0.0
+            scalar = float(batch.get("reward", [0.0])[i]) if "reward" in batch else 0.0
             r_tok = [scalar] * seq_len
         
-        # Apply KL adjustment if needed
         if reward_minus_kl_coef > 0:
             old_lp = old_lp_arrays[i]
             ref_lp = ref_lp_arrays[i]
             log_ratio = ref_lp - old_lp
             kl = (np.exp(log_ratio) - log_ratio - 1).sum()
-            r_tok = [r - reward_minus_kl_coef * kl for r in r_tok]
+            r_tok = [float(r - reward_minus_kl_coef * kl) for r in r_tok]
         
         rewards_out.append(r_tok)
         scalar_out.append(float(np.mean(r_tok)))
@@ -373,14 +370,14 @@ def _finalise_rl_columns(
         L = len(inp_ids_arr)
         
         # Look up group stats online
-        g_mean = group_lookup["mean"][group_idx]
-        g_std = group_lookup["std"][group_idx]
-        g_tok = group_lookup["avg_tok"][group_idx]
+        g_mean = float(group_lookup["mean"][group_idx])
+        g_std = float(group_lookup["std"][group_idx])
+        g_tok = float(group_lookup["avg_tok"][group_idx])
         
         # Compute advantages in-place
         adv = ((r_tok_arr - g_mean) / (g_std + 1e-4)).tolist()
         
-        gt = [float(g_tok)] * L
+        gt = [g_tok] * L
         
         pad_len = L - len(old_lp)
         if pad_len > 0:
@@ -436,17 +433,18 @@ def update_rewards_and_advantages(dataset: Dataset, eos_token_id: int, config: R
 
     _, group_indices = np.unique(group_ids_raw, return_inverse=True)
     
+    # Compute stats per group
     counts = np.bincount(group_indices)
     reward_sum = np.bincount(group_indices, weights=scalar_r)
     reward_sq_sum = np.bincount(group_indices, weights=scalar_r**2)
     token_sum = np.bincount(group_indices, weights=token_lens)
 
-    group_means = reward_sum / counts.clip(1)
-    group_vars = reward_sq_sum / counts.clip(1) - group_means**2
-    group_stds = np.sqrt(np.maximum(0.0, group_vars))
-    group_avg_tokens = token_sum / counts.clip(1)
+    group_means = (reward_sum / counts.clip(1)).astype(np.float32)
+    group_vars = (reward_sq_sum / counts.clip(1) - group_means**2).astype(np.float32)
+    group_stds = np.sqrt(np.maximum(0.0, group_vars)).astype(np.float32)
+    group_avg_tokens = (token_sum / counts.clip(1)).astype(np.float32)
 
-    logger.info("Computing advantages and final RL columns (pass 2/2)")
+    logger.info("Computing advantages and final columns (pass 2/2)")
     
     # Create a lookup dict with group-level stats
     group_lookup = {
@@ -486,9 +484,11 @@ def _assign_weights_fn(batch: dict[str, list], eos_token_id: int, config: RLConf
     overflow_out = []
     weights_out = []
     
-    for inp_ids in batch["input_ids"]:
-        has_eos = eos_token_id in inp_ids
-        full_len = len(inp_ids)
+    inp_ids_arrays = [np.asarray(ids, dtype=np.int32) for ids in batch["input_ids"]]
+    
+    for i, inp_ids_arr in enumerate(inp_ids_arrays):
+        full_len = len(inp_ids_arr)
+        has_eos = (inp_ids_arr == eos_token_id).any()
         
         overflow_out.append([0.0 if has_eos else 1.0] * full_len)
         if config.overlong_filtering and not has_eos:
