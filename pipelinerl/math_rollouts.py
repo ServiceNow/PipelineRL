@@ -1,15 +1,24 @@
 import time
-from typing import Dict, Tuple
 import aiohttp
 from omegaconf import DictConfig
 from pydantic import BaseModel
 from tapeagents.core import Prompt, LLMCall, TrainingText
 from tapeagents.llms.trainable import TrainableLLM
 
-from pipelinerl.actor_processing import RewardTable
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
-from pipelinerl.tapeagents_extensions import llm_async_generate
-from pipelinerl.verifier_api import verify_answer, verify_answer_rpc
+from pipelinerl.async_llm import llm_async_generate
+from pipelinerl.verifier_api import verify_answer_rpc
+
+
+class RewardTable(BaseModel):
+    wrong_answer_not_finished: float
+    wrong_answer_finished: float
+    no_answer_not_finished: float
+    no_answer_finished: float
+    unparsable_not_finished: float
+    unparsable_finished: float
+    correct_answer_not_finished: float
+    correct_answer_finished: float
 
 
 class RolloutResult(BaseModel):

@@ -170,6 +170,7 @@ cython_debug/
 *.sqlite
 !tests/res/*/*.sqlite
 *.zip
+**/__pycache__/
 **/.hypothesis/
 **/*.egg-info/
 /dist/*
