@@ -374,18 +374,50 @@ def run_preprocessing_loop(
                         if isinstance(dataset, Exception):
                             raise dataset
                         start_writing = time.time()
+
+                        # Filter out groups where all advantages are zero
+                        filtered_entries = []
+                        groups = {}
                         for entry in dataset:
+                            group_id = entry["group_id"]
+                            if group_id not in groups:
+                                groups[group_id] = []
+                            groups[group_id].append(entry)
+                        
+                        num_filtered_out = 0
+                        epsilon = 1e-6 # Threshold for considering advantage non-zero
+                        for group_id, entries in groups.items():
+                            has_non_zero_advantage = False
+                            for entry in entries:
+                                # advantages is a list, check if any absolute value is > epsilon
+                                if any(abs(adv) > epsilon for adv in entry["advantages"]):
+                                    has_non_zero_advantage = True
+                                    break
+                            if has_non_zero_advantage:
+                                filtered_entries.extend(entries)
+                            else:
+                                num_filtered_out += len(entries)
+
+                        if num_filtered_out > 0:
+                            logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
+
+                        # Write only the filtered entries
+                        for entry in filtered_entries:
                             writer.write(entry)
                         writing_took = time.time() - start_writing
-                        stats_aggregator.update([len(entry["input_ids"]) for entry in dataset])
+                        
+                        if filtered_entries: # Only update stats if we wrote something
+                            stats_aggregator.update([len(entry["input_ids"]) for entry in filtered_entries])
+                        
                         processed_chunks += 1
-                        published_samples += len(dataset)
+                        published_samples += len(filtered_entries) # Count only written samples
                         max_model_version = max(dataset["model_version"])
                         samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_size                        
                         stats = {
                             "preprocessor/published_samples": published_samples,
                             "preprocessor/published_model_version": max_model_version,
                             "preprocessor/samples_in_queue": samples_in_queue,
+                            "preprocessor/filtered_out_samples": num_filtered_out,
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
@@ -393,7 +425,7 @@ def run_preprocessing_loop(
                         stats_writer.write(stats)
                         processing_took = time.time() - start_processing
                         logger.info(
-                            f"Processed {len(dataset)} samples in {processing_took:.3f}s (writing took {writing_took}) and wrote to {output_stream}, total {published_samples} samples so far, {samples_in_queue} samples in queue"
+                            f"Processed {len(filtered_entries)} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s (writing took {writing_took}) and wrote to {output_stream}, total {published_samples} samples so far, {samples_in_queue} samples in queue"
                         )
                     except Exception as e:
                         logger.error(f"Error in preprocessor worker: {e}")
