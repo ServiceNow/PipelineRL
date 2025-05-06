@@ -1,9 +1,6 @@
 import asyncio
-import json
 import logging
-import os
 import signal
-from pydantic import TypeAdapter
 import torch
 import uvloop
 from vllm import AsyncLLMEngine
@@ -21,7 +18,6 @@ from vllm.entrypoints.openai.api_server import (
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-from vllm.logger import init_logger
 from vllm._version import version
 from vllm.worker.worker import Worker
 from vllm.executor.multiproc_worker_utils import ProcessWorkerWrapper
@@ -33,8 +29,7 @@ from vllm.worker.multi_step_worker import MultiStepWorker
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 
-import torch.distributed as dist
-from pipelinerl.run_finetune import TrainerMessage, WeightUpdateRequest
+from pipelinerl.run_finetune import WeightUpdateRequest
 import pipelinerl.torch_utils
 
 logger = logging.getLogger(__name__)
@@ -157,7 +152,7 @@ class WeightUpdateManager:
             self.driver_worker.receive_weight_update(message)
             for future in futures:
                 future.get()
-            logger.info(f"All workers received weight updates")
+            logger.info("All workers received weight updates")
     
 
 async def run_server(args, **uvicorn_kwargs) -> None:

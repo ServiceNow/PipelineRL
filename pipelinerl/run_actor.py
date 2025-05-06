@@ -23,7 +23,6 @@ from pipelinerl.load_datasets import load_datasets
 from pipelinerl.math_rollouts import RolloutResult, generate_math_rollout
 from pipelinerl.state import TrainerState
 import asyncio
-from collections import defaultdict
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamSpec,

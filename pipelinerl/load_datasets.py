@@ -8,7 +8,6 @@ import hydra
 import random
 from datasets import load_dataset
 from omegaconf import DictConfig
-from tqdm import tqdm
 
 """
 math_verify expects the following LaTeX format for the gold answer (with $ or \\boxed).
