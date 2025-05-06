@@ -1,15 +1,21 @@
-import argparse
-import json
+import time
+import requests
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+import aiohttp
+import uvicorn
 import logging
 import signal
-import sys
-import urllib.parse
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import pipelinerl.countdown_utils
-import random
+
+from omegaconf import DictConfig
 import math_verify  # Ensure math_verify is installed
-from typing import Dict
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from functools import partial
+
+import pipelinerl.countdown_utils
 
 logging.basicConfig(
     level=logging.DEBUG,  # Or INFO, WARNING, etc.
@@ -149,3 +155,75 @@ def verify_countdown(prediction: str, gold: str) -> str:
             return "wrong"
     except Exception as _:
         return "wrong"
+
+
+def run_verifier(cfg: DictConfig):
+    """
+    Serve the verification API using FastAPI.
+    """
+    app = FastAPI()
+    # Create a process pool with 4 workers
+    with ProcessPoolExecutor(max_workers=4) as process_pool:
+        @app.post("/verify_answer")
+        async def verify(request: dict):
+            prediction = request["prediction"]
+            gold = request["gold"]
+            strict = request["strict"]
+            max_prediction_length = request["max_prediction_length"]
+            
+            # Run verification in the process pool to avoid blocking the main thread
+            loop = asyncio.get_event_loop()
+            answer_status = await loop.run_in_executor(
+                process_pool,
+                partial(verify_answer, prediction, gold, strict, max_prediction_length)
+            )
+            return JSONResponse(content={"answer_status": answer_status})
+        @app.get("/health")
+        async def health():
+            return JSONResponse(content={"status": "ok"})
+        uvicorn.run(app, host="0.0.0.0", port=cfg.verifier.port, timeout_keep_alive=60)
+
+
+async def verify_answer_rpc(
+    session: aiohttp.ClientSession, 
+    verifier_cfg: DictConfig, 
+    prediction: str, 
+    gold: str, 
+    strict: bool = True, 
+    max_prediction_length: int = 1000
+):
+    """
+    Verify the answer using the verifier API.
+    """
+    json = {
+        "prediction": prediction,
+        "gold": gold,
+        "strict": strict,
+        "max_prediction_length": max_prediction_length,
+    }
+    async with session.post(
+        f"http://{verifier_cfg.host}:{verifier_cfg.port}/verify_answer",
+        json=json,
+    ) as response:
+        if response.status == 200:
+            data = await response.json()
+            return data["answer_status"]
+        else:
+            logger.error(f"Error verifying answer: {response.status}")
+            logger.error(f"Response: {await response.text()}")
+            raise ValueError("Error verifying answer")
+    
+
+def wait_for_verifier(verifier_cfg: DictConfig):
+    """
+    Wait for the verifier to be ready.
+    """
+    while True:
+        # use requests
+        try:
+            response = requests.get(f"http://{verifier_cfg.host}:{verifier_cfg.port}/health")
+            if response.status_code == 200:
+                break            
+        except:
+            logger.info("Verifier not ready yet, waiting...")
+            time.sleep(5.0)

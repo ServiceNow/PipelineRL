@@ -204,7 +204,7 @@ def add_ids(dataset: list[dict]):
     return dataset
 
 
-def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, List[Dict]]]:
+def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict]]:
     if dataset_names is None:
         return []
 

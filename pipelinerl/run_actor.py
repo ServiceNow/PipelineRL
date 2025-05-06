@@ -1,35 +1,29 @@
-import contextlib
-import copy
 import logging
 import math
 import os
 import queue
 import random
 import time
+import multiprocessing as mp
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty, Queue
-from typing import List
 
-from pipelinerl.cot_math_agent import (
-    CoTMathAgent,
-    RLMathTape,
-)
-from pipelinerl.actor_processing import (
-    convert_problems_to_tapes,
-    extract_tape_training_samples,
-)
-from omegaconf import DictConfig, OmegaConf
+import uvloop
+import aiohttp
+
+from omegaconf import DictConfig
 from pydantic import BaseModel, Field
 
-from tapeagents.core import Tape, TrainingText
-from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
+from pipelinerl.verifier_api import wait_for_verifier
 from tapeagents.llms import TrainableLLM
+from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 
 import wandb
 from pipelinerl.load_datasets import load_datasets
+from pipelinerl.math_rollouts import RolloutResult, generate_math_rollout
 from pipelinerl.state import TrainerState
+import asyncio
+from collections import defaultdict
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamSpec,
@@ -108,89 +102,205 @@ class SlidingWindowAggregator:
             "total_tokens_per_second": (total_output_tokens + total_prompt_tokens)
             / time_span,
         }
+    
 
-
-def chunks(problems: list, n: int, random_batch=False):
-    """Yield chunks from problems, either sequentially or randomly.
-
-    Args:
-        problems: List to chunk
-        n: Size of each chunk
-        random_batch: If True, yield random batches. If False, loop through once.
-    """
-    if n > len(problems):
-        raise ValueError("n should be less than or equal to the length of problems")
-    if random_batch:
-        while True:
-            yield random.sample(problems, min(n, len(problems)))
-    else:
-        for i in range(0, len(problems), n):
-            yield problems[i : i + n]
-
-
-def without_replacement(problems: list, n: int):
-    while True:
-        shuffled_problems = random.sample(problems, len(problems))
-        for i in range(0, len(problems), n):
-            if i + n > len(problems):
-                break
-            yield shuffled_problems[i : i + n]
-
-
-def focused_chunks(problems: list, n: int, focus_n: int, focus_duration: int):
-    """Choose focus_n samples to focus on. Yield focus_duration chunks of those samples. Repeat"""
-    if focus_n > len(problems):
-        raise ValueError("focus_n should be less than or equal to the length of problems")
-    while True:
-        focus_samples = random.sample(problems, focus_n)
-        for _ in range(focus_duration):
-            # sample n examples from the focus samples
-            yield random.sample(focus_samples, n)
-
-
-def batch_run_agent_replica(
-    agent: CoTMathAgent, tapes: list[RLMathTape], model_version: int, final_tape_queue: Queue
+async def schedule_rollouts(
+    cfg: DictConfig,
+    attempts: int, 
+    problem_queue: mp.Queue, 
+    result_queue: mp.Queue, 
+    trainer_state: TrainerState,
+    llms: list[TrainableLLM],
+    scheduler_name: str,
 ):
-    time_before_llm_call = time.time()
-    final_tapes = agent.run_batch(tapes)
-    for tape in final_tapes:
-        tape.metadata.result["model_version"] = model_version
-    latency = time.time() - time_before_llm_call
-    try:
-        final_tape_queue.put_nowait((final_tapes, latency))
-    except queue.Full:
-        logger.warning(
-            "We are making rollouts faster than we can write them"
-        )
-        final_tape_queue.put((final_tapes, latency))
+    """This courotuine does the following.
+    
+    - It run asyncio loop for doing many rollouts in parallel using llm_async_generate
+    - For each problem it does exactly `attempts` rollouts (let's call this a group)
+    - It keeps track of how many rollout coroutines are running for each llms
+    - it uses the LLM that has the least number of running coroutines for each new rollout
+    - when all LLMs are busy it does nothing
+    - It keeps track of how many rollouts are done for each group
+    - When the group is done it puts the result in the result queue
+    """
+    loop = asyncio.get_running_loop()
 
+    # Track active tasks per LLM
+    active_rollouts = [0] * len(llms)
+    started_rollouts = 0
+    finished_rollouts = 0
+    # Track rollouts per problem group
+    group_rollouts = {}
+
+    async def rollout_and_maybe_produce_result(
+        problem: dict, 
+        group_id: int,
+        llm_index: int, 
+        session: aiohttp.ClientSession,
+    ):
+        nonlocal started_rollouts, finished_rollouts
+        try:
+            llm = llms[llm_index]
+            model_version = trainer_state.propagated_weight_version
+            assert model_version is not None
+            rollout_result = await generate_math_rollout(cfg, llm, problem, session)
+            rollout_result.model_version = model_version    
+            # Make a group id that will be different from groups made by another rollout maker
+            full_group_id = f"{scheduler_name}_{group_id}"
+            rollout_result.group_id = full_group_id
+            for sample in rollout_result.training_texts:
+                # Downstream in the pipeline we'll need these fields in every sample
+                sample.metadata["model_version"] = model_version
+                sample.group_id = full_group_id
+            group_rollouts[group_id].append(rollout_result)
+            if len(group_rollouts[group_id]) == attempts:
+                # This is blocking call, but there's just one other thread reading from this queue.
+                random.shuffle(group_rollouts[group_id]) 
+                result_queue.put(group_rollouts[group_id])
+                del group_rollouts[group_id]
+            finished_rollouts += 1
+        except Exception as e:
+            # Cancel all tasks except the current one
+            logger.error("Exception in rollout", exc_info=e)
+            current_task = asyncio.current_task(loop=loop)
+            for task in asyncio.all_tasks(loop=loop):
+                if task != current_task:
+                    task.cancel()
+            result_queue.put(e)
+            logger.error("Stopped all tasks and put exception in the result queue")
+        finally:
+            active_rollouts[llm_index] -= 1
+
+    group_id = -1
+    group_rollout_index = attempts
+    problem = None
+
+    last_logged = time.time()
+    logger.info("Starting rollout scheduler")
+    connector = aiohttp.TCPConnector(limit=50000, limit_per_host=50000, keepalive_timeout=1.0)
+    timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        while True:
+            if time.time() - last_logged > 10. and sum(active_rollouts):
+                logger.info(f"{scheduler_name}: "
+                            f"rollouts in progress: {sum(active_rollouts)}, "
+                            f"groups in progress: {len(group_rollouts)}, "
+                            f"rollouts started so far: {started_rollouts}, "
+                            f"rollouts finished so far: {finished_rollouts}")
+                last_logged = time.time()
+
+            if group_rollout_index == attempts:
+                try:
+                    problem = problem_queue.get_nowait()
+                except queue.Empty:
+                    # give some quality time for other couroutines to work
+                    await asyncio.sleep(0.01)
+                    continue
+                group_id += 1
+                group_rollouts[group_id] = []
+                group_rollout_index = 0
+
+            next_llm = active_rollouts.index(min(active_rollouts))
+            if active_rollouts[next_llm] == cfg.actor.llm_max_rollouts:
+                # all llms are busy, wait for one to finish
+                await asyncio.sleep(0.01)
+                continue 
+            active_rollouts[next_llm] += 1
+            started_rollouts += 1
+            loop.create_task(
+                rollout_and_maybe_produce_result(
+                    problem=problem,
+                    group_id=group_id,
+                    llm_index=next_llm,
+                    session=session,
+                )
+            )
+            group_rollout_index += 1
+    logger.info("Rollout scheduler finished")
+
+
+def rollout_maker_entrypoint(
+    cfg: DictConfig,
+    attempts: int,
+    problem_queue: mp.Queue,
+    result_queue: mp.Queue,
+    llms: list[TrainableLLM],
+    scheduler_name: str,
+):
+    trainer_state = TrainerState(Path(cfg.output_dir))
+    if cfg.debug.mode in ["actor", "open_loop"]:
+        trainer_state.propagated_weight_version = 0  
+    else:
+        trainer_state.start_listening()
+        trainer_state.wait_for_model_version()
+    loop = uvloop.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(
+        schedule_rollouts(cfg, attempts, problem_queue, result_queue, trainer_state, llms, scheduler_name)
+    )    
+    loop.close()
+    logger.info("Rollout maker loop closed")
+
+
+
+def random_iter(problems: list):
+    while True:
+        yield random.sample(problems, 1)[0]
+
+
+def sequential_iter(problems: list):
+    for problem in problems:
+        yield problem
+        
 
 class ActorLoop:
     def __init__(
         self,
-        agent_replicas: list[CoTMathAgent],
-        tapes_stream: StreamSpec,
-        data_stream: StreamSpec | None,
-        trainer_state: TrainerState,
-        stats_stream: StreamSpec,
         cfg: DictConfig,
+        llms: list[TrainableLLM],
+        data_stream: StreamSpec,
+        stats_stream: StreamSpec,        
+        trainer_state: TrainerState,
+        is_training: bool = True,
     ) -> None:
-        self.agent_replicas = agent_replicas
-        self.tapes_stream = tapes_stream
         self.data_stream = data_stream
         self.trainer_state = trainer_state
         self.stats_stream = stats_stream
-        self.window_size = 500 // cfg.actor.chunk_size
+        self.window_size = 500 // cfg.attempts
         self.stats_aggregator = SlidingWindowAggregator(window_size=self.window_size)
-        self.thread_pool_size = cfg.actor.threads_per_llm * len(agent_replicas)
-        self.submit_delay = cfg.actor.submit_delay / len(agent_replicas)
-        self.sampling_cfg = cfg.actor.sampling
-        logger.info(
-            f"Using a thread pool of size {self.thread_pool_size}, submitting training chunks with delay {self.submit_delay}"
-        )
+        self.llms = llms
+        # Can't use typing with multiprocessing.
+        # Queue of dict or None
+        self.problem_queue = mp.Queue(32)
+         # Queue of list[RolloutResult] or Exception 
+        self.result_queue = mp.Queue()    
+        self.loop_start_time = -1
         self.cfg = cfg
-        # should be removed in the future when extract_tape_training_samples moved in the repo
-        OmegaConf.set_struct(self.cfg, False)  # Disable strict mode
+        self.is_training = is_training
+        self.is_scheduling_paused = False
+
+        # Determine the number of processes to use 
+        num_processes = min(self.cfg.actor.rollout_workers, len(self.llms))
+        attempts = self.cfg.attempts if is_training else 1
+        
+        # Divide LLMs approximately equally across processes
+        llm_groups = [[] for _ in range(num_processes)]
+        for i, llm in enumerate(self.llms):
+            llm_groups[i % num_processes].append((i, llm))
+        
+        # Create and start multiple rollout processes
+        self.rollout_processes = []
+        for llm_group in llm_groups:
+            assert llm_group             
+            llm_idxs = [llm[0] for llm in llm_group]
+            llms = [llm[1] for llm in llm_group]   
+            scheduler_name = f"{'train' if is_training else 'test'} scheduler for llms {','. join([str(i) for i in llm_idxs])}"
+            process = mp.Process(
+                target=rollout_maker_entrypoint,
+                args=(self.cfg, attempts, self.problem_queue, self.result_queue, llms, scheduler_name)
+            )
+            process.start()
+            self.rollout_processes.append(process)
 
     def init_stats(self):
         # reset after publishing
@@ -203,237 +313,151 @@ class ActorLoop:
         self.output_tokens = defaultdict(lambda: defaultdict(list))
         self.overflows = defaultdict(lambda: defaultdict(list))
     
-    def update_stats(self, new_tape, tape_stats):
-        dataset_name = new_tape.steps[0].metadata.other["dataset"]
-        parent_id = new_tape.metadata.parent_id
-        self.reward_stats[dataset_name][parent_id].append(tape_stats["reward"])
-        self.step_stats[dataset_name][parent_id].append(tape_stats["steps"])
-        self.success_stats[dataset_name][parent_id].append(tape_stats["success"])
-        self.no_errors_stats[dataset_name][parent_id].append(tape_stats["no_error"])
-        self.no_answer_stats[dataset_name][parent_id].append(tape_stats["no_answer"])
-        self.prompt_tokens[dataset_name][parent_id].append(tape_stats["prompt_tokens"])
-        self.output_tokens[dataset_name][parent_id].append(tape_stats["output_tokens"])
-        self.overflows[dataset_name][parent_id].append(tape_stats["overflow"])
+    def update_stats(self, result: RolloutResult):
+        dataset_name = result.dataset_name
+        group_id = result.group_id
+        stats = result.metrics
+        self.reward_stats[dataset_name][group_id].append(stats["reward"])
+        self.success_stats[dataset_name][group_id].append(stats["success"])
+        self.no_errors_stats[dataset_name][group_id].append(stats["no_error"])
+        self.no_answer_stats[dataset_name][group_id].append(stats["no_answer"])
+        self.prompt_tokens[dataset_name][group_id].append(stats["prompt_tokens"])
+        self.output_tokens[dataset_name][group_id].append(stats["output_tokens"])
+        self.overflows[dataset_name][group_id].append(stats["overflow"])
 
-    def run_agent_make_data(
-        self,
-        dataset: List[dict],
-        is_training: bool = True,
-    ):
+    def run(self, dataset: list[tuple[str, dict]]):
+        loop_start_time = time.time()
         self.init_stats()
-        final_tape_queue = Queue[tuple[list[RLMathTape], float]]()
-        next_agent_replica = 0
-        last_submit = 0
 
-        attempts = self.cfg.attempts if is_training else 1
-        submitted_tapes = 0
+        attempts = self.cfg.attempts if self.is_training else 1
         published_samples = 0
-        expected_number_of_tapes = -1 if is_training else len(dataset) * attempts
-        finished_tapes = 0
-        submitted_chunks = 0
-        finished_chunks = 0
+        submitted_groups = 0
+        finished_groups = 0
+        expected_number_of_samples = -1 if self.is_training else len(dataset)
+        if expected_number_of_samples > 0:
+            logger.info(f"Will stop after {expected_number_of_samples} samples")
+
         # If training, we expect to sample infinitely
         # for train sample, sample random batches infinitely
         # for test samples, loop through the dataset once
-        if is_training:
-            if self.sampling_cfg.method == "random":
-                logger.info(f"Using random problem sampling")
-                dataset_iter = chunks(
-                    dataset, self.cfg.actor.chunk_size // attempts, random_batch=True
-                )
-            elif self.sampling_cfg.method == "without_replacement":
-                logger.info(f"Using without replacement problem sampling")
-                dataset_iter = without_replacement(
-                    dataset, self.cfg.actor.chunk_size // attempts
-                )
-            elif self.sampling_cfg.method == "focused":
-                logger.info(f"Using focused problem sampling: {self.sampling_cfg}")
-                dataset_iter = focused_chunks(
-                    dataset,
-                    self.cfg.actor.chunk_size // attempts,
-                    self.sampling_cfg.focus_n,
-                    self.sampling_cfg.focus_duration,
-                )
-            else:
-                raise ValueError(f"Unknown sampling method: {self.sampling_cfg.method}")
+        if self.is_training:
+            problem_iter = random_iter(dataset)
         else:
-            dataset_iter = chunks(dataset, self.cfg.actor.chunk_size // attempts)
-        split_name = "" if is_training else "test"
+            problem_iter = sequential_iter(dataset)
+        split_name = "" if self.is_training else "test"
         assert self.trainer_state.propagated_weight_version is not None
 
         last_trainer_version = self.trainer_state.propagated_weight_version
-        max_lag = self.cfg.max_lag if is_training else None
+        max_lag = self.cfg.finetune.max_lag if self.is_training else None
         if max_lag is not None:
             total_batch_size = self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
             total_update_size = math.ceil(self.cfg.finetune.weight_update_interval / total_batch_size) * total_batch_size
-            if total_batch_size % self.cfg.actor.chunk_size != 0:
+            if total_batch_size % self.cfg.attempts != 0:
                 logger.warning(
-                    f"I'm trying to submit the exact right number of chunks for this batch."
-                    f" Actor chunk size {self.cfg.actor.chunk_size} ideally should divide total batch size {total_batch_size}"
+                    f"I'm trying to submit the exact right number of groups for this batch."
+                    f" The attempt number  {self.cfg.attempts} ideally should divide"
+                    f" total batch size {total_batch_size}"
                 )
-            chunks_per_update = math.ceil(total_update_size / self.cfg.actor.chunk_size)
-            lag_chunks = math.ceil(max_lag / self.cfg.actor.chunk_size)
-            logger.info(f"Sync RL mode on, can submit {chunks_per_update} chunks for each update,"
-                        f" that makes {chunks_per_update * self.cfg.actor.chunk_size} samples per update")
-            logger.info(f"Max lag is {max_lag} samples, that makes {lag_chunks} additional starting chunks")
-            can_submit_before_update = lag_chunks + chunks_per_update
+            groups_per_update = math.ceil(total_update_size / self.cfg.attempts)
+            lag_groups = math.ceil(self.cfg.finetune.max_lag / self.cfg.attempts)
+            logger.info(f"Sync RL mode on, can submit {groups_per_update} groups for each update,"
+                        f" that makes {groups_per_update * self.cfg.attempts} samples per update")
+            logger.info(f"Max lag is {self.cfg.finetune.max_lag} samples, that makes {lag_groups}"
+                        " additional starting chunks")
+            can_submit_before_update = lag_groups + groups_per_update
         else:
-            chunks_per_update = None
+            groups_per_update = None
             can_submit_before_update = math.inf
 
-        final_tape_queue = queue.Queue()
-        @contextlib.contextmanager
-        def maybe_write_stream(stream):
-            if stream:
-                with write_to_streams(stream, "a") as writer:
-                    yield writer
-            else:
-                yield None
+        logger.info(f"Start {'train' if self.is_training else 'test'} actor loop")
         with (
-            ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor,
-            maybe_write_stream(self.data_stream) as data_stream_writer,
-            write_to_streams(self.tapes_stream, "a") as tapes_stream_writer,
+            write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
         ):
-            logger.info(f"Using {executor} for parallel processing")
-            # take sub samples of size cfg.actor.chunk_size // cfg.attempts
             while True:
+                # the user function must do next(...) to run each iteration
+                yield
+
                 if self.trainer_state.propagated_weight_version > last_trainer_version:
                     if max_lag is not None:
-                        assert chunks_per_update is not None
-                        can_submit_before_update += chunks_per_update
+                        assert groups_per_update is not None
+                        can_submit_before_update += groups_per_update
                     last_trainer_version = self.trainer_state.propagated_weight_version
 
-                # First, submit a new task
-                cur_time = time.time()
-                if (
-                    cur_time - last_submit > (self.submit_delay if is_training else 0)
-                    and (submitted_chunks < can_submit_before_update or not is_training)
-                    and submitted_chunks - finished_chunks < self.thread_pool_size
-                ):
-                    try:
-                        sub_samples = next(dataset_iter)
-                        start_tapes = convert_problems_to_tapes(sub_samples, self.cfg)
-                        start_tapes = [
-                            copy.deepcopy(tape)
-                            for tape in start_tapes
-                            for _ in range(attempts)
-                        ]
-
-                        future = executor.submit(
-                            batch_run_agent_replica,
-                            self.agent_replicas[next_agent_replica],
-                            start_tapes,
-                            self.trainer_state.propagated_weight_version,
-                            final_tape_queue
+                # First, submit all problems you can
+                if not self.is_scheduling_paused:
+                    while True:
+                        blocked_by_lag = (
+                            submitted_groups == can_submit_before_update and self.is_training
                         )
-                        future.add_done_callback(
-                            lambda fut: logger.error(
-                                f"Exception while running the agent: {fut.exception()}",
-                                exc_info=fut.exception(),
-                            )
-                            if fut.exception()
-                            else None
-                        )
-                        logger.info(
-                            f"Submitted {len(start_tapes)}{' ' + split_name if split_name else ''} tapes to agent replica {next_agent_replica},"
-                            f" model version is {self.trainer_state.propagated_weight_version}"
-                        )
-                        next_agent_replica = (next_agent_replica + 1) % len(
-                            self.agent_replicas
-                        )
-                        submitted_chunks += 1
-                        submitted_tapes += len(start_tapes)
-                        last_submit = cur_time
-                    except StopIteration:
-                        pass
+                        if not blocked_by_lag and not self.problem_queue.full():
+                            try:
+                                problem = next(problem_iter)
+                                self.problem_queue.put_nowait(problem)  
+                                submitted_groups += 1
+                            except StopIteration:
+                                break
+                        else:
+                            break
 
                 # Second, try return a result
                 try:
-                    final_tapes, latency = final_tape_queue.get_nowait()
-                except Empty:
+                    rollout_results = self.result_queue.get_nowait()
+                    if isinstance(rollout_results, Exception):
+                        logger.error("Stop actor loop due to error")
+                        raise rollout_results
+                except queue.Empty:
                     continue
-                assert isinstance(final_tapes, list) and all(
-                    isinstance(tape, Tape) for tape in final_tapes
-                )
-                training_samples: List[TrainingText] = []
 
-                max_model_version = -1
-                for new_tape in final_tapes:
-                    tape_training_samples, tape_stats = (
-                        extract_tape_training_samples(
-                            new_tape, self.agent_replicas[0], self.cfg
-                        )
-                    )
-
-                    max_model_version = max(
-                        max_model_version, new_tape.metadata.result["model_version"]
-                    )
-                    overflow = False
-                    for sample in tape_training_samples:
-                        sample.metadata["model_version"] = new_tape.metadata.result[
-                            "model_version"
-                        ]
-                        eos_token_id = self.agent_replicas[
-                            next_agent_replica
-                        ].llm.tokenizer.eos_token_id
-                        overflow = (
-                            False if sample.input_ids[-1] == eos_token_id else True
-                        ) or overflow
-                    
-                    tape_stats |= {"overflow": overflow}
-                    self.update_stats(new_tape, tape_stats)
-
-                    if is_training:
-                        training_samples.extend(tape_training_samples)
-
-                    # Important: write the tape after training samples are extracted,
-                    # because rewards are added at that time
-                    tapes_stream_writer.write(new_tape)                            
-
-
-                published_samples += len(training_samples)
-                samples_in_queue = final_tape_queue.qsize() * self.cfg.actor.chunk_size                    
-                if data_stream_writer and training_samples:
-                    for text in training_samples:
+                assert isinstance(rollout_results, list)
+                assert isinstance(rollout_results[0], RolloutResult)
+                for result in rollout_results:
+                    if len(result.training_texts) > 1:
+                        raise NotImplementedError("Multi-turn rollouts not tested yet")
+                group_samples = sum(len(r.training_texts) for r in rollout_results)
+    
+                published_samples += group_samples
+                samples_in_queue = self.result_queue.qsize() * attempts                   
+                for r in rollout_results:
+                    for text in r.training_texts:
                         data_stream_writer.write(text)
-                    logger.info(
-                        f"Published {len(training_samples)}{' ' + split_name if split_name else ''} samples/tapes"
-                        f" to {self.data_stream} and {self.tapes_stream}, total {published_samples} samples so far, {samples_in_queue} samples in the queue"
-                    )
-                else:
-                    logger.info(
-                        f"Published {len(final_tapes)}{' ' + split_name if split_name else ''} tapes to {self.tapes_stream}"
-                    )
+                logger.info(
+                    f"Published {group_samples}{' ' + split_name if split_name else ''} samples"
+                    f" to {self.data_stream}, total {published_samples} samples so far, {samples_in_queue} samples in the queue"
+                )
 
                 flattened_prompt_tokens = [
-                    prompt_tokens
-                    for dataset_dict in self.prompt_tokens.values()
-                    for attempt_list in dataset_dict.values()
-                    for prompt_tokens in attempt_list
+                    call.prompt_length_tokens
+                    for result in rollout_results
+                    for call in result.llm_calls
                 ]
                 flattened_output_tokens = [
-                    output_tokens
-                    for dataset_dict in self.output_tokens.values()
-                    for attempt_list in dataset_dict.values()
-                    for output_tokens in attempt_list
+                    call.output_length_tokens
+                    for result in rollout_results
+                    for call in result.llm_calls
                 ]
+                max_model_version = 0
+                max_latency = 0
+                for result in rollout_results:
+                    assert result.model_version is not None
+                    max_model_version = max(max_model_version, result.model_version)
+                    max_latency = max(max_latency, result.latency)
+                    self.update_stats(result)
+
                 self.stats_aggregator.update(flattened_prompt_tokens, flattened_output_tokens)
 
-                finished_chunks += 1
-
-                finished_tapes += len(final_tapes)
-                yield final_tapes
+                finished_groups += 1
 
                 # if we are training publish stats at every step else if all tapes are finished, publish stats
-                if is_training or finished_tapes == expected_number_of_tapes:
-                    if is_training:
+                if self.is_training or published_samples == expected_number_of_samples:
+                    if self.is_training:
                         loop_stats = {
                             "published_samples": published_samples,
                             "samples_in_queue": samples_in_queue,
-                            "finished_chunks": finished_chunks,
+                            "finished_groups": finished_groups,
                             "published_model_version": max_model_version,
-                            "latency": latency,
+                            "latency": max_latency,
+                            "time_since_start": time.time() - loop_start_time,
                         }
                     else:
                         loop_stats = {"published_model_version": max_model_version}
@@ -444,8 +468,10 @@ class ActorLoop:
                         split_name=split_name,
                     )
 
-                if finished_tapes == expected_number_of_tapes:
+                if published_samples == expected_number_of_samples:
+                    logger.info(f"Finished {expected_number_of_samples} samples, stopping actor loop")
                     break
+
 
     def publish_stats(self, stats_writer: StreamWriter, loop_stats, split_name: str = ""):
         sliding_stats = self.stats_aggregator.get_stats()
@@ -529,7 +555,7 @@ class ActorLoop:
             stats |= sub_stats
 
         stats |= loop_stats
-        if "finished_chunks" in loop_stats and loop_stats["finished_chunks"] >= 2 * self.window_size:
+        if loop_stats.get("finished_groups", 0) >= 2 * self.window_size:
             stats |= sliding_stats
         wandb.log({"actor/" + k: v for k, v in stats.items()})
         stats_writer.write(stats)
@@ -548,10 +574,10 @@ def run_actor_loop(cfg: DictConfig):
     if run is None:
         raise ValueError("Failed to initialize wandb run")
 
-    tape_stream = SingleStreamSpec(exp_path=exp_path, topic="tapes")
-    test_tape_stream = SingleStreamSpec(exp_path=exp_path, topic="test_tapes")
     stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
+    test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test")
     data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
+    test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test")
 
     train_dataset = load_datasets(cfg.train_dataset_names)
     test_dataset = load_datasets(cfg.test_dataset_names)
@@ -560,8 +586,6 @@ def run_actor_loop(cfg: DictConfig):
     logger.info(f"Loaded {len(train_dataset)} training problems")
     logger.info(f"Loaded {len(test_dataset)} test problems")
 
-    # For now we assume that LLM and Actor Processes are co-located
-    #llm_urls = [f"http://localhost:{port}" for port in str(cfg.me.llm_ports).split("-")]
     finetune_model_path = exp_path / "finetune" / "current"
     if os.path.exists(finetune_model_path):
         actor_model_path = finetune_model_path
@@ -579,7 +603,6 @@ def run_actor_loop(cfg: DictConfig):
         )
         for url in llm_urls
     ]
-
     test_llms = [
         TrainableLLM(
             base_url=url,
@@ -592,57 +615,42 @@ def run_actor_loop(cfg: DictConfig):
         )
         for url in llm_urls
     ]
-    train_agent_replicas = [
-        CoTMathAgent.create(
-            system_prompt=cfg.system_prompt,
-            llm=llm,
-            max_prompt_length=cfg.agent.max_prompt_length,
-        )
-        for llm in train_llms
-    ]
-
-    test_agent_replicas = [
-        CoTMathAgent.create(
-            system_prompt=cfg.system_prompt,
-            llm=llm,
-            max_prompt_length=cfg.agent.max_prompt_length,
-        )
-        for llm in test_llms
-    ]
 
     wait_for_inference_servers(llm_urls)
+    wait_for_verifier(cfg.verifier)
     trainer_state = TrainerState(exp_path)
     if cfg.debug.mode in ["actor", "open_loop"]:
         trainer_state.propagated_weight_version = 0
     else:
         trainer_state.start_listening()
-        while trainer_state.propagated_weight_version is None:
-            logger.info("Waiting for the trainer to declare the initial weight version")
-            time.sleep(1)
+        trainer_state.wait_for_model_version()
 
-    train_set_generator = ActorLoop(
-        agent_replicas=train_agent_replicas,
-        tapes_stream=tape_stream,
+    train_loop = ActorLoop(
         data_stream=data_stream,
         cfg=cfg,
         trainer_state=trainer_state,
         stats_stream=stats_stream,
-    ).run_agent_make_data(
-        dataset=train_dataset,
-        is_training=True,
+        llms=train_llms
     )
-    test_actor_loop = ActorLoop(
-        agent_replicas=test_agent_replicas,
-        tapes_stream=test_tape_stream,
-        data_stream=None,
+    train_loop_run = train_loop.run(
+        dataset=train_dataset,
+    )
+    test_loop = ActorLoop(
+        data_stream=test_data_stream,
         cfg=cfg,
         trainer_state=trainer_state,
-        stats_stream=stats_stream,
+        stats_stream=test_stats_stream,
+        llms=test_llms,
+        is_training=False,
     )
-
+    test_loop_run = None
 
     last_regular_eval = -1
+    current_eval = -1
     while True:
+        assert trainer_state.propagated_weight_version is not None
+
+        # 1. Start a new test loop if needed
         next_regular_eval = (
             trainer_state.propagated_weight_version
             if last_regular_eval == -1
@@ -653,14 +661,25 @@ def run_actor_loop(cfg: DictConfig):
             and not cfg.debug.mode
             and trainer_state.propagated_weight_version >= next_regular_eval
             and test_dataset
+            and test_loop_run is None
         ):
-            logger.info("Evaluating model on test set")
-            _ = list(
-                test_actor_loop.run_agent_make_data(
-                    dataset=test_dataset,
-                    is_training=False,
-                )
+            logger.info("Create test loop")
+            test_loop_run = test_loop.run(
+                dataset=test_dataset,
             )
-            last_regular_eval = next_regular_eval
-        else:
-            _ = next(train_set_generator)
+            train_loop.is_scheduling_paused = True
+            current_eval = next_regular_eval
+
+        # 2. If there is an active test loop, keep it running
+        if test_loop_run is not None:
+            try:
+                _ = next(test_loop_run)
+            except StopIteration:
+                # 2.1 If the test loop is finished, resume scheduling the training loop
+                test_loop_run = None
+                last_regular_eval = current_eval
+                train_loop.is_scheduling_paused = False
+                logger.info("Test loop finished")
+
+        # 3. Keep running the training loop
+        _ = next(train_loop_run)

@@ -46,8 +46,6 @@ def _popen(
 def validate_config(cfg: DictConfig):
     if cfg.preprocess.chunk_size % cfg.attempts != 0:
         raise ValueError("preprocess chunk_size must be a multiple of attempts")
-    if cfg.actor.chunk_size % cfg.attempts != 0:
-        raise ValueError("actor chunk_size must be a multiple of attempts")
     if cfg.world.preprocessor_fraction == 0 and cfg.finetune.rl.kl_coef > 0.0:
         raise ValueError("Preprocessor fraction must be > 0 if KL is used")
 
@@ -149,6 +147,29 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
         cmd,
         env=dict(os.environ),
     )
+
+
+def run_verifier(cfg: DictConfig):
+    # run in a subprocess like in the rest of the code
+    cmd = [
+        "python", "-m", "pipelinerl.entrypoints.verifier",
+        "--config-dir", f"{cfg.output_dir}/conf",
+        "--config-name", "exp_config",
+        f"output_dir={cfg.output_dir}",
+        f"hydra.run.dir={cfg.output_dir}/verifier",
+    ]
+    logger.info(f"Running verifier with command: {' '.join(cmd)}")
+    log_dir = os.path.join(cfg.output_dir, "verifier")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file_path = os.path.join(log_dir, f"stdout.log")
+    err_file_path = os.path.join(log_dir, f"stderr.log")
+    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
+        yield _popen(
+            cmd,
+            env=dict(os.environ),
+            stdout=log_file,
+            stderr=err_file,
+        )    
 
 
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
@@ -359,7 +380,9 @@ def debug_link_streams(cfg: DictConfig, topics: list[str]):
 def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | None = None):
     exp_dir = Path(cfg.output_dir)
     processes = []
-    all_job_kinds = ["actor", "actor_llm", "preprocessor", "preprocessor_llm", "finetune"]
+    all_job_kinds = [
+        "actor", "verifier", "actor_llm", "preprocessor", "preprocessor_llm", "finetune"
+    ]
     if job_kind_filter is None:
         job_kind_filter = all_job_kinds
     for job in world_map.my_jobs():
@@ -369,6 +392,8 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
             continue
         if job.kind == "actor":
             processes.extend(run_actor(world_map, job.replica_idx, exp_dir))
+        elif job.kind == "verifier":
+            processes.extend(run_verifier(cfg))            
         elif job.kind == "actor_llm":
             processes.extend(run_actor_llm(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "preprocessor":
@@ -456,7 +481,7 @@ def main(cfg: DictConfig):
     if cfg.debug.mode == "finetune":
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
     elif cfg.debug.mode == "actor":
-        processes.extend(launch_jobs(cfg, world_map, ["actor", "actor_llm"]))
+        processes.extend(launch_jobs(cfg, world_map, ["actor", "verifier", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
         processes.extend(launch_jobs(cfg, world_map, ["preprocessor", "preprocessor_llm"]))
     elif cfg.debug.mode in ["", "open_loop"]:

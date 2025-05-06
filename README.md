@@ -6,7 +6,7 @@ Pipeline RL
 A scalable asynchronous reinforcement learning implementation with in-flight weight updates. Designed to maximize GPU utilization while staying as on-policy as possible.
 
 <p align="center">
-    <img src="figure1.jpg" alt="Pipeline-RL Architecture" width="600">
+    <img src="assets/figure1.jpg" alt="Pipeline-RL Architecture" width="600">
 </p>
 
 # Setup

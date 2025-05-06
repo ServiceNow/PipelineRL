@@ -132,13 +132,17 @@ class WorldMap:
                     self.job_map[node].append(
                         Job(kind="actor", replica_idx=worker_idx, node_rank=node, gpus=[])
                     )
+                    self.job_map[node].append(
+                        Job(kind="verifier", replica_idx=worker_idx, node_rank=node, gpus=[])
+                    )
                     actor_placed = True
                 gpus = [self.available_gpus[node].pop() for _ in range(self.gpus_per_llm)]
-                llm_url = f"http://{self.address_map[node]}:{8080 + actor_llm_idx}"
+                local_idx = min(gpus)
+                llm_url = f"http://{self.address_map[node]}:{8080 + local_idx}"
                 self.job_map[node].append(
                     Job(
                         kind="actor_llm", replica_idx=actor_llm_idx, 
-                        local_idx=actor_llm_idx, node_rank=node, gpus=gpus, url=llm_url
+                        local_idx=local_idx, node_rank=node, gpus=gpus, url=llm_url
                     )
                 )
 
@@ -154,11 +158,12 @@ class WorldMap:
                     )
                     preprocessor_placed = True
                 gpus = [self.available_gpus[node].pop() for _ in range(self.gpus_per_llm)]
-                ref_url = f"http://{self.address_map[node]}:{8180 + preprocessor_llm_idx}"
+                local_idx = min(gpus)
+                ref_url = f"http://{self.address_map[node]}:{8180 + local_idx}"
                 self.job_map[node].append(
                     Job(
                         kind="preprocessor_llm", replica_idx=preprocessor_llm_idx, 
-                        local_idx=preprocessor_llm_idx, node_rank=node, gpus=gpus, url=ref_url
+                        local_idx=local_idx, node_rank=node, gpus=gpus, url=ref_url
                     )
                 )
         if not preprocessor_placed:

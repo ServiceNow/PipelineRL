@@ -9,7 +9,7 @@ finetune:
   attn_implementation: flash_attention_2
   config_name: ${..model_path}
   output_dir: ${..output_dir}/finetune
-  seq_length: 10000
+  seq_length: 12000
   seq_packing: true
   rl:
     algo: grpo
@@ -39,11 +39,11 @@ finetune:
   weight_update_interval: 1
   pop_old_data: ${..pop_old_data}
 actor:
-  sampling:
-    method: random
-  chunk_size: 8
-  threads_per_llm: 32
-  submit_delay: 0.
+  llm_max_rollouts: 128
+  rollout_workers: 1
+verifier:
+  host: localhost
+  port: 7777
 preprocess:
   input: actor
   output: training_data
@@ -52,8 +52,6 @@ preprocess:
   chunk_size: 16
   submit_delay: 0.
   pop_old_data: ${..pop_old_data} 
-agent: 
-  max_prompt_length: 1024
 llm:
   parameters:
     # changed

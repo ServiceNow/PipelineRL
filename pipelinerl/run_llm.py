@@ -18,7 +18,6 @@ from vllm.entrypoints.openai.api_server import (
     create_server_socket,
     build_app,
     init_app_state,
-    TIMEOUT_KEEP_ALIVE
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
@@ -239,7 +238,8 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         host=args.host,
         port=args.port,
         log_level=args.uvicorn_log_level,
-        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+        # increase timeout
+        timeout_keep_alive=60,
         ssl_keyfile=args.ssl_keyfile,
         ssl_certfile=args.ssl_certfile,
         ssl_ca_certs=args.ssl_ca_certs,
