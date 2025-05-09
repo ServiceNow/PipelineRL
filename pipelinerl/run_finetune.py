@@ -92,13 +92,16 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
 
 def run_sample_loader(data_stream: SingleStreamSpec, sample_queue: Queue[Dict | Exception], pop_old_data: bool = False):
     with read_stream(data_stream) as stream_reader:
+        pop_count = 0  # Counter for popped items
         while True:
             try:
                 for data_item in stream_reader.read():
                     if pop_old_data:
                         if sample_queue.full():
-                            logger.info(f"Sample queue is full, popping old data")
-                            sample_queue.get()
+                            sample_queue.get()  # Pop old data
+                            pop_count += 1
+                            if pop_count % 100 == 0:
+                                logger.info(f"Popped {pop_count} old items from the sample queue")
                         sample_queue.put_nowait(data_item)
                     else:
                         sample_queue.put(data_item)
@@ -800,6 +803,8 @@ def rl_finetuning_worker(
         )
         time_to_save = time_to_save and not time_to_stop
         assert sum(micro_batches_size) == samples_per_worker_per_step
+        training_metrics.runtime += step_took
+        training_metrics.time_waiting_for_data += time_waiting_for_data
         if time_to_log or time_to_save:
             dt = log_time(dt, time_stats, "finetune/interim_eval")
             metrics_dict.update(
@@ -816,8 +821,9 @@ def rl_finetuning_worker(
                     "stats/min_actor_version": lag_stats["min_version"],
                     "stats/max_actor_version": lag_stats["max_version"],
                     "stats/queue_size": sample_queue.qsize(),
-                    "stats/time_waiting_for_data": time_waiting_for_data,
+                    "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
+                    "stats/runtime": training_metrics.runtime,
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
                     "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
@@ -847,8 +853,16 @@ def rl_finetuning_worker(
             )
 
             gathered_rl_metrics = gather_rl_metrics(rl_metrics)
+            time_waiting_for_data = 0.0
 
-            metrics_dict.update(get_avg_rl_stats(gathered_rl_metrics, samples_per_step))
+            average_rl_metrics = get_avg_rl_stats(gathered_rl_metrics, samples_per_step)
+            ess = average_rl_metrics["rl/ratio_new_old_sum"] ** 2 / average_rl_metrics["rl/ratio_new_old_squared_sum"] / average_rl_metrics["rl/num_output_tokens_sum"]
+            metrics_dict.update(average_rl_metrics)
+            metrics_dict.update(
+                {
+                    "rl/ess": ess,
+                }
+            )
 
             rl_metrics = defaultdict(list)
             time_stats = {}

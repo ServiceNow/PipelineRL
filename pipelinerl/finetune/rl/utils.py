@@ -13,6 +13,8 @@ def get_avg_rl_stats(rl_stats: dict, num_samples: int):
             op = torch.max
         elif k == "loss": # loss is already normalized
             op = torch.sum
+        elif "sum" in k:
+            op = torch.sum
         else:
             op = lambda x: torch.sum(x) / num_samples
         avg_rl_stats["rl/" + k] = op(torch.Tensor(v)).item()
@@ -119,7 +121,7 @@ def calculate_rewards_with_implicit_kl(row, reward_minus_kl_coef):
     return [reward - reward_minus_kl_coef * kl for reward in rewards]
 
 
-def calculate_advantage(row):
+def calculate_advantage(row, divide_advantage_by_std):
     """
     Calculate advantage values for a row of data.
 
@@ -137,7 +139,10 @@ def calculate_advantage(row):
     rewards = row["rewards"]
     mean = row["reward_mean"]
     std = row["reward_std"]
-    advantages = [(reward - mean) / (np.nan_to_num(std) + 1e-4) for reward in rewards]
+    if divide_advantage_by_std:
+        advantages = [(reward - mean) / (np.nan_to_num(std) + 1e-4) for reward in rewards]
+    else:
+        advantages = [(reward - mean) for reward in rewards]
     return advantages
 
 

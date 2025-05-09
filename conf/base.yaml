@@ -51,6 +51,7 @@ preprocess:
   chunk_size: 16
   submit_delay: 0.
   pop_old_data: ${..pop_old_data} 
+  min_dataset_size: ${..finetune.weight_update_interval}
 llm:
   parameters:
     # changed

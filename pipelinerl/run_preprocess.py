@@ -21,6 +21,7 @@ from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from typing import List
+import random
 
 import transformers
 from datasets.arrow_dataset import Dataset
@@ -332,6 +333,7 @@ def run_preprocessing_loop(
 
     stats_aggregator = SlidingWindowAggregator(window_size=500 // cfg.preprocess.chunk_size)
 
+    datasets = []
     with write_to_streams(output_stream) as writer, write_to_streams(stats_streams) as stats_writer:
         with mp.Manager() as manager, SharedMemoryManager() as smm:
             max_dataset_queue_size = 128
@@ -386,13 +388,22 @@ def run_preprocessing_loop(
                         if isinstance(dataset, Exception):
                             raise dataset
                         start_writing = time.time()
-                        for entry in dataset:
+                        datasets += dataset
+                        processed_chunks += 1
+
+                        min_dataset_size = cfg.preprocess.get("min_dataset_size", 1)
+                        logger.info(f"Len datasets {len(datasets)}, min dataset size {min_dataset_size}")
+                        if len(datasets) < min_dataset_size:
+                            continue
+
+                        random.shuffle(datasets)
+                        logger.info(f"Got {len(datasets)} samples to write")
+                        for entry in datasets:
                             writer.write(entry)
                         writing_took = time.time() - start_writing
-                        stats_aggregator.update([len(entry["input_ids"]) for entry in dataset])
-                        processed_chunks += 1
-                        published_samples += len(dataset)
-                        max_model_version = max([entry["model_version"] for entry in dataset])
+                        stats_aggregator.update([len(entry["input_ids"]) for entry in datasets])
+                        published_samples += len(datasets)
+                        max_model_version = max([dataset["model_version"] for dataset in datasets])
                         samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_size                        
                         stats = {
                             "preprocessor/published_samples": published_samples,
@@ -407,6 +418,7 @@ def run_preprocessing_loop(
                         logger.info(
                             f"Processed {len(dataset)} samples in {processing_took:.3f}s (fetching_took {fetching_took:.3f}, writing took {writing_took:.3f}) and wrote to {output_stream}, total {published_samples} samples so far, {samples_in_queue} samples in queue"
                         )
+                        datasets = []
                     except Exception as e:
                         logger.error(f"Error in preprocessor worker: {e}")
                         raise   
