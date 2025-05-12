@@ -58,12 +58,12 @@ from pipelinerl.streams import (
 logger = logging.getLogger(__name__)
 
 
-def gather_metrics(metrics: Dict[str, List]) -> Dict[str, List]:
+def gather_metrics(metrics: dict) -> dict:
     """
     Gather metrics from all processes using torch.distributed.all_gather_object.
     
     Args:
-        metrics: Dictionary mapping metric names to lists of values
+        metrics: Dictionary mapping metric names to metric values (list or single values).
         
     Returns:
         Dictionary with gathered metrics from all processes
@@ -83,7 +83,8 @@ def gather_metrics(metrics: Dict[str, List]) -> Dict[str, List]:
             # Flatten the list of lists into a single list
             combined_values = []
             for process_values in gathered_values:
-                assert isinstance(process_values, list)
+                if not isinstance(process_values, list):
+                    process_values = [process_values]
                 combined_values.extend(process_values)
             
             # Store the combined values
@@ -808,6 +809,9 @@ def rl_finetuning_worker(
 
         gathered_rl_metrics = gather_metrics(rl_metrics)
         lag_stats = gather_metrics(lag_stats)
+        logger.info(f"Gathered lag stats: {lag_stats}")
+        lag_stats["min_version"] = min(lag_stats["min_version"])
+        lag_stats["max_version"] = max(lag_stats["max_version"])
 
         average_rl_metrics = get_avg_rl_stats(gathered_rl_metrics, samples_per_step)
         ess = average_rl_metrics["rl/ratio_new_old_sum"] ** 2 / average_rl_metrics["rl/ratio_new_old_squared_sum"] / average_rl_metrics["rl/num_output_tokens_sum"]
