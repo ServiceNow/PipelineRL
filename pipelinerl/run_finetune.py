@@ -73,7 +73,8 @@ def gather_metrics(metrics: dict) -> dict:
     
     # Process each metric separately
     for key, values in metrics.items():
-        if values:
+        # TODO: just remove this condition? 
+        if values is not None:
             # Initialize a list to gather the results from all processes
             gathered_values = [None] * dist.get_world_size()
             
