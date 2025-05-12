@@ -657,6 +657,7 @@ def rl_finetuning_worker(
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
     discard_optimizer_step = False
+    discard_optimizer_step_turn_on_time = None
 
     while training_metrics.completed_steps < final_train_steps:
         # We include time waiting for data in the step time
@@ -823,17 +824,22 @@ def rl_finetuning_worker(
             }
         )
 
-        turn_on_discard_optimizer_step = ess < args.get("min_ess", 0)
-        turn_off_discard_optimizer_step = lag_stats["min_version"] == training_metrics.last_broadcasted_version
-        if turn_on_discard_optimizer_step and turn_off_discard_optimizer_step:
-            logger.error("ESS is below threshold, but lag is 0")
-        if turn_off_discard_optimizer_step:
-            logger.info(f"Start discarding optimizer steps, cause ESS {ess} is below threshold {args.get('min_ess', 0)}")
-            discard_optimizer_step = False
+        turn_on_discard_optimizer_step = (
+            discard_optimizer_step_turn_on_time is None
+            and ess < args.get("min_ess", 0)
+        )
+        turn_off_discard_optimizer_step = (
+            discard_optimizer_step_turn_on_time is not None
+            and time.time() > discard_optimizer_step_turn_on_time + 240
+        )
         if turn_on_discard_optimizer_step:
-            logger.info(f"Stop discarding optimizer steps, cause we have on-policy data coming now")
+            logger.info(f"Start discarding optimizer steps, cause ESS {ess} is below threshold {args.get('min_ess', 0)}")           
             discard_optimizer_step = True
-
+            discard_optimizer_step_turn_on_time = time.time()
+        if turn_off_discard_optimizer_step:
+            logger.info(f"Stop discarding optimizer steps, cause we waited enough time")
+            discard_optimizer_step = False
+            discard_optimizer_step_turn_on_time = None
         if discard_optimizer_step:
             logger.info(f"Discard optimizer step {training_metrics.completed_steps}")
             zero_grad()
