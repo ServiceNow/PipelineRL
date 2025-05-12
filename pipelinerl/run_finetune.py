@@ -837,7 +837,7 @@ def rl_finetuning_worker(
             dt = log_time(dt, time_stats, "finetune/interim_eval")
             metrics_dict.update(
                 {
-                    "stats/discard_optimizer_step": discard_optimizer_step,
+                    "stats/discard_optimizer_step": int(discard_optimizer_step),
                     "stats/lr": training_metrics.lr,
                     "stats/grad_norm": training_metrics.grad_norm,
                     "stats/samples": training_metrics.samples,
