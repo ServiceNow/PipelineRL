@@ -58,21 +58,21 @@ from pipelinerl.streams import (
 logger = logging.getLogger(__name__)
 
 
-def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
+def gather_metrics(metrics: Dict[str, List]) -> Dict[str, List]:
     """
-    Gather RL metrics from all processes using torch.distributed.all_gather_object.
+    Gather metrics from all processes using torch.distributed.all_gather_object.
     
     Args:
-        rl_metrics: Dictionary mapping metric names to lists of values
+        metrics: Dictionary mapping metric names to lists of values
         
     Returns:
         Dictionary with gathered metrics from all processes
     """
     # Initialize the result dictionary
-    gathered_rl_metrics = {}
+    gathered_metrics = {}
     
     # Process each metric separately
-    for key, values in rl_metrics.items():
+    for key, values in metrics.items():
         if values:
             # Initialize a list to gather the results from all processes
             gathered_values = [None] * dist.get_world_size()
@@ -83,12 +83,13 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
             # Flatten the list of lists into a single list
             combined_values = []
             for process_values in gathered_values:
+                assert isinstance(process_values, list)
                 combined_values.extend(process_values)
             
             # Store the combined values
-            gathered_rl_metrics[key] = combined_values
+            gathered_metrics[key] = combined_values
     
-    return gathered_rl_metrics
+    return gathered_metrics
 
 def run_sample_loader(data_stream: SingleStreamSpec, sample_queue: Queue[Dict | Exception], pop_old_data: bool = False):
     with read_stream(data_stream) as stream_reader:
@@ -654,6 +655,8 @@ def rl_finetuning_worker(
     rl_config = RLConfig(**args.rl)
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
+    discard_optimizer_step = False
+
     while training_metrics.completed_steps < final_train_steps:
         # We include time waiting for data in the step time
         if first_pass:
@@ -803,7 +806,8 @@ def rl_finetuning_worker(
         except Exception as e:
             logger.warning(f"Synchronization error: {e}. Continuing anyway...")
 
-        gathered_rl_metrics = gather_rl_metrics(rl_metrics)
+        gathered_rl_metrics = gather_metrics(rl_metrics)
+        lag_stats = gather_metrics(lag_stats)
 
         average_rl_metrics = get_avg_rl_stats(gathered_rl_metrics, samples_per_step)
         ess = average_rl_metrics["rl/ratio_new_old_sum"] ** 2 / average_rl_metrics["rl/ratio_new_old_squared_sum"] / average_rl_metrics["rl/num_output_tokens_sum"]
@@ -815,10 +819,19 @@ def rl_finetuning_worker(
             }
         )
 
-        discard_optimizer_step = True if (ess < args.get("min_ess", 0)) else False
+        turn_on_discard_optimizer_step = ess < args.get("min_ess", 0)
+        turn_off_discard_optimizer_step = lag_stats["min_version"] == training_metrics.last_broadcasted_version
+        if turn_on_discard_optimizer_step and turn_off_discard_optimizer_step:
+            logger.error("ESS is below threshold, but lag is 0")
+        if turn_off_discard_optimizer_step:
+            logger.info(f"Start discarding optimizer steps, cause ESS {ess} is below threshold {args.get('min_ess', 0)}")
+            discard_optimizer_step = False
+        if turn_on_discard_optimizer_step:
+            logger.info(f"Stop discarding optimizer steps, cause we have on-policy data coming now")
+            discard_optimizer_step = True
 
         if discard_optimizer_step:
-            logger.info(f"Discarding optimizer step, ESS {ess} is below threshold {args.get('min_ess', 0)}")
+            logger.info(f"Discard optimizer step {training_metrics.completed_steps}")
             zero_grad()
         else:
             optimizer_step_and_zero_grad()
