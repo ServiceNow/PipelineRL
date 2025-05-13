@@ -11,6 +11,7 @@ from pathlib import Path
 
 import uvloop
 import aiohttp
+from aiohttp.client_exceptions import ClientConnectionResetError
 
 from omegaconf import DictConfig
 from pydantic import BaseModel, Field
@@ -148,7 +149,16 @@ async def schedule_rollouts(
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
-            rollout_result = await generate_math_rollout(cfg, llm, problem, session)
+            rollout_result = None
+            for i in range(3):
+                try:
+                    rollout_result = await generate_math_rollout(cfg, llm, problem, session)
+                    break
+                except ClientConnectionResetError as e:
+                    logger.warning(f"ClientConnectionResetError: {e}, retrying...")
+                    continue
+            if rollout_result is None:
+                raise RuntimeError("Failed to generate rollout after 3 attempts because of ClientConnectionResetError")
             rollout_result.model_version = model_version    
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
