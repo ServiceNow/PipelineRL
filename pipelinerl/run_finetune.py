@@ -828,6 +828,7 @@ def rl_finetuning_worker(
         turn_on_discard_optimizer_step = (
             discard_optimizer_step_turn_on_time is None
             and ess < args.get("min_ess", 0)
+            and not lag_stats["min_version"] == training_metrics.last_broadcasted_version
         )
         turn_off_discard_optimizer_step = (
             discard_optimizer_step_turn_on_time is not None
