@@ -842,6 +842,7 @@ def rl_finetuning_worker(
             logger.info(f"Stop discarding optimizer steps, cause we waited enough time")
             discard_optimizer_step = False
             discard_optimizer_step_turn_on_time = None
+
         if discard_optimizer_step:
             logger.info(f"Discard optimizer step {training_metrics.completed_steps}")
             zero_grad()
@@ -849,6 +850,7 @@ def rl_finetuning_worker(
             optimizer_step_and_zero_grad()
             lr_scheduler.step()
 
+        step_and_optim_took = time.time() - step_start_time
         time_to_stop = training_metrics.completed_steps >= final_train_steps
         time_to_log = training_metrics.completed_steps % args.log_each_n_steps == 0
         time_to_save = (training_metrics.completed_steps % args.save_checkpoint_steps == 0) or (
@@ -878,6 +880,7 @@ def rl_finetuning_worker(
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
                     "stats/runtime": training_metrics.runtime,
+                    "stats/step_and_optim_took": step_and_optim_took,
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
                     "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
