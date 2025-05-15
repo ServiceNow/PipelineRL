@@ -1,0 +1,23 @@
+{
+    "mcpServers": {
+        "serper-search": {
+            "command": "uv",
+            "args": ["run", "tapeagents/tools/mcp_servers/web_search.py"],
+            "env": {"SERPER_API_KEY": ""}
+        },
+        "fetch": {
+            "command": "uvx",
+            "args": [
+                "mcp-server-fetch"
+            ]
+        },
+        "python_exec": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@pydantic/mcp-run-python",
+                "stdio"
+            ]
+        }
+    }
+}

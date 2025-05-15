@@ -1,0 +1,27 @@
+defaults:
+  - base
+  - override streams: redis
+  - _self_
+
+finetune:
+  seq_length: 5000
+  gradient_accumulation_passes: 1024
+
+llm:
+  parameters:
+    max_tokens: 4096
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+
+# debug:
+  # mode: open_loop
+
+output_dir: results/debug_4gpu_7b/${now:%Y_%m_%d}/${now:start_at_%H_%M_%S}
+
+# model_path: Qwen/Qwen2.5-0.5B
+
+# vllm_config:
+#   vllm_kwargs:
+#     enforce_eager: ""

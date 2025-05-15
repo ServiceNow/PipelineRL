@@ -1,8 +1,0 @@
-vllm==0.7.3
-accelerate @ git+https://github.com/ServiceNow/accelerate.git@v1.2.0-hotfix
-Tapeagents[finetune]==0.1.8
-transformers==4.48.3
-flash-attn==2.7.4.post1
-math-verify[antlr4_9_3]==0.7.0
-orjson==3.10.16
-redis==5.2.1

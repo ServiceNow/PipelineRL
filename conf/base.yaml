@@ -2,6 +2,7 @@ defaults:
   - finetune: base 
   - rewards: pure_success
   - streams: files
+  - actor: math
   - _self_
 
 finetune:
@@ -37,9 +38,6 @@ finetune:
   max_lag: ${..max_lag}
   weight_update_interval: 1
   pop_old_data: ${..pop_old_data}
-actor:
-  llm_max_rollouts: 128
-  rollout_workers: 1
 verifier:
   host: localhost
   port: 7777
@@ -67,7 +65,6 @@ test_llm:
 vllm_config:
   vllm_kwargs:
     dtype: bfloat16
-    download-dir: /mnt/llmd/base_models/ 
     gpu-memory-utilization: 0.9
     num-scheduler-steps: 1
     disable-log-requests: ""
@@ -89,11 +86,6 @@ world:
 
   actor_group_port: 9000
 
-# changed
-system_prompt: Please reason step by step, and put your final answer within \boxed{}.
-task_template: |-
-  {task}
-
 eval_every_n_versions: 78000
 
 # changed
@@ -114,7 +106,6 @@ force_restart: false
 pop_old_data: true
 max_lag: null
 attempts: 8
-discount_factor: 1
 train_dataset_names:
 - open_reasoner_zero_57k
 - open_reasoner_zero_extended_72k 
@@ -128,3 +119,7 @@ debug:
   mode: ""
   streams_from: null
   place_inference_workers: true
+
+hydra:
+  run:
+    dir: ${output_dir}

@@ -1,0 +1,8 @@
+log_each_n_secs: 10
+llm_max_rollouts: 128
+rollout_workers: 1
+rollout_policy: pipelinerl.math_rollouts.generate_math_rollout
+discount_factor: 1
+system_prompt: Please reason step by step, and put your final answer within \boxed{}.
+task_template: |-
+  {task}

@@ -1,40 +1,39 @@
 import os
+
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
-import multiprocessing as mp
-from multiprocessing.managers import SharedMemoryManager
-from concurrent.futures import ProcessPoolExecutor
 import logging
+import multiprocessing as mp
 import queue
-import time
-
-from litellm import BaseModel, Field
-    
-from pipelinerl.utils import wait_for_inference_servers
-from pipelinerl.world import WorldMap
-from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
-from pipelinerl.shared_memory_array import SharedMemoryArray
-
-logger = logging.getLogger(__name__)
 import threading
+import time
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from queue import Empty, Queue
 from typing import List
 
-import transformers
 import datasets
+import transformers
+from litellm import BaseModel, Field
+
+from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
+from pipelinerl.shared_memory_array import SharedMemoryArray
+from pipelinerl.utils import wait_for_inference_servers
+from pipelinerl.world import WorldMap
+
 datasets.disable_caching()
 from datasets.arrow_dataset import Dataset
 from datasets.fingerprint import Hasher
 from omegaconf import DictConfig
+from tapeagents.llms import TrainableLLM
+
 from pipelinerl.finetune.checkpoints import (
     load_tokenizer,
 )
 from pipelinerl.finetune.data import preprocess_fn
 from pipelinerl.finetune.rl import RL_DATA_COLUMNS, RLConfig, populate_rl_data
-from tapeagents.llms import TrainableLLM
-
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamRangeSpec,
@@ -61,9 +60,7 @@ def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
     return True
 
 
-def batch_annotate_traces_with_ref_logprobs(
-    llm: TrainableLLM, traces: List[dict]
-):
+def batch_annotate_traces_with_ref_logprobs(llm: TrainableLLM, traces: List[dict]):
     logger.info(f"Annotating {len(traces)} samples with ref logprobs")
     prompt_token_ids = []
     completion_token_ids = []
@@ -71,9 +68,7 @@ def batch_annotate_traces_with_ref_logprobs(
         prompt_token_ids.append(trace["input_ids"][: -len(trace["logprobs"])])
         completion_token_ids.append(trace["input_ids"][-len(trace["logprobs"]) :])
     try:
-        all_ref_logprobs = llm.get_batch_logprobs_token_ids(
-            prompt_token_ids, completion_token_ids
-        )
+        all_ref_logprobs = llm.get_batch_logprobs_token_ids(prompt_token_ids, completion_token_ids)
     except Exception as e:
         logger.error(f"Failed to get ref logprobs: {e}")
         assert (response := getattr(e, "response", None))
@@ -81,9 +76,9 @@ def batch_annotate_traces_with_ref_logprobs(
         raise e
     for trace, ref_logprobs in zip(traces, all_ref_logprobs):
         trace["ref_logprobs"] = [c["logprob"] for c in ref_logprobs["content"]]
-        assert len(trace["ref_logprobs"]) == len(
-            trace["logprobs"]
-        ), f"{len(trace['ref_logprobs'])} != {len(trace['logprobs'])}"
+        assert len(trace["ref_logprobs"]) == len(trace["logprobs"]), (
+            f"{len(trace['ref_logprobs'])} != {len(trace['logprobs'])}"
+        )
 
 
 def replace_oov_tokens_with_the(data: list[dict], tokenizer: transformers.PreTrainedTokenizerBase) -> list[dict]:
@@ -114,13 +109,13 @@ def replace_oov_tokens_with_the(data: list[dict], tokenizer: transformers.PreTra
                 completion_start = len(entry["input_ids"]) - completion_length
                 for i, token_id in enumerate(invalid_token_ids):
                     if i + completion_start < len(entry["input_ids"]):
-                        logger.warning(f"Invalid token in completion part, logprobs may be inconsistent")
+                        logger.warning("Invalid token in completion part, logprobs may be inconsistent")
         entry["input_ids"] = new_input_ids
         new_data.append(entry)
 
     if patched_entries > 0:
         logger.warning(f"Patched {patched_entries} entries with invalid token ids from {len(data)}")
-                       
+
     return new_data
 
 
@@ -131,14 +126,12 @@ def preprocess_dataset(
     seq_length: int,
     rl_config: RLConfig,
 ) -> Dataset:
-    preprocess = partial(
-        preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True
-    )
+    preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True)
     columns = ["input_ids", "labels", "attention_mask"] + RL_DATA_COLUMNS
     logger.debug(f"Instantiated preprocess function hash {Hasher.hash(preprocess)}")
 
     data = replace_oov_tokens_with_the(data, tokenizer)
-    
+
     # inplace update of the traces with ref logprobs
     if llm is not None:
         batch_annotate_traces_with_ref_logprobs(llm, data)
@@ -154,10 +147,7 @@ def preprocess_dataset(
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
     dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
-    dataset = dataset.add_column(
-        "model_version", 
-        [entry["metadata"]["model_version"] for entry in data]
-    ) # type: ignore
+    dataset = dataset.add_column("model_version", [entry["metadata"]["model_version"] for entry in data])  # type: ignore
     logger.debug(f"Preprocessed data part fingerprint: {dataset._fingerprint}")
     return dataset
 
@@ -168,7 +158,7 @@ def run_dataset_loader(
     check_group_size: int,
     chunk_size: int,
     pop_old_data: bool,
-):  
+):
     old_and_dropped = 0
     last_time_notice = 0
     with read_stream(data_stream) as reader:
@@ -180,7 +170,7 @@ def run_dataset_loader(
                     if len(buffer) == chunk_size:
                         break
                 if not _check_group_sizes(buffer, check_group_size):
-                    raise ValueError(f"Invalid group sizes in data")
+                    raise ValueError("Invalid group sizes in data")
                 try:
                     raw_chunk_queue.put_nowait(buffer)
                 except queue.Full:
@@ -300,7 +290,7 @@ def run_preprocessing_loop(
         partition_range=(0, max(world_map.total_finetune_gpus, 1)),
     )
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
-    logger.info(f"Streams initialized")
+    logger.info("Streams initialized")
 
     raw_chunk_queue = Queue(cfg.preprocess.queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
@@ -342,7 +332,7 @@ def run_preprocessing_loop(
             dataset_queue = manager.Queue(max_dataset_queue_size)
             io_buffer = SharedMemoryArray(smm, buffer_size, int(1e8))
             free_slots = set(range(buffer_size))
-            logger.info(f"Shared memory buffer size: {io_buffer.get_memory_size() / 2 ** 30} Gb")
+            logger.info(f"Shared memory buffer size: {io_buffer.get_memory_size() / 2**30} Gb")
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
                 while True:
@@ -356,9 +346,14 @@ def run_preprocessing_loop(
                                 slot = free_slots.pop()
                                 io_buffer[slot] = raw_chunk
                                 future = executor.submit(
-                                    process_chunk, 
-                                    llm, io_buffer, slot, tokenizer,
-                                    cfg.finetune.seq_length, rl_config, dataset_queue
+                                    process_chunk,
+                                    llm,
+                                    io_buffer,
+                                    slot,
+                                    tokenizer,
+                                    cfg.finetune.seq_length,
+                                    rl_config,
+                                    dataset_queue,
                                 )
                                 future.add_done_callback(
                                     lambda fut: logger.error(
@@ -379,7 +374,7 @@ def run_preprocessing_loop(
                             slot = dataset_queue.get(timeout=0.001)
                             dataset = io_buffer[slot]
                             free_slots.add(slot)
-                            fetching_took = time.time() - start_processing                            
+                            fetching_took = time.time() - start_processing
                         except Empty:
                             continue
                         if isinstance(dataset, Exception):
@@ -392,15 +387,16 @@ def run_preprocessing_loop(
                         processed_chunks += 1
                         published_samples += len(dataset)
                         max_model_version = max([entry["model_version"] for entry in dataset])
-                        samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_size                        
+                        samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_size
                         stats = {
                             "preprocessor/published_samples": published_samples,
                             "preprocessor/published_model_version": max_model_version,
-                            "preprocessor/samples_in_queue": samples_in_queue,
+                            "preprocessor/queue/dataset_samples": samples_in_queue,
+                            "preprocessor/queue/dataset": dataset_queue.qsize(),
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
-                        run.log(stats)   
+                        run.log(stats)
                         stats_writer.write(stats)
                         processing_took = time.time() - start_processing
                         logger.info(
@@ -411,4 +407,4 @@ def run_preprocessing_loop(
                         )
                     except Exception as e:
                         logger.error(f"Error in preprocessor worker: {e}")
-                        raise   
+                        raise

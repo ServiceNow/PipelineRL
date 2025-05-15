@@ -34,7 +34,7 @@ def _popen(
 ) -> subprocess.Popen:
     """Wrapper around subprocess.Popen that allows for easier debugging."""
     if os.environ.get("DRY_RUN", "0") == "1":
-        return # type: ignore
+        return  # type: ignore
     return subprocess.Popen(
         cmd,
         env=env,
@@ -54,28 +54,34 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     kwargs = cfg.vllm_config.vllm_kwargs
     if kwargs["num-scheduler-steps"] > 1:
         kwargs["num-scheduler-steps"] = 1
-        logger.warning(f"Set num-scheduler-steps to 1 for reference vLLM")
+        logger.warning("Set num-scheduler-steps to 1 for reference vLLM")
     log_dir = exp_dir / f"ref_vllm_{preprocessor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
 
     cmd = [
-        "python", "-m", "vllm.entrypoints.openai.api_server",
-        "--model", str(cfg.model_path),
-        "--port", str(8180 + local_idx),
-        "--host", "0.0.0.0",
-        "--seed", str(preprocessor_llm_idx),
+        "python",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        str(cfg.model_path),
+        "--port",
+        str(8180 + local_idx),
+        "--host",
+        "0.0.0.0",
+        "--seed",
+        str(preprocessor_llm_idx),
     ]
-    
+
     # Add vLLM kwargs as separate arguments
     for k, v in kwargs.items():
         cmd.append(f"--{k}")
         if v not in [None, ""]:
             cmd.append(str(v))
-    
+
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
-    log_file_path = os.path.join(log_dir, f"stdout.log")
-    err_file_path = os.path.join(log_dir, f"stderr.log")
+    log_file_path = os.path.join(log_dir, "stdout.log")
+    err_file_path = os.path.join(log_dir, "stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         yield _popen(
             cmd,
@@ -85,7 +91,9 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
         )
 
 
-def run_actor_llm(cfg: DictConfig, world_map: WorldMap, actor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
+def run_actor_llm(
+    cfg: DictConfig, world_map: WorldMap, actor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path
+):
     finetune_model_path = exp_dir / "finetune" / "current"
     if os.path.exists(finetune_model_path):
         actor_model_path = finetune_model_path
@@ -96,31 +104,42 @@ def run_actor_llm(cfg: DictConfig, world_map: WorldMap, actor_llm_idx: int, loca
     log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
     cmd = [
-        "python", "-m", "pipelinerl.entrypoints.llm",
-        "--model", str(actor_model_path),
-        "--host", "0.0.0.0",
-        "--port", str(8080 + local_idx),
-        "--seed", str(actor_llm_idx),
-        "--exp-root-dir", str(exp_dir),
-        "--actor-llm-idx", str(actor_llm_idx),
-        "--weight-update-group-init-method", f"tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
-        "--weight-update-group-world-size", str(world_map.weight_update_group_size),
+        "python",
+        "-m",
+        "pipelinerl.entrypoints.llm",
+        "--model",
+        str(actor_model_path),
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(8080 + local_idx),
+        "--seed",
+        str(actor_llm_idx),
+        "--exp-root-dir",
+        str(exp_dir),
+        "--actor-llm-idx",
+        str(actor_llm_idx),
+        "--weight-update-group-init-method",
+        f"tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
+        "--weight-update-group-world-size",
+        str(world_map.weight_update_group_size),
     ]
-    
+
     # Add vLLM kwargs as separate arguments
     if cfg.vllm_config.vllm_kwargs:
         for k, v in cfg.vllm_config.vllm_kwargs.items():
             cmd.append(f"--{k}")
             if v not in [None, ""]:
                 cmd.append(str(v))
-            
+
     if cfg.debug.mode in ["actor", "open_loop"]:
         cmd.append("--disable-weight-updates")
-        
+
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
-    log_file_path = os.path.join(log_dir, f"stdout.log")
-    err_file_path = os.path.join(log_dir, f"stderr.log")
+    save_command(log_dir, cmd)
+    log_file_path = os.path.join(log_dir, "stdout.log")
+    err_file_path = os.path.join(log_dir, "stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         yield _popen(
             cmd,
@@ -135,14 +154,19 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 actor yet")
     llm_urls = "+".join(world_map.get_actor_urls())
     cmd = [
-        "python", "-m", "pipelinerl.entrypoints.actor",
-        "--config-dir", f"{exp_dir}/conf",
-        "--config-name", "exp_config",
+        "python",
+        "-m",
+        "pipelinerl.entrypoints.actor",
+        "--config-dir",
+        f"{exp_dir}/conf",
+        "--config-name",
+        "exp_config",
         f"output_dir={exp_dir}",
         f"hydra.run.dir={exp_dir}/actor",
         f"+me.llm_urls={llm_urls}",
     ]
     logger.info(f"Running actor with command: {' '.join(cmd)}")
+    save_command(exp_dir / "actor", cmd)
     yield _popen(
         cmd,
         env=dict(os.environ),
@@ -152,24 +176,29 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
 def run_verifier(cfg: DictConfig):
     # run in a subprocess like in the rest of the code
     cmd = [
-        "python", "-m", "pipelinerl.entrypoints.verifier",
-        "--config-dir", f"{cfg.output_dir}/conf",
-        "--config-name", "exp_config",
+        "python",
+        "-m",
+        "pipelinerl.entrypoints.verifier",
+        "--config-dir",
+        f"{cfg.output_dir}/conf",
+        "--config-name",
+        "exp_config",
         f"output_dir={cfg.output_dir}",
         f"hydra.run.dir={cfg.output_dir}/verifier",
     ]
     logger.info(f"Running verifier with command: {' '.join(cmd)}")
+    save_command(Path(cfg.output_dir) / "verifier", cmd)
     log_dir = os.path.join(cfg.output_dir, "verifier")
     os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, f"stdout.log")
-    err_file_path = os.path.join(log_dir, f"stderr.log")
+    log_file_path = os.path.join(log_dir, "stdout.log")
+    err_file_path = os.path.join(log_dir, "stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         yield _popen(
             cmd,
             env=dict(os.environ),
             stdout=log_file,
             stderr=err_file,
-        )    
+        )
 
 
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
@@ -191,7 +220,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
                 if job.kind == "finetune":
                     filter_parts.append(f"{hosts[rank]}:{','.join(map(str, job.gpus))}")
         deepspeed_include_filter = "@".join(filter_parts)
-        logger.info(f"Deepspeed include filter: {deepspeed_include_filter}")            
+        logger.info(f"Deepspeed include filter: {deepspeed_include_filter}")
         # Orchestrator rank must have already created hostfile.txt
         hostfile_path = str(exp_dir / "hostfile.txt")
         cmd += [
@@ -206,7 +235,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
             "--deepspeed_hostfile",
             hostfile_path,
             "--deepspeed_inclusion_filter",
-            deepspeed_include_filter
+            deepspeed_include_filter,
         ]
     # get path to this file
     this_file_path = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -216,7 +245,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
             "--use_deepspeed",
             "--deepspeed_config_file",
             str(this_file_path / f"../conf/deepspeed/{cfg.deepspeed_config}.json"),
-        ]    
+        ]
     # DeepSpeed and non-DeepSpeed args
     accelerate_config = cfg.accelerate_config
     if accelerate_config is None:
@@ -231,7 +260,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         str(this_file_path / f"../conf/accelerate/{accelerate_config}.yaml"),
         "--rdzv_backend",
         "c10d",
-    ]    
+    ]
     if gpus:
         gpus_str = str(",".join([str(gpu) for gpu in gpus])) if len(gpus) < world_map.node_size else "all"
         cmd += [
@@ -251,19 +280,17 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         # TODO: figure out why we can't build WorldMap in run_finetune.py
         # Current workaround: pass the essential information as follows:
         f"+me.weight_update_group_init_method=tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
-        f"+me.weight_update_group_world_size={world_map.weight_update_group_size}",        
+        f"+me.weight_update_group_world_size={world_map.weight_update_group_size}",
         f"+me.llm_urls={'+'.join(world_map.get_actor_urls())}",
     ]
     if cfg.debug.mode in ["finetune", "open_loop"]:
         cmd.append("finetune.send_weight_updates=False")
-    
+
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
+    save_command(exp_dir / "finetune", cmd)
     env = dict(os.environ)
-    env["DS_ENV_FILE"] = str(exp_dir/".deepspeed_env")
-    yield _popen(
-        cmd,
-        env=env
-    )
+    env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
+    yield _popen(cmd, env=env)
 
 
 def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
@@ -271,14 +298,19 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 preprocessor yet")
     llm_urls = "+".join(world_map.get_preprocessor_urls())
     cmd = [
-        "python", "-m", "pipelinerl.entrypoints.preprocess",
-        "--config-dir", f"{exp_dir}/conf",
-        "--config-name", "exp_config",
+        "python",
+        "-m",
+        "pipelinerl.entrypoints.preprocess",
+        "--config-dir",
+        f"{exp_dir}/conf",
+        "--config-name",
+        "exp_config",
         f"output_dir={exp_dir}",
         f"hydra.run.dir={exp_dir}/preprocess",
         f"+me.llm_urls={llm_urls}",
     ]
     logger.info(f"Running preprocess with command: {' '.join(cmd)}")
+    save_command(exp_dir / "preprocess", cmd)
     yield _popen(
         cmd,
         env=dict(os.environ),
@@ -289,14 +321,32 @@ def run_redis(cfg: DictConfig):
     # Launch redis-server
     cmd = [
         "redis-server",
-        "--bind", "0.0.0.0",
-        "--port", str(cfg.streams.port),
-        "--dir", str(cfg.output_dir),
-        "--protected-mode", "no",
-        "--save", cfg.streams.save
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        str(cfg.streams.port),
+        "--dir",
+        str(cfg.output_dir),
+        "--protected-mode",
+        "no",
+        "--save",
+        cfg.streams.save,
     ]
     logger.info(f"Running redis with command: {' '.join(cmd)}")
+    save_command(Path(cfg.output_dir) / "redis", cmd)
     yield _popen(cmd, env=dict(os.environ))
+
+
+def save_command(script_dir: Path, cmd):
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = script_dir / "start.sh"
+    with open(script_path, "w") as f:
+        f.write("#!/bin/bash\n")
+        # Properly quote arguments for the shell script
+        quoted_cmd = [f"'{arg}'" if " " in arg or "$" in arg else arg for arg in cmd]
+        f.write(" ".join(quoted_cmd) + "\n")
+    os.chmod(script_path, 0o755)
+    logger.info(f"Saved start script to {script_path}")
 
 
 def clean_up(exp_dir, force_restart):
@@ -336,6 +386,7 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
         for proc in processes:
             logger.info(f"Terminating {proc.args}")
             terminate_with_children(proc.pid)
+
     logger.info("I have launched everyone, waiting for them to finish...")
 
     # last_trainer_version = -1
@@ -343,7 +394,7 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
 
     try:
         # Wait for all processes to complete
-        # if just one dies, stop all 
+        # if just one dies, stop all
         while True:
             for proc in processes:
                 if (return_code := proc.poll()) is not None:
@@ -353,13 +404,13 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
                     sys.exit(1)
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
-            #     and (version := trainer_state.propagated_weight_version is not None) 
+            #     and (version := trainer_state.propagated_weight_version is not None)
             #     and version > last_trainer_version):
             #     last_trainer_version = version
             #     last_time_new_version = time.time()
             # if not debug_mode and time.time() - last_time_new_version > 1800:
             #     logger.error("No new weight update in 30 minutes, exiting")
-            #     sys.exit(1) 
+            #     sys.exit(1)
             time.sleep(1.0)
     except KeyboardInterrupt:
         gently_stop_all_processes()
@@ -381,9 +432,7 @@ def debug_link_streams(cfg: DictConfig, topics: list[str]):
 def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | None = None):
     exp_dir = Path(cfg.output_dir)
     processes = []
-    all_job_kinds = [
-        "actor", "verifier", "actor_llm", "preprocessor", "preprocessor_llm", "finetune"
-    ]
+    all_job_kinds = ["actor", "verifier", "actor_llm", "preprocessor", "preprocessor_llm", "finetune"]
     if job_kind_filter is None:
         job_kind_filter = all_job_kinds
     for job in world_map.my_jobs():
@@ -394,7 +443,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
         if job.kind == "actor":
             processes.extend(run_actor(world_map, job.replica_idx, exp_dir))
         elif job.kind == "verifier":
-            processes.extend(run_verifier(cfg))            
+            processes.extend(run_verifier(cfg))
         elif job.kind == "actor_llm":
             processes.extend(run_actor_llm(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "preprocessor":
@@ -410,7 +459,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
 
 def setup_logging(log_file: Path):
     file_handler = logging.FileHandler(log_file)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     file_handler.setFormatter(formatter)
     root_logger = logging.getLogger()
     root_logger.addHandler(file_handler)
@@ -422,10 +471,10 @@ def setup_logging(log_file: Path):
     config_name="base",
     version_base="1.3.2",
 )
-def main(cfg: DictConfig):    
+def main(cfg: DictConfig):
     validate_config(cfg)
 
-    exp_dir = Path(cfg.output_dir)    
+    exp_dir = Path(cfg.output_dir)
     config_dir = exp_dir / "conf"
 
     os.makedirs(exp_dir / "launcher", exist_ok=True)
@@ -438,7 +487,7 @@ def main(cfg: DictConfig):
     if root:
         if not group.startswith(root + "/"):
             raise ValueError(f"run_dir {exp_dir} does not start with root {root}")
-        cfg.finetune.wandb_group = group[len(root) + 1:]
+        cfg.finetune.wandb_group = group[len(root) + 1 :]
     if world_map.total_finetune_gpus:
         accum_passes = cfg.finetune.gradient_accumulation_passes
         n_gpus = world_map.total_finetune_gpus
@@ -460,8 +509,8 @@ def main(cfg: DictConfig):
     if world_map.my_rank == 0:
         clean_up(exp_dir, cfg.force_restart)
         os.makedirs(config_dir, exist_ok=True)
-        OmegaConf.save(cfg, config_dir / "exp_config.yaml")        
-        logger.info(f"Orchestrator 0 created the exp folder")
+        OmegaConf.save(cfg, config_dir / "exp_config.yaml")
+        logger.info("Orchestrator 0 created the exp folder")
         if cfg.streams.backend == "redis":
             processes.extend(run_redis(cfg))
             redis = connect_to_redis(cfg.streams)
@@ -475,11 +524,11 @@ def main(cfg: DictConfig):
             hostfile_path = str(exp_dir / "hostfile.txt")
             with open(hostfile_path, "w") as f:
                 f.write(deepspeed_hostfile_content)
-            logger.info(f"Deepspeed hostfile content:\n{deepspeed_hostfile_content}")                          
+            logger.info(f"Deepspeed hostfile content:\n{deepspeed_hostfile_content}")
             logger.info(f"Orchestrator 0 created hostfile at {hostfile_path}")
 
         with write_to_streams(lead_launcher_stream) as stream:
-            stream.write(init_msg)        
+            stream.write(init_msg)
         if cfg.debug.mode == "finetune":
             debug_link_streams(cfg, [cfg.finetune.input])
         elif cfg.debug.mode == "preprocessor":
@@ -500,7 +549,7 @@ def main(cfg: DictConfig):
         processes.extend(launch_jobs(cfg, world_map))
     else:
         raise NotImplementedError(f"Unknown debug mode {cfg.debug.mode}")
-        
+
     if os.environ.get("DRY_RUN", "0") == "1":
         assert not processes
         return

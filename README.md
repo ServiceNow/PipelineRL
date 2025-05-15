@@ -35,7 +35,7 @@ Create the environments with dependencies.
 ```bash
 conda create -n pipeline-rl -y python=3.11
 conda run --no-capture-output -n pipeline-rl pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121 
-conda run --no-capture-output -n pipeline-rl pip install -r requirements.txt --no-build-isolation
+conda run --no-capture-output -n pipeline-rl pip install -e . --no-build-isolation
 ```
 
 By default Pipeline-RL will use the file system as the medium for streaming the generated data to the trainer processes. This works on one node, but the files can get quite large. To use Redis instead you will need to install the Redis server in the same conda environment:

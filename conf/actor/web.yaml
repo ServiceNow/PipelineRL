@@ -1,0 +1,109 @@
+log_each_n_secs: 10
+llm_max_rollouts: 128
+rollout_workers: 1
+rollout_policy: pipelinerl.tapeagents_rollouts.generate_rollout
+
+environment:
+  _target_: tapeagents.mcp.MCPEnvironment
+  config_path: conf/mcp/web.json
+
+llm:
+  _target_: tapeagents.llms.LiteLLM
+  model_name: o4-mini-2025-04-16
+  use_cache: true
+  context_size: 200000
+  parameters:
+    temperature: 1
+    max_completion_tokens: 16000
+
+agent:
+  _target_: tapeagents.agent.Agent
+  name : web_agent
+  llms:
+    default: ${llm}
+  templates:
+    system_prompt: |
+      You are an expert AI Agent trained to assist users with complex information processing tasks.
+      Your role is to understand user queries and respond in a helpful and accurate manner.
+      Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
+      Do not express emotions or opinions about user questions.
+    allowed_tools: |
+      You have access to the following tools:
+      {tools_description}
+    thought_format: |
+      Important! Respond with the plain text, do not include any JSON or code.
+      Do not output anything besides what I asked in this message.
+    allowed_steps: |
+      You have access to the following tools:
+      {tools_description}
+      You are allowed to produce ONLY steps with the following JSON schemas:
+      {allowed_steps}
+      Do not reproduce the schema when producing steps; use it as a reference.
+    format: >
+      Output only a single JSON dict or a single JSON list.
+      DO NOT OUTPUT ANYTHING BESIDES THE JSON! DO NOT PLACE ANY COMMENTS INSIDE THE JSON.
+      It will break the system that processes the output.
+
+  nodes:
+    - _target_: tapeagents.nodes.StandardNode
+      name: plan
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: |
+        Write a concise multi-step plan explaining which steps should be performed to find the answer for the given task.
+        Be specific about how each step should be performed. Only describe the intended actions here, do not perform them yet.
+        Consider that next steps may depend on results of previous steps, so include conditional branching using "if" statements where needed.
+        Start with the title "Plan". Every step should have short name and description.
+        ${agent.templates.thought_format}
+      steps_prompt: ${agent.templates.allowed_tools}
+
+    - _target_: tapeagents.nodes.StandardNode
+      name: reflect
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: |
+        Observe the current state of the task and produce the reflection text strictly following these rules:
+          1. Evaluate the action's success, explain its impact on the task and our plan,
+          2. If the last action was not successful, describe errors and the possible reasons for failure.
+          3. List the next steps to accomplish the current plan step and propose single next immediate action.
+          4. When proposing webpage interactions:
+            - Always accept cookie and close popups first before interacting
+            - If the last action was not successful, check if the target element is visible and use scrolling if it is not.
+          5. Describe the expected effect of the proposed action.
+        ${agent.templates.thought_format}
+      steps_prompt: ${agent.templates.allowed_tools}
+
+    - _target_: tapeagents.nodes.StandardNode
+      name: act
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: Then produce single function call for the next step. If the answer is ready, call FinalStep function.
+      steps:
+        - tapeagents.steps.ReasoningThought
+        - tapeagents.core.FinalStep
+      use_known_actions: true
+      use_function_calls: true
+      next_node: act
+
+    - _target_: tapeagents.nodes.StandardNode
+      name: summarize
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: |
+        Summarize last observation. If its an image, thoroughly describe it with all details.
+        Describe the results of the last action and observed changes. Discuss its impact on the task and our plan.
+        Do not hallucinate or make up any information, only describe what you see in the observation.
+        Do not guess or assume action effects, describe only visible changes.
+        ${agent.templates.thought_format}
+      steps_prompt: ${agent.templates.allowed_tools}
+      next_node: reflect
+
+split: validation
+batch: 2
+retry_unsolved: true
+
+only_tasks: #[] # list of (level, task_num)
+- [1, 0]
+- [1, 1]
+- [1, 2]
+- [1, 3]
+- [1, 4]
+- [1, 5]
+- [1, 6]
+- [1, 7]
