@@ -58,22 +58,23 @@ from pipelinerl.streams import (
 logger = logging.getLogger(__name__)
 
 
-def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
+def gather_metrics(metrics: dict) -> dict:
     """
-    Gather RL metrics from all processes using torch.distributed.all_gather_object.
+    Gather metrics from all processes using torch.distributed.all_gather_object.
     
     Args:
-        rl_metrics: Dictionary mapping metric names to lists of values
+        metrics: Dictionary mapping metric names to metric values (list or single values).
         
     Returns:
         Dictionary with gathered metrics from all processes
     """
     # Initialize the result dictionary
-    gathered_rl_metrics = {}
+    gathered_metrics = {}
     
     # Process each metric separately
-    for key, values in rl_metrics.items():
-        if values:
+    for key, values in metrics.items():
+        # TODO: just remove this condition? 
+        if values is not None:
             # Initialize a list to gather the results from all processes
             gathered_values = [None] * dist.get_world_size()
             
@@ -83,12 +84,14 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
             # Flatten the list of lists into a single list
             combined_values = []
             for process_values in gathered_values:
+                if not isinstance(process_values, list):
+                    process_values = [process_values]
                 combined_values.extend(process_values)
             
             # Store the combined values
-            gathered_rl_metrics[key] = combined_values
+            gathered_metrics[key] = combined_values
     
-    return gathered_rl_metrics
+    return gathered_metrics
 
 def run_sample_loader(data_stream: SingleStreamSpec, sample_queue: Queue[Dict | Exception], pop_old_data: bool = False):
     with read_stream(data_stream) as stream_reader:
@@ -654,6 +657,9 @@ def rl_finetuning_worker(
     rl_config = RLConfig(**args.rl)
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
+    discard_optimizer_step = False
+    discard_optimizer_step_turn_on_time = None
+
     while training_metrics.completed_steps < final_train_steps:
         # We include time waiting for data in the step time
         if first_pass:
@@ -722,6 +728,17 @@ def rl_finetuning_worker(
             else:
                 # accelerator's backward
                 get_accelerator().backward(loss)
+
+        def zero_grad():
+            """Zero gradients"""
+            if using_deepspeed:
+                # Zero gradients in DeepSpeed
+                assert model.bfloat16_enabled()
+                model.optimizer.zero_grad()
+                #model.optimizer.clear_lp_grads()
+                #model.optimizer.clear_hp_grads()
+            else:
+                optimizer.zero_grad()
 
         def optimizer_step_and_zero_grad():
             """Perform optimizer step and zero gradients"""
@@ -792,10 +809,48 @@ def rl_finetuning_worker(
         except Exception as e:
             logger.warning(f"Synchronization error: {e}. Continuing anyway...")
 
-        optimizer_step_and_zero_grad()
-        lr_scheduler.step()
+        gathered_rl_metrics = gather_metrics(rl_metrics)
+        lag_stats = gather_metrics(lag_stats)
+        logger.info(f"Gathered lag stats: {lag_stats}")
+        lag_stats["min_version"] = min(lag_stats["min_version"])
+        lag_stats["max_version"] = max(lag_stats["max_version"])
 
+        average_rl_metrics = get_avg_rl_stats(gathered_rl_metrics, samples_per_step)
+        ess = average_rl_metrics["rl/ratio_new_old_sum"] ** 2 / average_rl_metrics["rl/ratio_new_old_squared_sum"] / average_rl_metrics["rl/num_output_tokens_sum"]
         metrics_dict = {}
+        metrics_dict.update(average_rl_metrics)
+        metrics_dict.update(
+            {
+                "rl/ess": ess,
+            }
+        )
+
+        turn_on_discard_optimizer_step = (
+            discard_optimizer_step_turn_on_time is None
+            and ess < args.get("min_ess", 0)
+            and not lag_stats["min_version"] == training_metrics.last_broadcasted_version
+        )
+        turn_off_discard_optimizer_step = (
+            discard_optimizer_step_turn_on_time is not None
+            and time.time() > discard_optimizer_step_turn_on_time + 240
+        )
+        if turn_on_discard_optimizer_step:
+            logger.info(f"Start discarding optimizer steps, cause ESS {ess} is below threshold {args.get('min_ess', 0)}")           
+            discard_optimizer_step = True
+            discard_optimizer_step_turn_on_time = time.time()
+        if turn_off_discard_optimizer_step:
+            logger.info(f"Stop discarding optimizer steps, cause we waited enough time")
+            discard_optimizer_step = False
+            discard_optimizer_step_turn_on_time = None
+
+        if discard_optimizer_step:
+            logger.info(f"Discard optimizer step {training_metrics.completed_steps}")
+            zero_grad()
+        else:
+            optimizer_step_and_zero_grad()
+            lr_scheduler.step()
+
+        step_and_optim_took = time.time() - step_start_time
         time_to_stop = training_metrics.completed_steps >= final_train_steps
         time_to_log = training_metrics.completed_steps % args.log_each_n_steps == 0
         time_to_save = (training_metrics.completed_steps % args.save_checkpoint_steps == 0) or (
@@ -809,6 +864,7 @@ def rl_finetuning_worker(
             dt = log_time(dt, time_stats, "finetune/interim_eval")
             metrics_dict.update(
                 {
+                    "stats/discard_optimizer_step": int(discard_optimizer_step),
                     "stats/lr": training_metrics.lr,
                     "stats/grad_norm": training_metrics.grad_norm,
                     "stats/samples": training_metrics.samples,
@@ -824,6 +880,7 @@ def rl_finetuning_worker(
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
                     "stats/runtime": training_metrics.runtime,
+                    "stats/step_and_optim_took": step_and_optim_took,
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
                     "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
@@ -852,17 +909,8 @@ def rl_finetuning_worker(
                 }
             )
 
-            gathered_rl_metrics = gather_rl_metrics(rl_metrics)
             time_waiting_for_data = 0.0
 
-            average_rl_metrics = get_avg_rl_stats(gathered_rl_metrics, samples_per_step)
-            ess = average_rl_metrics["rl/ratio_new_old_sum"] ** 2 / average_rl_metrics["rl/ratio_new_old_squared_sum"] / average_rl_metrics["rl/num_output_tokens_sum"]
-            metrics_dict.update(average_rl_metrics)
-            metrics_dict.update(
-                {
-                    "rl/ess": ess,
-                }
-            )
 
             rl_metrics = defaultdict(list)
             time_stats = {}
@@ -877,7 +925,8 @@ def rl_finetuning_worker(
             log_metrics(logger, training_metrics.completed_steps, metrics_dict)
 
         if (
-            args.send_weight_updates
+            not discard_optimizer_step
+            and args.send_weight_updates
             and training_metrics.samples - training_metrics.last_broadcasted_version >= args.weight_update_interval
         ):
             assert weight_update_manager is not None

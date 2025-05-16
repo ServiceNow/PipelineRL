@@ -229,6 +229,12 @@ def rl_step(
 
     log_ratio_new_old = new_logprobs - old_logprobs
     ratio_new_old = torch.exp(log_ratio_new_old)
+    # Filtered ratio for computing ESS, deal with vLLM / transformers occasional large logprob differences
+    filtered_log_ratio_new_old = log_ratio_new_old.clone()
+    filtered_log_ratio_new_old[filtered_log_ratio_new_old > 1] = 0
+    filtered_log_ratio_new_old[filtered_log_ratio_new_old < -1] = 0
+    filtered_ratio_new_old = torch.exp(filtered_log_ratio_new_old)
+
     log_ratio_ref_new = ref_logprobs - new_logprobs
     assert torch.isfinite(log_ratio_ref_new).all(), (
         f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
@@ -314,10 +320,10 @@ def rl_step(
         "policy_loss": mean_sum(policy_loss, masks_shifted, segments).item(),
         "surr1": mean_sum(surr1, masks_shifted, segments).item(),
         "surr2": mean_sum(surr2, masks_shifted, segments).item(),
-        "ratio_new_old": mean_sum(ratio_new_old, masks_shifted, segments).item(),
-        "ratio_new_old_sum": sum_sum(ratio_new_old, masks_shifted, segments).item(),
+        "ratio_new_old": mean_sum(filtered_ratio_new_old, masks_shifted, segments).item(),
+        "ratio_new_old_sum": sum_sum(filtered_ratio_new_old, masks_shifted, segments).item(),
         "ratio_new_old_squared_sum": sum_sum( # useful to estimate the ESS
-            ratio_new_old * ratio_new_old, masks_shifted, segments
+            filtered_ratio_new_old * filtered_ratio_new_old, masks_shifted, segments
         ).item(),
         "ratio_ref_new": mean_sum(
             torch.exp(log_ratio_ref_new), masks_shifted, segments
