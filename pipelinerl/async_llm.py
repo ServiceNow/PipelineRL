@@ -1,7 +1,7 @@
 import logging
 import aiohttp
 
-from tapeagents.core import LLMCall, LLMOutput, Prompt, TokenLogprob
+from tapeagents.core import LLMCall, LLMOutput, Prompt
 from tapeagents.llms.trainable import TrainableLLM
 
 
