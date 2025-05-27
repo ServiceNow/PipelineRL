@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 
 _accelerator = None
 
+
 def get_accelerator():
     global _accelerator
     if _accelerator is None:
-        _accelerator = Accelerator(step_scheduler_with_optimizer=False) 
+        _accelerator = Accelerator(step_scheduler_with_optimizer=False)
     return _accelerator

@@ -30,7 +30,9 @@ MASKED_TOKEN_ID = -100
 
 
 def save_samples(training_samples: list[TrainingText], jsonl_filename: str):
-    assert jsonl_filename.endswith(".jsonl"), f"Filename {jsonl_filename} must end with .jsonl"
+    assert jsonl_filename.endswith(".jsonl"), (
+        f"Filename {jsonl_filename} must end with .jsonl"
+    )
     with open(jsonl_filename, "w") as f:
         for sample in training_samples:
             f.write(sample.model_dump_json() + "\n")
@@ -157,19 +159,27 @@ def collate(
     pad_to_multiple_of: int = 16,
 ) -> BatchEncoding:
     # turn list of dicts with the same keys into a dict of lists
-    example_dict = {key: [example[key] for example in examples] for key in examples[0].keys()}
+    example_dict = {
+        key: [example[key] for example in examples] for key in examples[0].keys()
+    }
     seq_length = max(len(i) for i in example_dict["input_ids"])
     if seq_length % pad_to_multiple_of:
         seq_length += pad_to_multiple_of - (seq_length % pad_to_multiple_of)
     result = {}
     for k, seq_list in example_dict.items():
         padded_sequences = []
-        pad_value = label_mask_value if k == "labels" else (0.0 if k in RL_DATA_COLUMNS else 0)
+        pad_value = (
+            label_mask_value if k == "labels" else (0.0 if k in RL_DATA_COLUMNS else 0)
+        )
         for seq in seq_list:
             if not isinstance(seq, list):
                 seq = [seq]
             padding = [pad_value] * (seq_length - len(seq))
-            padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
+            padded = (
+                (seq + padding)
+                if tokenizer.padding_side == "right"
+                else (padding + seq)
+            )
             padded_sequences.append(padded)
         result[k] = torch.tensor(padded_sequences)
     return BatchEncoding(result, tensor_type="pt")
@@ -185,13 +195,17 @@ def collate_packed(
 
     # create a single tensor for sequence boundaries
     seq_boundaries = torch.zeros(len(examples) + 1, dtype=torch.long)
-    seq_boundaries[1:] = torch.tensor([len(example["input_ids"]) for example in examples]).cumsum(0)
+    seq_boundaries[1:] = torch.tensor(
+        [len(example["input_ids"]) for example in examples]
+    ).cumsum(0)
 
     # preallocate all tensors at once
     base_tensors = {
         "input_ids": torch.empty(1, total_length, dtype=torch.long),
         "labels": torch.empty(1, total_length, dtype=torch.long),
-        "attention_mask": torch.ones(1, total_length, dtype=torch.long),  # initialize to 1s
+        "attention_mask": torch.ones(
+            1, total_length, dtype=torch.long
+        ),  # initialize to 1s
         "position_ids": torch.empty(1, total_length, dtype=torch.long),
     }
 
@@ -225,7 +239,9 @@ def collate_packed(
             else:
                 extra_lists[key].append(value)
 
-    extra_tensors = default_data_collator([{k: extra_lists[k] for k in extra_keys}], return_tensors="pt")
+    extra_tensors = default_data_collator(
+        [{k: extra_lists[k] for k in extra_keys}], return_tensors="pt"
+    )
 
     result = {**base_tensors, **extra_tensors}
     return BatchEncoding(result)
@@ -242,7 +258,9 @@ def create_dataloader(
     rl_data_callback: Callable | None = None,
     n_examples: int | None = None,
 ) -> DataLoader:
-    preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=is_rl)
+    preprocess = partial(
+        preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=is_rl
+    )
     columns = ["input_ids", "labels", "attention_mask"]
     if is_rl:
         columns += RL_DATA_COLUMNS

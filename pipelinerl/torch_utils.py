@@ -10,6 +10,7 @@ from torch.distributed.distributed_c10d import (
     rendezvous,
 )
 
+
 # Copy from pytorch to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 def init_extra_process_group(
@@ -22,7 +23,9 @@ def init_extra_process_group(
     group_name: str = None,
     pg_options: Optional[Any] = None,
 ):
-    assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
 
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"

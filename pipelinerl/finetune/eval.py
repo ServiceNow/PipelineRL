@@ -26,7 +26,9 @@ def evaluate(
     return torch.mean(torch.cat(losses)).item()
 
 
-def evaluate_and_get_metrics(args, model, eval_dataloader, dev_dataloader, training_metrics: TrainingMetrics):
+def evaluate_and_get_metrics(
+    args, model, eval_dataloader, dev_dataloader, training_metrics: TrainingMetrics
+):
     if eval_dataloader:
         logger.info("Evaluating model")
         training_metrics.eval_loss = evaluate(args, model, eval_dataloader)

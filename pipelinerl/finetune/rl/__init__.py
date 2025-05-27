@@ -316,7 +316,7 @@ def rl_step(
         "surr2": mean_sum(surr2, masks_shifted, segments).item(),
         "ratio_new_old": mean_sum(ratio_new_old, masks_shifted, segments).item(),
         "ratio_new_old_sum": sum_sum(ratio_new_old, masks_shifted, segments).item(),
-        "ratio_new_old_squared_sum": sum_sum( # useful to estimate the ESS
+        "ratio_new_old_squared_sum": sum_sum(  # useful to estimate the ESS
             ratio_new_old * ratio_new_old, masks_shifted, segments
         ).item(),
         "ratio_ref_new": mean_sum(

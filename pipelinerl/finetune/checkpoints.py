@@ -79,11 +79,15 @@ def load_model(args, model_class, current_dir):
             "Please upgrade transformers to use it"
         )
         loading_args["attn_implementation"] = "flash_attention_2"
-        logger.info(f"FlashAttention available: {torch.backends.cuda.flash_sdp_enabled()}")
+        logger.info(
+            f"FlashAttention available: {torch.backends.cuda.flash_sdp_enabled()}"
+        )
 
     is_ds_zero_3 = False
     if getattr(get_accelerator().state, "deepspeed_plugin", None):
-        del loading_args["low_cpu_mem_usage"]  # deepspeed is not compatible with this option
+        del loading_args[
+            "low_cpu_mem_usage"
+        ]  # deepspeed is not compatible with this option
         is_ds_zero_3 = get_accelerator().state.deepspeed_plugin.zero_stage == 3  # type: ignore
 
     if args.load_as_bf16:
@@ -131,7 +135,11 @@ def load_model(args, model_class, current_dir):
         if has_lora_checkpoint(current_dir):
             lora_load(current_dir, model)
     elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": args.reentrant_checkpointing})
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": args.reentrant_checkpointing
+            }
+        )
 
     get_accelerator().wait_for_everyone()
     return model
@@ -145,7 +153,9 @@ def save_training_state(
     extra_training_state: dict[str, typing.Any] = {},
 ):
     with get_temporary_folder_and_move(training_state_dir) as temp_dir:
-        _save_training_state(temp_dir, model, optimizer, lr_scheduler, extra_training_state)
+        _save_training_state(
+            temp_dir, model, optimizer, lr_scheduler, extra_training_state
+        )
 
 
 def _save_training_state(
@@ -166,9 +176,9 @@ def _save_training_state(
     Modified from https://github.com/huggingface/accelerate/blob/main/examples/by_feature/deepspeed_with_config_support.py#L247
     More details at: https://deepspeed.readthedocs.io/en/latest/model-checkpointing.html
     """
-    assert (
-        not os.path.exists(training_state_dir) or training_state_dir.is_dir()
-    ), f"output_dir {training_state_dir} must be a directory"
+    assert not os.path.exists(training_state_dir) or training_state_dir.is_dir(), (
+        f"output_dir {training_state_dir} must be a directory"
+    )
 
     if is_deepspeed_model(model):
         # Save both model and optimizer, as well as lr_scheduler if supported by deepspeed
@@ -178,9 +188,15 @@ def _save_training_state(
             logger.warning(
                 f"Manually adding DeepSpeed-unsupported lr_scheduler of type {type(lr_scheduler).__name__} to the checkpoint"
             )
-            client_state["lr_scheduler_state"] = lr_scheduler.state_dict()  # manually save state
-        success = model.save_checkpoint(training_state_dir, tag="deepspeed", client_state=client_state)
-        assert success, f"Failed to save deepspeed training state into {training_state_dir}"
+            client_state["lr_scheduler_state"] = (
+                lr_scheduler.state_dict()
+            )  # manually save state
+        success = model.save_checkpoint(
+            training_state_dir, tag="deepspeed", client_state=client_state
+        )
+        assert success, (
+            f"Failed to save deepspeed training state into {training_state_dir}"
+        )
         logger.info(f"Saved deepspeed training state to {training_state_dir}")
     else:  # multi_gpu mode (no deepspeed)
         # Only save training_state in main process
@@ -189,7 +205,9 @@ def _save_training_state(
             training_state = dict(extra_training_state)
             training_state["optimizer_state"] = optimizer.state_dict()
             training_state["lr_scheduler_state"] = lr_scheduler.state_dict()
-            get_accelerator().save(training_state, training_state_dir / "training_state.pt")
+            get_accelerator().save(
+                training_state, training_state_dir / "training_state.pt"
+            )
             logger.info(f"Saved accelerate training state to {training_state_dir}")
 
 
@@ -206,9 +224,9 @@ def load_training_checkpoint(
     - Without deepspeed, this will *only* load optimizer, lr_scheduler states in-place,
         but *not* model states!
     """
-    assert (
-        not os.path.exists(training_state_dir) or training_state_dir.is_dir()
-    ), f"output_dir {training_state_dir} must be a directory"
+    assert not os.path.exists(training_state_dir) or training_state_dir.is_dir(), (
+        f"output_dir {training_state_dir} must be a directory"
+    )
 
     if is_deepspeed_model(model):
         logger.info("Load deepspeed training state")
@@ -221,19 +239,25 @@ def load_training_checkpoint(
             load_lr_scheduler_states=True,
         )
         if load_path is None:
-            raise RuntimeError(f"Loading deepspeed checkpoint from {training_state_dir} failed")
+            raise RuntimeError(
+                f"Loading deepspeed checkpoint from {training_state_dir} failed"
+            )
         if (
             model.lr_scheduler is None
             and extra_training_state is not None
             and "lr_scheduler_state" in extra_training_state
         ):
             # Manually load lr_scheduler states
-            logger.warning(f"Manually loading ds-unsupported lr_scheduler of type {type(lr_scheduler).__name__}")
+            logger.warning(
+                f"Manually loading ds-unsupported lr_scheduler of type {type(lr_scheduler).__name__}"
+            )
             lr_scheduler.load_state_dict(extra_training_state["lr_scheduler_state"])
         logger.info(f"Loaded deepspeed checkpoint from {training_state_dir}")
     else:  # multi_gpu (no deepspeed)
         # This needs to be called from all processes
-        training_state = torch.load(training_state_dir / "training_state.pt", map_location="cpu")
+        training_state = torch.load(
+            training_state_dir / "training_state.pt", map_location="cpu"
+        )
         optimizer.load_state_dict(training_state["optimizer_state"])
         lr_scheduler.load_state_dict(training_state["lr_scheduler_state"])
         del training_state["optimizer_state"]
@@ -323,7 +347,9 @@ def save_model_only(
     The accelerate version must be called on *all* accelerate processes because all of them must save their shards.
     The DeepSpeed version is only called on the main process because the checkpointing and conversion mechanism will gather the shards from all processes.
     """
-    assert not os.path.exists(output_dir) or output_dir.is_dir(), f"output_dir {output_dir} must be a directory"
+    assert not os.path.exists(output_dir) or output_dir.is_dir(), (
+        f"output_dir {output_dir} must be a directory"
+    )
     get_accelerator().wait_for_everyone()
 
     logger.info(f"Save model to {output_dir}")
@@ -345,11 +371,19 @@ def save_model_only(
         )
         logger.info(f"Saved model to {output_dir}")
     else:
-        raise ValueError(f"model is neither a deepspeed model nor a transformers.PreTrainedModel: {type(model)}")
+        raise ValueError(
+            f"model is neither a deepspeed model nor a transformers.PreTrainedModel: {type(model)}"
+        )
 
-    if os.path.exists(output_dir / "model.safetensors") and os.path.exists(output_dir / "model.safetensors.index.json"):
-        logger.info("Hide model.safetensors because it utterly confuses the HF model loading code")
-        os.rename(output_dir / "model.safetensors", output_dir / "model.safetensors.bak")
+    if os.path.exists(output_dir / "model.safetensors") and os.path.exists(
+        output_dir / "model.safetensors.index.json"
+    ):
+        logger.info(
+            "Hide model.safetensors because it utterly confuses the HF model loading code"
+        )
+        os.rename(
+            output_dir / "model.safetensors", output_dir / "model.safetensors.bak"
+        )
 
 
 def save_tokenizer_only(
@@ -361,7 +395,9 @@ def save_tokenizer_only(
 
     Can be called on *all* processes.
     """
-    assert not os.path.exists(output_dir) or output_dir.is_dir(), f"output_dir {output_dir} must be a directory"
+    assert not os.path.exists(output_dir) or output_dir.is_dir(), (
+        f"output_dir {output_dir} must be a directory"
+    )
     if get_accelerator().is_main_process:
         logger.info(f"Save tokenizer to {output_dir}")
         tokenizer.save_pretrained(output_dir)
@@ -388,10 +424,18 @@ def load_training_state(
     training_metrics: TrainingMetrics,
 ):
     get_accelerator().wait_for_everyone()
-    training_state = load_training_checkpoint(training_state_dir, model, optimizer, lr_scheduler)
+    training_state = load_training_checkpoint(
+        training_state_dir, model, optimizer, lr_scheduler
+    )
     if training_state is None:
         raise ValueError(f"Could not load training state from {training_state_dir}")
-    
+
     # Update training_metrics with loaded training state (hasattr check is to avoid potential mismatches between training_metrics and training_state)
-    vars(training_metrics).update({key: val for key, val in training_state.items() if hasattr(training_metrics, key)})
+    vars(training_metrics).update(
+        {
+            key: val
+            for key, val in training_state.items()
+            if hasattr(training_metrics, key)
+        }
+    )
     return training_metrics

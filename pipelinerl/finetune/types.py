@@ -40,4 +40,3 @@ class TrainingMetrics:
     max_batch_len: int = 0
     min_batch_len: int = int(1e9)
     time_waiting_for_data: float = 0.0
-    

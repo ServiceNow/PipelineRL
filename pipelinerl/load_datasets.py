@@ -27,7 +27,9 @@ def process_eurus(dataset):
             yield None
         answer = "\\boxed{" + str(item["reward_model"]["ground_truth"]) + "}"
         task = item["prompt"][1]["content"]
-        task = task.replace("\n\nPresent the answer in LaTex format: \\boxed{Your answer}", "")
+        task = task.replace(
+            "\n\nPresent the answer in LaTex format: \\boxed{Your answer}", ""
+        )
         yield {
             "dataset": item["data_source"],
             "task": task,
@@ -146,18 +148,24 @@ def load_math(split):
         "prealgebra",
         "precalculus",
     ]:
-        dataset = load_dataset("EleutherAI/hendrycks_math", config, split=split, trust_remote_code=True)
+        dataset = load_dataset(
+            "EleutherAI/hendrycks_math", config, split=split, trust_remote_code=True
+        )
         for sample in dataset:
             data.append(sample)
     return datasets.Dataset.from_list(data)
 
 
 def _load_aime_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
-    aime_dataset = load_dataset("AI-MO/aimo-validation-aime", split="train", trust_remote_code=True)
+    aime_dataset = load_dataset(
+        "AI-MO/aimo-validation-aime", split="train", trust_remote_code=True
+    )
     aime_dataset = aime_dataset.filter(lambda x: str(year) in x["url"])
 
     dataset_name = f"aime_{year}" + ("" if upsample_factor > 0 else "_original")
-    samples = [s for s in process_aime_and_amc(aime_dataset, dataset_name) if s is not None]
+    samples = [
+        s for s in process_aime_and_amc(aime_dataset, dataset_name) if s is not None
+    ]
 
     original_size = len(samples)
     if upsample_factor > 0:
@@ -171,11 +179,15 @@ def _load_aime_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
 
 
 def _load_amc_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
-    amc_dataset = load_dataset("AI-MO/aimo-validation-amc", split="train", trust_remote_code=True)
+    amc_dataset = load_dataset(
+        "AI-MO/aimo-validation-amc", split="train", trust_remote_code=True
+    )
     amc_dataset = amc_dataset.filter(lambda x: str(year) in x["url"])
 
     dataset_name = f"amc_{year}" + ("" if upsample_factor > 0 else "_original")
-    samples = [s for s in process_aime_and_amc(amc_dataset, dataset_name) if s is not None]
+    samples = [
+        s for s in process_aime_and_amc(amc_dataset, dataset_name) if s is not None
+    ]
 
     original_size = len(samples)
     if upsample_factor > 0:
@@ -202,21 +214,27 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
         dataset_names = [dataset_names]
     datasets = []
     if "eurus_train" in dataset_names:
-        dataset = load_dataset("PRIME-RL/Eurus-2-RL-Data", split="train", trust_remote_code=True)
+        dataset = load_dataset(
+            "PRIME-RL/Eurus-2-RL-Data", split="train", trust_remote_code=True
+        )
         samples = [s for s in process_eurus(dataset) if s is not None]
         logger.info(f"Loading eurus train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     # great for debugging since its much smaller than eurus train
     if "eurus_validation" in dataset_names:
-        dataset = load_dataset("PRIME-RL/Eurus-2-RL-Data", split="validation", trust_remote_code=True)
+        dataset = load_dataset(
+            "PRIME-RL/Eurus-2-RL-Data", split="validation", trust_remote_code=True
+        )
         samples = [s for s in process_eurus(dataset) if s is not None]
         logger.info(f"Loading eurus validation dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "math_train" in dataset_names:
         # math_dataset = load_math("train")
-        dataset = load_dataset("hendrycks/competition_math", split="train", trust_remote_code=True)
+        dataset = load_dataset(
+            "hendrycks/competition_math", split="train", trust_remote_code=True
+        )
         samples = [s for s in process_math(dataset, "math_train") if s is not None]
         logger.info(f"Loading math train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
@@ -231,7 +249,9 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             split="train",
             trust_remote_code=True,
         )
-        samples = [s for s in process_math(dataset, "math_simplerl_train") if s is not None]
+        samples = [
+            s for s in process_math(dataset, "math_simplerl_train") if s is not None
+        ]
         logger.info(f"Loading math simplerl train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
@@ -245,52 +265,74 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             split="train",
             trust_remote_code=True,
         )
-        samples = [s for s in process_math(dataset, "math_simplerl_subset") if s is not None]
+        samples = [
+            s for s in process_math(dataset, "math_simplerl_subset") if s is not None
+        ]
         random.seed(42)
         random.shuffle(samples)
         samples = samples[:1000]
-        logger.info(f"Loading math simplerl subset test dataset: {len(samples)} samples")
+        logger.info(
+            f"Loading math simplerl subset test dataset: {len(samples)} samples"
+        )
         datasets += add_ids(samples)
 
     if "deepscaler_preview" in dataset_names:
-        dataset = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train", trust_remote_code=True)
+        dataset = load_dataset(
+            "agentica-org/DeepScaleR-Preview-Dataset",
+            split="train",
+            trust_remote_code=True,
+        )
         samples = [s for s in process_math(dataset, "deepscaler") if s is not None]
         logger.info(f"Loading deepscaler preview train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "math_test" in dataset_names:
         # math_dataset = load_math("test")
-        dataset = load_dataset("hendrycks/competition_math", split="test", trust_remote_code=True)
+        dataset = load_dataset(
+            "hendrycks/competition_math", split="test", trust_remote_code=True
+        )
         samples = [s for s in process_math(dataset, "math_test") if s is not None]
         logger.info(f"Loading math test dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "omni_math_500" in dataset_names:
-        dataset = load_dataset("reliable-agents/Omni-MATH-500", split="test", trust_remote_code=True)
+        dataset = load_dataset(
+            "reliable-agents/Omni-MATH-500", split="test", trust_remote_code=True
+        )
         samples = [s for s in process_math(dataset, "omni_math_500") if s is not None]
         logger.info(f"Loading omni math 500 dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "math_500" in dataset_names:
-        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test", trust_remote_code=True)
+        dataset = load_dataset(
+            "HuggingFaceH4/MATH-500", split="test", trust_remote_code=True
+        )
         samples = [s for s in process_math(dataset, "math_500") if s is not None]
         logger.info(f"Loading math 500 dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "open_r1_math_220k" in dataset_names:
-        dataset = load_dataset("open-r1/OpenR1-Math-220k", split="default", trust_remote_code=True)
-        samples = [s for s in process_math(dataset, "open_r1_math_220k") if s is not None]
+        dataset = load_dataset(
+            "open-r1/OpenR1-Math-220k", split="default", trust_remote_code=True
+        )
+        samples = [
+            s for s in process_math(dataset, "open_r1_math_220k") if s is not None
+        ]
         logger.info(f"Loading open r1 math 220k dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "gpqa_main" in dataset_names:
-        dataset = load_dataset("hendrydong/gpqa_main", split="test", trust_remote_code=True)
+        dataset = load_dataset(
+            "hendrydong/gpqa_main", split="test", trust_remote_code=True
+        )
         samples = [s for s in process_gpqa(dataset, "gpqa_main") if s is not None]
         logger.info(f"Loading gpqa main dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "gpqa_diamond" in dataset_names:
-        dataset = load_dataset("hendrydong/gpqa_diamond", split="test", trust_remote_code=True)
+        dataset = load_dataset(
+            "hendrydong/gpqa_diamond", split="test", trust_remote_code=True
+        )
         samples = [s for s in process_gpqa(dataset, "gpqa_diamond") if s is not None]
         logger.info(f"Loading gpqa diamond dataset: {len(samples)} samples")
         datasets += add_ids(samples)
@@ -299,13 +341,17 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
         pass
 
     if "gsm8k_train" in dataset_names:
-        dataset = load_dataset("openai/gsm8k", "main", split="train", trust_remote_code=True)
+        dataset = load_dataset(
+            "openai/gsm8k", "main", split="train", trust_remote_code=True
+        )
         samples = [s for s in process_gsm8k(dataset, "gsm8k_train") if s is not None]
         logger.info(f"Loading gsm8k train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     if "gsm8k_test" in dataset_names:
-        dataset = load_dataset("openai/gsm8k", "main", split="test", trust_remote_code=True)
+        dataset = load_dataset(
+            "openai/gsm8k", "main", split="test", trust_remote_code=True
+        )
         samples = [s for s in process_gsm8k(dataset, "gsm8k_test") if s is not None]
         logger.info(f"Loading gsm8k test dataset: {len(samples)} samples")
         datasets += add_ids(samples)
@@ -361,7 +407,11 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             split="train",
             trust_remote_code=True,
         )
-        samples = [s for s in process_open_reasoner(dataset, "open_reasoner_zero_57k") if s is not None]
+        samples = [
+            s
+            for s in process_open_reasoner(dataset, "open_reasoner_zero_57k")
+            if s is not None
+        ]
         logger.info(f"Loading Open Reasoner Zero dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
@@ -372,8 +422,14 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             split="train",
             trust_remote_code=True,
         )
-        samples = [s for s in process_open_reasoner(dataset, "open_reasoner_zero_extended_72k") if s is not None]
-        logger.info(f"Loading Open Reasoner Zero extended dataset: {len(samples)} samples")
+        samples = [
+            s
+            for s in process_open_reasoner(dataset, "open_reasoner_zero_extended_72k")
+            if s is not None
+        ]
+        logger.info(
+            f"Loading Open Reasoner Zero extended dataset: {len(samples)} samples"
+        )
         datasets += add_ids(samples)
 
     if "open_reasoner_zero_hard_13k" in dataset_names:
@@ -383,13 +439,21 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             split="train",
             trust_remote_code=True,
         )
-        samples = [s for s in process_open_reasoner(dataset, "open_reasoner_zero_hard_13k") if s is not None]
+        samples = [
+            s
+            for s in process_open_reasoner(dataset, "open_reasoner_zero_hard_13k")
+            if s is not None
+        ]
         logger.info(f"Loading Open Reasoner Zero hard dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
     for dataset_name in dataset_names:
-        test_matched = re.match(r"multiplication_(\d+)_by_(\d+)_(\d+)_test", dataset_name)
-        train_matched = re.match(r"multiplication(_upto)?_(\d+)_by_(\d+)_(\d+)_train", dataset_name)
+        test_matched = re.match(
+            r"multiplication_(\d+)_by_(\d+)_(\d+)_test", dataset_name
+        )
+        train_matched = re.match(
+            r"multiplication(_upto)?_(\d+)_by_(\d+)_(\d+)_train", dataset_name
+        )
         if test_matched:
             num_digits_1 = int(test_matched.group(1))
             num_digits_2 = int(test_matched.group(2))
@@ -401,10 +465,15 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             )
             samples = [
                 s
-                for s in process_math(dataset, f"multiplication_{num_digits_1}_by_{num_digits_2}_{num_samples}_test")
+                for s in process_math(
+                    dataset,
+                    f"multiplication_{num_digits_1}_by_{num_digits_2}_{num_samples}_test",
+                )
                 if s is not None
             ]
-            logger.info(f"Loading multiplication {num_digits_1}_by_{num_digits_2} dataset: {len(samples)} samples")
+            logger.info(
+                f"Loading multiplication {num_digits_1}_by_{num_digits_2} dataset: {len(samples)} samples"
+            )
             datasets += add_ids(samples)
         elif train_matched:
             upto_prefix = train_matched.group(1) or ""
@@ -419,7 +488,8 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             samples = [
                 s
                 for s in process_math(
-                    dataset, f"multiplication{upto_prefix}_{num_digits_1}_by_{num_digits_2}_{num_samples}_train"
+                    dataset,
+                    f"multiplication{upto_prefix}_{num_digits_1}_by_{num_digits_2}_{num_samples}_train",
                 )
                 if s is not None
             ]
@@ -430,7 +500,10 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
 
     if "countdown" in dataset_names:
         dataset = load_dataset(
-            "parquet", data_files="data/xiaoyin/train.parquet", trust_remote_code=True, split="train"
+            "parquet",
+            data_files="data/xiaoyin/train.parquet",
+            trust_remote_code=True,
+            split="train",
         )
         samples = [s for s in process_countdown(dataset) if s is not None]
         logger.info(f"Loading countdown dataset: {len(samples)} samples")

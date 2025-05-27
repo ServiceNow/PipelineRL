@@ -22,7 +22,9 @@ def has_lora_checkpoint(current_dir: Path) -> bool:
     )
 
 
-def prepare_model_for_bf16_training(model, use_gradient_checkpointing=False, gradient_checkpointing_kwargs=None):
+def prepare_model_for_bf16_training(
+    model, use_gradient_checkpointing=False, gradient_checkpointing_kwargs=None
+):
     logger.info("Prepare LoRA for BF16 training")
     for _, param in model.named_parameters():
         # freeze base model's layers
@@ -57,7 +59,9 @@ def prepare_lora_model(lora_config, model, gradient_checkpointing) -> PeftModel:
     )
     all_params = model.num_parameters()
     model = lora_prepare_fn(
-        model, use_gradient_checkpointing=gradient_checkpointing, gradient_checkpointing_kwargs={"use_reentrant": True}
+        model,
+        use_gradient_checkpointing=gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": True},
     )
     lora_config = LoraConfig(
         inference_mode=False,
@@ -147,7 +151,9 @@ def merge_lora(lora_model_path):
     assert os.path.exists(lora_model_config), f"{lora_model_config} does not exists"
 
     logger.info(f"Merge lora checkpoint {lora_model_path}")
-    model = lora_load_and_merge(lora_model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    model = lora_load_and_merge(
+        lora_model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+    )
     tokenizer = AutoTokenizer.from_pretrained(lora_model_path)
 
     tmp_dir = f"{lora_model_path}_merged"

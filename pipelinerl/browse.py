@@ -15,5 +15,7 @@ while not os.path.exists(exp_dir / "llm_calls.sqlite") and exp_dir != Path("."):
 os.environ["TAPEAGENTS_SQLITE_DB"] = os.path.join(exp_dir, "llm_calls.sqlite")
 
 
-browser = TapeBrowser(RLMathTape, sys.argv[1], CameraReadyRenderer(), file_extension=".json")
+browser = TapeBrowser(
+    RLMathTape, sys.argv[1], CameraReadyRenderer(), file_extension=".json"
+)
 browser.launch(port=7680 if len(sys.argv) < 3 else int(sys.argv[2]))

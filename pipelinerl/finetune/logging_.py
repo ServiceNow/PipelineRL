@@ -42,22 +42,26 @@ def init_wandb(
         raise NotImplementedError()
     else:
         raise ValueError(f"Unknown value for wandb_resume: {cfg.finetune.wandb_resume}")
-    
+
     wandb_name = str(run_dir)
     root = cfg.finetune.wandb_workspace_root
     if root:
         if not wandb_name.startswith(root + "/"):
             raise ValueError(f"run_dir {run_dir} does not start with root {root}")
-        wandb_name = wandb_name[len(root) + 1:]
-    
-    wandb_id = cfg.finetune.wandb_id    
+        wandb_name = wandb_name[len(root) + 1 :]
+
+    wandb_id = cfg.finetune.wandb_id
     if not wandb_id:
         wandb_id = wandb_name.replace("/", "_")
 
     if len(wandb_name) > 128:
-        logger.warning(f"wandb_name: {wandb_name} is longer than 128 characters. Truncating to 128 characters.")
+        logger.warning(
+            f"wandb_name: {wandb_name} is longer than 128 characters. Truncating to 128 characters."
+        )
 
-    logging.info(f"Initializing W&B with\nname: {wandb_name[:128]}\nid: {wandb_id}\nresume: {resume}")
+    logging.info(
+        f"Initializing W&B with\nname: {wandb_name[:128]}\nid: {wandb_id}\nresume: {resume}"
+    )
     run = wandb.init(
         name=wandb_name[:128],  # wandb limits name to 128 characters
         entity=cfg.finetune.wandb_entity_name,
@@ -77,7 +81,9 @@ def init_wandb(
 def setup_logging(cfg: DictConfig, output_dir: Path, run: wandb_run.Run | None = None):
     log_dir = output_dir / "log/"
     log_dir.mkdir(parents=True, exist_ok=True)
-    debug_handler = logging.FileHandler(log_dir / f"info_{get_accelerator().process_index}.log")
+    debug_handler = logging.FileHandler(
+        log_dir / f"info_{get_accelerator().process_index}.log"
+    )
     debug_handler.setLevel(logging.INFO)
     logging.basicConfig(
         format="%(asctime)s.%(msecs)03d - %(levelname)s - %(name)s - %(message)s",
@@ -87,7 +93,9 @@ def setup_logging(cfg: DictConfig, output_dir: Path, run: wandb_run.Run | None =
         force=True,  # forget previous handlers
     )
     if get_accelerator().is_main_process:  # we only want to setup logging once
-        config_for_wandb = {str(k): str(v) for k, v in get_accelerator().state.__dict__.items()}
+        config_for_wandb = {
+            str(k): str(v) for k, v in get_accelerator().state.__dict__.items()
+        }
         config_for_wandb.update(flatten_dict_config(cfg))
 
         logger.setLevel(logging.INFO)

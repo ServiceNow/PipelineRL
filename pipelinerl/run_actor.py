@@ -104,20 +104,20 @@ class SlidingWindowAggregator:
             "total_tokens_per_second": (total_output_tokens + total_prompt_tokens)
             / time_span,
         }
-    
+
 
 async def schedule_rollouts(
     cfg: DictConfig,
-    attempts: int, 
-    problem_queue: mp.Queue, 
-    result_queue: mp.Queue, 
-    io_buffer, 
+    attempts: int,
+    problem_queue: mp.Queue,
+    result_queue: mp.Queue,
+    io_buffer,
     trainer_state: TrainerState,
     llms: list[TrainableLLM],
     scheduler_name: str,
 ):
     """This courotuine does the following.
-    
+
     - It run asyncio loop for doing many rollouts in parallel using llm_async_generate
     - For each problem it does exactly `attempts` rollouts (let's call this a group)
     - It keeps track of how many rollout coroutines are running for each llms
@@ -137,10 +137,10 @@ async def schedule_rollouts(
     group_rollouts = {}
 
     async def rollout_and_maybe_produce_result(
-        problem: dict, 
+        problem: dict,
         slot: int,
         group_id: int,
-        llm_index: int, 
+        llm_index: int,
         session: aiohttp.ClientSession,
     ):
         nonlocal started_rollouts, finished_rollouts, max_group_size_bytes
@@ -149,7 +149,7 @@ async def schedule_rollouts(
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
             rollout_result = await generate_math_rollout(cfg, llm, problem, session)
-            rollout_result.model_version = model_version    
+            rollout_result.model_version = model_version
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
             rollout_result.group_id = full_group_id
@@ -160,7 +160,7 @@ async def schedule_rollouts(
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
-                random.shuffle(group_rollouts[group_id]) 
+                random.shuffle(group_rollouts[group_id])
                 group_bytes = group_rollouts[group_id]
                 max_group_size_bytes = max(max_group_size_bytes, len(group_bytes))
                 io_buffer[slot] = group_bytes
@@ -187,17 +187,21 @@ async def schedule_rollouts(
 
     last_logged = time.time()
     logger.info("Starting rollout scheduler")
-    connector = aiohttp.TCPConnector(limit=50000, limit_per_host=50000, keepalive_timeout=1.0)
+    connector = aiohttp.TCPConnector(
+        limit=50000, limit_per_host=50000, keepalive_timeout=1.0
+    )
     timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         while True:
-            if time.time() - last_logged > 10. and sum(active_rollouts):
-                logger.info(f"{scheduler_name}: "
-                            f"rollouts in progress: {sum(active_rollouts)}, "
-                            f"groups in progress: {len(group_rollouts)}, "
-                            f"rollouts started so far: {started_rollouts}, "
-                            f"rollouts finished so far: {finished_rollouts}, "
-                            f"max group size in bytes: {max_group_size_bytes}")
+            if time.time() - last_logged > 10.0 and sum(active_rollouts):
+                logger.info(
+                    f"{scheduler_name}: "
+                    f"rollouts in progress: {sum(active_rollouts)}, "
+                    f"groups in progress: {len(group_rollouts)}, "
+                    f"rollouts started so far: {started_rollouts}, "
+                    f"rollouts finished so far: {finished_rollouts}, "
+                    f"max group size in bytes: {max_group_size_bytes}"
+                )
                 last_logged = time.time()
 
             if group_rollout_index == attempts:
@@ -216,7 +220,7 @@ async def schedule_rollouts(
             if active_rollouts[next_llm] == cfg.actor.llm_max_rollouts:
                 # all llms are busy, wait for one to finish
                 await asyncio.sleep(0.01)
-                continue 
+                continue
             active_rollouts[next_llm] += 1
             started_rollouts += 1
             assert problem is not None and slot is not None
@@ -244,18 +248,26 @@ def rollout_maker_entrypoint(
 ):
     trainer_state = TrainerState(Path(cfg.output_dir))
     if cfg.debug.mode in ["actor", "open_loop"]:
-        trainer_state.propagated_weight_version = 0  
+        trainer_state.propagated_weight_version = 0
     else:
         trainer_state.start_listening()
         trainer_state.wait_for_model_version()
     loop = uvloop.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(
-        schedule_rollouts(cfg, attempts, problem_queue, result_queue, io_buffer, trainer_state, llms, scheduler_name)
-    )    
+        schedule_rollouts(
+            cfg,
+            attempts,
+            problem_queue,
+            result_queue,
+            io_buffer,
+            trainer_state,
+            llms,
+            scheduler_name,
+        )
+    )
     loop.close()
     logger.info("Rollout maker loop closed")
-
 
 
 def random_iter(problems: list):
@@ -266,7 +278,7 @@ def random_iter(problems: list):
 def sequential_iter(problems: list):
     for problem in problems:
         yield problem
-        
+
 
 class ActorLoop:
     def __init__(
@@ -274,7 +286,7 @@ class ActorLoop:
         cfg: DictConfig,
         llms: list[TrainableLLM],
         data_stream: StreamSpec,
-        stats_stream: StreamSpec,        
+        stats_stream: StreamSpec,
         trainer_state: TrainerState,
         is_training: bool = True,
     ) -> None:
@@ -289,15 +301,15 @@ class ActorLoop:
         self.is_training = is_training
         self.is_scheduling_paused = False
 
-        # Determine the number of processes to use 
+        # Determine the number of processes to use
         num_processes = min(self.cfg.actor.rollout_workers, len(self.llms))
         attempts = self.cfg.attempts if is_training else 1
-        
+
         # Divide LLMs approximately equally across processes
         llm_groups = [[] for _ in range(num_processes)]
         for i, llm in enumerate(self.llms):
             llm_groups[i % num_processes].append((i, llm))
-        
+
         self.smm = SharedMemoryManager()
         self.smm.start()
 
@@ -310,19 +322,31 @@ class ActorLoop:
         self.io_buffer = SharedMemoryArray(self.smm, self.buffer_size, int(1e7))
         self.free_slots = set(range(self.buffer_size))
         logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
-        logger.info(f"Max groups in progress: {self.max_groups_in_progress}, buffer size: {self.buffer_size}")
-        logger.info(f"Shared memory buffer size: {self.io_buffer.get_memory_size() / 2 ** 30} Gb")
+        logger.info(
+            f"Max groups in progress: {self.max_groups_in_progress}, buffer size: {self.buffer_size}"
+        )
+        logger.info(
+            f"Shared memory buffer size: {self.io_buffer.get_memory_size() / 2**30} Gb"
+        )
 
         # Create and start multiple rollout processes
         self.rollout_processes = []
         for llm_group in llm_groups:
-            assert llm_group             
+            assert llm_group
             llm_idxs = [llm[0] for llm in llm_group]
-            llms = [llm[1] for llm in llm_group]   
-            scheduler_name = f"{'train' if is_training else 'test'} scheduler for llms {','. join([str(i) for i in llm_idxs])}"
+            llms = [llm[1] for llm in llm_group]
+            scheduler_name = f"{'train' if is_training else 'test'} scheduler for llms {','.join([str(i) for i in llm_idxs])}"
             process = mp.Process(
                 target=rollout_maker_entrypoint,
-                args=(self.cfg, attempts, self.problem_queue, self.result_queue, self.io_buffer, llms, scheduler_name)
+                args=(
+                    self.cfg,
+                    attempts,
+                    self.problem_queue,
+                    self.result_queue,
+                    self.io_buffer,
+                    llms,
+                    scheduler_name,
+                ),
             )
             process.start()
             self.rollout_processes.append(process)
@@ -337,7 +361,7 @@ class ActorLoop:
         self.prompt_tokens = defaultdict(lambda: defaultdict(list))
         self.output_tokens = defaultdict(lambda: defaultdict(list))
         self.overflows = defaultdict(lambda: defaultdict(list))
-    
+
     def update_stats(self, result: RolloutResult):
         dataset_name = result.dataset_name
         group_id = result.group_id
@@ -375,8 +399,14 @@ class ActorLoop:
         last_trainer_version = self.trainer_state.propagated_weight_version
         max_lag = self.cfg.finetune.max_lag if self.is_training else None
         if max_lag is not None:
-            total_batch_size = self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
-            total_update_size = math.ceil(self.cfg.finetune.weight_update_interval / total_batch_size) * total_batch_size
+            total_batch_size = (
+                self.cfg.finetune.train_batch_size
+                * self.cfg.finetune.gradient_accumulation_passes
+            )
+            total_update_size = (
+                math.ceil(self.cfg.finetune.weight_update_interval / total_batch_size)
+                * total_batch_size
+            )
             if total_batch_size % self.cfg.attempts != 0:
                 logger.warning(
                     f"I'm trying to submit the exact right number of groups for this batch."
@@ -385,10 +415,14 @@ class ActorLoop:
                 )
             groups_per_update = math.ceil(total_update_size / self.cfg.attempts)
             lag_groups = math.ceil(self.cfg.finetune.max_lag / self.cfg.attempts)
-            logger.info(f"Sync RL mode on, can submit {groups_per_update} groups for each update,"
-                        f" that makes {groups_per_update * self.cfg.attempts} samples per update")
-            logger.info(f"Max lag is {self.cfg.finetune.max_lag} samples, that makes {lag_groups}"
-                        " additional starting chunks")
+            logger.info(
+                f"Sync RL mode on, can submit {groups_per_update} groups for each update,"
+                f" that makes {groups_per_update * self.cfg.attempts} samples per update"
+            )
+            logger.info(
+                f"Max lag is {self.cfg.finetune.max_lag} samples, that makes {lag_groups}"
+                " additional starting chunks"
+            )
             can_submit_before_update = lag_groups + groups_per_update
         else:
             groups_per_update = None
@@ -413,16 +447,23 @@ class ActorLoop:
                 if not self.is_scheduling_paused:
                     while True:
                         blocked_by_lag = (
-                            submitted_groups == can_submit_before_update and self.is_training
+                            submitted_groups == can_submit_before_update
+                            and self.is_training
                         )
                         in_progress = submitted_groups - finished_groups
-                        assert 0 <= in_progress and in_progress <= self.max_groups_in_progress
-                        if not blocked_by_lag and in_progress < self.max_groups_in_progress:
+                        assert (
+                            0 <= in_progress
+                            and in_progress <= self.max_groups_in_progress
+                        )
+                        if (
+                            not blocked_by_lag
+                            and in_progress < self.max_groups_in_progress
+                        ):
                             try:
                                 problem = next(problem_iter)
                                 slot = self.free_slots.pop()
                                 self.io_buffer[slot] = problem
-                                self.problem_queue.put_nowait(slot)  
+                                self.problem_queue.put_nowait(slot)
                                 submitted_groups += 1
                             except StopIteration:
                                 break
@@ -446,9 +487,9 @@ class ActorLoop:
                     if len(result.training_texts) > 1:
                         raise NotImplementedError("Multi-turn rollouts not tested yet")
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
-    
+
                 published_samples += group_samples
-                samples_in_queue = self.result_queue.qsize() * attempts                   
+                samples_in_queue = self.result_queue.qsize() * attempts
                 for r in rollout_results:
                     for text in r.training_texts:
                         data_stream_writer.write(text)
@@ -460,12 +501,10 @@ class ActorLoop:
                 )
 
                 prompt_length_tokens = [
-                    result.metrics["prompt_tokens"]
-                    for result in rollout_results                    
+                    result.metrics["prompt_tokens"] for result in rollout_results
                 ]
                 output_length_tokens = [
-                    result.metrics["output_tokens"]
-                    for result in rollout_results
+                    result.metrics["output_tokens"] for result in rollout_results
                 ]
                 max_model_version = 0
                 max_latency = 0
@@ -500,11 +539,14 @@ class ActorLoop:
                     )
 
                 if published_samples == expected_number_of_samples:
-                    logger.info(f"Finished {expected_number_of_samples} samples, stopping actor loop")
+                    logger.info(
+                        f"Finished {expected_number_of_samples} samples, stopping actor loop"
+                    )
                     break
 
-
-    def publish_stats(self, stats_writer: StreamWriter, loop_stats, split_name: str = ""):
+    def publish_stats(
+        self, stats_writer: StreamWriter, loop_stats, split_name: str = ""
+    ):
         sliding_stats = self.stats_aggregator.get_stats()
         stats = (
             {
@@ -538,7 +580,7 @@ class ActorLoop:
             | {
                 (split_name + "_" if split_name else "") + k: v
                 for k, v in always_or_never_success_stats(self.success_stats).items()
-              }
+            }
         )
 
         for dataset_name in self.reward_stats.keys():
@@ -613,7 +655,7 @@ def run_actor_loop(cfg: DictConfig):
     train_dataset = load_datasets(cfg.train_dataset_names)
     test_dataset = load_datasets(cfg.test_dataset_names)
     if cfg.train_subset:
-        train_dataset = train_dataset[cfg.train_subset.begin:cfg.train_subset.end]
+        train_dataset = train_dataset[cfg.train_subset.begin : cfg.train_subset.end]
     logger.info(f"Loaded {len(train_dataset)} training problems")
     logger.info(f"Loaded {len(test_dataset)} test problems")
 
@@ -661,7 +703,7 @@ def run_actor_loop(cfg: DictConfig):
         cfg=cfg,
         trainer_state=trainer_state,
         stats_stream=stats_stream,
-        llms=train_llms
+        llms=train_llms,
     )
     train_loop_run = train_loop.run(
         dataset=train_dataset,

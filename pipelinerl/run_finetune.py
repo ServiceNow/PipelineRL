@@ -61,36 +61,41 @@ logger = logging.getLogger(__name__)
 def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
     """
     Gather RL metrics from all processes using torch.distributed.all_gather_object.
-    
+
     Args:
         rl_metrics: Dictionary mapping metric names to lists of values
-        
+
     Returns:
         Dictionary with gathered metrics from all processes
     """
     # Initialize the result dictionary
     gathered_rl_metrics = {}
-    
+
     # Process each metric separately
     for key, values in rl_metrics.items():
         if values:
             # Initialize a list to gather the results from all processes
             gathered_values = [None] * dist.get_world_size()
-            
+
             # Gather the values from all processes
             dist.all_gather_object(gathered_values, values)
-            
+
             # Flatten the list of lists into a single list
             combined_values = []
             for process_values in gathered_values:
                 combined_values.extend(process_values)
-            
+
             # Store the combined values
             gathered_rl_metrics[key] = combined_values
-    
+
     return gathered_rl_metrics
 
-def run_sample_loader(data_stream: SingleStreamSpec, sample_queue: Queue[Dict | Exception], pop_old_data: bool = False):
+
+def run_sample_loader(
+    data_stream: SingleStreamSpec,
+    sample_queue: Queue[Dict | Exception],
+    pop_old_data: bool = False,
+):
     with read_stream(data_stream) as stream_reader:
         pop_count = 0  # Counter for popped items
         while True:
@@ -101,7 +106,9 @@ def run_sample_loader(data_stream: SingleStreamSpec, sample_queue: Queue[Dict | 
                             sample_queue.get()  # Pop old data
                             pop_count += 1
                             if pop_count % 100 == 0:
-                                logger.info(f"Popped {pop_count} old items from the sample queue")
+                                logger.info(
+                                    f"Popped {pop_count} old items from the sample queue"
+                                )
                         sample_queue.put_nowait(data_item)
                     else:
                         sample_queue.put(data_item)
@@ -147,14 +154,21 @@ def run_fixed_batch_data_loader(
                 if len(buffer) == batch_size:
                     batch = collate(buffer, tokenizer=tokenizer)
                     batch = {
-                        k: (v.to(get_accelerator().device) if isinstance(v, torch.Tensor) else v)
+                        k: (
+                            v.to(get_accelerator().device)
+                            if isinstance(v, torch.Tensor)
+                            else v
+                        )
                         for k, v in batch.items()
                     }
                     batch = VersionedTensors(
-                        tensors=batch, model_version=min(sample["model_version"] for sample in buffer)
+                        tensors=batch,
+                        model_version=min(sample["model_version"] for sample in buffer),
                     )
                     batch_queue.put(batch)
-                    logger.debug(f"Loaded {len(buffer)} samples, queue size is now {batch_queue.qsize()}")
+                    logger.debug(
+                        f"Loaded {len(buffer)} samples, queue size is now {batch_queue.qsize()}"
+                    )
                     break
 
         except Exception as e:
@@ -196,12 +210,18 @@ def run_dynamic_batch_size_data_loader(
                     )
                     collated_batch = collate_packed(current_batch, tokenizer=tokenizer)
                     collated_batch = {
-                        k: (v.to(get_accelerator().device) if isinstance(v, torch.Tensor) else v)
+                        k: (
+                            v.to(get_accelerator().device)
+                            if isinstance(v, torch.Tensor)
+                            else v
+                        )
                         for k, v in collated_batch.items()
                     }
                     collated_batch = VersionedTensors(
                         tensors=collated_batch,
-                        model_version=min(sample["model_version"] for sample in current_batch),
+                        model_version=min(
+                            sample["model_version"] for sample in current_batch
+                        ),
                     )
                     batch_queue.put(collated_batch)
 
@@ -254,8 +274,9 @@ TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | WeightBeingSavedToD
 
 
 class WeightUpdateManager:
-
-    def __init__(self, llm_urls: list[str], accelerated_model, update_stream, actor_update_group):
+    def __init__(
+        self, llm_urls: list[str], accelerated_model, update_stream, actor_update_group
+    ):
         self.llm_urls = llm_urls
         self.accelerated_model = accelerated_model
         self.update_stream = update_stream
@@ -265,7 +286,9 @@ class WeightUpdateManager:
     def _request_weight_update(self, url: str, message: WeightUpdateRequest):
         response = None
         try:
-            response = requests.post(url + "/receive_weight_update", json=message.model_dump())
+            response = requests.post(
+                url + "/receive_weight_update", json=message.model_dump()
+            )
             response.raise_for_status()
         except requests.RequestException as e:
             logger.error(f"Error sending weight update request to {url}: {e}")
@@ -273,18 +296,22 @@ class WeightUpdateManager:
             if response is not None:
                 logger.error(f"Response: {response.status_code} - {response.text}")
 
-
     def request_weight_updates(self, message: WeightUpdateRequest):
         futures = []
         for url in self.llm_urls:
-            futures.append(self.thread_pool.submit(self._request_weight_update, url, message))
+            futures.append(
+                self.thread_pool.submit(self._request_weight_update, url, message)
+            )
         return futures
 
     def send_weight_update(
         self,
         version: int,
     ):
-        if isinstance(self.accelerated_model, deepspeed.DeepSpeedEngine) and self.accelerated_model.zero_optimization_stage() == 3:
+        if (
+            isinstance(self.accelerated_model, deepspeed.DeepSpeedEngine)
+            and self.accelerated_model.zero_optimization_stage() == 3
+        ):
             module = self.accelerated_model.module
             logger.info("Start gathering and sending ZeRO Stage 3 weights")
             named_parameters = dict(module.named_parameters())
@@ -292,20 +319,30 @@ class WeightUpdateManager:
             if get_accelerator().is_main_process:
                 parameters_info = [
                     # assume DeepSpeed Stage 3
-                    ParameterInfo(name=name, shape=list(parameter.ds_shape), dtype=str(torch.bfloat16))
+                    ParameterInfo(
+                        name=name,
+                        shape=list(parameter.ds_shape),
+                        dtype=str(torch.bfloat16),
+                    )
                     for name, parameter in named_parameters.items()
                 ]
-                message = WeightUpdateRequest(version=version, parameters_info=parameters_info)
+                message = WeightUpdateRequest(
+                    version=version, parameters_info=parameters_info
+                )
                 futures = self.request_weight_updates(message)
                 logger.info(f"Published weight update request for version {version}")
 
             for name, parameter in named_parameters.items():
                 with deepspeed.zero.GatheredParameters([parameter]):
                     if get_accelerator().is_main_process:
-                        dist.broadcast(parameter.data.bfloat16(), src=0, group=self.actor_update_group)
+                        dist.broadcast(
+                            parameter.data.bfloat16(),
+                            src=0,
+                            group=self.actor_update_group,
+                        )
             if get_accelerator().is_main_process:
                 logger.info("Wait for HTTP requests")
-                for future in futures: # type: ignore
+                for future in futures:  # type: ignore
                     future.result()
             logger.info("Finished broadcasting weights")
 
@@ -316,12 +353,22 @@ class WeightUpdateManager:
         else:
             logger.info("Gather all weights at rank 0")
             if isinstance(self.accelerated_model, FSDP):
-                full_state_dict_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
-                with FSDP.state_dict_type(self.accelerated_model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+                full_state_dict_config = FullStateDictConfig(
+                    offload_to_cpu=False, rank0_only=True
+                )
+                with FSDP.state_dict_type(
+                    self.accelerated_model,
+                    StateDictType.FULL_STATE_DICT,
+                    full_state_dict_config,
+                ):
                     named_parameters = self.accelerated_model.state_dict()
                 if "lm_head.weight" in named_parameters:
-                    logger.info("Removing lm_head.weight from gathered parameters, because it's not a parameter.")
-                    logger.info("See https://github.com/huggingface/transformers/issues/9753")
+                    logger.info(
+                        "Removing lm_head.weight from gathered parameters, because it's not a parameter."
+                    )
+                    logger.info(
+                        "See https://github.com/huggingface/transformers/issues/9753"
+                    )
                     del named_parameters["lm_head.weight"]
             else:
                 unwrapped = get_accelerator().unwrap_model(self.accelerated_model)
@@ -330,14 +377,22 @@ class WeightUpdateManager:
                 assert self.update_stream is not None
                 parameters_info = [
                     # assume DeepSpeed Stage 3
-                    ParameterInfo(name=name, shape=list(parameter.shape), dtype=str(torch.bfloat16))
+                    ParameterInfo(
+                        name=name,
+                        shape=list(parameter.shape),
+                        dtype=str(torch.bfloat16),
+                    )
                     for name, parameter in named_parameters.items()
                 ]
-                messages = WeightUpdateRequest(version=version, parameters_info=parameters_info)
+                messages = WeightUpdateRequest(
+                    version=version, parameters_info=parameters_info
+                )
                 futures = self.request_weight_updates(messages)
                 logger.info(f"Published weight update request for version {version}")
                 for _, parameter in named_parameters.items():
-                    dist.broadcast(parameter.data.bfloat16(), src=0, group=self.actor_update_group)
+                    dist.broadcast(
+                        parameter.data.bfloat16(), src=0, group=self.actor_update_group
+                    )
                 dist.barrier(self.actor_update_group)
                 for future in futures:
                     future.result()
@@ -352,7 +407,9 @@ class WeightUpdateManager:
 def get_batch_token_count(batch):
     """Count actual tokens in batch (excluding padding)"""
     attention_mask = batch.get("attention_mask")
-    assert attention_mask is not None, "We need attention_mask for accurate token counting"
+    assert attention_mask is not None, (
+        "We need attention_mask for accurate token counting"
+    )
     return attention_mask.sum().item()
 
 
@@ -396,14 +453,24 @@ def run_finetuning_loop(
     validate_packing_config(args)
 
     if not args.gradient_accumulation_passes % num_processes == 0:
-        raise ValueError("gradient_accumulation_passes must be divisible by num_processes")
+        raise ValueError(
+            "gradient_accumulation_passes must be divisible by num_processes"
+        )
     args.gradient_accumulation_passes //= num_processes
     if (ds_plugin := get_accelerator().state.deepspeed_plugin) is not None:
-        logger.info("Manual inform Deepspeed about micro batch size and gradient accumulation")
-        ds_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = args.train_batch_size
-        ds_plugin.deepspeed_config["gradient_accumulation_steps"] = args.gradient_accumulation_passes
+        logger.info(
+            "Manual inform Deepspeed about micro batch size and gradient accumulation"
+        )
+        ds_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = (
+            args.train_batch_size
+        )
+        ds_plugin.deepspeed_config["gradient_accumulation_steps"] = (
+            args.gradient_accumulation_passes
+        )
         if args.gradient_clipping_threshold:
-            ds_plugin.deepspeed_config["gradient_clipping"] = args.gradient_clipping_threshold
+            ds_plugin.deepspeed_config["gradient_clipping"] = (
+                args.gradient_clipping_threshold
+            )
 
     set_seed(args.seed)
 
@@ -417,13 +484,17 @@ def run_finetuning_loop(
         remove_results(current_dir, intermediate_root_dir, training_state_dir, log_dir)
 
     # Render-vous with inference servers
-    weight_update_stream = SingleStreamSpec(exp_path=exp_root_dir, topic="weight_update_request")
+    weight_update_stream = SingleStreamSpec(
+        exp_path=exp_root_dir, topic="weight_update_request"
+    )
 
     # Logging
     if get_accelerator().is_main_process:
         setup_logging(cfg, output_dir)
     else:
-        logger.info(f"Last logging message from {get_accelerator().process_index}, will be quiet from now on")
+        logger.info(
+            f"Last logging message from {get_accelerator().process_index}, will be quiet from now on"
+        )
         logging.disable(logging.INFO)
 
     logger.info(get_accelerator().state)
@@ -445,16 +516,22 @@ def run_finetuning_loop(
     )
 
     if args.seq_packing:
-        samples_per_worker_per_step = args.gradient_accumulation_passes * args.train_batch_size
+        samples_per_worker_per_step = (
+            args.gradient_accumulation_passes * args.train_batch_size
+        )
         run_data_loader = partial(
             run_dynamic_batch_size_data_loader,
             max_seq_length=args.seq_length,
             samples_per_worker_per_step=samples_per_worker_per_step,
         )
     else:
-        run_data_loader = partial(run_fixed_batch_data_loader, batch_size=args.train_batch_size)
+        run_data_loader = partial(
+            run_fixed_batch_data_loader, batch_size=args.train_batch_size
+        )
 
-    logger.info(f"Using {'packed' if args.seq_packing else 'unpacked'} collate function")
+    logger.info(
+        f"Using {'packed' if args.seq_packing else 'unpacked'} collate function"
+    )
 
     optimizer = get_optimizer(args.optim, model, args.learning_rate, args.weight_decay)
     lr_scheduler = get_scheduler(
@@ -467,13 +544,20 @@ def run_finetuning_loop(
     for group in optimizer.param_groups:
         for param in group["params"]:
             dtypes.add(param.dtype)
-    logger.info(f"Before accelerator.prepare() the optimizer's parameters had dtypes {dtypes}")
+    logger.info(
+        f"Before accelerator.prepare() the optimizer's parameters had dtypes {dtypes}"
+    )
 
-    if isinstance(plugin := getattr(get_accelerator().state, "fsdp_plugin", None), FullyShardedDataParallelPlugin):
+    if isinstance(
+        plugin := getattr(get_accelerator().state, "fsdp_plugin", None),
+        FullyShardedDataParallelPlugin,
+    ):
         assert isinstance(plugin, FullyShardedDataParallelPlugin)
         value_to_dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}
         if plugin.mixed_precision_policy is not None:
-            logger.info("Will override FSDP mixed precision policy with settings from now-reasoner config")
+            logger.info(
+                "Will override FSDP mixed precision policy with settings from now-reasoner config"
+            )
             plugin.mixed_precision_policy = MixedPrecision(
                 param_dtype=value_to_dtype[cfg.fsdp.param_dtype],
                 reduce_dtype=value_to_dtype[cfg.fsdp.reduce_dtype],
@@ -496,7 +580,9 @@ def run_finetuning_loop(
     for group in optimizer.param_groups:
         for param in group["params"]:
             after_dtype.add(param.dtype)
-    logger.info(f"After accelerator.prepare() the optimizer's parameters had dtypes {after_dtype}")
+    logger.info(
+        f"After accelerator.prepare() the optimizer's parameters had dtypes {after_dtype}"
+    )
 
     get_accelerator().wait_for_everyone()
 
@@ -518,7 +604,9 @@ def run_finetuning_loop(
     training_metrics = TrainingMetrics()
     if os.path.exists(training_state_dir):
         # WARNING: In case of deepspeed this will overwrite model weights too
-        training_metrics = load_training_state(training_state_dir, model, optimizer, lr_scheduler, training_metrics)
+        training_metrics = load_training_state(
+            training_state_dir, model, optimizer, lr_scheduler, training_metrics
+        )
         training_metrics.lr = optimizer.param_groups[0]["lr"]
         logger.info("LR after loading training state: %.2E" % training_metrics.lr)
         dt = log_time(dt, time_stats, "finetune/training_state_load")
@@ -529,7 +617,7 @@ def run_finetuning_loop(
             wait_for_inference_servers(llm_urls)
         get_accelerator().wait_for_everyone()
         weight_update_manager = WeightUpdateManager(
-            llm_urls=llm_urls, 
+            llm_urls=llm_urls,
             accelerated_model=model,
             update_stream=weight_update_stream,
             actor_update_group=actor_update_group,
@@ -547,10 +635,7 @@ def run_finetuning_loop(
         pop_old_data=cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode,
     )
 
-    stream_to_queue_thread = threading.Thread(
-        target=sample_loader_worker_fn,
-        args=()
-    )
+    stream_to_queue_thread = threading.Thread(target=sample_loader_worker_fn, args=())
     stream_to_queue_thread.start()
 
     batch_queue = Queue(maxsize=1)
@@ -612,7 +697,9 @@ def rl_finetuning_worker(
                     batch_or_exc = batch_queue.get(timeout=timeout)
                     break
                 except Empty:
-                    logger.info(f"Batch queue is empty, retrying with timeout {timeout}")
+                    logger.info(
+                        f"Batch queue is empty, retrying with timeout {timeout}"
+                    )
                     timeout = min(timeout * 1.5, 5.0)
             if isinstance(batch_or_exc, Exception):
                 raise batch_or_exc
@@ -642,8 +729,12 @@ def rl_finetuning_worker(
 
     time_waiting_for_data = 0.0
 
-    samples_per_worker_per_step = args.gradient_accumulation_passes * args.train_batch_size
-    samples_per_step = samples_per_worker_per_step * get_accelerator().state.num_processes
+    samples_per_worker_per_step = (
+        args.gradient_accumulation_passes * args.train_batch_size
+    )
+    samples_per_step = (
+        samples_per_worker_per_step * get_accelerator().state.num_processes
+    )
     start_samples = training_metrics.samples
     last_model_version = training_metrics.samples
     tokens_processed = []
@@ -678,15 +769,19 @@ def rl_finetuning_worker(
         # check if too old, don't drop but count
         if (
             args.max_lag is not None
-            and training_metrics.last_broadcasted_version - versioned_batch.model_version > args.max_lag
+            and training_metrics.last_broadcasted_version
+            - versioned_batch.model_version
+            > args.max_lag
         ):
             training_metrics.samples_too_old_to_train += args.train_batch_size
         batch = versioned_batch.tensors
         lag_stats["min_version"] = min(
-            lag_stats.get("min_version", versioned_batch.model_version), versioned_batch.model_version
+            lag_stats.get("min_version", versioned_batch.model_version),
+            versioned_batch.model_version,
         )
         lag_stats["max_version"] = max(
-            lag_stats.get("max_version", versioned_batch.model_version), versioned_batch.model_version
+            lag_stats.get("max_version", versioned_batch.model_version),
+            versioned_batch.model_version,
         )
         last_model_version = versioned_batch.model_version
 
@@ -709,7 +804,7 @@ def rl_finetuning_worker(
 
         dist.all_gather(all_samples, local_samples)
         total_samples = sum(int(tensor.item()) for tensor in all_samples)
-        do_optimizer_step = total_samples == target_samples 
+        do_optimizer_step = total_samples == target_samples
         using_deepspeed = isinstance(model, deepspeed.DeepSpeedEngine)
 
         def backward(loss, is_final_micro_batch=False):
@@ -745,7 +840,11 @@ def rl_finetuning_worker(
         with toggle_sync(do_optimizer_step):
             # Choose RL step function based on seq_packing config
             loss, this_step_rl_metrics = rl_step(
-                model, batch, training_metrics.completed_steps, final_train_steps, rl_config
+                model,
+                batch,
+                training_metrics.completed_steps,
+                final_train_steps,
+                rl_config,
             )
             if is_sentinel_batch:
                 # zero out the loss and do not update the metrics
@@ -757,7 +856,7 @@ def rl_finetuning_worker(
 
                 training_metrics.lr = optimizer.param_groups[0]["lr"]
 
-            backward(loss, is_final_micro_batch=do_optimizer_step) 
+            backward(loss, is_final_micro_batch=do_optimizer_step)
 
         if not is_sentinel_batch:
             passes_took.append(time.time() - time_before_pass)
@@ -777,9 +876,13 @@ def rl_finetuning_worker(
         training_metrics.completed_steps += 1
         training_metrics.samples = start_samples + total_samples
         this_worker_tokens = sum(tokens_processed)
-        training_metrics.tokens += this_worker_tokens * get_accelerator().state.num_processes
+        training_metrics.tokens += (
+            this_worker_tokens * get_accelerator().state.num_processes
+        )
         if args.gradient_clipping_threshold:
-            grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), args.gradient_clipping_threshold)
+            grad_norm = get_accelerator().clip_grad_norm_(
+                model.parameters(), args.gradient_clipping_threshold
+            )
             # grad_norm is None when using DeepSpeed
             training_metrics.grad_norm = grad_norm.item() if grad_norm else -1.0
 
@@ -798,8 +901,11 @@ def rl_finetuning_worker(
         metrics_dict = {}
         time_to_stop = training_metrics.completed_steps >= final_train_steps
         time_to_log = training_metrics.completed_steps % args.log_each_n_steps == 0
-        time_to_save = (training_metrics.completed_steps % args.save_checkpoint_steps == 0) or (
-            len(args.also_save_steps) and training_metrics.completed_steps in args.also_save_steps
+        time_to_save = (
+            training_metrics.completed_steps % args.save_checkpoint_steps == 0
+        ) or (
+            len(args.also_save_steps)
+            and training_metrics.completed_steps in args.also_save_steps
         )
         time_to_save = time_to_save and not time_to_stop
         assert sum(micro_batches_size) == samples_per_worker_per_step
@@ -821,13 +927,23 @@ def rl_finetuning_worker(
                     "stats/max_actor_version": lag_stats["max_version"],
                     "stats/queue_size": sample_queue.qsize(),
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
-                    "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
-                    "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
-                    "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
+                    "stats/lag": training_metrics.last_broadcasted_version
+                    - lag_stats["min_version"],
+                    "throughput/tokens_perGPU_per_sec": this_worker_tokens
+                    / sum(passes_took)
+                    if passes_took
+                    else 0,
+                    "throughput/tokens_per_step": this_worker_tokens
+                    * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
-                    "throughput/min_tokens_per_micro_batch": min(tokens_processed) if tokens_processed else 0,
-                    "throughput/max_tokens_per_micro_batch": max(tokens_processed) if tokens_processed else 0,
-                    "throughput/tokens_per_micro_batch": this_worker_tokens / len(tokens_processed)
+                    "throughput/min_tokens_per_micro_batch": min(tokens_processed)
+                    if tokens_processed
+                    else 0,
+                    "throughput/max_tokens_per_micro_batch": max(tokens_processed)
+                    if tokens_processed
+                    else 0,
+                    "throughput/tokens_per_micro_batch": this_worker_tokens
+                    / len(tokens_processed)
                     if tokens_processed
                     else 0,
                     "throughput/tokens_per_sec": this_worker_tokens
@@ -836,13 +952,22 @@ def rl_finetuning_worker(
                     if passes_took
                     else 0,
                     "throughput/real_tokens_per_sec": this_worker_tokens / step_took,
-                    "throughput/sec_per_pass": sum(passes_took) / len(passes_took) if passes_took else 0,
+                    "throughput/sec_per_pass": sum(passes_took) / len(passes_took)
+                    if passes_took
+                    else 0,
                     "throughput/steps_per_sec": 1 / step_took if step_took else 0,
-                    "throughput/samples_per_sec": samples_per_step / sum(passes_took) if passes_took else 0, 
+                    "throughput/samples_per_sec": samples_per_step / sum(passes_took)
+                    if passes_took
+                    else 0,
                     "throughput/sec_per_step": step_took,
-                    "throughput/max_sequences_per_micro_batch": max(micro_batches_size) if micro_batches_size else 0,
-                    "throughput/min_sequences_per_micro_batch": min(micro_batches_size) if micro_batches_size else 0,
-                    "throughput/sequences_per_micro_batch": sum(micro_batches_size) / len(micro_batches_size)
+                    "throughput/max_sequences_per_micro_batch": max(micro_batches_size)
+                    if micro_batches_size
+                    else 0,
+                    "throughput/min_sequences_per_micro_batch": min(micro_batches_size)
+                    if micro_batches_size
+                    else 0,
+                    "throughput/sequences_per_micro_batch": sum(micro_batches_size)
+                    / len(micro_batches_size)
                     if micro_batches_size
                     else 0,
                     "dataset_stats/max_batch_len": training_metrics.max_batch_len,
@@ -854,7 +979,11 @@ def rl_finetuning_worker(
             time_waiting_for_data = 0.0
 
             average_rl_metrics = get_avg_rl_stats(gathered_rl_metrics, samples_per_step)
-            ess = average_rl_metrics["rl/ratio_new_old_sum"] ** 2 / average_rl_metrics["rl/ratio_new_old_squared_sum"] / average_rl_metrics["rl/num_output_tokens_sum"]
+            ess = (
+                average_rl_metrics["rl/ratio_new_old_sum"] ** 2
+                / average_rl_metrics["rl/ratio_new_old_squared_sum"]
+                / average_rl_metrics["rl/num_output_tokens_sum"]
+            )
             metrics_dict.update(average_rl_metrics)
             metrics_dict.update(
                 {
@@ -876,7 +1005,8 @@ def rl_finetuning_worker(
 
         if (
             args.send_weight_updates
-            and training_metrics.samples - training_metrics.last_broadcasted_version >= args.weight_update_interval
+            and training_metrics.samples - training_metrics.last_broadcasted_version
+            >= args.weight_update_interval
         ):
             assert weight_update_manager is not None
             weight_update_manager.send_weight_update(training_metrics.samples)
@@ -901,7 +1031,9 @@ def rl_finetuning_worker(
             )
 
             if args.keep_intermediate_checkpoints:
-                intermediate_dir = intermediate_root_dir / str(training_metrics.completed_steps)
+                intermediate_dir = intermediate_root_dir / str(
+                    training_metrics.completed_steps
+                )
                 save_model_and_tokenizer(
                     intermediate_dir,
                     model,
@@ -952,7 +1084,11 @@ def rl_finetuning_worker(
 def calculate_train_steps(args, interrupt_train_steps):
     if interrupt_train_steps == -1:
         assert args.interrupt_train_steps <= args.max_train_steps
-        final_train_steps = args.max_train_steps if args.interrupt_train_steps < 0 else args.interrupt_train_steps
+        final_train_steps = (
+            args.max_train_steps
+            if args.interrupt_train_steps < 0
+            else args.interrupt_train_steps
+        )
     else:
         assert interrupt_train_steps <= args.max_train_steps
         final_train_steps = interrupt_train_steps

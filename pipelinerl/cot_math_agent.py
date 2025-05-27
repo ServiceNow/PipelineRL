@@ -22,7 +22,8 @@ class Task(Observation):
     kind: Literal["task"] = "task"
     task: str
     template: str = Field(
-        description="Template for the task. Should contain a {task} placeholder for the task text.", default="{task}"
+        description="Template for the task. Should contain a {task} placeholder for the task text.",
+        default="{task}",
     )
 
     def llm_view(self, indent: int | None = 2) -> str:
@@ -62,7 +63,8 @@ class ReasoningNode(StandardNode):
         except Exception as e:
             logger.info(f"Failed to parse agent output: {completion}\n\nError: {e}")
             yield LLMOutputParsingFailureAction(
-                error=f"Failed to parse agent output: {completion}\n\nError: {e}", llm_output=completion
+                error=f"Failed to parse agent output: {completion}\n\nError: {e}",
+                llm_output=completion,
             )
             return
         yield step
@@ -71,12 +73,12 @@ class ReasoningNode(StandardNode):
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
-        
+
         # the tape is only step long and it is the task
         task = tape.steps[0]
         assert isinstance(task, Task), f"Expected a Task, got {task.__class__.__name__}"
         messages.append({"role": "user", "content": task.llm_view()})
-        #messages = self.tape_to_messages(cleaned_tape, steps_description)
+        # messages = self.tape_to_messages(cleaned_tape, steps_description)
         prompt_token_ids = agent.llm.tokenizer.apply_chat_template(
             messages, add_special_tokens=True, add_generation_prompt=True
         )

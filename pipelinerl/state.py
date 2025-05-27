@@ -15,6 +15,7 @@ from pipelinerl.streams import SingleStreamSpec, read_stream
 
 logger = logging.getLogger(__name__)
 
+
 class TrainerState:
     def __init__(self, exp_path: Path):
         self.exp_path = exp_path

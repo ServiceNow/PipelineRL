@@ -37,7 +37,9 @@ def get_optimizer(name, model, learning_rate, weight_decay):
         case "cpuadam":
             import deepspeed.ops.adam
 
-            optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(grouped_params, lr=learning_rate)
+            optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(
+                grouped_params, lr=learning_rate
+            )
         case "lion":
             optimizer = Lion(grouped_params, lr=learning_rate)
         case _:

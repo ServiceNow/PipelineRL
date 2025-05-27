@@ -22,6 +22,7 @@ from tapeagents.core import Prompt
 
 logger = logging.getLogger(__name__)
 
+
 def generate_cuda_device_strings(total_gpus: int, gpus_per_model: int) -> List[str]:
     """
     Generate a list of CUDA device strings for assigning GPUs to models.
@@ -45,7 +46,9 @@ def setup_logging(output_dir):
     print(f"Setting up logging to {output_dir}")
 
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)  # Create the output directory if it doesn't exist
+    output_dir.mkdir(
+        parents=True, exist_ok=True
+    )  # Create the output directory if it doesn't exist
 
     # Define log file paths
     info_log = output_dir / "info.log"
@@ -74,9 +77,10 @@ def setup_logging(output_dir):
     stdout_handler = logging.StreamHandler()
     stdout_handler.setLevel(logging.INFO)
 
-
     # Create formatters and set them to the handlers
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
 
     info_handler.setFormatter(formatter)
     debug_handler.setFormatter(formatter)
@@ -149,7 +153,9 @@ def clean_up(target_path: Path, state: Dict, state_path: str | Path) -> None:
         logger.info(f"{directory} removed.")
 
 
-def always_or_never_success_stats(success_stats: Mapping[str, Mapping[str, list[int]]]) -> dict[str, float]:
+def always_or_never_success_stats(
+    success_stats: Mapping[str, Mapping[str, list[int]]],
+) -> dict[str, float]:
     always_success = {}
     never_success = {}
     sometimes_success = {}
@@ -157,8 +163,10 @@ def always_or_never_success_stats(success_stats: Mapping[str, Mapping[str, list[
         for problem in success_stats[dataset]:
             always_success[problem] = all(success_stats[dataset][problem])
             never_success[problem] = not any(success_stats[dataset][problem])
-            sometimes_success[problem] = not always_success[problem] and not never_success[problem]
-    return { # type: ignore
+            sometimes_success[problem] = (
+                not always_success[problem] and not never_success[problem]
+            )
+    return {  # type: ignore
         "always_success": float(np.mean(list(always_success.values()))),
         "never_success": float(np.mean(list(never_success.values()))),
         "sometimes_success": float(np.mean(list(sometimes_success.values()))),
@@ -167,7 +175,7 @@ def always_or_never_success_stats(success_stats: Mapping[str, Mapping[str, list[
 
 def calculate_per_group_stats(stats):
     merged_stats = defaultdict(list)
-    
+
     # Iterate through each dataset
     for dataset_name, dataset_stats in stats.items():
         # Iterate through each data point
@@ -179,12 +187,12 @@ def calculate_per_group_stats(stats):
         merged_stats[dataset_name].append(np.mean(dataset_stats_list))
     # merged stats is a dictionary with dataset names as keys and a list with one element as values
     return calculate_stats(merged_stats)
-            
+
 
 def calculate_stats(stats):
     if isinstance(stats, list):
         stats = {"key": stats}
-        
+
     aggregated_stats = {
         "max": float(np.mean([max(stat) for stat in stats.values() if stat])),
         "min": float(np.mean([min(stat) for stat in stats.values() if stat])),
@@ -201,17 +209,22 @@ def calculate_stats(stats):
     return aggregated_stats
 
 
-def get_tokens_from_hf_tokenizer(tokenizer: PreTrainedTokenizer | None, prompt: Prompt, output: LLMOutput) -> list:
+def get_tokens_from_hf_tokenizer(
+    tokenizer: PreTrainedTokenizer | None, prompt: Prompt, output: LLMOutput
+) -> list:
     if not tokenizer:
         return []
     prompt_token_ids = tokenizer.apply_chat_template(
         conversation=prompt.messages, tokenize=True, add_generation_prompt=True
     )
     text_token_ids = tokenizer.apply_chat_template(
-        prompt.messages + [{"role": "assistant", "content": output.content}], tokenize=True
+        prompt.messages + [{"role": "assistant", "content": output.content}],
+        tokenize=True,
     )
     output_token_ids = text_token_ids[len(prompt_token_ids) :]
-    output_tokens = [tokenizer.decode(output_token_id) for output_token_id in output_token_ids]
+    output_tokens = [
+        tokenizer.decode(output_token_id) for output_token_id in output_token_ids
+    ]
     return output_tokens
 
 
@@ -234,7 +247,7 @@ def wait_for_inference_servers(urls: list[str]):
         if all_servers_up:
             break
         logger.info(f"Still waiting for {still_not_up} ...")
-        time.sleep(3.)
+        time.sleep(3.0)
     logger.info("All inference servers are up")
 
 
@@ -251,6 +264,7 @@ def better_crashing(entrypoint_name: str):
         terminate_with_children(process_id)
         logger.error(f"I should not even be here...")
         import sys
+
         sys.exit(1)
 
 
@@ -259,23 +273,23 @@ def terminate_with_children(process_id: int):
     try:
         parent = psutil.Process(process_id)
         children = parent.children(recursive=True)
-        
+
         # First attempt graceful termination of children
         for child in children:
             child.terminate()
-        
+
         # Wait for children to terminate
         _, alive = psutil.wait_procs(children, timeout=5)
-        
+
         if alive:
             logger.info(f"{len(alive)} children still alive, trying SIGKILL")
             for child in alive:
                 child.kill()
-            
+
         # Terminate parent process
         parent.terminate()
         parent.wait(timeout=3)
-        
+
         # Force kill parent if still alive
         if parent.is_running():
             parent.kill()

@@ -31,16 +31,12 @@ class RolloutResult(BaseModel):
     group_id: str | None = None
 
 
-
 def make_prompt(problem: dict, cfg: DictConfig) -> Prompt:
     messages = []
     if cfg.system_prompt:
         messages.append({"role": "system", "content": cfg.system_prompt})
     messages.append(
-        {
-            "role": "user", 
-            "content": cfg.task_template.format(task=problem["task"])
-        }
+        {"role": "user", "content": cfg.task_template.format(task=problem["task"])}
     )
     return Prompt(messages=messages)
 
@@ -48,29 +44,29 @@ def make_prompt(problem: dict, cfg: DictConfig) -> Prompt:
 async def process_llm_call(
     session: aiohttp.ClientSession,
     verifier_cfg: DictConfig,
-    llm_call: LLMCall, 
-    llm: TrainableLLM, 
+    llm_call: LLMCall,
+    llm: TrainableLLM,
     answer: str,  # Gold answer to verify against
-    rewards: RewardTable, 
-    discount_factor: float
+    rewards: RewardTable,
+    discount_factor: float,
 ) -> tuple[TrainingText, dict[str, float]]:
     assert llm_call.output.content is not None
     answer_status = await verify_answer_rpc(
         session=session,
         verifier_cfg=verifier_cfg,
         prediction=llm_call.output.content,
-        gold=answer, 
-        strict=True
+        gold=answer,
+        strict=True,
     )
-    
+
     trace = llm.make_training_text(llm_call.prompt, llm_call.output)
 
     input_ids = [lp.token_id for lp in llm_call.logprobs]
     labels = [lp.token_id for lp in llm_call.logprobs if lp.generated]
-    
+
     # Check if the generation is finished (ended with EOS token)
     finished = 1 if input_ids[-1] == llm.tokenizer.eos_token_id else 0
-    
+
     # Determine reward based on answer status and finished state
     match (answer_status, finished):
         case ("wrong", 0):
@@ -90,10 +86,12 @@ async def process_llm_call(
         case ("correct", 1):
             reward = rewards.correct_answer_finished
         case _:
-            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{finished}")
-    
+            raise ValueError(
+                f"Invalid answer_status/finished combination: {answer_status}/{finished}"
+            )
+
     # Apply discount factor based on output length
-    reward *= discount_factor ** llm_call.output_length_tokens
+    reward *= discount_factor**llm_call.output_length_tokens
 
     # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * (len(input_ids) - len(labels)) + labels
@@ -102,7 +100,7 @@ async def process_llm_call(
     trace.labels = labels
     trace.reward = reward
     trace.logprobs = [lp.logprob for lp in llm_call.logprobs if lp.generated]
-    
+
     stats = {
         "reward": reward,
         "success": answer_status == "correct",
@@ -112,8 +110,9 @@ async def process_llm_call(
         "output_tokens": llm_call.output_length_tokens,
         "overflow": 0 if finished else 1,
     }
-    
+
     return trace, stats
+
 
 async def generate_math_rollout(
     cfg: DictConfig,
@@ -121,10 +120,7 @@ async def generate_math_rollout(
     problem: dict,
     session: aiohttp.ClientSession,
 ) -> RolloutResult:
-    prompt = make_prompt(
-        problem=problem,
-        cfg=cfg
-    )
+    prompt = make_prompt(problem=problem, cfg=cfg)
     time_start = time.time()
     llm_call = await llm_async_generate(llm, prompt, session)
     latency = time.time() - time_start
@@ -135,12 +131,11 @@ async def generate_math_rollout(
         llm=llm,
         answer=problem["answer"],
         rewards=RewardTable(**dict(cfg.rewards)),
-        discount_factor=cfg.discount_factor
+        discount_factor=cfg.discount_factor,
     )
     return RolloutResult(
         training_texts=[sample],
         metrics=metrics,
         latency=latency,
-        dataset_name=problem.get("dataset")
+        dataset_name=problem.get("dataset"),
     )
-    
