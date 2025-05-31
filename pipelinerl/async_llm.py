@@ -1,7 +1,9 @@
 import logging
 import aiohttp
 
-from tapeagents.core import LLMCall, LLMOutput, Prompt
+from pipelinerl.finetune.data import MASKED_TOKEN_ID
+
+from tapeagents.core import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainingText
 from tapeagents.llms.trainable import TrainableLLM
 
 
@@ -46,19 +48,24 @@ async def llm_async_generate(llm: TrainableLLM, prompt: Prompt, session: aiohttp
         if not content:
             logger.warning(f"Empty completion {data}")
 
-        logprobs = None
+        parsed_logprobs = []
         if llm.collect_logprobs:
-            prompt_token_ids = llm.tokenizer.apply_chat_template(
-                prompt.messages, add_special_tokens=True, add_generation_prompt=True
-            )
             completion_logprobs = data["choices"][0]["logprobs"]["content"]
-            logprobs = llm.make_llm_call_logprobs(prompt_token_ids, completion_logprobs)
-            # <end_of_turn> is the end of message for Gemma2B, eos_token is wrong for this model
-            for eos_str in [llm.tokenizer.eos_token, "<end_of_turn>"]:
-                if content.endswith(eos_str):
-                    # the eos was added in the case where self.collect_logprobs is True
-                    # TapeAgents is not expecting the eos token in the completion
-                    content = content[: -len(eos_str)]
+            for logprob in completion_logprobs:
+                if logprob:
+                    try:
+                        # We assume that the server was launched with --return-tokens-as-token-ids
+                        # and that the tokens are provided as: ['token_id:1271', 'token_id:1505', '
+                        parsed_logprobs.append(
+                            TokenLogprob(
+                                token_id=int(logprob["token"].split(":")[-1]),
+                                logprob=logprob["logprob"],
+                                generated=1,
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to process logprobs: {logprob}")
+                        logger.error(e)
     except Exception as e:
         logger.exception(f"Failed to parse llm response: {data}")
         raise e
@@ -66,5 +73,23 @@ async def llm_async_generate(llm: TrainableLLM, prompt: Prompt, session: aiohttp
     output = LLMOutput(content=content)
     llm_call = llm.log_output(prompt, output)
     assert llm_call is not None, "llm_call is None"
-    llm_call.logprobs = logprobs
+    llm_call.logprobs = parsed_logprobs
     return llm_call
+
+
+def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
+    training_text = llm.make_training_text(llm_call.prompt, llm_call.output)
+    if not llm_call.logprobs:
+        raise ValueError("Logprobs are required to make training data for RL")
+    # We add the exact token ids and logprobs to "training_text" to ensure inference/training consistency
+    prompt_token_ids = llm.tokenizer.apply_chat_template(
+        llm_call.prompt.messages, add_special_tokens=True, add_generation_prompt=True
+    )    
+    labels = [lp.token_id for lp in llm_call.logprobs]
+    input_ids = prompt_token_ids + labels
+    # Apply masking to input tokens that aren't generated
+    labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
+    training_text.input_ids = input_ids
+    training_text.labels = labels
+    training_text.logprobs = [lp.logprob for lp in llm_call.logprobs]
+    return training_text

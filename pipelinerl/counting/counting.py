@@ -5,8 +5,8 @@ import time
 import aiohttp
 from omegaconf import DictConfig
 
-from pipelinerl.async_llm import llm_async_generate
-from pipelinerl.rollouts import RolloutResult, make_training_text
+from pipelinerl.async_llm import llm_async_generate, make_training_text
+from pipelinerl.rollouts import RolloutResult
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
 
