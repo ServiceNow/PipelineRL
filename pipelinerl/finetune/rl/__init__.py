@@ -91,6 +91,10 @@ class RLConfig(BaseModel):
         default=1.0,
         description="Temperature for the training log probs",
     )
+    filter_zero_advantage_groups: bool = Field(
+        default=False,
+        description="Filter out groups where all advantages are zero during preprocessing",
+    )
 
 
 def make_rl_data_callback(args, current_dir, rl_config, model):
