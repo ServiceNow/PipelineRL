@@ -191,7 +191,7 @@ def calculate_stats(stats):
         "max": float(np.mean([max(stat) for stat in stats.values() if stat])),
         "min": float(np.mean([min(stat) for stat in stats.values() if stat])),
         "var": float(np.mean([np.var(stat) for stat in stats.values() if stat])),
-        "mean": float(np.mean([np.mean(stat) for stat in stats.values() if stat])),
+        "mean": float(np.mean([val for stat in stats.values() if stat for val in stat])),
     }
 
     if aggregated_stats["var"] == 0:
