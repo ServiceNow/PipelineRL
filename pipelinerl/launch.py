@@ -45,8 +45,6 @@ def _popen(
 
 
 def validate_config(cfg: DictConfig):
-    if cfg.preprocess.chunk_size % cfg.attempts != 0:
-        raise ValueError("preprocess chunk_size must be a multiple of attempts")
     if cfg.world.preprocessor_fraction == 0 and cfg.finetune.rl.kl_coef > 0.0:
         raise ValueError("Preprocessor fraction must be > 0 if KL is used")
 

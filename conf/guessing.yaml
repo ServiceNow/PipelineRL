@@ -1,0 +1,19 @@
+defaults:
+    - base
+finetune:
+    seq_length: 2000
+    gradient_accumulation_passes: 1024
+llm:
+    parameters:
+        max_tokens: 500
+test_llm:
+    parameters:
+        max_tokens: 500
+actor:
+    rollout_policy: pipelinerl.guessing.guessing.generate_guessing_rollout
+environment: null
+dataset_loader: pipelinerl.guessing.guessing.load_problems
+train_dataset_names:
+    - train
+test_dataset_names:
+    - test

@@ -1,8 +1,6 @@
 import logging
 import os
-from dataclasses import dataclass, field
 from functools import partial
-from typing import Literal
 from pydantic import BaseModel, Field
 
 import numpy as np
@@ -13,8 +11,6 @@ from datasets import Dataset
 from transformers import BatchEncoding, PreTrainedModel
 
 from .utils import (
-    calculate_advantage,
-    calculate_rewards_with_implicit_kl,
     sum_sum,
     mean_sum,
     replace_dataset_column,
@@ -326,60 +322,71 @@ def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> D
     Returns:
         Dataset: The dataset populated with RL-specific columns
     """
-    logger.debug("Populate RL Data")
-
     # Convert to pandas for processing
-    df = dataset.to_pandas()
+    df_init = dataset.to_pandas()
+    assert isinstance(df_init, pd.DataFrame)
 
-    # Update rewards with implicit KL if needed
-    if config.reward_minus_kl_coef > 0:
-        logger.info("Updating Reward with Implicit KL")
-        calculate_rewards_with_implicit_kl_ = partial(
-            calculate_rewards_with_implicit_kl,
-            reward_minus_kl_coef=config.reward_minus_kl_coef,
-        )
-        df["rewards"] = df.apply(calculate_rewards_with_implicit_kl_, axis=1)
-        df["reward"] = df["rewards"].apply(lambda x: np.mean(x))
-
-    # Combined groupby for both reward statistics and token calculations
-    grouped = (
-        df.groupby("group_id")
+    # Step 1: calculate group-level statistics
+    df_stats = df_init[["group_id", "rollout_index"]].copy()
+    df_stats["num_tokens"] = df_init["input_ids"].apply(lambda x: len(x))
+    # We assume that rewards for all tokens are the same
+    df_stats["rollout_reward"] = df_init["rewards"].apply(lambda x: x[0])
+    # Check that the reward is the same at each rollout index
+    assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1
+    # Only keep rollout_index == 0
+    df_stats = df_stats[df_stats["rollout_index"] == 0].drop(columns=["rollout_index"])
+    df_grouped = (
+        df_stats.groupby("group_id")
         .agg(
-            reward_mean=("reward", "mean"),
-            reward_std=("reward", "std"),
-            new_group_tokens=(
-                "input_ids",
-                lambda x: sum(len(tokens) for tokens in x) / len(x),
-            ),
+            rollout_reward_mean=("rollout_reward", "mean"),
+            rollout_reward_std=("rollout_reward", "std"),
+            group_tokens=("num_tokens", "mean"), 
         )
         .reset_index()
     )
+    assert df_grouped.columns.tolist() == ["group_id", "rollout_reward_mean", "rollout_reward_std", "group_tokens"]
 
-    # Single merge to bring all statistics back
-    df = pd.merge(df, grouped, on="group_id", how="left")
-
-    # Calculate advantages
-    df["advantages"] = df.apply(
-        calculate_advantage,
-        axis=1,
-        divide_advantage_by_std=config.divide_advantage_by_std,
+    # Step 2: calculate advantages for each sample
+    df_advantages = pd.merge(
+        df_init[["group_id", "rollout_index", "step_index", "rewards"]],
+        df_grouped,
+        on="group_id",
+        how="left"
     )
+    assert len(df_advantages) == len(df_init)
+    def calculate_advantages(row):
+        rewards = row["rewards"]
+        mean = row["rollout_reward_mean"]
+        std = row["rollout_reward_std"]
+        if config.divide_advantage_by_std:
+            advantages = [(reward - mean) / (np.nan_to_num(std) + 1e-4) for reward in rewards]
+        else:
+            advantages = [(reward - mean) for reward in rewards]
+        return advantages
+    df_advantages["advantages"] = df_advantages.apply(
+        calculate_advantages,
+        axis=1,
+    )
+    df_advantages = df_advantages.drop(columns=["rewards", "rollout_reward_mean", "rollout_reward_std"])
+    assert df_advantages.columns.tolist() == ["group_id", "rollout_index", "step_index", "group_tokens", "advantages"]
 
-    # Handle overflow
+    # Step 3: bring advantages and group level stats back to the main df
+    df = df_init.drop(columns=["advantages", "group_tokens"])
+    df = pd.merge(df, df_advantages, on=["group_id", "rollout_index", "step_index"], how="left")
+    # Debug print lengths of all dataframes
+    assert len(df) == len(df_init)
+
+    # Step 4: make token-level overflow and mean group length information
     df["overflow"] = df.apply(
         lambda row: [0.0] * len(row["overflow"]) if eos_token_id in row["input_ids"] else [1.0] * len(row["overflow"]),
         axis=1,
     )
+    df["group_tokens"] = df.apply(lambda row: [row["group_tokens"]] * len(row["input_ids"]), axis=1)
 
-    # Broadcast group tokens
-    df["new_group_tokens"] = df.apply(lambda row: [row["new_group_tokens"]] * len(row["input_ids"]), axis=1)
-
-    # Replace columns in the dataset
+    # Step 5: move the results back to the dataset
     dataset = replace_dataset_column(dataset, "advantages", df["advantages"].tolist())
-    dataset = replace_dataset_column(dataset, "group_tokens", df["new_group_tokens"].tolist())
+    dataset = replace_dataset_column(dataset, "group_tokens", df["group_tokens"].tolist())
     dataset = replace_dataset_column(dataset, "overflow", df["overflow"].tolist())
-
-    logger.debug("Finish Populate RL Data")
     return dataset
 
 

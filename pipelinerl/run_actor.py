@@ -134,6 +134,7 @@ async def schedule_rollouts(
         problem: dict,
         slot: int,
         group_id: int,
+        rollout_index: int,
         llm_index: int,
         session: aiohttp.ClientSession,
     ):
@@ -147,9 +148,11 @@ async def schedule_rollouts(
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
             rollout_result.group_id = full_group_id
-            for sample in rollout_result.training_texts:
+            for step_index, sample in enumerate(rollout_result.training_texts):
                 # Downstream in the pipeline we'll need these fields in every sample
                 sample.metadata["model_version"] = model_version
+                sample.metadata["rollout_index"] = rollout_index
+                sample.metadata["step_index"] = step_index
                 sample.group_id = full_group_id
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
@@ -221,6 +224,7 @@ async def schedule_rollouts(
                     problem=problem,
                     slot=slot,
                     group_id=group_id,
+                    rollout_index=group_rollout_index,
                     llm_index=next_llm,
                     session=session,
                 )
@@ -443,16 +447,15 @@ class ActorLoop:
 
                 assert isinstance(rollout_results, list)
                 assert isinstance(rollout_results[0], RolloutResult)
-                for result in rollout_results:
-                    if len(result.training_texts) > 1:
-                        raise NotImplementedError("Multi-turn rollouts not tested yet")
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
+                all_text_dumps = []
                 for r in rollout_results:
                     for text in r.training_texts:
-                        data_stream_writer.write(text)
+                        all_text_dumps.append(text.model_dump())
+                data_stream_writer.write(all_text_dumps)
                 in_progress = submitted_groups - finished_groups
                 logger.info(
                     f"Published {group_samples}{' ' + split_name if split_name else ''} samples"

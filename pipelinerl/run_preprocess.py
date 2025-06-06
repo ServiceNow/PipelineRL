@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -35,6 +36,7 @@ from pipelinerl.finetune.checkpoints import (
 )
 from pipelinerl.finetune.data import preprocess_fn
 from pipelinerl.finetune.rl import RL_DATA_COLUMNS, RLConfig, populate_rl_data
+import traceback
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamRangeSpec,
@@ -48,14 +50,15 @@ logger = logging.getLogger(__name__)
 
 def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
     """Check that each group_id occures exactly group_size times."""
-    group_counts = {}
+    group_rollouts = defaultdict(set)
     for text in texts:
         group_id = text["group_id"]
-        group_counts[group_id] = group_counts.get(group_id, 0) + 1
+        rollout_index = text["metadata"]["rollout_index"]
+        group_rollouts[group_id].add(rollout_index)
 
-    for group_id, count in group_counts.items():
-        if count != group_size:
-            logger.error(f"Group sizes are wrong: {group_counts}")
+    for group_id, rollout_ids in group_rollouts.items():
+        if len(rollout_ids) != group_size:
+            logger.error(f"Group sizes are wrong: {group_rollouts}")
             return False
 
     return True
@@ -141,16 +144,15 @@ def preprocess_dataset(
         for entry in data:
             entry["ref_logprobs"] = entry["logprobs"]
 
-    dataset = Dataset.from_list(data)
-    logger.debug(f"Raw data part size: {dataset.num_rows}")
-    logger.debug(f"Raw data part fingerprint: {dataset._fingerprint}")
+    dataset = Dataset.from_list(data)    
     dataset = dataset.map(preprocess, keep_in_memory=True, load_from_cache_file=False)
     dataset = dataset.with_format(columns=columns)
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
-    dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
     dataset = dataset.add_column("model_version", [entry["metadata"]["model_version"] for entry in data])  # type: ignore
-    logger.debug(f"Preprocessed data part fingerprint: {dataset._fingerprint}")
+    dataset = dataset.add_column("rollout_index", [entry["metadata"]["rollout_index"] for entry in data])  # type: ignore    
+    dataset = dataset.add_column("step_index", [entry["metadata"]["step_index"] for entry in data])  # type: ignore
+    dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
     return dataset
 
 
@@ -158,7 +160,7 @@ def run_dataset_loader(
     raw_chunk_queue: Queue,
     data_stream: SingleStreamSpec,
     check_group_size: int,
-    chunk_size: int,
+    chunk_n_groups: int,
     pop_old_data: bool,
 ):
     old_and_dropped = 0
@@ -167,9 +169,11 @@ def run_dataset_loader(
         while True:
             try:
                 buffer = []
-                for entry in reader.read():
-                    buffer.append(entry)
-                    if len(buffer) == chunk_size:
+                n_groups = 0
+                for group in reader.read():
+                    buffer.extend(group)
+                    n_groups += 1
+                    if n_groups == chunk_n_groups:
                         break
                 if not _check_group_sizes(buffer, check_group_size):
                     raise ValueError("Invalid group sizes in data")
@@ -263,6 +267,7 @@ def process_chunk(
         dataset_queue.put(slot)
     except Exception as e:
         logger.error(f"Failed to preprocess chunk: {e}")
+        e.__traceback_str = traceback.format_exc()
         io_buffer[slot] = e
         dataset_queue.put(slot)
 
@@ -340,7 +345,7 @@ def run_preprocessing_loop(
         raw_chunk_queue=raw_chunk_queue,
         data_stream=input_stream,
         check_group_size=cfg.attempts,
-        chunk_size=cfg.preprocess.chunk_size,
+        chunk_n_groups=cfg.preprocess.chunk_n_groups,
         pop_old_data=cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode,
     )
     # Start the dataset loader thread using Thread
@@ -363,7 +368,7 @@ def run_preprocessing_loop(
     worker_pool_size = cfg.preprocess.n_workers
     next_llm_index = 0
 
-    stats_aggregator = SlidingWindowAggregator(window_size=max(10, 1000 // cfg.preprocess.chunk_size))
+    stats_aggregator = SlidingWindowAggregator(window_size=max(10, 1000 // cfg.preprocess.chunk_n_groups))
 
     buffer = []
     total_filtered_out = 0  # Track total filtered samples across all batches
@@ -379,101 +384,100 @@ def run_preprocessing_loop(
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
                 while True:
-                    try:
-                        llm = llms[next_llm_index] if llms else None
-                        if submitted_chunks - processed_chunks < max_pool_tasks:
-                            try:
-                                raw_chunk = raw_chunk_queue.get(timeout=0.001)
-                                if isinstance(raw_chunk, Exception):
-                                    raise raw_chunk
-                                slot = free_slots.pop()
-                                io_buffer[slot] = raw_chunk
-                                future = executor.submit(
-                                    process_chunk,
-                                    llm,
-                                    io_buffer,
-                                    slot,
-                                    tokenizer,
-                                    cfg.finetune.seq_length,
-                                    rl_config,
-                                    dataset_queue,
-                                )
-                                future.add_done_callback(
-                                    lambda fut: logger.error(
-                                        f"Exception while preprocessing: {fut.exception()}",
-                                        exc_info=fut.exception(),
-                                    )
-                                    if fut.exception()
-                                    else None
-                                )
-                                submitted_chunks += 1
-                                next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
-                            except Empty:
-                                pass
-
-                        start_processing = time.time()
+                    llm = llms[next_llm_index] if llms else None
+                    if submitted_chunks - processed_chunks < max_pool_tasks:
                         try:
-                            # Try to write the next dataset to the output stream, if it is ready
-                            slot = dataset_queue.get(timeout=0.001)
-                            dataset = io_buffer[slot]
-                            free_slots.add(slot)
-                            fetching_took = time.time() - start_processing
+                            raw_chunk = raw_chunk_queue.get(timeout=0.001)
+                            if isinstance(raw_chunk, Exception):
+                                raise raw_chunk
+                            slot = free_slots.pop()
+                            io_buffer[slot] = raw_chunk
+                            future = executor.submit(
+                                process_chunk,
+                                llm,
+                                io_buffer,
+                                slot,
+                                tokenizer,
+                                cfg.finetune.seq_length,
+                                rl_config,
+                                dataset_queue,
+                            )
+                            future.add_done_callback(
+                                lambda fut: logger.error(
+                                    f"Exception while preprocessing: {fut.exception()}",
+                                    exc_info=fut.exception(),
+                                )
+                                if fut.exception()
+                                else None
+                            )
+                            submitted_chunks += 1
+                            next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
                         except Empty:
-                            continue
-                        if isinstance(dataset, Exception):
-                            raise dataset
-                        start_writing = time.time()
-                        buffer += dataset
-                        processed_chunks += 1
+                            pass
 
-                        if len(buffer) < cfg.preprocess.buffer_size:
-                            continue
-                        if cfg.preprocess.buffer_size:
-                            # If buffer size is not set, no point in logging
-                            logger.info(f"Buffer is full with {len(buffer)} samples, start writing")
-                            random.shuffle(buffer)
+                    start_processing = time.time()
+                    try:
+                        # Try to write the next dataset to the output stream, if it is ready
+                        slot = dataset_queue.get(timeout=0.001)
+                        dataset = io_buffer[slot]
+                        free_slots.add(slot)
+                        fetching_took = time.time() - start_processing
+                    except Empty:
+                        continue
+                    if isinstance(dataset, Exception):
+                        logger.error(f"Got exception from the result queue")
+                        logger.error(dataset.__traceback_str)
+                        raise dataset
+                    start_writing = time.time()
+                    buffer += dataset
+                    processed_chunks += 1
 
-                        # Conditionally filter out groups where all advantages are zero
-                        if rl_config.filter_zero_advantage_groups:
-                            filtered_buffer, num_filtered_out = filter_zero_advantage_groups(buffer)
-                            total_filtered_out += num_filtered_out
-                            
-                            if num_filtered_out > 0:
-                                logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
-                        else:
-                            filtered_buffer = buffer
-                            num_filtered_out = 0
+                    if len(buffer) < cfg.preprocess.buffer_size:
+                        continue
+                    if cfg.preprocess.buffer_size:
+                        # If buffer size is not set, no point in logging
+                        logger.info(f"Buffer is full with {len(buffer)} samples, start writing")
+                        random.shuffle(buffer)
 
-                        # Write the entries (filtered or unfiltered based on config)
-                        for entry in filtered_buffer:
-                            writer.write(entry)
-                        writing_took = time.time() - start_writing
-                        stats_aggregator.update([len(entry["input_ids"]) for entry in filtered_buffer])
-                        published_samples += len(filtered_buffer)  # Count only written samples
-                        max_model_version = max([entry["model_version"] for entry in filtered_buffer]) if filtered_buffer else 0
-                        samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_size
-                        stats = {
-                            "preprocessor/published_samples": published_samples,
-                            "preprocessor/published_model_version": max_model_version,
-                            "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_size,
-                            "preprocessor/queue/raw": raw_chunk_queue.qsize(),
-                            "preprocessor/queue/dataset_samples": samples_in_queue,
-                            "preprocessor/queue/dataset": dataset_queue.qsize(),
-                            "preprocessor/filtered_out_samples": num_filtered_out,
-                            "preprocessor/total_filtered_out_samples": total_filtered_out,
-                        }
-                        if stats_aggregator.has_enough_data():
-                            stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
-                        run.log(stats)
-                        stats_writer.write(stats)
-                        processing_took = time.time() - start_processing
-                        logger.info(
-                            f"Processed {len(filtered_buffer)} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
-                            f" (last fetching took {fetching_took:.3f}, all writing took {writing_took:.3f})"
-                            f" and wrote to {output_stream}, total {published_samples} samples so far,"
-                            f" {samples_in_queue} samples in queue, max buffer entry size {io_buffer._max_written_entry_size}"
-                        )
-                        buffer = []
-                    except Exception as e:
-                        logger.error(f"Error in preprocessor worker: {e}")
-                        raise
+                    # Conditionally filter out groups where all advantages are zero
+                    if rl_config.filter_zero_advantage_groups:
+                        filtered_buffer, num_filtered_out = filter_zero_advantage_groups(buffer)
+                        total_filtered_out += num_filtered_out
+                        
+                        if num_filtered_out > 0:
+                            logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
+                    else:
+                        filtered_buffer = buffer
+                        num_filtered_out = 0
+
+                    # Write the entries (filtered or unfiltered based on config)
+                    for entry in filtered_buffer:
+                        writer.write(entry)
+                    writing_took = time.time() - start_writing
+                    stats_aggregator.update([len(entry["input_ids"]) for entry in filtered_buffer])
+                    published_samples += len(filtered_buffer)  # Count only written samples
+                    max_model_version = max([entry["model_version"] for entry in filtered_buffer]) if filtered_buffer else 0
+                    samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_n_groups
+                    stats = {
+                        "preprocessor/published_samples": published_samples,
+                        "preprocessor/published_model_version": max_model_version,
+                        "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_n_groups,
+                        "preprocessor/queue/raw": raw_chunk_queue.qsize(),
+                        "preprocessor/queue/dataset_samples": samples_in_queue,
+                        "preprocessor/queue/dataset": dataset_queue.qsize(),
+                        "preprocessor/filtered_out_samples": num_filtered_out,
+                        "preprocessor/total_filtered_out_samples": total_filtered_out,
+                    }
+                    if stats_aggregator.has_enough_data():
+                        stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
+                    run.log(stats)
+                    stats_writer.write(stats)
+                    processing_took = time.time() - start_processing
+                    logger.info(
+                        f"Processed {len(filtered_buffer)} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
+                        f" (last fetching took {fetching_took:.3f}, all writing took {writing_took:.3f})"
+                        f" and wrote to {output_stream}, total {published_samples} samples so far,"
+                        f" {samples_in_queue} samples in queue, max buffer entry size {io_buffer._max_written_entry_size}"
+                    )
+                    buffer = []
+
