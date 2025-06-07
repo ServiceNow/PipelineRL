@@ -1,0 +1,24 @@
+defaults:
+    - base
+finetune:
+    seq_length: 2000
+    gradient_accumulation_passes: 1024
+llm:
+    parameters:
+        max_tokens: 500
+test_llm:
+    parameters:
+        max_tokens: 500
+actor:
+    rollout_policy: pipelinerl.miniwob.rollouts.generate_miniwob_rollout
+environment:
+  _target_: pipelinerl.miniwob.environment_server.WebEnvironment
+dataset_loader: pipelinerl.miniwob.load_tasks.load_tasks
+dataset_loader_params:
+  train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
+  seeds: [0, 42, 1337, 900, 103]
+  max_loops: 10  # max number of agent - environment interactions for each task
+train_dataset_names:
+    - train
+test_dataset_names:
+    - test

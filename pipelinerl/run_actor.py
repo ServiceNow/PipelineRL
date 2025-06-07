@@ -577,8 +577,11 @@ def run_actor_loop(cfg: DictConfig):
     test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test")
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)
-    train_dataset = dataset_loader(cfg.train_dataset_names)
-    test_dataset = dataset_loader(cfg.test_dataset_names)
+    # Get dataset loader parameters if they exist in config, otherwise use empty dict
+    dataset_loader_params = cfg.get('dataset_loader_params', {})
+    # Use **dataset_loader_params to pass parameters only if they exist
+    train_dataset = dataset_loader(cfg.train_dataset_names, **dataset_loader_params)
+    test_dataset = dataset_loader(cfg.test_dataset_names, **dataset_loader_params)
     if cfg.train_subset:
         train_dataset = train_dataset[cfg.train_subset.begin : cfg.train_subset.end]
     logger.info(f"Loaded {len(train_dataset)} training problems")
