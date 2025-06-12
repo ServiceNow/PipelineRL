@@ -338,15 +338,7 @@ class ActorLoop:
             self.rollout_processes.append(process)
 
     def init_stats(self):
-        self.reward_stats = make_stats_dict()
-        self.step_stats = make_stats_dict()
-        self.no_errors_stats = make_stats_dict()
-        self.no_answer_stats = make_stats_dict()
-        self.success_stats = make_stats_dict()
-        self.prompt_tokens = make_stats_dict()
-        self.output_tokens = make_stats_dict()
-        self.num_turns = make_stats_dict()
-        self.overflows = make_stats_dict()
+        self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
@@ -356,21 +348,18 @@ class ActorLoop:
             assert result.model_version is not None
             dataset_name = result.dataset_name
             group_id = result.group_id
-            stats = result.metrics
-            self.reward_stats[dataset_name][group_id].append(stats["reward"])
-            self.success_stats[dataset_name][group_id].append(stats["success"])
-            self.no_errors_stats[dataset_name][group_id].append(stats["no_error"])
-            self.no_answer_stats[dataset_name][group_id].append(stats["no_answer"])
-            self.prompt_tokens[dataset_name][group_id].append(sum(result.prompt_tokens))
-            self.output_tokens[dataset_name][group_id].append(sum(result.output_tokens))
-            self.overflows[dataset_name][group_id].append(stats["overflow"])
-            self.num_turns[dataset_name][group_id].append(len(result.training_texts))
             self.latency_list.append(result.latency)
             self.model_versions_list.append(result.model_version)
-        dataset_name = rollout_results[0].dataset_name
+            for k, v in result.metrics.model_dump().items():
+                if isinstance(v, list):
+                    self.stats[k][dataset_name][group_id] += v
+                elif isinstance(v, float) or isinstance(v, bool):
+                    self.stats[k][dataset_name][group_id].append(v)
+                else:
+                    raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
         
-        prompt_length_tokens = list(itertools.chain(*(result.prompt_tokens for result in rollout_results)))
-        output_length_tokens = list(itertools.chain(*(result.output_tokens for result in rollout_results)))
+        prompt_length_tokens = list(itertools.chain(*(result.metrics.prompt_tokens for result in rollout_results)))
+        output_length_tokens = list(itertools.chain(*(result.metrics.output_tokens for result in rollout_results)))
         self.sliding_aggregator.update(prompt_length_tokens, output_length_tokens)
         sliding_window_stats = self.sliding_aggregator.get_stats()
         if sliding_window_stats is not None:
@@ -530,42 +519,20 @@ class ActorLoop:
 
     def publish_stats(self, stats_writer: StreamWriter, loop_stats: Dict):
         split_name = "test_" if not self.is_training else ""
-        stats = (
+
+        stats = defaultdict(float)
+        for metric_name, dict_of_stats_per_metric in self.stats.items():
+            for agg, group_stats in calculate_stats(dict_of_stats_per_metric).items():
+                stats[f"{split_name}{metric_name}_{agg}"] = group_stats
+
+            for dataset_name, list_of_stats_per_metric_and_dataset in self.stats[metric_name].items():
+                for agg, sub_stats in calculate_stats(list_of_stats_per_metric_and_dataset).items():
+                    stats[f"{dataset_name}/{split_name}{metric_name}_{agg}"] = sub_stats
+
+        stats |= (
             {
-                f"{split_name}reward_" + k: v
-                for k, v in calculate_stats(self.reward_stats).items()
-            }
-            | {
-                f"{split_name}success_" + k: v
-                for k, v in calculate_stats(self.success_stats).items()
-            }
-            | {
-                f"{split_name}no_error_" + k: v
-                for k, v in calculate_stats(self.no_errors_stats).items()
-            }
-            | {
-                f"{split_name}no_answer_" + k: v
-                for k, v in calculate_stats(self.no_answer_stats).items()
-            }
-            | {
-                f"{split_name}prompt_tokens_" + k: v
-                for k, v in calculate_stats(self.prompt_tokens).items()
-            }
-            | {
-                f"{split_name}output_tokens_" + k: v
-                for k, v in calculate_stats(self.output_tokens).items()
-            }
-            | {
-                f"{split_name}num_turns_" + k: v
-                for k, v in calculate_stats(self.num_turns).items()
-            }
-            | {
-                f"{split_name}overflows_" + k: v
-                for k, v in calculate_stats(self.overflows).items()
-            }
-            | {
                 f"{split_name}{k}": v
-                for k, v in always_or_never_success_stats(self.success_stats).items()
+                for k, v in always_or_never_success_stats(self.stats["success"]).items()
             }
             | {
                 f"{split_name}latency_" + k: v
@@ -577,19 +544,6 @@ class ActorLoop:
             }
         )
 
-        for dataset_name in self.reward_stats.keys():
-            sub_stats = (
-                {"reward_" + k: v for k, v in calculate_stats(self.reward_stats[dataset_name]).items()}
-                | {"success_" + k: v for k, v in calculate_stats(self.success_stats[dataset_name]).items()}
-                | {"no_error_" + k: v for k, v in calculate_stats(self.no_errors_stats[dataset_name]).items()}
-                | {"no_answer_" + k: v for k, v in calculate_stats(self.no_answer_stats[dataset_name]).items()}
-                | {"prompt_tokens_" + k: v for k, v in calculate_stats(self.prompt_tokens[dataset_name]).items()}
-                | {"output_tokens_" + k: v for k, v in calculate_stats(self.output_tokens[dataset_name]).items()}
-                | {"overflows_" + k: v for k, v in calculate_stats(self.overflows[dataset_name]).items()}
-            )
-            sub_stats = {dataset_name + "/" + k: v for k, v in sub_stats.items()}
-            stats |= sub_stats
-    
         stats |= loop_stats
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0

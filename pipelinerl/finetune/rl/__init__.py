@@ -202,6 +202,8 @@ def rl_step(
     overflow = batch["overflow"][:, 1:]
 
     if config.group_normalization:
+        # assert that group_tokens is not zero
+        assert (group_tokens > 0).all(), "group_tokens must be greater than zero for group normalization"
         tokens_weights = torch.ones_like(group_tokens) / group_tokens
     else:
         tokens_weights = torch.ones_like(group_tokens) / config.batch_size
@@ -301,6 +303,8 @@ def rl_step(
         ).item(),
         "num_nans": torch.isnan(loss).sum().item(),
         "token_weight": mean_sum(tokens_weights, masks_shifted, segments).item(),
+        "max_token_weight": tokens_weights[masks_shifted].max().item(),
+        "min_token_weight": tokens_weights[masks_shifted].min().item(),
         "kl_coef": num_sequences * kl_coef,
         "entropy_bonus_coef": num_sequences * entropy_bonus_coef,
         "num_output_tokens_sum": masks_shifted.sum().item(),

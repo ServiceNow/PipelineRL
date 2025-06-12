@@ -401,11 +401,11 @@ def run_finetuning_loop(
 
     if not args.gradient_accumulation_passes % num_processes == 0:
         raise ValueError("gradient_accumulation_passes must be divisible by num_processes")
-    args.gradient_accumulation_passes //= num_processes
+    gradient_accumulation_passes_per_gpu = args.gradient_accumulation_passes // num_processes
     if (ds_plugin := get_accelerator().state.deepspeed_plugin) is not None:
         logger.info("Manual inform Deepspeed about micro batch size and gradient accumulation")
         ds_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = args.train_batch_size
-        ds_plugin.deepspeed_config["gradient_accumulation_steps"] = args.gradient_accumulation_passes
+        ds_plugin.deepspeed_config["gradient_accumulation_steps"] = gradient_accumulation_passes_per_gpu
         if args.gradient_clipping_threshold:
             ds_plugin.deepspeed_config["gradient_clipping"] = args.gradient_clipping_threshold
 
@@ -449,7 +449,7 @@ def run_finetuning_loop(
     )
 
     if args.seq_packing:
-        samples_per_worker_per_step = args.gradient_accumulation_passes * args.train_batch_size
+        samples_per_worker_per_step = gradient_accumulation_passes_per_gpu * args.train_batch_size
         run_data_loader = partial(
             run_dynamic_batch_size_data_loader,
             max_seq_length=args.seq_length,
@@ -643,7 +643,8 @@ def rl_finetuning_worker(
 
     time_waiting_for_data = 0.0
 
-    samples_per_worker_per_step = args.gradient_accumulation_passes * args.train_batch_size
+    gradient_accumulation_passes_per_gpu = args.gradient_accumulation_passes // get_accelerator().state.num_processes
+    samples_per_worker_per_step = gradient_accumulation_passes_per_gpu * args.train_batch_size
     samples_per_step = samples_per_worker_per_step * get_accelerator().state.num_processes
     start_samples = training_metrics.samples
     last_model_version = training_metrics.samples
