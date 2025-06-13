@@ -80,7 +80,7 @@ vllm_config:
     num-scheduler-steps: 1
     disable-log-requests: ""
     disable-frontend-multiprocessing: ""
-    max-num-seqs: 512
+    max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 1024
     enable-chunked-prefill: ""
     return-tokens-as-token-ids: ""

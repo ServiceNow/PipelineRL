@@ -24,7 +24,6 @@ os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
-os.environ["VLLM_USE_V1"] = "0"
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 def _popen(
@@ -114,8 +113,6 @@ def run_actor_llm(
         str(8080 + local_idx),
         "--seed",
         str(actor_llm_idx),
-        "--exp-root-dir",
-        str(exp_dir),
         "--actor-llm-idx",
         str(actor_llm_idx),
         "--weight-update-group-init-method",

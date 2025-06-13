@@ -1,12 +1,7 @@
-import asyncio
-import json
 import logging
-import os
 import signal
-from pydantic import TypeAdapter
 import torch
 import uvloop
-from vllm import AsyncLLMEngine
 from vllm.utils import FlexibleArgumentParser, set_ulimit
 from vllm.entrypoints.openai.cli_args import (
     make_arg_parser,
@@ -21,20 +16,16 @@ from vllm.entrypoints.openai.api_server import (
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-from vllm.logger import init_logger
 from vllm._version import version
-from vllm.worker.worker import Worker
-from vllm.executor.multiproc_worker_utils import ProcessWorkerWrapper
-from vllm.executor.mp_distributed_executor import MultiprocessingDistributedExecutor
-from vllm.model_executor.layers.sampler import SamplerOutput
-from vllm.sequence import ExecuteModelRequest
 from vllm.usage.usage_lib import UsageContext
-from vllm.worker.multi_step_worker import MultiStepWorker
-from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+from vllm.config import ModelConfig
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.core_client import AsyncMPClient
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
-import torch.distributed as dist
-from pipelinerl.run_finetune import TrainerMessage, WeightUpdateRequest
+from pipelinerl.run_finetune import WeightUpdateRequest
+from typing import Any, Protocol, runtime_checkable
 import pipelinerl.torch_utils
 
 logger = logging.getLogger(__name__)
@@ -48,122 +39,82 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
-def make_worker_class(multi_step: bool):
-    base_class = MultiStepWorker if multi_step else Worker
+@runtime_checkable
+class LikeWorker(Protocol):
+    rank: int
+    local_rank: int
+    device: torch.device
+    model_runner: GPUModelRunner 
+    pg_rank: int
+    process_group: Any
+    model_config: ModelConfig
 
-    class NewWorkerClass(base_class):
-        def init_actor_update_group(
-            self,
-            actor_idx: int,
-            actor_ngpus: int,
-            weight_update_group_init_method: str,
-            weight_update_group_world_size: int,
-        ):
-            self.pg_rank = 1 + actor_idx * actor_ngpus + self.rank
-            # log all you know
-            prefix = "[INIT_ACTOR_UPDATE_GROUP]: "
-            logger.info(
-                prefix
-                + f"Actor index: {actor_idx}, actor ngpus: {actor_ngpus}, rank: {self.rank}, pg_rank: {self.pg_rank}"
+
+class WorkerExtension:
+
+    def init_actor_update_group(
+        self: LikeWorker,
+        actor_idx: int,
+        actor_ngpus: int,
+        weight_update_group_init_method: str,
+        weight_update_group_world_size: int,
+    ):
+        self.pg_rank = 1 + actor_idx * actor_ngpus + self.rank
+        # log all you know
+        prefix = "[INIT_ACTOR_UPDATE_GROUP]: "
+        logger.info(
+            prefix
+            + f"Actor index: {actor_idx}, actor ngpus: {actor_ngpus}, rank: {self.rank}, pg_rank: {self.pg_rank}"
+        )
+        logger.info(
+            prefix
+            + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
+        )
+        self.process_group = pipelinerl.torch_utils.init_extra_process_group(
+            group_name="actor",
+            backend="nccl",
+            init_method=weight_update_group_init_method,
+            rank=self.pg_rank,
+            world_size=weight_update_group_world_size,
+        )
+
+    def receive_weight_update(self: LikeWorker, request: WeightUpdateRequest):
+        torch.cuda.synchronize(self.device)
+        logger.info("Start receiving weight update")
+        for info in request.parameters_info:
+            model_dtype = self.model_config.dtype
+            assert info.dtype == str(model_dtype), (
+                f"mismatch dtype: src {info.dtype}, dst {self.model_config.dtype}"
             )
-            logger.info(
-                prefix
-                + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
-            )
-            self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-                group_name="actor",
-                backend="nccl",
-                init_method=weight_update_group_init_method,
-                rank=self.pg_rank,
-                world_size=weight_update_group_world_size,
-            )
-
-        def receive_weight_update(self, request: WeightUpdateRequest):
-            torch.cuda.synchronize(self.device)
-            for info in request.parameters_info:
-                model_dtype = self.model_config.dtype
-                assert info.dtype == str(model_dtype), (
-                    f"mismatch dtype: src {info.dtype},\ dst {self.model_config.dtype}"
-                )
-                buffer = torch.empty(tuple(info.shape), dtype=model_dtype, device=self.device)
-                torch.distributed.broadcast(buffer, src=0, group=self.process_group)
-                if isinstance(self.model_runner, MultiStepModelRunner):
-                    loaded_params = self.model_runner._base_model_runner.model.load_weights(
-                        weights=[(info.name, buffer)]
-                    )
-                else:
-                    loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])
-                if len(loaded_params) != 1:
-                    raise ValueError(f"model {info.name} not found in model state dict")
-            logger.info("Weight update received")
-
-    return NewWorkerClass
-
-
-AsyncRLWorker = make_worker_class(multi_step=False)
-AsyncRLMultiStepWorker = make_worker_class(multi_step=True)
-
-executor_lock = asyncio.Lock()
-
-
-class AsyncRLExecutor(MultiprocessingDistributedExecutor):
-    async def execute_model_async(self, execute_model_req: ExecuteModelRequest) -> list[SamplerOutput]:
-        async with executor_lock:
-            return await super().execute_model_async(execute_model_req)
-
-    async def stop_remote_worker_execution_loop_async(self) -> None:
-        async with executor_lock:
-            await super().stop_remote_worker_execution_loop_async()
-
-    async def stop_remote_worker_execution_loop_no_lock(self) -> None:
-        await super().stop_remote_worker_execution_loop_async()
+            buffer = torch.empty(tuple(info.shape), dtype=model_dtype, device=self.device)
+            torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
+            if len(loaded_params) != 1:
+                raise ValueError(f"model {info.name} not found in model state dict")
+        logger.info("Weight update received")
 
 
 class WeightUpdateManager:
-    def __init__(self, args, executor: AsyncRLExecutor):
-        self.executor = executor
-        self.driver_worker = getattr(executor, "driver_worker")
-        self.multi_step = args.num_scheduler_steps > 1
-        assert isinstance(self.driver_worker.worker, AsyncRLMultiStepWorker if self.multi_step else AsyncRLWorker)
-        self.other_workers = getattr(executor, "workers")
+    def __init__(self, args, engine_client: AsyncMPClient):
         self.args = args
+        self.engine_client = engine_client
 
-    def input_process_groups(self):
-        # Make a render-vous with the trainer
-        futures = []
-        for i, worker in enumerate(self.other_workers):
-            assert isinstance(worker, ProcessWorkerWrapper)
-            futures.append(
-                worker.execute_method(
-                    "init_actor_update_group",
-                    self.args.actor_llm_idx,
-                    torch.cuda.device_count(),
-                    self.args.weight_update_group_init_method,
-                    self.args.weight_update_group_world_size,
-                )
-            )
-        self.driver_worker.init_actor_update_group(
-            self.args.actor_llm_idx,
-            torch.cuda.device_count(),
-            self.args.weight_update_group_init_method,
-            self.args.weight_update_group_world_size,
+    async def input_process_groups(self):
+        await self.engine_client.collective_rpc_async(
+            "init_actor_update_group",
+            args=(
+                self.args.actor_llm_idx,
+                torch.cuda.device_count(),
+                self.args.weight_update_group_init_method,
+                self.args.weight_update_group_world_size,
+            ),
         )
-        for future in futures:
-            future.get()
 
-    async def receive_weight_update(self, message: WeightUpdateRequest):
-        logger.info(f"Received weight update request")
-        async with executor_lock:
-            if isinstance(self.executor, AsyncRLExecutor):
-                await self.executor.stop_remote_worker_execution_loop_no_lock()
-            logger.info(f"Stopped remote worker")
-            futures = []
-            for worker in self.other_workers:
-                futures.append(worker.execute_method("receive_weight_update", message))
-            self.driver_worker.receive_weight_update(message)
-            for future in futures:
-                future.get()
-            logger.info(f"All workers received weight updates")
+    async def receive_weight_update(self, request: WeightUpdateRequest):
+        await self.engine_client.collective_rpc_async(
+            "receive_weight_update", args=(request,)
+        )
+        logger.info("Weight update processed")
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
@@ -196,27 +147,20 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Build the engine with the bespoke Executor and orker clases
-    multi_step = args.num_scheduler_steps > 1
     engine_args = AsyncEngineArgs.from_cli_args(args)
+    engine_args.worker_extension_cls = "pipelinerl.run_llm.WorkerExtension"
     engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
-    engine_config.parallel_config.distributed_executor_backend = AsyncRLExecutor
-    engine_config.parallel_config.worker_cls = (
-        "pipelinerl.run_llm.AsyncRLMultiStepWorker" if multi_step else "pipelinerl.run_llm.AsyncRLWorker"
-    )
-    engine = AsyncLLMEngine.from_vllm_config(
+    engine = AsyncLLM.from_vllm_config(
         vllm_config=engine_config,
         usage_context=UsageContext.OPENAI_API_SERVER,
-        stat_loggers=None,
-        start_engine_loop=True,
         disable_log_stats=engine_args.disable_log_stats,
         disable_log_requests=engine_args.disable_log_requests,
     )
+    assert isinstance(engine.engine_core, AsyncMPClient)
 
-    assert isinstance(engine.engine.model_executor, AsyncRLExecutor)
-    weight_update_manager = WeightUpdateManager(args, engine.engine.model_executor)
+    weight_update_manager = WeightUpdateManager(args, engine.engine_core)
     if not args.disable_weight_updates:
-        weight_update_manager.input_process_groups()
+        await weight_update_manager.input_process_groups()
 
     # Run HTTP server
     sock_addr = (args.host or "", args.port)
@@ -257,7 +201,6 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 def run_llm():
     parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
     parser = make_arg_parser(parser)
-    parser.add_argument("--exp-root-dir", type=str, required=True, help="Root directory of the experiment")
     parser.add_argument(
         "--disable-weight-updates", action="store_true", help="Whether to receive weight updates from the trainer"
     )
