@@ -11,6 +11,7 @@ import numpy as np
 from omegaconf import DictConfig
 import psutil
 import requests
+from importlib.metadata import distributions
 from transformers import PreTrainedTokenizer
 from collections import defaultdict
 
@@ -18,7 +19,68 @@ from pipelinerl.world import Job
 from tapeagents.llms import LLMOutput
 from tapeagents.core import Prompt
 
+import wandb
+from wandb.sdk import wandb_run
+
 logger = logging.getLogger(__name__)
+
+
+def init_wandb(
+    cfg: DictConfig,
+    run_dir: Path,
+    config_for_wandb: DictConfig | dict,
+) -> wandb_run.Run:
+    """Initialize W&B.
+
+    config_for_wandb is the configuration that will be logged to W&B.
+
+    """
+    if config_for_wandb is None:
+        config_for_wandb = cfg.dict()
+
+    python_env = {}
+    for dist in distributions():
+        python_env[dist.metadata["Name"]] = dist.version
+    config_for_wandb["python_env"] = python_env
+
+    if cfg.wandb.wandb_resume == "always":
+        resume = "allow"
+    elif cfg.wandb.wandb_resume == "never":
+        resume = "never"
+    elif cfg.wandb.wandb_resume == "if_not_interactive":
+        raise NotImplementedError()
+    else:
+        raise ValueError(f"Unknown value for wandb_resume: {cfg.finetune.wandb_resume}")
+
+    wandb_name = str(run_dir)
+    root = cfg.wandb.wandb_workspace_root
+    if root:
+        if not wandb_name.startswith(root + "/"):
+            raise ValueError(f"run_dir {run_dir} does not start with root {root}")
+        wandb_name = wandb_name[len(root) + 1 :]
+
+    wandb_id = cfg.wandb.wandb_id
+    if not wandb_id:
+        wandb_id = wandb_name.replace("/", "_")
+
+    if len(wandb_name) > 128:
+        logger.warning(f"wandb_name: {wandb_name} is longer than 128 characters. Truncating to 128 characters.")
+
+    logging.info(f"Initializing W&B with\nname: {wandb_name[:128]}\nid: {wandb_id}\nresume: {resume}")
+    run = wandb.init(
+        name=wandb_name[:128],  # wandb limits name to 128 characters
+        entity=cfg.wandb.wandb_entity_name,
+        project=cfg.wandb.wandb_project_name,
+        group=cfg.wandb.wandb_group,
+        dir=cfg.wandb.wandb_dir,
+        config=config_for_wandb,  # type: ignore
+        resume=resume,
+        id=wandb_id,
+        tags=cfg.wandb.tags,
+    )
+    if not isinstance(run, wandb_run.Run):
+        raise ValueError("W&B init failed")
+    return run
 
 
 def generate_cuda_device_strings(total_gpus: int, gpus_per_model: int) -> List[str]:

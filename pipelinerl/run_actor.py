@@ -315,7 +315,7 @@ class ActorLoop:
         self.problem_queue = mp.Queue()
         self.result_queue = mp.Queue(max_ready_groups_waiting)
         self.buffer_size = self.max_groups_in_progress + max_ready_groups_waiting
-        self.io_buffer = SharedMemoryArray(self.smm, self.buffer_size, int(1e7))
+        self.io_buffer = SharedMemoryArray(self.smm, self.buffer_size, cfg.actor.shared_memory_entry_size)
         self.free_slots = set(range(self.buffer_size))
         logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
         logger.info(f"Max groups in progress: {self.max_groups_in_progress}, buffer size: {self.buffer_size}")
@@ -593,7 +593,8 @@ class ActorLoop:
         stats |= loop_stats
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
-        wandb.log({f"actor/{k}": v for k, v in stats.items()})
+        if self.cfg.wandb.use_wandb:
+            wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
         self.init_stats()  # Reset stats for the next iteration
 
@@ -605,10 +606,11 @@ def run_actor_loop(cfg: DictConfig):
     exp_path = Path(cfg.output_dir)
     setup_logging(str(exp_path / "actor"))
     logger.info(f"Current dir: {os.getcwd()}, experiment root dir: {cfg.output_dir}")
-    run = init_wandb(cfg, exp_path / "actor", flatten_dict_config(cfg))  # type: ignore
+    if cfg.wandb.use_wandb:
+        run = init_wandb(cfg, exp_path / "actor", flatten_dict_config(cfg))  # type: ignore
+        if run is None:
+            raise ValueError("Failed to initialize wandb run")
     llm_urls = str(cfg.me.llm_urls).split("+")
-    if run is None:
-        raise ValueError("Failed to initialize wandb run")
 
     stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
     test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test")
@@ -616,8 +618,11 @@ def run_actor_loop(cfg: DictConfig):
     test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test")
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)
-    train_dataset = dataset_loader(cfg.train_dataset_names)
-    test_dataset = dataset_loader(cfg.test_dataset_names)
+    # Get dataset loader parameters if they exist in config, otherwise use empty dict
+    dataset_loader_params = cfg.get('dataset_loader_params', {})
+    # Use **dataset_loader_params to pass parameters only if they exist
+    train_dataset = dataset_loader(cfg.train_dataset_names, **dataset_loader_params)
+    test_dataset = dataset_loader(cfg.test_dataset_names, **dataset_loader_params)
     if cfg.train_subset:
         train_dataset = train_dataset[cfg.train_subset.begin : cfg.train_subset.end]
     logger.info(f"Loaded {len(train_dataset)} training problems")

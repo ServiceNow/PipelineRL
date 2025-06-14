@@ -20,25 +20,6 @@ lora:
   dropout: 0.05 # the dropout probability for Lora layers.
   bias: "none" # Bias type for Lora. Can be 'none', 'all' or 'lora_only'
   target_modules: [] # the names of the modules to apply Lora to.
-# Comma-separated list of keywords to tag the run.
-tags: []
-#Use W&B experiment logging
-use_wandb: True
-# W&B id; if given, will resume this run
-wandb_id: null
-wandb_name: null
-# W&B entity name
-wandb_entity_name: null
-# W&B project name
-wandb_project_name: pipeline-rl
-# W&B resume policy
-wandb_resume: always
-# Whether to use only the basename or the full path as the run name
-wandb_use_basename: True
-wandb_workspace_root: results
-# set the group in your config
-wandb_group: null
-wandb_dir: null
 # Overwrite existing model checkpoints. If False, resume training from existing checkpoint if exists
 force_restart: False
 # Rewind dataloder to the last used position if training resumed from existing checkpoint

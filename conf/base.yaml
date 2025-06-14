@@ -49,6 +49,7 @@ actor:
   task_template: |-
     {task}
   throughput_window_size: 50
+  shared_memory_entry_size: 10000000
 environment:
   _target_: pipelinerl.domains.math.MathEnvironment
 preprocess:
@@ -60,6 +61,7 @@ preprocess:
   submit_delay: 0.
   pop_old_data: ${..pop_old_data} 
   buffer_size: 0
+  shared_memory_entry_size: 100000000
 llm:
   parameters:
     # changed
@@ -145,3 +147,23 @@ me:
 hydra:
   run:
     dir: ${output_dir}
+
+wandb:
+  use_wandb: true
+  wandb_id: null
+  wandb_name: null
+  # W&B entity name
+  wandb_entity_name: null
+  # W&B project name
+  wandb_project_name: pipeline-rl
+  # W&B resume policy
+  wandb_resume: always
+  # Whether to use only the basename or the full path as the run name
+  wandb_use_basename: True
+  wandb_workspace_root: results
+  # set the group in your config
+  wandb_group: null
+  wandb_dir: null
+  # Comma-separated list of keywords to tag the run.
+  tags: []
+

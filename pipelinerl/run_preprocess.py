@@ -20,9 +20,9 @@ import datasets
 import transformers
 from litellm import BaseModel, Field
 
-from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
+from pipelinerl.finetune.logging_ import flatten_dict_config
 from pipelinerl.shared_memory_array import SharedMemoryArray
-from pipelinerl.utils import wait_for_inference_servers
+from pipelinerl.utils import wait_for_inference_servers, init_wandb
 from pipelinerl.world import WorldMap
 
 datasets.disable_caching()
@@ -319,9 +319,10 @@ def run_preprocessing_loop(
     world_map = WorldMap(cfg, verbose=True)
     exp_root_dir = Path(cfg.output_dir)
 
-    run = init_wandb(cfg, exp_root_dir / "preprocessor", flatten_dict_config(cfg))
-    if run is None:
-        raise ValueError("Failed to initialize wandb run")
+    if cfg.wandb.use_wandb:
+        run = init_wandb(cfg, exp_root_dir / "preprocessor", flatten_dict_config(cfg))
+        if run is None:
+            raise ValueError("Failed to initialize wandb run")
 
     tokenizer = load_tokenizer(cfg.finetune.config_name)
 
@@ -378,7 +379,7 @@ def run_preprocessing_loop(
             max_pool_tasks = 2 * worker_pool_size
             buffer_size = 2 * max_pool_tasks + max_dataset_queue_size
             dataset_queue = manager.Queue(max_dataset_queue_size)
-            io_buffer = SharedMemoryArray(smm, buffer_size, int(1e8))
+            io_buffer = SharedMemoryArray(smm, buffer_size, cfg.preprocess.shared_memory_entry_size)
             free_slots = set(range(buffer_size))
             logger.info(f"Shared memory buffer size: {io_buffer.get_memory_size() / 2**30} Gb")
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
