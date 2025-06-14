@@ -131,7 +131,7 @@ def preprocess_dataset(
     rl_config: RLConfig,
 ) -> Dataset:
     preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True)
-    columns = ["input_ids", "labels", "attention_mask", "group_id"] + RL_DATA_COLUMNS
+    columns = ["input_ids", "labels", "attention_mask", "group_id"] + RL_DATA_COLUMNS + ["pixel_values", "image_thw"]
     
     logger.debug(f"Instantiated preprocess function hash {Hasher.hash(preprocess)}")
 
@@ -378,7 +378,7 @@ def run_preprocessing_loop(
             max_pool_tasks = 2 * worker_pool_size
             buffer_size = 2 * max_pool_tasks + max_dataset_queue_size
             dataset_queue = manager.Queue(max_dataset_queue_size)
-            io_buffer = SharedMemoryArray(smm, buffer_size, int(1e8))
+            io_buffer = SharedMemoryArray(smm, buffer_size, int(1e10))
             free_slots = set(range(buffer_size))
             logger.info(f"Shared memory buffer size: {io_buffer.get_memory_size() / 2**30} Gb")
             logger.info(f"Start {worker_pool_size} workers for preprocessing")

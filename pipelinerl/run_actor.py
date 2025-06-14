@@ -17,6 +17,7 @@ import uvloop
 from omegaconf import DictConfig
 from pydantic import BaseModel, Field
 from tapeagents.llms import TrainableLLM
+from pipelinerl.async_vlm import TrainableVLM
 from typing import Dict, List
 
 import wandb
@@ -315,7 +316,7 @@ class ActorLoop:
         self.problem_queue = mp.Queue()
         self.result_queue = mp.Queue(max_ready_groups_waiting)
         self.buffer_size = self.max_groups_in_progress + max_ready_groups_waiting
-        self.io_buffer = SharedMemoryArray(self.smm, self.buffer_size, int(1e7))
+        self.io_buffer = SharedMemoryArray(self.smm, self.buffer_size, int(1e10))
         self.free_slots = set(range(self.buffer_size))
         logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
         logger.info(f"Max groups in progress: {self.max_groups_in_progress}, buffer size: {self.buffer_size}")
@@ -628,8 +629,13 @@ def run_actor_loop(cfg: DictConfig):
         actor_model_path = finetune_model_path
     else:
         actor_model_path = cfg.model_path
+    
+    # Use TrainableVLM for vision-language models
+    is_vision_model = cfg.finetune.model_class == "vision2seq-language-modeling"
+    llm_class = TrainableVLM if is_vision_model else TrainableLLM
+    
     train_llms = [
-        TrainableLLM(
+        llm_class(
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
@@ -641,7 +647,7 @@ def run_actor_loop(cfg: DictConfig):
         for url in llm_urls
     ]
     test_llms = [
-        TrainableLLM(
+        llm_class(
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),

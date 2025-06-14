@@ -21,13 +21,13 @@ async def llm_async_generate(llm: TrainableLLM, prompt: Prompt, session: aiohttp
         "stream": llm.stream,
     }
     if llm.collect_logprobs:
-        data.update(
-            {
-                "logprobs": 1,
-                "include_stop_str_in_output": True,
-                "skip_special_tokens": False,
-            }
-        )
+        logprob_data = {
+            "logprobs": 1,
+            "include_stop_str_in_output": True,
+            "skip_special_tokens": False,
+            "echo": True,  
+        }
+        data.update(logprob_data)
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
@@ -50,22 +50,27 @@ async def llm_async_generate(llm: TrainableLLM, prompt: Prompt, session: aiohttp
 
         parsed_logprobs = []
         if llm.collect_logprobs:
-            completion_logprobs = data["choices"][0]["logprobs"]["content"]
-            for logprob in completion_logprobs:
-                if logprob:
-                    try:
-                        # We assume that the server was launched with --return-tokens-as-token-ids
-                        # and that the tokens are provided as: ['token_id:1271', 'token_id:1505', '
-                        parsed_logprobs.append(
-                            TokenLogprob(
-                                token_id=int(logprob["token"].split(":")[-1]),
-                                logprob=logprob["logprob"],
-                                generated=1,
-                            )
+            prompt_logprobs = data['prompt_logprobs'][1:]
+            for prompt_logprob in prompt_logprobs:
+                for k, v in prompt_logprob.items():
+                    parsed_logprobs.append(
+                        TokenLogprob(
+                            token_id=int(k),
+                            logprob=v["logprob"],
+                            generated=0,  # Prompt tokens are not generated
                         )
-                    except Exception as e:
-                        logger.error(f"Failed to process logprobs: {logprob}")
-                        logger.error(e)
+                    )
+            
+            completion_logprobs = data["choices"][0]["logprobs"]["content"]
+            for completion_logprob in completion_logprobs:
+                parsed_logprobs.append(
+                    TokenLogprob(
+                        token_id=int(completion_logprob["token"].split(":")[-1]),  # Extract token ID from 'token_id:1271' format
+                        logprob=completion_logprob["logprob"],
+                        generated=1,  # Completion tokens are generated
+                    )
+                )
+            
     except Exception as e:
         logger.exception(f"Failed to parse llm response: {data}")
         raise e
@@ -83,15 +88,21 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     training_text = llm.make_training_text(llm_call.prompt, llm_call.output)
     if not llm_call.logprobs:
         raise ValueError("Logprobs are required to make training data for RL")
-    # We add the exact token ids and logprobs to "training_text" to ensure inference/training consistency
-    prompt_token_ids = llm.tokenizer.apply_chat_template(
-        llm_call.prompt.messages, add_special_tokens=True, add_generation_prompt=True
-    )    
-    labels = [lp.token_id for lp in llm_call.logprobs]
+    
+    # Extract prompt tokens from logprobs if available (when echo=True)
+    # This ensures we use the exact same tokenization as VLLM
+    prompt_logprobs = [lp for lp in llm_call.logprobs if lp.generated == 0]
+    completion_logprobs = [lp for lp in llm_call.logprobs if lp.generated == 1]
+    
+    # Use prompt tokens from VLLM (consistent with server tokenization)
+    prompt_token_ids = [lp.token_id for lp in prompt_logprobs]
+    labels = [lp.token_id for lp in completion_logprobs]
+    logprobs = [lp.logprob for lp in completion_logprobs]
+    
     input_ids = prompt_token_ids + labels
     # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
     training_text.input_ids = input_ids
     training_text.labels = labels
-    training_text.logprobs = [lp.logprob for lp in llm_call.logprobs]
+    training_text.logprobs = logprobs
     return training_text

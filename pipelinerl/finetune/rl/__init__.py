@@ -177,6 +177,12 @@ def rl_step(
     }
     if is_packed:
         model_inputs["position_ids"] = batch["position_ids"]
+    
+    # Add visual features if present (for multimodal models)
+    if "pixel_values" in batch and batch["pixel_values"] is not None:
+        model_inputs["pixel_values"] = batch["pixel_values"]
+    if "image_thw" in batch and batch["image_thw"] is not None:
+        model_inputs["image_grid_thw"] = batch["image_thw"].reshape((1, 3))
 
     outputs = model(**model_inputs)
 

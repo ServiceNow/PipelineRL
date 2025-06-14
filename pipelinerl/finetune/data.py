@@ -147,6 +147,13 @@ def preprocess_fn(
             entry["logprobs"],
             entry["ref_logprobs"],
         )
+    
+    # Preserve visual fields if they exist
+    if "pixel_values" in entry:
+        encoding["pixel_values"] = entry["pixel_values"]
+    if "image_thw" in entry:
+        encoding["image_thw"] = entry["image_thw"]
+    
     return encoding
 
 
@@ -157,21 +164,40 @@ def collate(
     pad_to_multiple_of: int = 16,
 ) -> BatchEncoding:
     # turn list of dicts with the same keys into a dict of lists
+    #TODO: pop useless fields like "group_id" if they are not needed
     example_dict = {key: [example[key] for example in examples] for key in examples[0].keys()}
     seq_length = max(len(i) for i in example_dict["input_ids"])
     if seq_length % pad_to_multiple_of:
         seq_length += pad_to_multiple_of - (seq_length % pad_to_multiple_of)
     result = {}
+    
+    # Visual feature fields that should be stacked, not padded
+    visual_fields = {"pixel_values", "image_thw"}
+    
     for k, seq_list in example_dict.items():
-        padded_sequences = []
-        pad_value = label_mask_value if k == "labels" else (0.0 if k in RL_DATA_COLUMNS else 0)
-        for seq in seq_list:
-            if not isinstance(seq, list):
-                seq = [seq]
-            padding = [pad_value] * (seq_length - len(seq))
-            padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
-            padded_sequences.append(padded)
-        result[k] = torch.tensor(padded_sequences)
+        if k == "group_id": # TODO: why is group_id here now?
+            continue
+        if k in visual_fields:
+            # Handle visual tensors: filter out None values and stack
+            if k == "image_thw":
+                # image_thw should remain as a list of lists for the model to iterate over
+                # Don't convert to tensor - just collect the lists
+                result[k] = seq_list
+            else:
+                # Other visual fields like pixel_values can be stacked as tensors
+                valid_tensors = [torch.tensor(seq) for seq in seq_list]
+                result[k] = torch.stack(valid_tensors)
+        else:
+            # Handle sequence data: pad as usual
+            padded_sequences = []
+            pad_value = label_mask_value if k == "labels" else (0.0 if k in RL_DATA_COLUMNS else 0)
+            for seq in seq_list:
+                if not isinstance(seq, list):
+                    seq = [seq]
+                padding = [pad_value] * (seq_length - len(seq))
+                padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
+                padded_sequences.append(padded)
+            result[k] = torch.tensor(padded_sequences)
     return BatchEncoding(result, tensor_type="pt")
 
 
@@ -198,6 +224,10 @@ def collate_packed(
     # initialize lists for extra keys
     extra_keys = [col for col in RL_DATA_COLUMNS if col in examples[0]]
     extra_lists = {key: [] for key in extra_keys}
+    
+    # handle visual features separately
+    visual_fields = {"pixel_values", "image_thw"}
+    visual_tensors = {}
 
     for i, example in enumerate(examples):
         start_idx = seq_boundaries[i].item()
@@ -222,10 +252,29 @@ def collate_packed(
                 extra_lists[key].extend(value)
             else:
                 extra_lists[key].append(value)
+        
+        # collect visual features
+        for visual_field in visual_fields:
+            if visual_field in example and example[visual_field] is not None:
+                if visual_field not in visual_tensors:
+                    visual_tensors[visual_field] = []
+                visual_tensors[visual_field].append(example[visual_field])
 
     extra_tensors = default_data_collator([{k: extra_lists[k] for k in extra_keys}], return_tensors="pt")
 
-    result = {**base_tensors, **extra_tensors}
+    # stack visual tensors
+    for visual_field, tensors in visual_tensors.items():
+        if tensors:
+            if visual_field == "image_thw":
+                # image_thw should remain as a list of lists for the model to iterate over
+                visual_tensors[visual_field] = tensors
+            else:
+                # Other visual fields like pixel_values can be stacked as tensors
+                visual_tensors[visual_field] = torch.stack(tensors)
+        else:
+            visual_tensors[visual_field] = None
+
+    result = {**base_tensors, **extra_tensors, **visual_tensors}
     return BatchEncoding(result)
 
 
