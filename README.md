@@ -28,7 +28,7 @@ PipelineRL tackles the classic trade-off between **inference throughput** (large
 Clone the repository and change the directory to `pipelinerl`
 ```bash
 git clone git@github.com:ServiceNow/PipelineRL.git
-cd pipelinerl
+cd PipelineRL
 ```
 
 Create the environments with dependencies.
