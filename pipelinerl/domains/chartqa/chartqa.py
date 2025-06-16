@@ -48,7 +48,7 @@ def create_multimodal_message(image: Image.Image, question: str) -> Dict[str, An
             {
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/png;base64,{image_base64}",
+                    "url": f"data:image;base64,{image_base64}",
                 }
             },
             {

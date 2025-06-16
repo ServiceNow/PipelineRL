@@ -11,6 +11,10 @@ from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, List, Literal
+from PIL import Image
+import io
+import base64
+import numpy as np
 
 import deepspeed
 import requests
@@ -126,21 +130,14 @@ def sample_generator_fn(sample_queue):
         yield sample_or_exc
 
 
-def convert_base64_to_image(base64_str: str) -> torch.Tensor:
+def convert_base64_to_image(base64_str: str) -> np.ndarray:
     """Convert a base64-encoded image string to a PyTorch tensor."""
-    from PIL import Image
-    import io
-    import base64
-    import numpy as np
 
     # Decode the base64 string
     image_data = base64.b64decode(base64_str)
     # Convert bytes to a PIL Image
-    image = Image.open(io.BytesIO(image_data)).convert("RGB")
-    # Convert PIL Image to a PyTorch tensor
-    # TODO: permute looks weird here
-    tensor = torch.tensor(np.array(image)).permute(2, 0, 1)  # Change to CxHxW format
-    return tensor.float() / 255.0  # Normalize to [0, 1]
+    image = Image.open(io.BytesIO(image_data))
+    return np.array(image)
 
 def run_fixed_batch_data_loader(
     sample_queue: Queue[Dict | Exception],
@@ -158,22 +155,24 @@ def run_fixed_batch_data_loader(
             buffer = []
             while True:
                 entry = next(sample_generator)
-                if entry and "images" in entry:
-                    print(entry)
-                    text = ""
-                    images = [convert_base64_to_image(img) for img in entry["images"]]
+                if entry is None:
+                    continue
+
+                if images_base64 := entry.get("images"):
+                    prompt_token_ids = [t for t, l in zip(entry["input_ids"], entry["labels"]) if l == -100]
+                    text = tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
+                    images = [convert_base64_to_image(image_base64) for image_base64 in images_base64]
                     processed = processor(
                         text=[text],
-                        images=entry["image"],
+                        images=images,
                         padding=True,
                         return_tensors=None
                     )
                     # Convert numpy arrays to lists for JSON serialization
                     entry["pixel_values"] = processed.pixel_values # num_channels, image_size, image_size
                     entry["image_thw"] = processed.image_grid_thw # 3
+                    _ = entry.pop("images", None)  # Remove images_base64 to avoid duplication
 
-                if entry is None:
-                    continue
                 buffer.append(entry)
                 if len(buffer) == batch_size:
                     batch = collate(buffer, tokenizer=tokenizer)

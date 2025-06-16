@@ -155,9 +155,9 @@ def extract_images_from_messages(messages) -> List[str]:
                 elif content_item.get('type') == 'image_url' and 'image_url' in content_item:
                     # Handle base64 format
                     url = content_item['image_url']['url']
-                    if url.startswith('data:image/png;base64,'):
+                    if url.startswith('data:image;base64,,'):
                         try:
-                            base64_data = url.split('data:image/png;base64,')[1]
+                            base64_data = url.split('data:image;base64,,')[1]
                             images.append(base64_data)
                         except Exception as e:
                             raise e
