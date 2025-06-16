@@ -26,7 +26,7 @@ class VLMCall(LLMCall):
 
 class MultimodalTrainingText(TrainingText):
     """Extended TrainingText class for multimodal inputs with visual features."""
-    image: bytes | None = None
+    images: list[str]
     
     #pixel_values: Optional[list] = None
     #image_thw: Optional[list] = None
