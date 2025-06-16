@@ -1,6 +1,6 @@
 import logging
 import aiohttp
-from typing import Optional
+from typing import Optional, List
 import torch
 import base64
 import io
@@ -10,6 +10,8 @@ from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from tapeagents.core import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainingText
 from tapeagents.llms.trainable import TrainableLLM
 from transformers import AutoProcessor
+from vllm.multimodal.image import ImageMediaIO
+import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -24,10 +26,10 @@ class VLMCall(LLMCall):
 
 class MultimodalTrainingText(TrainingText):
     """Extended TrainingText class for multimodal inputs with visual features."""
-    model_config = {"arbitrary_types_allowed": True}
+    image: bytes | None = None
     
-    pixel_values: Optional[list] = None
-    image_thw: Optional[list] = None
+    #pixel_values: Optional[list] = None
+    #image_thw: Optional[list] = None
 
 
 class TrainableVLM(TrainableLLM):
@@ -53,9 +55,9 @@ async def vlm_async_generate(vlm: TrainableVLM, prompt: Prompt, session: aiohttp
     vlm.load_processor()
     
     # Extract images and calculate metrics
-    images = extract_images_from_messages(prompt.messages)
-    num_images = len(images)
-    image_sizes = [img.size for img in images] if images else None
+    #images = extract_images_from_messages(prompt.messages)
+    #num_images = len(images)
+    #image_sizes = [img.size for img in images] if images else None
     
     headers = {"Content-Type": "application/json"}
     if vlm.api_token:
@@ -129,15 +131,15 @@ async def vlm_async_generate(vlm: TrainableVLM, prompt: Prompt, session: aiohttp
     # Convert to VLMCall with image metrics
     vlm_call = VLMCall(
         **llm_call.model_dump(),
-        num_images=num_images,
-        image_sizes=image_sizes,
+        #num_images=num_images,
+        #image_sizes=image_sizes,
         logprobs=parsed_logprobs
     )
     
     return vlm_call
 
 
-def extract_images_from_messages(messages):
+def extract_images_from_messages(messages) -> List[str]:
     """Extract PIL Images from multimodal messages."""
     if messages is None:
         raise ValueError("Messages cannot be None")
@@ -153,12 +155,10 @@ def extract_images_from_messages(messages):
                 elif content_item.get('type') == 'image_url' and 'image_url' in content_item:
                     # Handle base64 format
                     url = content_item['image_url']['url']
-                    if url.startswith('data:image;base64,'):
+                    if url.startswith('data:image/png;base64,'):
                         try:
-                            base64_data = url.split('data:image;base64,')[1]
-                            image_data = base64.b64decode(base64_data)
-                            image = Image.open(io.BytesIO(image_data))
-                            images.append(image)
+                            base64_data = url.split('data:image/png;base64,')[1]
+                            images.append(base64_data)
                         except Exception as e:
                             raise e
     
@@ -174,45 +174,9 @@ def make_multimodal_training_text(vlm: TrainableVLM, vlm_call: VLMCall) -> Multi
     
     # Start with regular training text
     training_text = make_training_text(vlm, vlm_call)
+    images = extract_images_from_messages(vlm_call.prompt.messages)
     
-    # Extract visual features if present
-    pixel_values = None
-    image_thw = None
-    
-    if hasattr(vlm_call.prompt, 'messages'):
-        images = extract_images_from_messages(vlm_call.prompt.messages)
-        if images:
-            # Load processor if not already loaded
-            if vlm.processor is None:
-                vlm.load_processor()
-            
-            if vlm.processor is not None:
-                try:
-                    # Process images and text with the model's processor
-                    # Apply chat template to get text representation
-                    text = vlm.processor.apply_chat_template(
-                        vlm_call.prompt.messages, 
-                        tokenize=False, 
-                        add_generation_prompt=True
-                    )
-                    
-                    # Process with both text and images
-                    processed = vlm.processor(
-                        text=[text],
-                        images=images,
-                        padding=True,
-                        return_tensors=None
-                    )
-                    # Convert numpy arrays to lists for JSON serialization
-                    pixel_values = processed.pixel_values.tolist() # num_channels, image_size, image_size
-                    image_thw = processed.image_grid_thw.tolist() # 3
-                except Exception as e:
-                    raise ValueError(f"Failed to process images with processor: {e}")
-    
-    # Create multimodal training text with visual features
-    assert pixel_values is not None or image_thw is not None, "No visual features found in llm_call"
     return MultimodalTrainingText(
         **training_text.model_dump(),
-        pixel_values=pixel_values,
-        image_thw=image_thw
+        images=images
     )

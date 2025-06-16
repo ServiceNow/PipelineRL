@@ -172,13 +172,14 @@ def collate(
     result = {}
     
     # Visual feature fields that should be stacked, not padded
-    visual_fields = {"pixel_values", "image_thw"}
+    visual_fields = {"image_bytes"}
     
     for k, seq_list in example_dict.items():
         if k == "group_id": # TODO: why is group_id here now?
             continue
         if k in visual_fields:
             # Handle visual tensors: filter out None values and stack
+            result["image_thw"]
             if k == "image_thw":
                 # image_thw should remain as a list of lists for the model to iterate over
                 # Don't convert to tensor - just collect the lists

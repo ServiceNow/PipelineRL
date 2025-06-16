@@ -134,11 +134,27 @@ def run_fixed_batch_data_loader(
 ):
     """Incrementally load chunks to populate the dataset queue."""
     sample_generator = sample_generator_fn(sample_queue)
+    #TODO: rm debug code
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
     while True:
         try:
             buffer = []
             while True:
                 entry = next(sample_generator)
+                if "image" in entry:
+                    print(entry)
+                    text = ""
+                    processed = processor(
+                        text=[text],
+                        images=entry["image"],
+                        padding=True,
+                        return_tensors=None
+                    )
+                    # Convert numpy arrays to lists for JSON serialization
+                    entry["pixel_values"] = processed.pixel_values # num_channels, image_size, image_size
+                    entry["image_thw"] = processed.image_grid_thw # 3
+
                 if entry is None:
                     continue
                 buffer.append(entry)

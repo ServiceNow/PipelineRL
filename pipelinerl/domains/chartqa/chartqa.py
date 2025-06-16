@@ -15,7 +15,7 @@ from pipelinerl.async_vlm import TrainableVLM
 
 from pipelinerl.async_vlm import vlm_async_generate, make_multimodal_training_text
 from .evaluation import evaluate_answer
-
+from vllm.multimodal.image import ImageMediaIO
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +40,7 @@ def encode_image_to_base64(image: Image.Image) -> str:
 
 def create_multimodal_message(image: Image.Image, question: str) -> Dict[str, Any]:
     """Create a multimodal message with image and text."""
-    image_base64 = encode_image_to_base64(image)
+    image_base64 = ImageMediaIO().encode_base64(image)
     
     return {
         "role": "user",
@@ -48,7 +48,7 @@ def create_multimodal_message(image: Image.Image, question: str) -> Dict[str, An
             {
                 "type": "image_url",
                 "image_url": {
-                    "url": image_base64
+                    "url": f"data:image/png;base64,{image_base64}",
                 }
             },
             {
