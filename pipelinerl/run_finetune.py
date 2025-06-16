@@ -126,6 +126,22 @@ def sample_generator_fn(sample_queue):
         yield sample_or_exc
 
 
+def convert_base64_to_image(base64_str: str) -> torch.Tensor:
+    """Convert a base64-encoded image string to a PyTorch tensor."""
+    from PIL import Image
+    import io
+    import base64
+    import numpy as np
+
+    # Decode the base64 string
+    image_data = base64.b64decode(base64_str)
+    # Convert bytes to a PIL Image
+    image = Image.open(io.BytesIO(image_data)).convert("RGB")
+    # Convert PIL Image to a PyTorch tensor
+    # TODO: permute looks weird here
+    tensor = torch.tensor(np.array(image)).permute(2, 0, 1)  # Change to CxHxW format
+    return tensor.float() / 255.0  # Normalize to [0, 1]
+
 def run_fixed_batch_data_loader(
     sample_queue: Queue[Dict | Exception],
     batch_queue: Queue[VersionedTensors | Exception],
@@ -142,9 +158,10 @@ def run_fixed_batch_data_loader(
             buffer = []
             while True:
                 entry = next(sample_generator)
-                if "image" in entry:
+                if entry and "images" in entry:
                     print(entry)
                     text = ""
+                    images = [convert_base64_to_image(img) for img in entry["images"]]
                     processed = processor(
                         text=[text],
                         images=entry["image"],
