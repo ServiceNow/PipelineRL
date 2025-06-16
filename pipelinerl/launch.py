@@ -19,7 +19,7 @@ from pipelinerl.world import Job, WorldMap
 logger = logging.getLogger(__name__)
 
 # All the launch commands in this file pass the environment to child processes
-os.environ["PYTHONPATH"] = f"{os.getcwd()}"
+os.environ["PYTHONPATH"] = f"/home/toolkit/TapeAgents"
 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -128,7 +128,7 @@ def run_actor_llm(
             if v not in [None, ""]:
                 cmd.append(str(v))
 
-    if cfg.debug.mode in ["actor", "open_loop"]:
+    if cfg.debug.mode:
         cmd.append("--disable-weight-updates")
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
@@ -444,10 +444,14 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
         elif job.kind == "environment":
             processes.extend(run_environment(cfg, job))
         elif job.kind == "actor_llm":
+            if cfg.debug.use_existing_llms:
+                continue
             processes.extend(run_actor_llm(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "preprocessor":
             processes.extend(run_preprocess(world_map, job.replica_idx, exp_dir))
         elif job.kind == "preprocessor_llm":
+            if cfg.debug.use_existing_llms:
+                continue            
             processes.extend(run_ref_llm(cfg, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "finetune":
             processes.extend(run_finetune(cfg, world_map, job.gpus, exp_dir))
@@ -483,11 +487,11 @@ def main(cfg: DictConfig):
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
 
     group = str(exp_dir)
-    root = cfg.finetune.wandb_workspace_root
+    root = cfg.wandb.wandb_workspace_root
     if root:
         if not group.startswith(root + "/"):
             raise ValueError(f"run_dir {exp_dir} does not start with root {root}")
-        cfg.finetune.wandb_group = group[len(root) + 1 :]
+        cfg.wandb.wandb_group = group[len(root) + 1 :]
     if world_map.total_finetune_gpus:
         accum_passes = cfg.finetune.gradient_accumulation_passes
         n_gpus = world_map.total_finetune_gpus
@@ -545,6 +549,8 @@ def main(cfg: DictConfig):
         processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
         processes.extend(launch_jobs(cfg, world_map, ["preprocessor", "preprocessor_llm"]))
+    elif cfg.debug.mode == "actor+preprocessor":
+        processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm", "preprocessor", "preprocessor_llm"]))       
     elif cfg.debug.mode in ["", "open_loop"]:
         processes.extend(launch_jobs(cfg, world_map))
     else:

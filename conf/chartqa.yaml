@@ -27,6 +27,10 @@ actor:
     
     Please analyze the chart step by step and put your final answer within \\boxed{{}}.
   llm_max_rollouts: 16
+  shared_memory_entry_size: 2000000000
+
+preprocess:
+  shared_memory_entry_size: 2000000000
 
 environment: null
 

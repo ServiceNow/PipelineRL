@@ -1,0 +1,140 @@
+defaults:
+  - base
+
+world:
+  actor_fraction: 4
+  preprocessor_fraction: 1
+  finetune_fraction: 3
+
+# debug:
+#   mode: actor
+save_tapes: False
+
+output_dir: results/miniwob_debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: meta-llama/Llama-3.1-8B-Instruct
+
+finetune:
+  save_checkpoint_steps: 10
+  seq_length: 4096
+  train_batch_size: 1
+  gradient_accumulation_passes: 1024
+  learning_rate: 1e-6
+  optim: adamw_torch
+  rl:
+    kl_coef: 0.01  # GRPO beta coefficient
+    reward_minus_kl_coef: 0.0  # RLOO beta coefficient
+    use_advantages: true
+    algo: grpo
+
+llm:
+  parameters:
+    max_tokens: 3072
+    temperature: 1.0
+test_llm:
+  parameters:
+    max_tokens: ${...llm.parameters.max_tokens}
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 50
+
+vllm_config:
+  vllm_kwargs:
+    enable-auto-tool-choice: ""
+    tool-call-parser: llama3_json # use hermes for qwen
+    chat_template: pipelinerl/miniwob/tool_chat_template_llama3.1_json.jinja  # copy pasted from https://github.com/vllm-project/vllm/blob/main/examples/tool_chat_template_llama3.1_json.jinja
+    enforce-eager: ""  # speed the actor llm startup a bit
+
+actor:
+  rollout_policy: pipelinerl.miniwob.rollouts.generate_miniwob_rollout
+  shared_memory_entry_size: 100000000
+
+preprocess:
+  shared_memory_entry_size: 1000000000
+
+# AGENT CONFIGURATION
+agent_max_loops: 10  # max number of agent - environment interactions for each task
+agent:
+  _target_: tapeagents.agent.Agent
+  name : web_agent
+  max_iterations: 4  # max number of iterations (make_prompt + llm? + generate_steps) for each loop
+  store_llm_calls: true
+  templates:
+    system_prompt: |
+      You are an expert AI Agent, your goal is to help the user perform tasks using a web browser.
+      Your role is to understand user queries and respond in a helpful and accurate manner.
+      Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
+      You will be provided with the content of the current page and a task from the user.
+      Do not express your emotions or opinions about the user question.
+    allowed_tools: |
+      You have access to the following tools:
+      {tools_description}
+    thought_format: |
+      Important! Respond with the plain text, do not include any JSON or code.
+      Do not output anything besides what I asked in this message.
+  nodes:
+    - _target_: examples.rl_webagent.agent.WebNode
+      name: set_goal
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: |
+        Produce the thought that describes the intended solution to the task. In the reasoning lines:
+        - review the instructions from the user and the content of the page.
+        - outline the main task to be accomplished and the steps to be taken to achieve it.
+        - produce definiton of done, that will be checked later to verify if the task was completed.
+        ${agent.templates.thought_format}
+      steps_prompt: ${agent.templates.allowed_tools}
+      trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
+      max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
+    - _target_: examples.rl_webagent.agent.WebNode
+      name: reflect
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: |
+        Review the current state of the page and previous steps to find the best possible next action to accomplish the task.
+        Produce the reflection_thought to describe the current page state, reflect on your last action, describe what is left to do, and what will be the immediate next action.
+        Produce only one reflection_thought step!
+        ${agent.templates.thought_format}
+      steps_prompt: ${agent.templates.allowed_tools}
+      trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
+      max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
+    - _target_: examples.rl_webagent.agent.WebNode
+      name: act
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: |
+        Produce the single next tool call to be performed with the current page.
+        If you think that the task is solved, call the FinalAnswer.
+        You can interact with the page elements using their BIDs or coordinates as arguments for actions.
+        HINTS:
+        - You can use the BIDs of the elements or the mouse position in x, y coordinates to interact with them.
+        - To select value in a dropdown or combobox, ALWAYS use SelectOption tool.
+        - To click on a checkbox or radio button, ALWAYS use BID (or coordinates) of the corresponding Text and not the BID (or coordinates) of the element itself.
+        - Press enter key to submit the search query.
+      use_known_actions: true
+      use_function_calls: true
+      steps:
+        - examples.rl_webagent.steps.FinalAnswerAction
+      trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
+      max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
+      next_node: reflect
+
+
+# ENVIRONMENT CONFIGURATION
+start_attempts: 3  # number of attempts to start each task
+environment:
+  _target_: pipelinerl.miniwob.environment_server.WebEnvironmentServer
+  miniwob_url: file:///home/toolkit/miniwob-plusplus/miniwob/html/miniwob/
+  n_envs: 64
+  host: "0.0.0.0"
+  max_session_inactivity_secs: 300
+  web_env_target: examples.rl_webagent.environment.WebEnvironment
+  exp_path: ${output_dir}/env_server
+  headless: true
+  observation_format: html
+
+# DATASET CONFIGURATION
+dataset_loader: pipelinerl.miniwob.load_tasks.load_tasks
+dataset_loader_params:
+  train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
+  seeds: [0, 42, 1337, 900, 103]
+train_dataset_names:
+  - train
+test_dataset_names:
+  - test
