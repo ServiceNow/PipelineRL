@@ -8,6 +8,8 @@ finetune:
   seq_length: 8000
   gradient_accumulation_passes: 512
   seq_packing: false
+  preprocessor:
+    _target_: 
 
 llm:
   parameters:
