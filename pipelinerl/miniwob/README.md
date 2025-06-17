@@ -9,7 +9,6 @@ Clone [TapeAgents](https://github.com/ServiceNow/TapeAgents/) in your parent fol
 cd ..
 git clone git@github.com:ServiceNow/TapeAgents.git
 cd TapeAgents
-git checkout async_web_agent  # required until #230 is merged into main
 pip install -e .
 pip install 'tapeagents[finetune,converters]=0.1.12'
 cd ../PipelineRL
