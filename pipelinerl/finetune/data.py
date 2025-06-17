@@ -164,7 +164,6 @@ def collate(
     pad_to_multiple_of: int = 16,
 ) -> BatchEncoding:
     # turn list of dicts with the same keys into a dict of lists
-    #TODO: pop useless fields like "group_id" if they are not needed
     example_dict = {key: [example[key] for example in examples] for key in examples[0].keys()}
     seq_length = max(len(i) for i in example_dict["input_ids"])
     if seq_length % pad_to_multiple_of:
@@ -175,7 +174,8 @@ def collate(
     visual_fields = {"pixel_values", "image_thw"}
     
     for k, seq_list in example_dict.items():
-        if k == "group_id": # TODO: why is group_id here now?
+        if any([isinstance(seq, str) for seq in seq_list]) or any([isinstance(seq, dict) for seq in seq_list]) :
+            logger.info(f"Skipping key {k} because it contains non-sequence data")
             continue
         if k in visual_fields:
             # Handle visual tensors: filter out None values and stack

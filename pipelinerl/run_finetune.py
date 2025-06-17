@@ -148,8 +148,12 @@ def run_fixed_batch_data_loader(
     """Incrementally load chunks to populate the dataset queue."""
     sample_generator = sample_generator_fn(sample_queue)
     #TODO: rm debug code
-    from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+    #from transformers import AutoProcessor
+    #processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+    from vllm.model_executor.models.qwen_vl import QwenVLProcessor
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+    processor = QwenVLProcessor(config=config, tokenizer=tokenizer)
     while True:
         try:
             buffer = []
