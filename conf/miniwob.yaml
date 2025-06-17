@@ -123,7 +123,7 @@ environment:
   miniwob_url: file:///home/toolkit/miniwob-plusplus/miniwob/html/miniwob/
   n_envs: 64
   host: "0.0.0.0"
-  max_session_inactivity_secs: 300
+  max_session_inactivity_secs: 600
   web_env_target: examples.rl_webagent.environment.WebEnvironment
   exp_path: ${output_dir}/env_server
   headless: true
