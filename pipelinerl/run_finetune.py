@@ -712,45 +712,9 @@ def rl_finetuning_worker(
         dist.all_gather(all_samples, local_samples)
         total_samples = sum(int(tensor.item()) for tensor in all_samples)
         do_optimizer_step = total_samples == target_samples
-        using_deepspeed = isinstance(model, deepspeed.DeepSpeedEngine)
 
-        def backward(loss, is_final_micro_batch=False):
-            """Perform backward pass with appropriate gradient accumulation boundary"""
-            if using_deepspeed:
-                # Tell DeepSpeed whether this is a boundary for gradient accumulation
-                model.set_gradient_accumulation_boundary(is_final_micro_batch)
-                # DeepSpeed's backward
-                model.backward(loss)
-            else:
-                # accelerator's backward
-                get_accelerator().backward(loss)
-
-        def optimizer_step_and_zero_grad():
-            """Perform optimizer step and zero gradients"""
-            if using_deepspeed:
-                # Final boundary before optimizer step
-                model.set_gradient_accumulation_boundary(True)
-                model.step()
-                grad_norm = model.get_global_grad_norm() if hasattr(model, "get_global_grad_norm") else None
-                if isinstance(training_metrics.grad_norm, torch.Tensor):
-                    grad_norm = grad_norm.item()
-                training_metrics.grad_norm = grad_norm if grad_norm is not None else -1.0
-            else:
-                max_grad_norm = args.get("gradient_clipping_threshold", None)
-                training_metrics.grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-        
-        @contextlib.contextmanager
-        def toggle_sync(sync: bool):
-            """Wrap accelerate.no_sync() if sync is False."""
-            if sync:
-                yield  # do not enforce no_sync mode
-            else:
-                with get_accelerator().no_sync(model):
-                    yield
-
-        with toggle_sync(do_optimizer_step):
+        # Use Accelerate's accumulate context manager to handle gradient accumulation automatically
+        with get_accelerator().accumulate(model):
             # Choose RL step function based on seq_packing config
             loss, this_step_rl_metrics = rl_step(
                 model, batch, training_metrics.completed_steps, final_train_steps, rl_config
@@ -765,7 +729,21 @@ def rl_finetuning_worker(
 
                 training_metrics.lr = optimizer.param_groups[0]["lr"]
 
-            backward(loss, is_final_micro_batch=do_optimizer_step)
+            # Use accelerator's unified backward method
+            get_accelerator().backward(loss)
+            
+            # Only perform optimizer step when sync_gradients is True (handled automatically by accumulate)
+            if get_accelerator().sync_gradients:
+                # Clip gradients using accelerator's unified method (handles DeepSpeed/FSDP automatically)
+                max_grad_norm = args.get("gradient_clipping_threshold", None)
+                if max_grad_norm is not None:
+                    grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
+                    training_metrics.grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                else:
+                    training_metrics.grad_norm = -1.0
+                    
+                optimizer.step()
+                optimizer.zero_grad()
 
         if not is_sentinel_batch:
             passes_took.append(time.time() - time_before_pass)
@@ -786,16 +764,10 @@ def rl_finetuning_worker(
         training_metrics.samples = start_samples + total_samples
         this_worker_tokens = sum(tokens_processed)
         training_metrics.tokens += this_worker_tokens * get_accelerator().state.num_processes
-        try:
-            # Synchronize workers before optimizer step
-            logger.info("Waiting for all workers to synchronize...")
-            torch.cuda.synchronize()  # Ensure CUDA operations are complete
-            get_accelerator().wait_for_everyone()
-            logger.info("All workers synchronized successfully")
-        except Exception as e:
-            logger.warning(f"Synchronization error: {e}. Continuing anyway...")
+        
+        # Wait for everyone using accelerator's method
+        get_accelerator().wait_for_everyone()
 
-        optimizer_step_and_zero_grad()
         lr_scheduler.step()
 
         metrics_dict = {}
