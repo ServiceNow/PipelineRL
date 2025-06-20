@@ -75,6 +75,8 @@ objective: rl
 eval_callback:
   _target_: tapeagents.finetune.eval.dummy_eval_callback
   config_name: ""
+# Enable value head for PPO-style training
+use_value_head: false
 rl:
   kl_coef: 0.0
   final_kl_coef: ${..rl.kl_coef}
@@ -84,3 +86,5 @@ rl:
   temperature: 1.0
   entropy_bonus: 0.0
   overlong_filtering: false
+  # Coefficient for value loss (when use_value_head is true)
+  value_loss_coef: 0.5

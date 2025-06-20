@@ -289,7 +289,32 @@ class WeightUpdateManager:
         ):
             module = self.accelerated_model.module
             logger.info("Start gathering and sending ZeRO Stage 3 weights")
-            named_parameters = dict(module.named_parameters())
+            
+            # Log all parameter names before filtering
+            all_param_names = list(module.named_parameters())
+            logger.info(f"Total parameters before filtering: {len(all_param_names)}")
+            for idx, (name, _) in enumerate(all_param_names):
+                if idx < 10:
+                    logger.info(f"  Before filter: {name}")
+                elif idx == 10:
+                    logger.info(f"  ... and {len(all_param_names) - 10} more parameters")
+                    break
+            
+            # Filter out value head parameters and get only the pretrained model parameters
+            named_parameters = {
+                name.replace('pretrained_model.', ''): param 
+                for name, param in module.named_parameters() 
+                if name.startswith('pretrained_model.') and not name.startswith('pretrained_model.value_head.')
+            }
+            
+            # Log parameter names after filtering
+            logger.info(f"Total parameters after filtering: {len(named_parameters)}")
+            for idx, name in enumerate(sorted(named_parameters.keys())):
+                if idx < 10:
+                    logger.info(f"  After filter: {name}")
+                elif idx == 10:
+                    logger.info(f"  ... and {len(named_parameters) - 10} more parameters")
+                    break
 
             if get_accelerator().is_main_process:
                 parameters_info = [
@@ -329,7 +354,9 @@ class WeightUpdateManager:
                     del named_parameters["lm_head.weight"]
             else:
                 unwrapped = get_accelerator().unwrap_model(self.accelerated_model)
-                named_parameters = dict(unwrapped.named_parameters())
+                # Filter out value head parameters
+                named_parameters = {name: param for name, param in unwrapped.named_parameters() 
+                                  if not name.startswith('value_head.')}
             if get_accelerator().is_main_process:
                 assert self.update_stream is not None
                 parameters_info = [

@@ -21,6 +21,7 @@ from transformers.models.auto.modeling_auto import _BaseAutoModelClass
 from .context import get_accelerator, logger
 from .lora import has_lora_checkpoint, lora_load, lora_save, prepare_lora_model
 from .types import ModelClass, TrainingMetrics
+from .value_model import AutoModelForCausalLMWithValueHead
 
 
 def is_deepspeed_model(model) -> bool:
@@ -71,6 +72,9 @@ def load_processor(config_name):
 
 def load_model(args, model_class, current_dir):
     get_accelerator().wait_for_everyone()
+    
+    # Check if value head is enabled
+    use_value_head = getattr(args, 'use_value_head', False)
 
     assert not (
         os.path.exists(current_dir / "pytorch_model.bin")
@@ -137,12 +141,27 @@ def load_model(args, model_class, current_dir):
         logger.info(f"Initializing model {model_cls} from {args.config_name}")
 
     logger.info(f"Loading args: {loading_args}")
-    model = model_cls.from_pretrained(model_to_load, **loading_args)
+    
+    # Load the base model
+    if use_value_head and model_class == "causal-language-modeling":
+        # First load the base model
+        base_model = model_cls.from_pretrained(model_to_load, **loading_args)
+        # Then wrap it with value head
+        model = AutoModelForCausalLMWithValueHead(base_model)
+        logger.info("Loaded model with value head for PPO training")
+    else:
+        model = model_cls.from_pretrained(model_to_load, **loading_args)
 
     if args.lora.enabled:
-        model = prepare_lora_model(args.lora, model, args.gradient_checkpointing)
-        if has_lora_checkpoint(current_dir):
-            lora_load(current_dir, model)
+        # If using value head, apply LoRA to the base model
+        if use_value_head and hasattr(model, 'pretrained_model'):
+            model.pretrained_model = prepare_lora_model(args.lora, model.pretrained_model, args.gradient_checkpointing)
+            if has_lora_checkpoint(current_dir):
+                lora_load(current_dir, model.pretrained_model)
+        else:
+            model = prepare_lora_model(args.lora, model, args.gradient_checkpointing)
+            if has_lora_checkpoint(current_dir):
+                lora_load(current_dir, model)
     elif args.gradient_checkpointing:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": args.reentrant_checkpointing}
@@ -344,6 +363,19 @@ def save_model_only(
     logger.info(f"Save model to {output_dir}")
 
     unwrapped_model = get_accelerator().unwrap_model(model) if unwrap else model
+    
+    # Handle value head model
+    if isinstance(unwrapped_model, AutoModelForCausalLMWithValueHead):
+        logger.info("Saving model with value head")
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=get_accelerator().is_main_process,
+            save_function=get_accelerator().save,
+            state_dict=get_accelerator().get_state_dict(model),
+            safe_serialization=safe_serialization,
+        )
+        return
+    
     if lora:
         lora_save(output_dir, unwrapped_model)
         return
