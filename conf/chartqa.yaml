@@ -1,0 +1,52 @@
+defaults:
+  - base
+  - override streams: redis
+  - _self_
+
+finetune:
+  model_class: vision2seq-language-modeling
+  seq_length: 8000
+  gradient_accumulation_passes: 512
+  seq_packing: false
+
+llm:
+  parameters:
+    max_tokens: 2048
+    temperature: 0.7
+
+test_llm:
+  parameters:
+    max_tokens: 2048
+    temperature: 0.7
+
+actor:
+  rollout_policy: pipelinerl.domains.chartqa.generate_chartqa_rollout
+  system_prompt: You are an expert at analyzing charts and graphs. Please examine the chart carefully and answer the question accurately. Remember to provide your final answer in a boxed format, like \\boxed{{your answer}}.
+  task_template: |-
+    Question: {question}
+    
+    Please analyze the chart step by step and put your final answer within \\boxed{{}}.
+  llm_max_rollouts: 16
+  shared_memory_entry_size: 2000000000
+
+preprocess:
+  shared_memory_entry_size: 2000000000
+
+environment: null
+
+dataset_loader: pipelinerl.domains.chartqa.load_problems
+
+train_dataset_names:
+  - chartqa_train
+
+test_dataset_names:
+  - chartqa_test
+
+# Use vision-language model for multimodal support
+model_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+# Override vLLM config for multimodal support
+vllm_config:
+  vllm_kwargs:
+    max-num-seqs: 64
+    max-num-batched-tokens: 32768

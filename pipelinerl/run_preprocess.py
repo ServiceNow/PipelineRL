@@ -8,11 +8,11 @@ import multiprocessing as mp
 import queue
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+from multiprocessing import Process, Queue
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty
 from typing import List
 import random
 
@@ -21,8 +21,8 @@ import transformers
 from litellm import BaseModel, Field
 
 from pipelinerl.finetune.logging_ import flatten_dict_config
-from pipelinerl.shared_memory_array import SharedMemoryArray
-from pipelinerl.utils import wait_for_inference_servers, init_wandb
+from pipelinerl.shared_memory_array import SharedMemoryArray, SharedMemoryQueue
+from pipelinerl.utils import setup_logging, wait_for_inference_servers, init_wandb
 from pipelinerl.world import WorldMap
 
 datasets.disable_caching()
@@ -129,11 +129,8 @@ def preprocess_dataset(
     tokenizer: transformers.PreTrainedTokenizerBase,
     seq_length: int,
     rl_config: RLConfig,
-) -> Dataset:
+) -> list[dict]:
     preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True)
-    columns = ["input_ids", "labels", "attention_mask", "group_id"] + RL_DATA_COLUMNS
-    
-    logger.debug(f"Instantiated preprocess function hash {Hasher.hash(preprocess)}")
 
     data = replace_oov_tokens_with_the(data, tokenizer)
 
@@ -144,14 +141,19 @@ def preprocess_dataset(
         for entry in data:
             entry["ref_logprobs"] = entry["logprobs"]
 
-    dataset = Dataset.from_list(data)    
-    dataset = dataset.map(preprocess, keep_in_memory=True, load_from_cache_file=False)
-    dataset = dataset.with_format(columns=columns)
+    # now without Huggingface datasets
+    dataset = []
+    for i in range(len(data)):
+        entry = dict(data[i])
+        for k, v in preprocess(data[i]).items():
+            entry[k] = v
+        dataset.append(entry)        
+    for entry in dataset:
+        entry["model_version"] = entry["metadata"]["model_version"]
+        entry["rollout_index"] = entry["metadata"]["rollout_index"]
+        entry["step_index"] = entry["metadata"]["step_index"]
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
-    dataset = dataset.add_column("model_version", [entry["metadata"]["model_version"] for entry in data])  # type: ignore
-    dataset = dataset.add_column("rollout_index", [entry["metadata"]["rollout_index"] for entry in data])  # type: ignore    
-    dataset = dataset.add_column("step_index", [entry["metadata"]["step_index"] for entry in data])  # type: ignore
     dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
     return dataset
 
@@ -247,29 +249,33 @@ class SlidingWindowAggregator:
 
 def process_chunk(
     llm: TrainableLLM,
-    io_buffer,
-    slot: int,
     tokenizer: transformers.PreTrainedTokenizerBase,
     seq_length: int,
     rl_config: RLConfig,
-    dataset_queue: Queue,
+    input_queue: SharedMemoryQueue,
+    output_queue: SharedMemoryQueue,
 ):
+    """Worker process function to preprocess chunks of data"""
     try:
-        chunk = io_buffer[slot]
-        dataset = preprocess_dataset(
-            llm=llm,
-            data=chunk,
-            tokenizer=tokenizer,
-            seq_length=seq_length,
-            rl_config=rl_config,
-        )
-        io_buffer[slot] = dataset
-        dataset_queue.put(slot)
-    except Exception as e:
-        logger.error(f"Failed to preprocess chunk: {e}")
-        e.__traceback_str = traceback.format_exc()
-        io_buffer[slot] = e
-        dataset_queue.put(slot)
+        while True:
+            try:
+                chunk = input_queue.get()
+                dataset = preprocess_dataset(
+                    llm=llm,
+                    data=chunk,
+                    tokenizer=tokenizer,
+                    seq_length=seq_length,
+                    rl_config=rl_config,
+                )
+                output_queue.put(dataset)
+            except Exception as e:
+                error_info = {
+                    "error": str(e),
+                    "traceback": traceback.format_exc()
+                }
+                output_queue.put(error_info)
+    except KeyboardInterrupt:
+        return
 
 
 def filter_zero_advantage_groups(dataset: list[dict], epsilon: float = 1e-6) -> tuple[list[dict], int]:
@@ -318,11 +324,14 @@ def run_preprocessing_loop(
 
     world_map = WorldMap(cfg, verbose=True)
     exp_root_dir = Path(cfg.output_dir)
+    setup_logging(exp_root_dir / "preprocessor", "preprocessor")
 
     if cfg.wandb.use_wandb:
-        run = init_wandb(cfg, exp_root_dir / "preprocessor", flatten_dict_config(cfg))
-        if run is None:
+        wandb_run = init_wandb(cfg, exp_root_dir / "preprocessor", flatten_dict_config(cfg))
+        if wandb_run is None:
             raise ValueError("Failed to initialize wandb run")
+    else:
+        wandb_run = None
 
     tokenizer = load_tokenizer(cfg.finetune.config_name)
 
@@ -339,7 +348,7 @@ def run_preprocessing_loop(
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
     logger.info("Streams initialized")
 
-    raw_chunk_queue = Queue(cfg.preprocess.queue_size)
+    raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
     dataset_loader_worker_fn = partial(
         run_dataset_loader,
@@ -374,43 +383,44 @@ def run_preprocessing_loop(
     buffer = []
     total_filtered_out = 0  # Track total filtered samples across all batches
     with write_to_streams(output_stream) as writer, write_to_streams(stats_streams) as stats_writer:
-        with mp.Manager() as manager, SharedMemoryManager() as smm:
-            max_dataset_queue_size = 128
-            max_pool_tasks = 2 * worker_pool_size
-            buffer_size = 2 * max_pool_tasks + max_dataset_queue_size
-            dataset_queue = manager.Queue(max_dataset_queue_size)
-            io_buffer = SharedMemoryArray(smm, buffer_size, cfg.preprocess.shared_memory_entry_size)
-            free_slots = set(range(buffer_size))
-            logger.info(f"Shared memory buffer size: {io_buffer.get_memory_size() / 2**30} Gb")
+        with SharedMemoryManager() as smm:
+            # Create shared memory queues without the manager parameter
+            input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
+            output_queue = SharedMemoryQueue(smm, cfg.preprocess.output_queue_size, cfg.preprocess.shared_memory_entry_size)
+            logger.info(f"Input queue size: {input_queue.get_memory_size() / 2**30} Gb")
+            logger.info(f"Output queue size: {output_queue.get_memory_size() / 2**30} Gb")
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
-            with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
+            
+            # List to keep track of worker processes
+            workers = []
+            
+            # Start worker processes
+            for _ in range(worker_pool_size):
+                worker = Process(
+                    target=process_chunk,
+                    args=(
+                        None,  # We'll assign the LLM in the main loop
+                        tokenizer,
+                        cfg.finetune.seq_length,
+                        rl_config,
+                        input_queue,
+                        output_queue,
+                    )
+                )
+                worker.start()
+                workers.append(worker)
+            
+            try:
                 while True:
                     llm = llms[next_llm_index] if llms else None
-                    if submitted_chunks - processed_chunks < max_pool_tasks:
+                    if not input_queue.full():
                         try:
                             raw_chunk = raw_chunk_queue.get(timeout=0.001)
                             if isinstance(raw_chunk, Exception):
                                 raise raw_chunk
-                            slot = free_slots.pop()
-                            io_buffer[slot] = raw_chunk
-                            future = executor.submit(
-                                process_chunk,
-                                llm,
-                                io_buffer,
-                                slot,
-                                tokenizer,
-                                cfg.finetune.seq_length,
-                                rl_config,
-                                dataset_queue,
-                            )
-                            future.add_done_callback(
-                                lambda fut: logger.error(
-                                    f"Exception while preprocessing: {fut.exception()}",
-                                    exc_info=fut.exception(),
-                                )
-                                if fut.exception()
-                                else None
-                            )
+                            
+                            # Put chunk in the input queue for workers
+                            input_queue.put(raw_chunk)
                             submitted_chunks += 1
                             next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
                         except Empty:
@@ -419,18 +429,19 @@ def run_preprocessing_loop(
                     start_processing = time.time()
                     try:
                         # Try to write the next dataset to the output stream, if it is ready
-                        slot = dataset_queue.get(timeout=0.001)
-                        dataset = io_buffer[slot]
-                        free_slots.add(slot)
+                        dataset = output_queue.get(timeout=0.001)
                         fetching_took = time.time() - start_processing
                     except Empty:
                         continue
-                    if isinstance(dataset, Exception):
-                        logger.error(f"Got exception from the result queue")
-                        logger.error(dataset.__traceback_str)
-                        raise dataset
+                    
+                    if isinstance(dataset, dict) and "error" in dataset:
+                        logger.error(f"Got exception from the result queue: {dataset['error']}")
+                        logger.error(f"Traceback: {dataset['traceback']}")
+                        raise Exception(dataset['error'])
+                    
                     start_writing = time.time()
-                    buffer += dataset
+                    for entry in dataset:
+                        buffer.append(entry)
                     processed_chunks += 1
 
                     if len(buffer) < cfg.preprocess.buffer_size:
@@ -458,27 +469,34 @@ def run_preprocessing_loop(
                     stats_aggregator.update([len(entry["input_ids"]) for entry in filtered_buffer])
                     published_samples += len(filtered_buffer)  # Count only written samples
                     max_model_version = max([entry["model_version"] for entry in filtered_buffer]) if filtered_buffer else 0
-                    samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_n_groups
+                    samples_in_output_queue = output_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts
                     stats = {
                         "preprocessor/published_samples": published_samples,
                         "preprocessor/published_model_version": max_model_version,
-                        "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_n_groups,
+                        "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts,
                         "preprocessor/queue/raw": raw_chunk_queue.qsize(),
-                        "preprocessor/queue/dataset_samples": samples_in_queue,
-                        "preprocessor/queue/dataset": dataset_queue.qsize(),
+                        "preprocessor/queue/output_samples": samples_in_output_queue,
+                        "preprocessor/queue/output": output_queue.qsize(),
                         "preprocessor/filtered_out_samples": num_filtered_out,
                         "preprocessor/total_filtered_out_samples": total_filtered_out,
                     }
                     if stats_aggregator.has_enough_data():
                         stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
-                    run.log(stats)
+                    if wandb_run is not None:
+                        wandb_run.log(stats)
                     stats_writer.write(stats)
                     processing_took = time.time() - start_processing
                     logger.info(
                         f"Processed {len(filtered_buffer)} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
                         f" (last fetching took {fetching_took:.3f}, all writing took {writing_took:.3f})"
                         f" and wrote to {output_stream}, total {published_samples} samples so far,"
-                        f" {samples_in_queue} samples in queue, max buffer entry size {io_buffer._max_written_entry_size}"
+                        f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
                     )
                     buffer = []
+            finally:
+                # Clean up worker processes
+                for worker in workers:
+                    if worker.is_alive():
+                        worker.terminate()
+                        worker.join(timeout=1.0)
 

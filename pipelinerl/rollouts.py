@@ -1,8 +1,6 @@
 from pydantic import BaseModel, Field
-from tapeagents.core import LLMCall
-from tapeagents.llms.trainable import TrainableLLM
-from typing import List, Optional
-
+from typing import List, Optional, Dict
+import numpy as np
 
 class BaseMetrics(BaseModel):
     reward: float
@@ -27,6 +25,8 @@ class TrainingText(BaseModel):
         finished (bool): Indicates whether the text is finished or not.
         prompt_tokens (int): The number of tokens in the prompt part of the text.
         output_tokens (int): The number of tokens in the output part of the text.
+        pixel_values (Optional[List[float]]): Optional pixel values for image inputs, if applicable.
+        image_thw (Optional[List[int]]): Optional dimensions of the image in height, width, and channels.
         metadata (dict): Additional metadata associated with the training text.
         prompt_text (str): Portion of the text that serves as the prompt (i.e., the text excluding the predicted tokens).
         output_text (str): Portion of the text that represents the predicted output (i.e., the last n_predicted tokens).
@@ -43,7 +43,10 @@ class TrainingText(BaseModel):
     finished: bool = False
     prompt_tokens: int = Field(default=0)
     output_tokens: int = Field(default=0)
+    visual_features: Optional[Dict[str, np.ndarray]] = None  # For vision language models
     metadata: dict = Field(default_factory=dict)
+
+    model_config = {"arbitrary_types_allowed": True}
 
     @property
     def prompt_text(self) -> str:

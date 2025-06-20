@@ -1,5 +1,5 @@
 data: null
-# Model class. Must be one of the following: causal-language-modeling, seq2seq-language-modeling
+# Model class. Must be one of the following: causal-language-modeling, seq2seq-language-modeling, vision2seq-language-modeling
 model_class: causal-language-modeling
 # Model name or path of model to be trained.
 config_name: ???
