@@ -764,7 +764,6 @@ def rl_finetuning_worker(
         training_metrics.samples = start_samples + total_samples
         this_worker_tokens = sum(tokens_processed)
         training_metrics.tokens += this_worker_tokens * get_accelerator().state.num_processes
-        
         try:
             # Synchronize workers before optimizer step
             logger.info("Waiting for all workers to synchronize...")
