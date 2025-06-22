@@ -765,8 +765,14 @@ def rl_finetuning_worker(
         this_worker_tokens = sum(tokens_processed)
         training_metrics.tokens += this_worker_tokens * get_accelerator().state.num_processes
         
-        # Wait for everyone using accelerator's method
-        get_accelerator().wait_for_everyone()
+        try:
+            # Synchronize workers before optimizer step
+            logger.info("Waiting for all workers to synchronize...")
+            torch.cuda.synchronize()  # Ensure CUDA operations are complete
+            get_accelerator().wait_for_everyone()
+            logger.info("All workers synchronized successfully")
+        except Exception as e:
+            logger.warning(f"Synchronization error: {e}. Continuing anyway...")
 
         lr_scheduler.step()
 
