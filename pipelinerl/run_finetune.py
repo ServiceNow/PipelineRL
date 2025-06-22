@@ -713,7 +713,7 @@ def rl_finetuning_worker(
         total_samples = sum(int(tensor.item()) for tensor in all_samples)
         do_optimizer_step = total_samples == target_samples
 
-        # Use Accelerate's accumulate context manager to handle gradient accumulation automatically
+        # Perform backward pass with appropriate gradient accumulation boundary
         with get_accelerator().accumulate(model):
             # Choose RL step function based on seq_packing config
             loss, this_step_rl_metrics = rl_step(
@@ -732,9 +732,9 @@ def rl_finetuning_worker(
             # Use accelerator's unified backward method
             get_accelerator().backward(loss)
             
-            # Only perform optimizer step when sync_gradients is True (handled automatically by accumulate)
+            # Only perform optimizer step when sync_gradients is True
             if get_accelerator().sync_gradients:
-                # Clip gradients using accelerator's unified method (handles DeepSpeed/FSDP automatically)
+                # Clip gradients
                 max_grad_norm = args.get("gradient_clipping_threshold", None)
                 if max_grad_norm is not None:
                     grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
