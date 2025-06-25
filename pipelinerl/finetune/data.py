@@ -147,6 +147,13 @@ def preprocess_fn(
             entry["logprobs"],
             entry["ref_logprobs"],
         )
+    
+    # Preserve visual fields if they exist
+    if "pixel_values" in entry:
+        encoding["pixel_values"] = entry["pixel_values"]
+    if "image_thw" in entry:
+        encoding["image_thw"] = entry["image_thw"]
+    
     return encoding
 
 
@@ -162,16 +169,32 @@ def collate(
     if seq_length % pad_to_multiple_of:
         seq_length += pad_to_multiple_of - (seq_length % pad_to_multiple_of)
     result = {}
+    
+    # Visual feature fields that should be stacked, not padded
+    if "visual_features" in example_dict and isinstance(example_dict["visual_features"][0], dict):
+        for k, seq_list in example_dict["visual_features"][0].items():
+            if k == "image_grid_thw":
+                # image_grid_thw should remain as a list
+                result[k] = seq_list
+            else:
+                # Other visual fields like pixel_values can be stacked as tensors
+                valid_tensors = [torch.tensor(seq) for seq in seq_list]
+                result[k] = torch.stack(valid_tensors)
+    
     for k, seq_list in example_dict.items():
-        padded_sequences = []
-        pad_value = label_mask_value if k == "labels" else (0.0 if k in RL_DATA_COLUMNS else 0)
-        for seq in seq_list:
-            if not isinstance(seq, list):
-                seq = [seq]
-            padding = [pad_value] * (seq_length - len(seq))
-            padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
-            padded_sequences.append(padded)
-        result[k] = torch.tensor(padded_sequences)
+        if any(isinstance(seq, (str, dict)) for seq in seq_list):
+            continue
+        else:
+            # Handle sequence data: pad as usual
+            padded_sequences = []
+            pad_value = label_mask_value if k == "labels" else (0.0 if k in RL_DATA_COLUMNS else 0)
+            for seq in seq_list:
+                if not isinstance(seq, list):
+                    seq = [seq]
+                padding = [pad_value] * (seq_length - len(seq))
+                padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
+                padded_sequences.append(padded)
+            result[k] = torch.tensor(padded_sequences)
     return BatchEncoding(result, tensor_type="pt")
 
 

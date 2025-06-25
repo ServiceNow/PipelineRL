@@ -11,7 +11,9 @@ from packaging import version
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
+    AutoModelForVision2Seq,
     AutoTokenizer,
+    AutoProcessor,
     BitsAndBytesConfig,
 )
 from transformers.models.auto.modeling_auto import _BaseAutoModelClass
@@ -35,6 +37,8 @@ def get_auto_model_class(
             return AutoModelForCausalLM
         case "seq2seq-language-modeling":
             return AutoModelForSeq2SeqLM
+        case "vision2seq-language-modeling":
+            return AutoModelForVision2Seq
         case _:
             raise ValueError(f"Unsupported model class: {model_class}")
 
@@ -53,6 +57,16 @@ def load_tokenizer(config_name):
         tokenizer.add_special_tokens({"additional_special_tokens": ["<n>", "<t>"]})  # type: ignore
         tokenizer.add_tokens(new_tokens=["▁{", "{", "▁}", "}"])
     return tokenizer
+
+
+def load_processor(config_name):
+    """Load AutoProcessor for vision-language models."""
+    try:
+        processor = AutoProcessor.from_pretrained(config_name)
+        return processor
+    except Exception as e:
+        logger.warning(f"Failed to load processor for {config_name}: {e}")
+        return None
 
 
 def load_model(args, model_class, current_dir):

@@ -177,6 +177,12 @@ def rl_step(
     }
     if is_packed:
         model_inputs["position_ids"] = batch["position_ids"]
+    
+    # Add visual features if present (for multimodal models)
+    if "pixel_values" in batch and batch["pixel_values"] is not None:
+        model_inputs["pixel_values"] = batch["pixel_values"]
+    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
+        model_inputs["image_grid_thw"] = batch["image_grid_thw"].reshape((1, 3))
 
     outputs = model(**model_inputs)
 
@@ -313,7 +319,7 @@ def rl_step(
     return final_loss, stats
 
 
-def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
+def populate_rl_data(dataset: list[BatchEncoding], eos_token_id: int, config: RLConfig) -> list[BatchEncoding]:
     """
     Populates a dataset with reinforcement learning specific data columns including
     rewards, advantages, and token weights.
@@ -327,18 +333,18 @@ def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> D
         Dataset: The dataset populated with RL-specific columns
     """
     # Convert to pandas for processing
-    df_init = dataset.to_pandas()
+    df_init = pd.DataFrame(dataset)
     assert isinstance(df_init, pd.DataFrame)
 
     # Step 1: calculate group-level statistics
-    df_stats = df_init[["group_id", "rollout_index"]].copy()
+    df_stats = df_init[["group_id", "rollout_index", "step_index"]].copy()
     df_stats["num_tokens"] = df_init["input_ids"].apply(lambda x: len(x))
     # We assume that rewards for all tokens are the same
     df_stats["rollout_reward"] = df_init["rewards"].apply(lambda x: x[0])
-    # Check that the reward is the same at each rollout index
+    # Check that the reward is the same for each step in the rollout
     assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1
-    # Only keep rollout_index == 0
-    df_stats = df_stats[df_stats["rollout_index"] == 0].drop(columns=["rollout_index"])
+    # Only keep step_index == 0
+    df_stats = df_stats[df_stats["step_index"] == 0].drop(columns=["step_index"])
     df_grouped = (
         df_stats.groupby("group_id")
         .agg(
@@ -388,9 +394,13 @@ def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> D
     df["group_tokens"] = df.apply(lambda row: [row["group_tokens"]] * len(row["input_ids"]), axis=1)
 
     # Step 5: move the results back to the dataset
-    dataset = replace_dataset_column(dataset, "advantages", df["advantages"].tolist())
-    dataset = replace_dataset_column(dataset, "group_tokens", df["group_tokens"].tolist())
-    dataset = replace_dataset_column(dataset, "overflow", df["overflow"].tolist())
+    advantages_list = df["advantages"].tolist()
+    group_tokens_list = df["group_tokens"].tolist()
+    overflow_list = df["overflow"].tolist()
+    for i, entry in enumerate(dataset):
+        entry["advantages"] = advantages_list[i]
+        entry["group_tokens"] = group_tokens_list[i]
+        entry["overflow"] = overflow_list[i]
     return dataset
 
 

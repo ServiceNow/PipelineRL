@@ -1,6 +1,6 @@
 import sys
 import hydra
-from pipelinerl.run_finetune import run_finetuning_loop
+from pipelinerl.finetune_loop import run_finetuning_loop
 from pipelinerl.utils import better_crashing
 
 

@@ -44,6 +44,8 @@ actor:
   llm_max_rollouts: 64
   rollout_workers: 1
   discount_factor: 1
+  problem_queue_size: 64
+  result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
 environment: null
@@ -51,7 +53,9 @@ preprocess:
   input: actor
   output: training_data
   n_workers: 8
-  queue_size: 8
+  raw_queue_size: 8
+  input_queue_size: 32
+  output_queue_size: 32
   chunk_n_groups: 2
   submit_delay: 0.
   pop_old_data: ${..pop_old_data} 
@@ -71,6 +75,7 @@ test_llm:
     top_k: 50
 
 vllm_config:
+  use_v1: false
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
@@ -124,6 +129,7 @@ debug:
   mode: ""
   streams_from: null
   place_inference_workers: true
+  use_existing_llms: false
 
 me:
   # Which job is this one? This will be autopopulated

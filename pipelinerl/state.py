@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
-from pipelinerl.run_finetune import (
+from pipelinerl.finetune_loop import (
     TRAINER_TOPIC,
     TrainerMessage,
     WeightBeingSavedToDisk,
