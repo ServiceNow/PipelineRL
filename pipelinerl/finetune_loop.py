@@ -744,6 +744,7 @@ def rl_finetuning_worker(
                     
                 optimizer.step()
                 optimizer.zero_grad()
+                torch.cuda.empty_cache() 
 
         if not is_sentinel_batch:
             passes_took.append(time.time() - time_before_pass)
