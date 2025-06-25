@@ -19,7 +19,6 @@ from transformers import (
 from transformers.models.auto.modeling_auto import _BaseAutoModelClass
 
 from .context import get_accelerator, logger
-from .lora import has_lora_checkpoint, lora_load, lora_save, prepare_lora_model
 from .types import ModelClass, TrainingMetrics
 
 
@@ -101,23 +100,6 @@ def load_model(args, model_class, current_dir):
 
     if args.load_as_bf16:
         loading_args["torch_dtype"] = torch.bfloat16
-    if args.lora.enabled:
-        if is_ds_zero_3:
-            raise Exception("LoRA is not compatible with Deepspeed zero stage 3")
-        if args.lora.base_model_8bit:
-            loading_args["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=False,
-                load_in_8bit=True,
-                llm_int8_has_fp16_weight=args.load_as_bf16,
-            )
-        elif args.lora.base_model_4bit:
-            loading_args["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                load_in_8bit=False,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=False,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
     if args.auto_device_map:
         loading_args["device_map"] = "auto"
     model_cls = get_auto_model_class(model_class)
@@ -130,23 +112,13 @@ def load_model(args, model_class, current_dir):
         # Size mismatch errors here may be due to improper used of Deepspeed+save_pretrained()
         # instead, always call save_model_only() in all processes
 
-        # when LoRA enabled, always preload the original model, the lora weights will be loaded later
-        model_to_load = args.config_name if args.lora.enabled else str(current_dir)
+        model_to_load = args.config_name 
         logger.info(f"Loading model {model_cls} weights from {current_dir}")
     else:  # from scratch
         logger.info(f"Initializing model {model_cls} from {args.config_name}")
 
     logger.info(f"Loading args: {loading_args}")
     model = model_cls.from_pretrained(model_to_load, **loading_args)
-
-    if args.lora.enabled:
-        model = prepare_lora_model(args.lora, model, args.gradient_checkpointing)
-        if has_lora_checkpoint(current_dir):
-            lora_load(current_dir, model)
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": args.reentrant_checkpointing}
-        )
 
     get_accelerator().wait_for_everyone()
     return model
@@ -300,7 +272,6 @@ def save_model_and_tokenizer(
     output_dir: Path,
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer | transformers.PreTrainedTokenizerFast,
-    lora: bool = False,
     safe_serialization: bool = False,
 ):
     logger.info("Saving model and tokenizer")
@@ -309,7 +280,6 @@ def save_model_and_tokenizer(
             temp_dir,
             model,
             unwrap=True,
-            lora=lora,
             safe_serialization=safe_serialization,
         )
         save_tokenizer_only(temp_dir, tokenizer)
@@ -319,7 +289,6 @@ def save_model_only(
     output_dir: Path,
     model,
     unwrap: bool = True,
-    lora: bool = False,
     safe_serialization: bool = False,
 ):
     """
@@ -344,12 +313,8 @@ def save_model_only(
     logger.info(f"Save model to {output_dir}")
 
     unwrapped_model = get_accelerator().unwrap_model(model) if unwrap else model
-    if lora:
-        lora_save(output_dir, unwrapped_model)
-        return
-
     # for non-deepspeed models
-    elif isinstance(unwrapped_model, transformers.PreTrainedModel):
+    if isinstance(unwrapped_model, transformers.PreTrainedModel):
         logger.info("Saving model using transformers save_pretrained")
         unwrapped_model.save_pretrained(  # type: ignore
             output_dir,
