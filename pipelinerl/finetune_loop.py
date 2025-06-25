@@ -732,19 +732,19 @@ def rl_finetuning_worker(
             # Use accelerator's unified backward method
             get_accelerator().backward(loss)
             
-            # Only perform optimizer step when sync_gradients is True
-            if get_accelerator().sync_gradients:
-                # Clip gradients
-                max_grad_norm = args.get("gradient_clipping_threshold", None)
-                if max_grad_norm is not None:
-                    grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
-                    training_metrics.grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-                else:
-                    training_metrics.grad_norm = -1.0
-                    
-                optimizer.step()
-                optimizer.zero_grad()
-                torch.cuda.empty_cache() 
+        # Only perform optimizer step when sync_gradients is True
+        if get_accelerator().sync_gradients:
+            # Clip gradients
+            max_grad_norm = args.get("gradient_clipping_threshold", None)
+            if max_grad_norm is not None:
+                grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
+                training_metrics.grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            else:
+                training_metrics.grad_norm = -1.0
+                
+            optimizer.step()
+            optimizer.zero_grad()
+            torch.cuda.empty_cache()
 
         if not is_sentinel_batch:
             passes_took.append(time.time() - time_before_pass)
