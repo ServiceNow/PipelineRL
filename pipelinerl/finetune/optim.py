@@ -1,12 +1,11 @@
 import torch
-from peft.peft_model import PeftModel
 from torch.optim.adamw import AdamW
 from torch.optim.optimizer import Optimizer
 from transformers import Adafactor, PreTrainedModel
 
 
 def get_grouped_params(
-    model: PreTrainedModel | PeftModel,
+    model: PreTrainedModel,
     weight_decay: float,
     no_decay: list[str] = ["bias", "LayerNorm.weight"],
 ):

@@ -15,14 +15,16 @@ authors = [
 dependencies = [
     "torch>=2.6",
     "vllm==0.8.3",
-    "accelerate==1.7.0",
-    "Tapeagents[finetune]==0.1.15",
+    "Tapeagents==0.1.15",
+    "deepspeed~=0.15.4",
+    "accelerate==1.8.0",
     "transformers==4.51.0",
     "flash-attn==2.7.4.post1",
     "math-verify[antlr4_9_3]==0.7.0",
     "orjson==3.10.16",
     "redis==5.2.1",
     "hydra-core>=1.3.2",
+    "wandb~=0.19",
 ]
 
 [tool.setuptools.packages.find]
