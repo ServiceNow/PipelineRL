@@ -45,7 +45,7 @@ vllm_config:
     enforce-eager: ""  # speed the actor llm startup a bit
 
 actor:
-  rollout_policy: pipelinerl.miniwob.rollouts.generate_miniwob_rollout
+  rollout_policy: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
   shared_memory_entry_size: 100000000
 
 preprocess:
@@ -119,7 +119,7 @@ agent:
 # ENVIRONMENT CONFIGURATION
 start_attempts: 3  # number of attempts to start each task
 environment:
-  _target_: pipelinerl.miniwob.environment_server.WebEnvironmentServer
+  _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
   miniwob_url: file:///home/toolkit/miniwob-plusplus/miniwob/html/miniwob/
   n_envs: 64
   host: "0.0.0.0"
@@ -130,7 +130,7 @@ environment:
   observation_format: html
 
 # DATASET CONFIGURATION
-dataset_loader: pipelinerl.miniwob.load_tasks.load_tasks
+dataset_loader: pipelinerl.domains.miniwob.load_tasks.load_tasks
 dataset_loader_params:
   train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
   seeds: [0, 42, 1337, 900, 103]
