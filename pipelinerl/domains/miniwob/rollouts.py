@@ -5,6 +5,7 @@ import os
 import random
 import time
 import aiohttp
+from fastapi import HTTPException
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
@@ -73,7 +74,10 @@ async def generate_miniwob_rollout(
             except Exception as e:
                 start_attempts -= 1
                 if start_attempts <= 0:
-                    raise e
+                    if isinstance(e, HTTPException):
+                        raise RuntimeError(f"HTTPException: {e.status_code} {e.detail}")
+                    else:
+                        raise e
                 logger.warning(f"Failed to start task, retry after 5 seconds: {e}")
                 await asyncio.sleep(5)
         logger.info(f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds")
