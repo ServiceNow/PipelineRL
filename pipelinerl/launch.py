@@ -24,7 +24,6 @@ os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
-os.environ["VLLM_USE_V1"] = "0"
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 def _popen(
@@ -47,6 +46,15 @@ def _popen(
 def validate_config(cfg: DictConfig):
     if cfg.world.preprocessor_fraction == 0 and cfg.finetune.rl.kl_coef > 0.0:
         raise ValueError("Preprocessor fraction must be > 0 if KL is used")
+    
+    # Check for vision language model constraints
+    if cfg.finetune.model_class == "vision2seq-language-modeling":
+        if "Qwen2.5-VL" not in cfg.model_path:
+            raise ValueError("Only Qwen2.5-VL models are supported for vision language modeling")
+        if cfg.finetune.seq_packing:
+            raise ValueError("Vision language models cannot use sequence packing (seq_packing must be false)")
+        if cfg.finetune.train_batch_size > 1:
+            raise ValueError("Vision language models cannot use batch size > 1 (train_batch_size must be 1)")
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
@@ -102,10 +110,15 @@ def run_actor_llm(
     # TODO: add support for tensor and process parallelism
     log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
+    entrypoint = (
+        "pipelinerl.entrypoints.run_vllm1" 
+        if cfg.vllm_config.use_v1 else 
+        "pipelinerl.entrypoints.run_vllm0"
+    )
     cmd = [
         "python",
         "-m",
-        "pipelinerl.entrypoints.llm",
+        entrypoint,
         "--model",
         str(actor_model_path),
         "--host",
@@ -114,8 +127,6 @@ def run_actor_llm(
         str(8080 + local_idx),
         "--seed",
         str(actor_llm_idx),
-        "--exp-root-dir",
-        str(exp_dir),
         "--actor-llm-idx",
         str(actor_llm_idx),
         "--weight-update-group-init-method",
@@ -131,7 +142,7 @@ def run_actor_llm(
             if v not in [None, ""]:
                 cmd.append(str(v))
 
-    if cfg.debug.mode in ["actor", "open_loop"]:
+    if cfg.debug.mode:
         cmd.append("--disable-weight-updates")
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
@@ -155,7 +166,7 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     cmd = [
         "python",
         "-m",
-        "pipelinerl.entrypoints.actor",
+        "pipelinerl.entrypoints.run_actor",
         "--config-dir",
         f"{exp_dir}/conf",
         "--config-name",
@@ -178,7 +189,7 @@ def run_environment(cfg: DictConfig, job: Job):
     cmd = [
         "python",
         "-m",
-        "pipelinerl.entrypoints.environment",
+        "pipelinerl.entrypoints.run_environment",
         "--config-dir",
         f"{cfg.output_dir}/conf",
         "--config-name",
@@ -236,6 +247,8 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
             hostfile_path,
             "--deepspeed_inclusion_filter",
             deepspeed_include_filter,
+            "--deepspeed_multinode_launcher",
+            "nossh"
         ]
     # get path to this file
     this_file_path = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -270,7 +283,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     cmd += [
         "--num_processes",
         str(world_map.total_finetune_gpus),
-        "pipelinerl/entrypoints/finetune.py",
+        "pipelinerl/entrypoints/run_finetune.py",
         "--config-dir",
         f"{exp_dir}/conf",
         "--config-name",
@@ -300,7 +313,7 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
     cmd = [
         "python",
         "-m",
-        "pipelinerl.entrypoints.preprocess",
+        "pipelinerl.entrypoints.run_preprocess",
         "--config-dir",
         f"{exp_dir}/conf",
         "--config-name",
@@ -445,10 +458,14 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
         elif job.kind == "environment":
             processes.extend(run_environment(cfg, job))
         elif job.kind == "actor_llm":
+            if cfg.debug.use_existing_llms:
+                continue
             processes.extend(run_actor_llm(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "preprocessor":
             processes.extend(run_preprocess(world_map, job.replica_idx, exp_dir))
         elif job.kind == "preprocessor_llm":
+            if cfg.debug.use_existing_llms:
+                continue            
             processes.extend(run_ref_llm(cfg, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "finetune":
             processes.extend(run_finetune(cfg, world_map, job.gpus, exp_dir))
@@ -546,6 +563,8 @@ def main(cfg: DictConfig):
         processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
         processes.extend(launch_jobs(cfg, world_map, ["preprocessor", "preprocessor_llm"]))
+    elif cfg.debug.mode == "actor+preprocessor":
+        processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm", "preprocessor", "preprocessor_llm"]))       
     elif cfg.debug.mode in ["", "open_loop"]:
         processes.extend(launch_jobs(cfg, world_map))
     else:

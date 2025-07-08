@@ -4,7 +4,7 @@ import random
 import aiohttp
 from omegaconf import DictConfig
 from pydantic import BaseModel
-from pipelinerl.rollouts import RolloutResult
+from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from pipelinerl.world import Job
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
@@ -12,6 +12,8 @@ from tapeagents.llms.trainable import TrainableLLM
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from .verifier_api import verify_answer_rpc
 
+class Metrics(BaseMetrics):
+    penalty: float
 
 class RewardTable(BaseModel):
     wrong_answer_not_finished: float
@@ -22,7 +24,15 @@ class RewardTable(BaseModel):
     unparsable_finished: float
     correct_answer_not_finished: float
     correct_answer_finished: float
+    buffer_tokens: int = 0 # 0 means no overlong reward shaping
 
+def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
+    """
+    Compute the overlong penalty
+    """
+    if sequence_length > (max_length - buffer_tokens) and sequence_length <= max_length:
+        return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
+    return 0.
 
 async def generate_math_rollout(
     cfg: DictConfig,
@@ -59,47 +69,46 @@ async def generate_math_rollout(
     )
 
     trace = make_training_text(llm, llm_call)
-    # Check if the generation is finished (ended with EOS token)
-    finished = 1 if trace.input_ids[-1] == llm.tokenizer.eos_token_id else 0
-
     # Determine reward based on answer status and finished state
-    match (answer_status, finished):
-        case ("wrong", 0):
+    match (answer_status, trace.finished):
+        case ("wrong", False):
             reward = rewards.wrong_answer_not_finished
-        case ("wrong", 1):
+        case ("wrong", True):
             reward = rewards.wrong_answer_finished
-        case ("no_answer", 0):
+        case ("no_answer", False):
             reward = rewards.no_answer_not_finished
-        case ("no_answer", 1):
+        case ("no_answer", True):
             reward = rewards.no_answer_finished
-        case ("unparsable", 0):
+        case ("unparsable", False):
             reward = rewards.unparsable_not_finished
-        case ("unparsable", 1):
+        case ("unparsable", True):
             reward = rewards.unparsable_finished
-        case ("correct", 0):
+        case ("correct", False):
             reward = rewards.correct_answer_not_finished
-        case ("correct", 1):
+        case ("correct", True):
             reward = rewards.correct_answer_finished
         case _:
-            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{finished}")
+            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{trace.finished}")
 
     # Apply discount factor based on output length
     reward *= discount_factor**llm_call.output_length_tokens
+    overlong_penalty = 0
+    if rewards.buffer_tokens > 0:
+        overlong_penalty = length_penalty(llm.parameters['max_tokens'], llm_call.output_length_tokens, rewards.buffer_tokens)
+    reward += overlong_penalty
     trace.reward = reward
 
-    metrics = {
-        "reward": reward,
-        "success": answer_status == "correct",
-        "no_error": answer_status != "unparsable",
-        "no_answer": answer_status == "no_answer",
-        "overflow": 0 if finished else 1,
-    }
+    metrics = Metrics(
+        reward=reward,
+        success=answer_status == "correct",
+        no_error=answer_status != "unparsable",
+        no_answer=answer_status == "no_answer",
+        penalty=overlong_penalty,
+    )
 
     return RolloutResult(
         training_texts=[trace],
         metrics=metrics,
         latency=latency, 
         dataset_name=problem.get("dataset"),
-        prompt_tokens=[llm_call.prompt_length_tokens],
-        output_tokens=[llm_call.output_length_tokens],
     )

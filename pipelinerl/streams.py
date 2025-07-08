@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+import pickle
+import numpy
 import orjson
 import json
 import logging
@@ -149,7 +151,7 @@ class RedisStreamWriter(StreamWriter):
     def write(self, data):
         if isinstance(data, BaseModel):
             data = data.model_dump()
-        data = orjson.dumps(data).decode("utf-8")
+        data = pickle.dumps(data)
         self._redis.xadd(self._stream_name, {"index": self._index, "data": data}, maxlen=1000000, approximate=True)
         self._index += 1
 
@@ -180,12 +182,11 @@ class RedisStreamReader(StreamReader):
                 assert stream_name.decode("utf-8") == self._stream_name
                 assert isinstance(result, list) and len(result) == 1
                 entry_id, entry = result[0]
-                entry = {k.decode("utf-8"): v.decode("utf-8") for k, v in entry.items()}
-                if int(entry["index"]) != self._index:
+                if int(entry[b"index"].decode("utf-8")) != self._index:
                     raise ValueError(f"Index mismatch: expected {self._index}, got {entry['index']}")
                 self._last_id = entry_id
                 self._index += 1
-                yield json.loads(entry["data"])
+                yield pickle.loads(entry[b"data"])
 
 
 class RoundRobinRedisStreamWriter(StreamWriter):
@@ -252,9 +253,10 @@ class FileStreamWriter(StreamWriter):
         self._file.close()
 
     def write(self, data):
+        # Textual streams are so useful, that we try hard to jsonify the given object.
         if isinstance(data, BaseModel):
             data = data.model_dump()
-        self._file.write(orjson.dumps(data).decode("utf-8"))
+        self._file.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY).decode("utf-8"))
         self._file.write("\n")
         self._file.flush()
 

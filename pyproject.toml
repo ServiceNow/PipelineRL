@@ -15,8 +15,8 @@ authors = [
 dependencies = [
     "torch>=2.6",
     "vllm==0.8.3",
-    "accelerate @ git+https://github.com/ServiceNow/accelerate.git@v1.2.0-hotfix",
-    "Tapeagents[finetune]==0.1.12",
+    "accelerate==1.7.0",
+    "Tapeagents[finetune]==0.1.15",
     "transformers==4.51.0",
     "flash-attn==2.7.4.post1",
     "math-verify[antlr4_9_3]==0.7.0",

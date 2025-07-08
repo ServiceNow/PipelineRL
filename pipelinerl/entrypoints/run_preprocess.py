@@ -1,5 +1,5 @@
 import hydra
-from pipelinerl.run_preprocess import run_preprocessing_loop
+from pipelinerl.preprocess import run_preprocessing_loop
 from pipelinerl.utils import better_crashing
 
 

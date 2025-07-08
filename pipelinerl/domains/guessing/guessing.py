@@ -6,7 +6,7 @@ import aiohttp
 from omegaconf import DictConfig
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.rollouts import RolloutResult
+from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
 
@@ -67,29 +67,22 @@ async def generate_guessing_rollout(
             break
     latency = time.time() - time_start        
 
-    all_finished = 1
-    prompt_tokens = [llm_call.prompt_length_tokens for llm_call in llm_calls]
-    output_tokens = [llm_call.output_length_tokens for llm_call in llm_calls]
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     for text in training_texts:
         text.reward = reward
-        all_finished &= 1 if text.input_ids[-1] == llm.tokenizer.eos_token_id else 0
 
-    metrics = {
-        "reward": reward,
-        "success": success,
-        "no_error": not error,
-        "no_answer": error,
-        "overflow": 0 if all_finished else 1,
-    }
+    metrics = BaseMetrics(
+        reward=reward,
+        success=success,
+        no_error=not error,
+        no_answer=error,
+    )
 
     return RolloutResult(
         training_texts=training_texts,
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
     )
     
 

@@ -1,7 +1,7 @@
 import hydra
 from omegaconf import DictConfig
 
-from pipelinerl.run_actor import run_actor_loop
+from pipelinerl.actor import run_actor_loop
 from pipelinerl.utils import better_crashing
 
 

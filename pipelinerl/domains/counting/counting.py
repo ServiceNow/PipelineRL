@@ -6,7 +6,7 @@ import aiohttp
 from omegaconf import DictConfig
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.rollouts import RolloutResult
+from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
 
@@ -51,23 +51,18 @@ async def generate_counting_rollout(
     training_text = make_training_text(llm, llm_call)
     training_text.reward = reward
 
-    finished = 1 if training_text.input_ids[-1] == llm.tokenizer.eos_token_id else 0
-
-    metrics = {
-        "reward": reward,
-        "success": reward,
-        "no_error": not error,
-        "no_answer": error,
-        "overflow": 0 if finished else 1,
-    }
+    metrics = BaseMetrics(
+        reward=reward,
+        success=reward,
+        no_error=not error,
+        no_answer=error,
+    )
 
     return RolloutResult(
         training_texts=[training_text],
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
-        prompt_tokens= [llm_call.prompt_length_tokens],
-        output_tokens=[llm_call.output_length_tokens],
     )
     
 

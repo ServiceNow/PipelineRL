@@ -102,17 +102,17 @@ def generate_cuda_device_strings(total_gpus: int, gpus_per_model: int) -> List[s
     return cuda_device_strings
 
 
-def setup_logging(output_dir):
-    print(f"Setting up logging to {output_dir}")
+def setup_logging(logging_dir: Path, stage: str):
+    print(f"Setting up logging to {logging_dir}")
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)  # Create the output directory if it doesn't exist
+    logging_dir = Path(logging_dir)
+    logging_dir.mkdir(parents=True, exist_ok=True)  # Create the output directory if it doesn't exist
 
     # Define log file paths
-    info_log = output_dir / "info.log"
-    debug_log = output_dir / "debug.log"
-    error_log = output_dir / "error.log"
-    warning_log = output_dir / "warning.log"
+    info_log = logging_dir / "info.log"
+    debug_log = logging_dir / "debug.log"
+    error_log = logging_dir / "error.log"
+    warning_log = logging_dir / "warning.log"
 
     # Clear any existing handlers
     logger = logging.getLogger()  # get root logger
@@ -136,7 +136,7 @@ def setup_logging(output_dir):
     stdout_handler.setLevel(logging.INFO)
 
     # Create formatters and set them to the handlers
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter(f"[{stage}]: %(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     info_handler.setFormatter(formatter)
     debug_handler.setFormatter(formatter)

@@ -34,7 +34,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 
 import torch.distributed as dist
-from pipelinerl.run_finetune import TrainerMessage, WeightUpdateRequest
+from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
 import pipelinerl.torch_utils
 
 logger = logging.getLogger(__name__)
@@ -202,7 +202,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     engine_config.parallel_config.distributed_executor_backend = AsyncRLExecutor
     engine_config.parallel_config.worker_cls = (
-        "pipelinerl.run_llm.AsyncRLMultiStepWorker" if multi_step else "pipelinerl.run_llm.AsyncRLWorker"
+        "pipelinerl.vllm0.AsyncRLMultiStepWorker" if multi_step else "pipelinerl.vllm0.AsyncRLWorker"
     )
     engine = AsyncLLMEngine.from_vllm_config(
         vllm_config=engine_config,
@@ -257,7 +257,6 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 def run_llm():
     parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
     parser = make_arg_parser(parser)
-    parser.add_argument("--exp-root-dir", type=str, required=True, help="Root directory of the experiment")
     parser.add_argument(
         "--disable-weight-updates", action="store_true", help="Whether to receive weight updates from the trainer"
     )

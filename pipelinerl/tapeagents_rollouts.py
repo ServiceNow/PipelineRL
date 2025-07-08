@@ -4,7 +4,7 @@ import time
 import aiohttp
 from omegaconf import DictConfig
 from tapeagents.agent import Agent, LLMEvent, LLMStream
-from tapeagents.core import Prompt, StopStep, TrainingText
+from tapeagents.core import Prompt, StopStep
 from tapeagents.dialog_tape import DialogTape, UserStep
 from tapeagents.environment import Environment
 from tapeagents.llms.trainable import TrainableLLM
@@ -12,6 +12,7 @@ from tapeagents.orchestrator import get_agent_and_env_from_config, main_loop
 
 from pipelinerl.async_llm import llm_async_generate
 from pipelinerl.math.rollouts import RolloutResult
+from pipelinerl.rollouts import TrainingText
 
 
 def run_tapeagent(
