@@ -15,13 +15,13 @@ model_path: meta-llama/Llama-3.1-8B-Instruct
 
 finetune:
   save_checkpoint_steps: 10
-  seq_length: 4096
+  seq_length: 8192
   train_batch_size: 1
   gradient_accumulation_passes: 1024
   learning_rate: 1e-6
   optim: adamw_torch
   rl:
-    kl_coef: 0.01  # GRPO beta coefficient
+    kl_coef: 0.  # GRPO beta coefficient
     reward_minus_kl_coef: 0.0  # RLOO beta coefficient
     use_advantages: true
     algo: grpo
@@ -121,10 +121,10 @@ start_attempts: 3  # number of attempts to start each task
 environment:
   _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
   miniwob_url: file:///home/toolkit/miniwob-plusplus/miniwob/html/miniwob/
-  n_envs: 64
+  n_envs: 8
   host: "0.0.0.0"
   max_session_inactivity_secs: 600  # kill session after 10 minutes of inactivity
-  env_call_timeout: 60  # timeout for each environment call (e.g. start_task, act, etc.)
+  env_call_timeout: 120  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
   exp_path: ${output_dir}/env_server
   headless: true
@@ -136,6 +136,5 @@ dataset_loader_params:
   train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
   seeds: [0, 42, 1337, 900, 103]
 train_dataset_names:
-  - train
-test_dataset_names:
-  - test
+  - debug
+test_dataset_names: null

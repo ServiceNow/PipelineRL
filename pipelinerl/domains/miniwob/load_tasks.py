@@ -53,6 +53,8 @@ def load_tasks(dataset_names: list[str], train_split: float = 0.6, seeds: list[i
         TEST_SPLIT = [t.get_task_id() for t in ALL_MINIWOB_TASKS[n_train_tasks:]]
 
     tasks = []
+    if dataset_names is None:
+        return tasks
     for name in dataset_names:
         if name == "debug":
             tasks.extend([

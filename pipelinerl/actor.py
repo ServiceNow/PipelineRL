@@ -205,7 +205,7 @@ async def schedule_rollouts(
                 try:
                     problem = problem_queue.get(block=False)
                 except Empty:
-                    # give some quality time for other couroutines to work
+                    # give some quality time for other coroutines to work
                     await asyncio.sleep(0.01)
                     continue
                 group_id += 1

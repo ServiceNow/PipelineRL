@@ -12,6 +12,7 @@ cd TapeAgents
 pip install -e .
 pip install 'tapeagents[finetune,converters]=0.1.12'
 cd ../PipelineRL
+export PYTHONPATH=PATH_TO_TAPEAGENTS:$PYTHONPATH
 ```
 
 ### Miniwob
