@@ -443,7 +443,6 @@ def run_preprocessing_loop(
             
             try:
                 while True:
-                    llm = llms[next_llm_index] if llms else None
                     if not input_queue.full():
                         try:
                             raw_chunk = raw_chunk_queue.get(timeout=0.001)
@@ -484,6 +483,7 @@ def run_preprocessing_loop(
                     num_filtered_out = 0
                     entries_processed = []
                     # print how many entries in buffer
+
                     while not buffer.empty():
                         try:
                             if len(processed_entries_queue) == processed_entries_queue.maxlen:
@@ -502,6 +502,9 @@ def run_preprocessing_loop(
                         stats_aggregator.update([len(entry["input_ids"]) for entry in entries_processed])
                         max_model_version = max([entry["model_version"] for entry in entries_processed]) if entries_processed else 0
                     
+                    # DIMA: wait for the trainer to broadcast the first model version.
+                    # Then initialize these variables outside of the loop
+
                     # Check if trainer is ready for more data using TrainerState
                     if trainer_state.samples_processed is None:
                         # Trainer state not initialized yet, keep preprocessing data
@@ -513,11 +516,9 @@ def run_preprocessing_loop(
                         samples_per_worker = [published_samples // num_workers] * num_workers
                     
                     
-                    #TODO: cfg
-                    EXTRA_BATCHES = 1
-                    target_number_of_batches = math.ceil(trainer_state.samples_processed / train_batch_size) + EXTRA_BATCHES
-                    target_published_samples = target_number_of_batches * train_batch_size
-                    target_samples_per_worker = [target_published_samples // num_workers] * num_workers
+                    next_batch_number = math.ceil(trainer_state.samples_processed / train_batch_size) + 1
+                    batch_boundary = next_batch_number * train_batch_size
+                    target_samples_per_worker = batch_boundary // num_workers
 
                     start_writing = time.time()
                     if published_samples == target_published_samples and batch_done:
@@ -525,6 +526,7 @@ def run_preprocessing_loop(
                         continue
 
                     batch_done = False
+
                     while len(processed_entries_queue) > 0 and not batch_done:
                         logger.info(f"Worker {worker_id} has {samples_per_worker[worker_id]} samples, target is {target_samples_per_worker[worker_id]}")
                         if cfg.finetune.seq_packing:
@@ -572,7 +574,7 @@ def run_preprocessing_loop(
                             logger.info(f"Created batch with {len(batch_entries)} samples for worker {worker_id}")
 
                         worker_id = (worker_id + 1) % num_workers
-                        batch_done = (published_samples % train_batch_size == 0) and worker_id == 0
+                        batch_done = published_samples == batch_boundary and worker_id == 0
                         logger.info(
                             f"Published {published_samples} samples, "
                             f"worker {worker_id} processed {samples_per_worker[worker_id]} samples, "
@@ -580,6 +582,7 @@ def run_preprocessing_loop(
                         )
                             
                     writing_took = time.time() - start_writing
+                    # DIMA: let's log at every iteration if debug.mode
                     if batch_done: 
                         samples_in_output_queue = output_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts
                         stats = {
@@ -601,6 +604,7 @@ def run_preprocessing_loop(
                             wandb_run.log(stats)
                         stats_writer.write(stats)
                         
+                        # DIMA: make sure all the logged counters are properly accumulated
                         processing_took = time.time() - start_processing
                         logger.info(
                             f"Processed {len(entries_processed)} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
