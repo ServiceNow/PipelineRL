@@ -2,9 +2,9 @@ defaults:
   - base
 
 world:
-  actor_fraction: 4
-  preprocessor_fraction: 1
-  finetune_fraction: 3
+  actor_fraction: 2
+  preprocessor_fraction: 0
+  finetune_fraction: 6
 
 # debug:
 #   mode: actor
