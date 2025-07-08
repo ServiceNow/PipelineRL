@@ -15,7 +15,7 @@ model_path: meta-llama/Llama-3.1-8B-Instruct
 
 finetune:
   save_checkpoint_steps: 10
-  seq_length: 4096
+  seq_length: 8192
   train_batch_size: 1
   gradient_accumulation_passes: 1024
   learning_rate: 1e-6
