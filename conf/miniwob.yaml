@@ -123,7 +123,8 @@ environment:
   miniwob_url: file:///home/toolkit/miniwob-plusplus/miniwob/html/miniwob/
   n_envs: 64
   host: "0.0.0.0"
-  max_session_inactivity_secs: 600
+  max_session_inactivity_secs: 600  # kill session after 10 minutes of inactivity
+  env_call_timeout: 60  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
   exp_path: ${output_dir}/env_server
   headless: true
