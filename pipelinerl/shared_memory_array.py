@@ -1,8 +1,9 @@
 import pickle
 import struct
-from multiprocessing.managers import SharedMemoryManager
+from multiprocessing import Queue
+from multiprocessing.managers import SharedMemoryManager, SyncManager
 from typing import Any
-
+from queue import Empty, Full
 
 
 class SharedMemoryArray:
@@ -42,7 +43,7 @@ class SharedMemoryArray:
         for i in range(num_entries):
             self._set_entry_size(i, 0)
 
-        self._max_written_entry_size = 0
+        self._max_actual_entry_size = 0
 
     def get_memory_size(self) -> int:
         """Get the size of the shared memory buffer."""
@@ -69,6 +70,7 @@ class SharedMemoryArray:
     def __getitem__(self, index: int) -> Any:
         """Get the object at the given index."""
         size = self._get_entry_size(index)
+        self._max_actual_entry_size = max(self._max_actual_entry_size, size)
         if size == 0:
             return None
 
@@ -93,25 +95,102 @@ class SharedMemoryArray:
         self.shared_mem.buf[offset : offset + size] = data
         # Update the size
         self._set_entry_size(index, size)
-        self._max_written_entry_size = max(self._max_written_entry_size, size)
+        self._max_actual_entry_size = max(self._max_actual_entry_size, size)
 
     def __len__(self) -> int:
         """Return the number of entries in the array."""
         return self.num_entries
+    
+    def max_actual_entry_size(self) -> int:
+        """Return the maximum size of an entry written to the array."""
+        return self._max_actual_entry_size
 
-    def clear(self, index: int | None = None) -> None:
+
+class SharedMemoryQueue:
+    """
+    A fixed-size queue backed by shared memory.
+    
+    Uses a SharedMemoryArray for storage and multiprocessing Queues to track available and filled slots.
+    Items are stored in the shared memory array and slot indices are managed via the queues.
+    """
+
+    def __init__(self, smm: SharedMemoryManager, max_size: int, max_entry_size: int):
         """
-        Clear an entry or the entire array.
+        Initialize a shared memory queue.
 
         Args:
-            index: If provided, clear this specific index; otherwise clear all entries
+            smm: SharedMemoryManager instance
+            max_size: Maximum number of items the queue can hold
+            max_entry_size: Maximum size in bytes for each item when serialized
         """
-        if index is not None:
-            self._set_entry_size(index, 0)
-        else:
-            for i in range(self.num_entries):
-                self._set_entry_size(i, 0)
+        self.max_size = max_size
+        self.shared_array = SharedMemoryArray(smm, max_size, max_entry_size)
+        
+        # Queue to track available slots (indices)
+        self.free_slots = Queue(maxsize=max_size)
+        
+        # Queue to track filled slots (indices)
+        self.content_slots = Queue(maxsize=max_size)
+        
+        # Initialize with all slots available
+        for i in range(max_size):
+            self.free_slots.put(i)
 
-    def is_empty(self, index: int) -> bool:
-        """Check if an entry is empty."""
-        return self._get_entry_size(index) == 0
+    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
+        """
+        Put an item into the queue.
+
+        Args:
+            item: The item to add to the queue
+            block: Whether to block if the queue is full
+            timeout: Timeout for blocking operations
+        """
+        # Get an available slot
+        try:
+            slot_index = self.free_slots.get(block=block, timeout=timeout)
+        except Empty:
+            raise Full()
+        
+        # Store the item in the shared array
+        self.shared_array[slot_index] = item
+        
+        # Add slot to filled slots queue
+        self.content_slots.put(slot_index)
+
+    def get(self, block: bool = True, timeout: float | None = None) -> Any:
+        """
+        Get an item from the queue.
+
+        Args:
+            block: Whether to block if the queue is empty
+            timeout: Timeout for blocking operations
+
+        Returns:
+            The item retrieved from the queue
+        """
+        # Get a filled slot
+        slot_index = self.content_slots.get(block=block, timeout=timeout)
+        
+        # Retrieve the item from the shared array
+        item = self.shared_array[slot_index]
+        
+        # Return slot to available pool
+        self.free_slots.put(slot_index)
+        
+        return item
+    
+    def get_memory_size(self) -> int:
+        """Get the size of the shared memory buffer."""
+        return self.shared_array.get_memory_size()
+    
+    def full(self) -> bool:
+        """Check if the queue is full."""
+        return self.free_slots.empty()
+    
+    def qsize(self) -> int:
+        """Get the current size of the queue."""
+        return self.content_slots.qsize()
+    
+    def max_actual_entry_size(self) -> int:
+        """Get the maximum size of an entry written to the queue."""
+        return self.shared_array.max_actual_entry_size()

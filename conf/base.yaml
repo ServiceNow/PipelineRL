@@ -43,20 +43,19 @@ actor:
   log_each_n_secs: 0
   llm_max_rollouts: 64
   rollout_workers: 1
-  rollout_policy: pipelinerl.domains.math.generate_math_rollout
   discount_factor: 1
-  system_prompt: Please reason step by step, and put your final answer within \boxed{}.
-  task_template: |-
-    {task}
+  problem_queue_size: 64
+  result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
-environment:
-  _target_: pipelinerl.domains.math.MathEnvironment
+environment: null
 preprocess:
   input: actor
   output: training_data
   n_workers: 8
-  queue_size: 8
+  raw_queue_size: 8
+  input_queue_size: 32
+  output_queue_size: 32
   chunk_n_groups: 2
   submit_delay: 0.
   pop_old_data: ${..pop_old_data} 
@@ -76,13 +75,14 @@ test_llm:
     top_k: 50
 
 vllm_config:
+  use_v1: false
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
     num-scheduler-steps: 1
     disable-log-requests: ""
     disable-frontend-multiprocessing: ""
-    max-num-seqs: 512
+    max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 1024
     enable-chunked-prefill: ""
     return-tokens-as-token-ids: ""
@@ -124,21 +124,12 @@ force_restart: false
 pop_old_data: true
 max_lag: null
 attempts: 8
-
-dataset_loader: pipelinerl.domains.math.load_datasets
-train_dataset_names:
-- open_reasoner_zero_57k
-- open_reasoner_zero_extended_72k 
 train_subset: null
-test_dataset_names:
-  - aime_2024
-  - amc_2023
-  - math_500
-
 debug:
   mode: ""
   streams_from: null
   place_inference_workers: true
+  use_existing_llms: false
 
 me:
   # Which job is this one? This will be autopopulated

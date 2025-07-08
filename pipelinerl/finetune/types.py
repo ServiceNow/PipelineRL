@@ -3,7 +3,7 @@ from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict
 
-ModelClass: TypeAlias = Literal["causal-language-modeling", "seq2seq-language-modeling"]
+ModelClass: TypeAlias = Literal["causal-language-modeling", "seq2seq-language-modeling", "vision2seq-language-modeling"]
 
 
 class DataPartArgs(BaseModel):
