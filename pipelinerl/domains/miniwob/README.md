@@ -26,4 +26,4 @@ The environment server will need to have playwright installed.
 
 ## Launch Command
 
-`python -m pipelinerl.launch --config-name miniwob`
+`python -m pipelinerl.launch --config-name  environment.miniwob_url=file:///PATH/TO/miniwob-plusplus/miniwob/html/miniwob/`
