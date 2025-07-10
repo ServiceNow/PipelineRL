@@ -123,7 +123,7 @@ async def generate_miniwob_rollout(
     ]
 
     # (4) # For each LLM interaction in the tape, make a training example.
-    all_finished = 0
+    all_finished = 1
     prompt_tokens = [llm_call.prompt_length_tokens for llm_call in llm_calls]
     output_tokens = [llm_call.output_length_tokens for llm_call in llm_calls]
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
