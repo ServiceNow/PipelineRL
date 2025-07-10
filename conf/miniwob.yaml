@@ -75,6 +75,9 @@ agent:
     thought_format: |
       Important! Respond with the plain text, do not include any JSON or code.
       Do not output anything besides what I asked in this message.
+    json_format: |
+      Important! Respond with parsable JSON, do not include any text or code.
+      Do not output anything besides one JSON object.
   nodes:
     - _target_: examples.rl_webagent.agent.WebNode
       name: set_goal
@@ -90,7 +93,8 @@ agent:
         - review the instructions from the user and the content of the page.
         - outline the main task to be accomplished and the steps to be taken to achieve it.
         - produce definiton of done, that will be checked later to verify if the task was completed.
-        Produce only one step!
+        Produce only one reasoning_thought step!
+        ${agent.templates.json_format}
       # steps_prompt: ${agent.templates.allowed_tools}
       steps_prompt: ${agent.templates.allowed_steps}
       steps:
@@ -104,6 +108,7 @@ agent:
         Review the current state of the page and previous steps to find the best possible next action to accomplish the task.
         Produce the reflection_thought to describe the current page state, reflect on your last action, describe what is left to do, and what will be the immediate next action.
         Produce only one reflection_thought step!
+        ${agent.templates.json_format}
       #   ${agent.templates.thought_format}
       # steps_prompt: ${agent.templates.allowed_tools}
       steps_prompt: ${agent.templates.allowed_steps}
@@ -134,11 +139,10 @@ agent:
         - Press enter key to submit the search query.
         - Always produce only one step at a time.
         - Step kind is always lowercase and underscore separated.
+        ${agent.templates.json_format}
       # steps_prompt: ${agent.templates.allowed_tools}
       steps_prompt: ${agent.templates.allowed_steps}
-      # use_known_actions: true
-      steps:
-        - examples.rl_webagent.steps.WebAgentAction
+      use_known_actions: true
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
       next_node: reflect
