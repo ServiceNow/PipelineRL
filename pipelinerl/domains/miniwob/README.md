@@ -14,6 +14,11 @@ pip install 'tapeagents[finetune,converters]=0.1.12'
 cd ../PipelineRL
 ```
 
+Make sure to add the TapeAgent folder to your python path.
+```bash
+export PYTHONPATH="/path/to/TapeAgents:$PYTHONPATH"
+```
+
 ### Miniwob
 
 see setup here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/README.md
