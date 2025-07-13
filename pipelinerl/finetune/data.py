@@ -198,15 +198,39 @@ def collate(
             # Handle sequence data: pad as usual
             padded_sequences = []
             pad_value = label_mask_value if k == "labels" else (0.0 if k in RL_DATA_COLUMNS else 0)
-            for seq in seq_list:
-                if seq is None:
-                    continue  # Skip None sequences, e.g. visual features when absent
-                if not isinstance(seq, list):
-                    seq = [seq]
-                padding = [pad_value] * (seq_length - len(seq))
-                padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
-                padded_sequences.append(padded)
-            result[k] = torch.tensor(padded_sequences)
+            
+            # Special handling for value_labels (3D tensor)
+            if k == "value_labels":
+                # Skip if any example has None value_labels
+                if any(seq is None for seq in seq_list):
+                    continue
+                    
+                # Get number of bins from first non-None example
+                num_bins = len(seq_list[0][0]) if seq_list[0] else None
+                if num_bins is None:
+                    continue
+                    
+                for seq in seq_list:
+                    if seq is None:
+                        # Create padded sequence of zeros
+                        padded = [[0.0] * num_bins] * seq_length
+                    else:
+                        # Pad with zero distributions
+                        padding = [[0.0] * num_bins] * (seq_length - len(seq))
+                        padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
+                    padded_sequences.append(padded)
+                result[k] = torch.tensor(padded_sequences)
+            else:
+                # Regular 1D sequence handling
+                for seq in seq_list:
+                    if seq is None:
+                        continue  # Skip None sequences, e.g. visual features when absent
+                    if not isinstance(seq, list):
+                        seq = [seq]
+                    padding = [pad_value] * (seq_length - len(seq))
+                    padded = (seq + padding) if tokenizer.padding_side == "right" else (padding + seq)
+                    padded_sequences.append(padded)
+                result[k] = torch.tensor(padded_sequences)
     result["model_version"] = min([example.get("model_version", 0) for example in examples])
     result["is_packed"] = False 
     return PipelineBatchEncoding(**result)
@@ -244,6 +268,10 @@ def collate_packed(
     # initialize lists for extra keys
     extra_keys = [col for col in RL_DATA_COLUMNS if col in examples[0]]
     extra_lists = {key: [] for key in extra_keys}
+    has_value_labels = "value_labels" in extra_keys and examples[0].get("value_labels") is not None
+    if has_value_labels:
+        # Get number of bins from first example
+        num_bins = len(examples[0]["value_labels"][0]) if examples[0]["value_labels"] else None
 
     for i, example in enumerate(examples):
         start_idx = seq_boundaries[i].item()
@@ -269,7 +297,16 @@ def collate_packed(
             else:
                 extra_lists[key].append(value)
 
-    extra_tensors = default_data_collator([{k: extra_lists[k] for k in extra_keys}], return_tensors="pt")
+    # Handle extra tensors with special case for value_labels
+    extra_tensors = {}
+    for key in extra_keys:
+        if key == "value_labels" and has_value_labels:
+            # Stack value_labels into 3D tensor
+            extra_tensors[key] = torch.tensor(extra_lists[key], dtype=torch.float).unsqueeze(0)  # (1, seq_len, num_bins)
+        else:
+            # Use default collator for other fields
+            collated = default_data_collator([{key: extra_lists[key]}], return_tensors="pt")
+            extra_tensors[key] = collated[key]
 
     result = {**base_tensors, **extra_tensors}
     result["model_version"] = min([example.get("model_version", 0) for example in examples])

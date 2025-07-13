@@ -17,6 +17,7 @@ from .utils import (
     mean_sum,
     replace_dataset_column,
 )
+from ..hl_gauss_loss import HLGaussLoss
 
 # FIXME: remove a warnings, but might be worth investigating
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -32,6 +33,7 @@ RL_DATA_COLUMNS = [
     "advantages",
     "old_logprobs",
     "ref_logprobs",
+    "value_labels",
 ]
 
 
@@ -96,6 +98,26 @@ class RLConfig(BaseModel):
     value_loss_coef: float = Field(
         default=0.0,
         description="Coefficient for the value loss in the final loss",
+    )
+    use_hl_gauss: bool = Field(
+        default=False,
+        description="Use HL-Gauss loss for value function training instead of MSE",
+    )
+    hl_gauss_min_value: float = Field(
+        default=-10.0,
+        description="Minimum value for HL-Gauss categorical distribution support",
+    )
+    hl_gauss_max_value: float = Field(
+        default=10.0,
+        description="Maximum value for HL-Gauss categorical distribution support",
+    )
+    hl_gauss_num_bins: int = Field(
+        default=51,
+        description="Number of bins for HL-Gauss discretization",
+    )
+    hl_gauss_sigma_ratio: float = Field(
+        default=0.75,
+        description="Ratio of sigma to bin width for HL-Gauss smoothing",
     )
 
 
@@ -301,8 +323,28 @@ def rl_step(
         assert values.shape == tokens_weights.shape, (
             f"Values shape {values.shape} does not match example weights shape {tokens_weights.shape}"
         )
-        value_loss = 0.5 * torch.square(values - values_labels) * tokens_weights
-        value_loss = sum_sum(value_loss, masks_shifted, segments) 
+        
+        if config.use_hl_gauss and hasattr(outputs, 'value_logits') and outputs.value_logits is not None:
+            # Use HL-Gauss loss with precomputed labels
+            if batch.value_labels is None:
+                raise ValueError("HL-Gauss is enabled but value_labels not found in batch")
+            
+            value_logits = outputs.value_logits[:, :-1]  # Remove last token
+            value_labels_dist = batch.value_labels[:, 1:]  # Already shifted categorical distributions
+            
+            # Compute cross-entropy loss
+            # value_logits: (batch_size, seq_len, num_bins)
+            # value_labels_dist: (batch_size, seq_len, num_bins)
+            log_probs = F.log_softmax(value_logits, dim=-1)
+            value_loss = -(value_labels_dist * log_probs).sum(dim=-1)  # (batch_size, seq_len)
+            
+            # Apply masks and weights
+            value_loss = value_loss * tokens_weights
+            value_loss = sum_sum(value_loss, masks_shifted, segments)
+        else:
+            # Use standard MSE loss
+            value_loss = 0.5 * torch.square(values - values_labels) * tokens_weights
+            value_loss = sum_sum(value_loss, masks_shifted, segments)
         
         # Combine policy loss and value loss
         final_loss = final_loss + config.value_loss_coef * value_loss
@@ -367,6 +409,37 @@ def rl_step(
         stats["value_loss"] = value_loss.item()
 
     return final_loss, stats
+
+
+def create_hl_gauss_labels(
+    rewards: np.ndarray,
+    config: RLConfig,
+) -> np.ndarray:
+    """
+    Create HL-Gauss categorical distributions from scalar rewards.
+    
+    Args:
+        rewards: Array of scalar rewards
+        config: RLConfig containing HL-Gauss parameters
+    
+    Returns:
+        Array of categorical distributions
+    """
+    hl_gauss = HLGaussLoss(
+        min_value=config.hl_gauss_min_value,
+        max_value=config.hl_gauss_max_value,
+        num_bins=config.hl_gauss_num_bins,
+        sigma_ratio=config.hl_gauss_sigma_ratio,
+    )
+    
+    # Convert to tensor for processing
+    rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+    
+    # Create target distributions
+    with torch.no_grad():
+        target_dists = hl_gauss._create_target_distribution(rewards_tensor)
+    
+    return target_dists.numpy()
 
 
 def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
@@ -444,7 +517,17 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df["group_tokens"] = df.apply(lambda row: [row["group_tokens"]] * len(row["input_ids"]), axis=1)
     df["num_out_tokens_in_seq"] = df.apply(lambda row: [sum(1 for label in row["labels"] if label != -100)] * len(row["input_ids"]), axis=1)
 
-    # Step 5: move the results back to the dataset
+    # Step 5: create HL-Gauss value labels if needed
+    if config.use_hl_gauss:
+        value_labels_list = []
+        for i, entry in enumerate(dataset):
+            rewards = np.array(entry["rewards"])
+            value_labels = create_hl_gauss_labels(rewards, config)
+            value_labels_list.append(value_labels.tolist())
+    else:
+        value_labels_list = [None] * len(dataset)
+    
+    # Step 6: move the results back to the dataset
     advantages_list = df["advantages"].tolist()
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()
@@ -454,6 +537,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         entry["group_tokens"] = group_tokens_list[i]
         entry["overflow"] = overflow_list[i]
         entry["num_out_tokens_in_seq"] = num_out_tokens_in_seq_list[i]
+        entry["value_labels"] = value_labels_list[i]
     return dataset
 
 
@@ -478,4 +562,5 @@ def prepare_rl_fields(
     encoding["overflow"] = [0] * len(encoding["labels"])  # place holder
     encoding["group_tokens"] = [0] * len(encoding["labels"])  # place holder
     encoding["num_out_tokens_in_seq"] = [1 if label != -100 else 0 for label in encoding["labels"]]  # count only output tokens
+    encoding["value_labels"] = None  # Will be populated during HL-Gauss preprocessing if needed
     return encoding

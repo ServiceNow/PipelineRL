@@ -7,6 +7,7 @@ from transformers.modeling_outputs import ModelOutput
 from typing import Optional, Tuple, Union
 from transformers import AutoModelForCausalLM
 from .context import get_accelerator, logger
+from .hl_gauss_loss import ValueHeadWithHLGauss
 
 
 @dataclass
@@ -21,6 +22,8 @@ class CausalLMOutputWithValue(ModelOutput):
             Prediction scores of the language modeling head.
         value (`torch.FloatTensor` of shape `(batch_size, sequence_length)`):
             Value predictions from the value head.
+        value_logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, num_bins)`, *optional*):
+            Categorical logits from HL-Gauss value head.
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*):
             Contains cached key/value states.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*):
@@ -32,6 +35,7 @@ class CausalLMOutputWithValue(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     value: torch.FloatTensor = None
+    value_logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
@@ -56,14 +60,26 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
     A wrapper around a causal language model that adds a value head for PPO training.
     """
 
-    def __init__(self, pretrained_model):
+    def __init__(self, pretrained_model, use_hl_gauss: bool = False, 
+                 min_value: float = -10.0, max_value: float = 10.0,
+                 num_bins: int = 51, sigma_ratio: float = 0.75):
         super().__init__()
         self.pretrained_model = pretrained_model
         self.config = pretrained_model.config
         hidden_size = self.config.hidden_size
+        self.use_hl_gauss = use_hl_gauss
 
         # Initialize value head
-        self.value_head = ValueHead(hidden_size)
+        if use_hl_gauss:
+            self.value_head = ValueHeadWithHLGauss(
+                hidden_size,
+                min_value=min_value,
+                max_value=max_value,
+                num_bins=num_bins,
+                sigma_ratio=sigma_ratio,
+            )
+        else:
+            self.value_head = ValueHead(hidden_size)
 
         # Copy relevant attributes from the pretrained model
         self.main_input_name = pretrained_model.main_input_name
@@ -103,12 +119,17 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         hidden_states = outputs.hidden_states[-1]
 
         # Compute values
-        values = self.value_head(hidden_states)
+        if self.use_hl_gauss:
+            values, value_logits = self.value_head(hidden_states)
+        else:
+            values = self.value_head(hidden_states)
+            value_logits = None
 
         return CausalLMOutputWithValue(
             loss=outputs.loss,
             logits=outputs.logits,
             value=values,
+            value_logits=value_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -171,10 +192,22 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
             logger.info(f"Saved value head to {value_head_path}")
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, 
+                       use_hl_gauss: bool = False, min_value: float = -10.0,
+                       max_value: float = 10.0, num_bins: int = 51,
+                       sigma_ratio: float = 0.75, **kwargs):
         """Load a model with value head from pretrained weights."""
 
         logger.info(f"Loading pretrained model from {pretrained_model_name_or_path}...")
+
+        # Extract HL-Gauss parameters before passing to base model
+        hl_gauss_params = {
+            'use_hl_gauss': use_hl_gauss,
+            'min_value': min_value,
+            'max_value': max_value,
+            'num_bins': num_bins,
+            'sigma_ratio': sigma_ratio,
+        }
 
         # Load the base model
         pretrained_model = AutoModelForCausalLM.from_pretrained(
@@ -182,7 +215,7 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         )
 
         # Create the model with value head
-        model = cls(pretrained_model)
+        model = cls(pretrained_model, **hl_gauss_params)
 
         # Try to load value head weights if they exist
         value_head_path = os.path.join(pretrained_model_name_or_path, "value_head.pt")

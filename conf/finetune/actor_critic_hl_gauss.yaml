@@ -1,0 +1,13 @@
+defaults:
+  - base
+  - _self_
+
+model_class: causal-language-modeling-with-value-head
+rl:
+  value_loss_coef: 0.1
+  algo: ppo
+  use_hl_gauss: true
+  hl_gauss_min_value: -10.0
+  hl_gauss_max_value: 10.0
+  hl_gauss_num_bins: 51
+  hl_gauss_sigma_ratio: 0.75

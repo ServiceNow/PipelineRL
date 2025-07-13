@@ -122,6 +122,16 @@ def load_model(args, model_class, current_dir):
 
     logger.info(f"Loading args: {loading_args}")
     
+    # Add HL-Gauss parameters if using value head model
+    if model_cls == AutoModelForCausalLMWithValueHead and hasattr(args, 'rl') and args.rl:
+        if args.rl.use_hl_gauss:
+            loading_args['use_hl_gauss'] = True
+            loading_args['min_value'] = args.rl.hl_gauss_min_value
+            loading_args['max_value'] = args.rl.hl_gauss_max_value
+            loading_args['num_bins'] = args.rl.hl_gauss_num_bins
+            loading_args['sigma_ratio'] = args.rl.hl_gauss_sigma_ratio
+            logger.info(f"Using HL-Gauss value head with min_value={args.rl.hl_gauss_min_value}, max_value={args.rl.hl_gauss_max_value}, num_bins={args.rl.hl_gauss_num_bins}, sigma_ratio={args.rl.hl_gauss_sigma_ratio}")
+    
     model = model_cls.from_pretrained(model_to_load, **loading_args)
 
     if args.gradient_checkpointing:

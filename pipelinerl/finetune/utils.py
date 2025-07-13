@@ -33,6 +33,12 @@ def create_sentinel_batch(device, tokenizer=None, model_version=0) -> PipelineBa
     zeros = [0.0] * length
     ones = [1.0] * length
 
+    # TODO: Get num_bins from config instead of hardcoding
+    num_bins = 51
+    
+    # Create a uniform distribution over bins for value_labels
+    uniform_dist = torch.ones(1, length, num_bins, dtype=torch.float) / num_bins
+    
     sentinel_batch = {
         "input_ids": torch.tensor(input_ids, dtype=torch.long).reshape(1, -1),
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long).reshape(1, -1),
@@ -45,6 +51,7 @@ def create_sentinel_batch(device, tokenizer=None, model_version=0) -> PipelineBa
         "group_tokens": torch.tensor(ones, dtype=torch.float).reshape(1, -1),
         "num_out_tokens_in_seq": torch.tensor(ones, dtype=torch.float).reshape(1, -1),
         "overflow": torch.tensor(zeros, dtype=torch.float).reshape(1, -1),
+        "value_labels": uniform_dist,
         "seq_boundaries": torch.tensor([0, length], dtype=torch.int)
     }
 
@@ -70,6 +77,7 @@ def create_sentinel_example(n_tokens: int, tokenizer=None, model_version=0) -> d
         "group_tokens": n_tokens * [1.0],
         "num_out_tokens_in_seq": n_tokens * [1.0], 
         "overflow": n_tokens * [0.0],
+        "value_labels": None,  # Will be None for sentinel examples
         "model_version": model_version,
     }
     return example

@@ -61,6 +61,7 @@ class PipelineBatchEncoding(BaseModel):
     group_tokens: torch.FloatTensor
     num_out_tokens_in_seq: torch.FloatTensor 
     overflow: torch.FloatTensor
+    value_labels: torch.FloatTensor | None = None  # HL-Gauss categorical distributions
     
     model_version: int
     sentinel: bool = False
@@ -95,7 +96,7 @@ class PipelineBatchEncoding(BaseModel):
         return torch.tensor(v, dtype=torch.int)
     
     # TODO: am i needed?
-    @field_validator('rewards', 'advantages', 'ref_logprobs', 'old_logprobs', 'group_tokens', 'num_out_tokens_in_seq', 'overflow', 'pixel_values', mode='before')
+    @field_validator('rewards', 'advantages', 'ref_logprobs', 'old_logprobs', 'group_tokens', 'num_out_tokens_in_seq', 'overflow', 'pixel_values', 'value_labels', mode='before')
     @classmethod
     def convert_to_float_tensor(cls, v: List[float] | torch.Tensor | None) -> torch.FloatTensor | None:
         """Handle initialization of float tensors from different types."""
@@ -164,6 +165,7 @@ class PipelineBatchEncoding(BaseModel):
                 "group_tokens": self.group_tokens[:, bs[i]:bs[i + 1]],
                 "overflow": self.overflow[:, bs[i]:bs[i + 1]],
                 "num_out_tokens_in_seq": self.num_out_tokens_in_seq[:, bs[i]:bs[i + 1]],
+                "value_labels": self.value_labels[:, bs[i]:bs[i + 1]] if self.value_labels is not None else None,
                 # metadata
                 "model_version": self.model_version,
                 "sentinel": self.sentinel,
