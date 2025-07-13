@@ -403,6 +403,15 @@ def rl_step(
     }
 
     if has_value_head:
+        if config.use_hl_gauss and hasattr(outputs, 'value_logits') and outputs.value_logits is not None:
+            # For HL-Gauss, compute entropy from categorical logits
+            value_logits_shifted = outputs.value_logits[:, :-1]
+            value_probs = F.softmax(value_logits_shifted, dim=-1)
+            value_entropy = -(value_probs * F.log_softmax(value_logits_shifted, dim=-1)).sum(dim=-1)
+        else:
+            # For scalar value heads, this is not meaningful - set to 0
+            value_entropy = torch.zeros_like(value_predictions)
+        stats["value_entropy"] = sum_sum(value_entropy / stats_denom, masks_shifted, segments).item()
         stats["value_mean"] = sum_sum(value_predictions / stats_denom, masks_shifted, segments).item()
         stats["value_max"] = value_predictions[masks_shifted].max().item() if masks_shifted.any() else 0.0
         stats["value_min"] = value_predictions[masks_shifted].min().item() if masks_shifted.any() else 0.0
