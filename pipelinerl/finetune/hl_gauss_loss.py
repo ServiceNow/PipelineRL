@@ -207,6 +207,7 @@ class ValueHeadWithHLGauss(nn.Module):
             values: Scalar value predictions of shape (batch_size, seq_len)
             logits: Categorical logits of shape (batch_size, seq_len, num_bins)
         """
-        logits = self.output(hidden_states)  # (batch_size, seq_len, num_bins)
+        hidden_states_detached = hidden_states.detach()  # Detach to avoid gradients through hidden states
+        logits = self.output(hidden_states_detached)  # (batch_size, seq_len, num_bins)
         values = self.hl_gauss_loss.get_values_from_logits(logits)
         return values, logits

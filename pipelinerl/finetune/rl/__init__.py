@@ -265,6 +265,9 @@ def rl_step(
         value_predictions = outputs.value[:, :-1] # no target for the last token 
         # Compute value-based advantages: A(s,a) = MC_return - V(s)
         # where MC_return is the Monte Carlo return (rewards) and V(s) is the value prediction
+        assert value_predictions.shape == rewards.shape, (
+            f"Value predictions shape {value_predictions.shape} does not match rewards shape {rewards.shape}"
+        )
         advantages = rewards - value_predictions
     else:
         advantages = batch.advantages[:, 1:]
