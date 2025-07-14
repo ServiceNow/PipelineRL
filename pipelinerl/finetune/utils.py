@@ -37,7 +37,7 @@ def create_sentinel_batch(device, tokenizer=None, model_version=0) -> PipelineBa
     num_bins = 51
     
     # Create a uniform distribution over bins for value_labels
-    uniform_dist = torch.ones(1, length, num_bins, dtype=torch.float) / num_bins
+    uniform_dist = torch.zeros(1, length, num_bins, dtype=torch.float) 
     
     sentinel_batch = {
         "input_ids": torch.tensor(input_ids, dtype=torch.long).reshape(1, -1),

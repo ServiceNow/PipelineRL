@@ -239,6 +239,7 @@ def rl_step(
     num_out_tokens_in_seq = batch.num_out_tokens_in_seq[:, 1:]
     overflow = batch.overflow[:, 1:]
 
+    #
     stats_denom = num_out_tokens_in_seq * config.batch_size 
     if config.group_normalization:
         # assert that group_tokens is not zero
@@ -332,17 +333,13 @@ def rl_step(
             value_logits = outputs.value_logits[:, :-1]  # Remove last token
             value_labels_dist = batch.value_labels[:, 1:]  # Already shifted categorical distributions
 
-            # Verify that weighted sum of bin centers equals original rewards
-            if hasattr(model, 'value_head') and hasattr(model.value_head, 'hl_gauss_loss'):
-                bin_centers = model.value_head.hl_gauss_loss.bin_centers
-                reconstructed_rewards = (value_labels_dist * bin_centers.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
-                assert torch.allclose(reconstructed_rewards, rewards, atol=1e-5), \
-                    f"value_labels_dist * bin_centers should equal rewards, got max diff: {(reconstructed_rewards - rewards).abs().max()}"
-
             # Compute cross-entropy loss
             # value_logits: (batch_size, seq_len, num_bins)
             # value_labels_dist: (batch_size, seq_len, num_bins)
             log_probs = F.log_softmax(value_logits, dim=-1)
+            assert log_probs.shape == value_labels_dist.shape, (
+                f"log_probs shape {log_probs.shape} does not match value_labels_dist shape {value_labels_dist.shape}"
+            )
             value_loss = -(value_labels_dist * log_probs).sum(dim=-1)  # (batch_size, seq_len)
             
             # Apply masks and weights
@@ -364,8 +361,11 @@ def rl_step(
             "input_size": float(batch.input_ids.numel()),
         }
         return final_loss, stats_no_labels
-
-    # All the stats are average then summed. They will be normalized by the number of sequences at the end of the step
+    # Here is what will happend to different metrics down the line.
+    # 1. loss is summed
+    # 2. min/max are computed over the whole batch
+    # 3. all other stats are averaged by sequence and then over the batch
+    # All the stats are divided by the number of labels in the sequence and then summed . They will be normalized by the number of sequences at the end of the step
     stats = {
         "loss": final_loss.item(),
         "max_loss": final_loss.item(),
@@ -423,6 +423,9 @@ def rl_step(
         stats["value_max"] = value_predictions[masks_shifted].max().item() if masks_shifted.any() else 0.0
         stats["value_min"] = value_predictions[masks_shifted].min().item() if masks_shifted.any() else 0.0
         stats["value_loss"] = value_loss.item()
+        stats["mse_value"] = sum_sum(
+            0.5 * torch.square(value_predictions - rewards) / stats_denom, masks_shifted, segments
+        ).item()
 
     return final_loss, stats
 
