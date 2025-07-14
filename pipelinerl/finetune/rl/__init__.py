@@ -17,7 +17,7 @@ from .utils import (
     mean_sum,
     replace_dataset_column,
 )
-from ..hl_gauss_loss import HLGaussLoss
+from ..hl_gauss_loss import HLGaussLoss, ValueHeadWithHLGauss
 
 # FIXME: remove a warnings, but might be worth investigating
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -331,7 +331,14 @@ def rl_step(
             
             value_logits = outputs.value_logits[:, :-1]  # Remove last token
             value_labels_dist = batch.value_labels[:, 1:]  # Already shifted categorical distributions
-            
+
+            # Verify that weighted sum of bin centers equals original rewards
+            if hasattr(model, 'value_head') and hasattr(model.value_head, 'hl_gauss_loss'):
+                bin_centers = model.value_head.hl_gauss_loss.bin_centers
+                reconstructed_rewards = (value_labels_dist * bin_centers.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
+                assert torch.allclose(reconstructed_rewards, rewards, atol=1e-5), \
+                    f"value_labels_dist * bin_centers should equal rewards, got max diff: {(reconstructed_rewards - rewards).abs().max()}"
+
             # Compute cross-entropy loss
             # value_logits: (batch_size, seq_len, num_bins)
             # value_labels_dist: (batch_size, seq_len, num_bins)

@@ -101,3 +101,4 @@ rl:
   temperature: ${...llm.parameters.temperature}
   aggregate_loss: sum
   overlong_filtering: false
+  use_hl_gauss: false
