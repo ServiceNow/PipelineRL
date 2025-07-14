@@ -292,14 +292,17 @@ def collate_packed(
         # handle extra keys
         for key in extra_keys:
             value = example[key]
-            if isinstance(value, (list, tuple)):
-                extra_lists[key].extend(value)
-            else:
-                extra_lists[key].append(value)
+            if value is not None:
+                if isinstance(value, (list, tuple)):
+                    extra_lists[key].extend(value)
+                else:
+                    extra_lists[key].append(value)
 
     # Handle extra tensors with special case for value_labels
     extra_tensors = {}
     for key in extra_keys:
+        if not extra_lists[key]:  # Skip if list is empty after filtering None values
+            continue
         if key == "value_labels" and has_value_labels:
             # Stack value_labels into 3D tensor
             extra_tensors[key] = torch.tensor(extra_lists[key], dtype=torch.float).unsqueeze(0)  # (1, seq_len, num_bins)
