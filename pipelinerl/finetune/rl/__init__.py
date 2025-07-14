@@ -112,11 +112,11 @@ class RLConfig(BaseModel):
         description="Maximum value for HL-Gauss categorical distribution support",
     )
     hl_gauss_num_bins: int = Field(
-        default=51,
+        default=11,
         description="Number of bins for HL-Gauss discretization",
     )
     hl_gauss_sigma_ratio: float = Field(
-        default=0.75,
+        default=0.5,
         description="Ratio of sigma to bin width for HL-Gauss smoothing",
     )
 

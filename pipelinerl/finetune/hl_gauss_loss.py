@@ -184,17 +184,11 @@ class ValueHeadWithHLGauss(nn.Module):
         self.num_bins = num_bins
         
         # 3-layer neural network
-        self.layer1 = nn.Linear(hidden_size, hidden_size)
-        self.layer2 = nn.Linear(hidden_size, hidden_size)
-        self.layer3 = nn.Linear(hidden_size, num_bins)
+        self.layer = nn.Linear(hidden_size, num_bins)
         
         # Initialize all layers
-        nn.init.xavier_uniform_(self.layer1.weight)
-        nn.init.zeros_(self.layer1.bias)
-        nn.init.xavier_uniform_(self.layer2.weight)
-        nn.init.zeros_(self.layer2.bias)
-        nn.init.xavier_uniform_(self.layer3.weight)
-        nn.init.zeros_(self.layer3.bias)
+        nn.init.xavier_uniform_(self.layer.weight)
+        nn.init.zeros_(self.layer.bias)
         
         # HL-Gauss loss function
         self.hl_gauss_loss = HLGaussLoss(
@@ -215,12 +209,8 @@ class ValueHeadWithHLGauss(nn.Module):
             values: Scalar value predictions of shape (batch_size, seq_len)
             logits: Categorical logits of shape (batch_size, seq_len, num_bins)
         """
-        hidden_states_detached = hidden_states.detach()  # Detach to avoid gradients through hidden states
         
-        # Pass through 3-layer network
-        x = F.relu(self.layer1(hidden_states_detached))
-        x = F.relu(self.layer2(x))
-        logits = self.layer3(x)  # (batch_size, seq_len, num_bins)
+        logits = self.layer(hidden_states)  # (batch_size, seq_len, num_bins)
         
         values = self.hl_gauss_loss.get_values_from_logits(logits)
         return values, logits
