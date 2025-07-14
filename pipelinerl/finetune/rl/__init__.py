@@ -423,7 +423,7 @@ def rl_step(
         stats["value_max"] = value_predictions[masks_shifted].max().item() if masks_shifted.any() else 0.0
         stats["value_min"] = value_predictions[masks_shifted].min().item() if masks_shifted.any() else 0.0
         stats["value_loss"] = value_loss.item()
-        stats["mse_value"] = sum_sum(
+        stats["value_mse"] = sum_sum(
             0.5 * torch.square(value_predictions - rewards) / stats_denom, masks_shifted, segments
         ).item()
 
