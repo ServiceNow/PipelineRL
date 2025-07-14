@@ -185,7 +185,7 @@ class ValueHeadWithHLGauss(nn.Module):
         
         # Output layer predicts logits for each bin
         self.output = nn.Linear(hidden_size, num_bins)
-        nn.init.normal_(self.output.weight, std=1e-3)
+        nn.init.xavier_uniform_(self.output.weight)
         nn.init.zeros_(self.output.bias)
         
         # HL-Gauss loss function
