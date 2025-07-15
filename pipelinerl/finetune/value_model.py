@@ -46,6 +46,7 @@ class ValueHead(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
         self.output = nn.Linear(hidden_size, 1)
+        torch.manual_seed(42)  # For reproducibility
         nn.init.normal_(self.output.weight, std=1e-3)
         nn.init.zeros_(self.output.bias)
 
