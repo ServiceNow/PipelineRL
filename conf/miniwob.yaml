@@ -1,5 +1,7 @@
 defaults:
   - base
+  - override streams: redis
+  - _self_
 
 world:
   actor_fraction: 2
