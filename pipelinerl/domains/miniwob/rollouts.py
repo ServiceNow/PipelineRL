@@ -91,7 +91,7 @@ async def generate_miniwob_rollout(
         tape: WebTape = WebTape(**tape_dict)  # convert http response dict to WebTape object
         t = time.perf_counter()
         if no_error:  # only run the agent if the task started successfully
-            logger.info(f"Running agent for task {problem['dataset']}/{problem['task']]}/{problem['seed']}")
+            logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
             try:
                 actions = await env.a_actions()
                 tools_description = await env.a_tools_description()
