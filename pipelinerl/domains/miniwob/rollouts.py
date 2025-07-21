@@ -33,7 +33,8 @@ def tape_contains_an_error(tape: WebTape) -> bool:
     - the last step is a PageObservation with an error
     """
     return (
-        isinstance(tape.steps[-1], LLMOutputParsingFailureAction)
+        len(tape.steps) == 0
+        or isinstance(tape.steps[-1], LLMOutputParsingFailureAction)
         or tape.metadata.result.get("error") is not None
         or (isinstance(tape.steps[-1], PageObservation) and tape.steps[-1].error)
     )
@@ -63,6 +64,7 @@ async def generate_miniwob_rollout(
     env_job_url = f"http://{env_job.hostname}:{env_job.port}"
 
     # (2) Generate environment, TapeAgent, and run them to get a Tape
+    no_error = True  # track if there was an error in the tape
     environment = AsyncRemoteEnvironment(server_url=env_job_url)  # type: ignore
     async with environment.acontext(session, wait_for_env=True) as env:
         start_attempts = cfg.start_attempts
@@ -72,26 +74,35 @@ async def generate_miniwob_rollout(
                 tape_dict, _ = await env.start_task(problem)
                 break
             except Exception as e:
+                logger.warning(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']}")
                 start_attempts -= 1
                 if start_attempts <= 0:
-                    if isinstance(e, HTTPException):
-                        raise RuntimeError(f"HTTPException: {e.status_code} {e.detail}")
-                    else:
-                        raise e
-                logger.warning(f"Failed to start task, retry after 5 seconds: {e}")
-                await asyncio.sleep(5)
+                    no_error = False
+                    tape_dict = {}
+                    break
+                    # if isinstance(e, HTTPException):
+                    #     raise RuntimeError(f"HTTPException: {e.status_code} {e.detail}")
+                    # else:
+                    #     raise e
+                else:
+                    logger.warning(f"retry after 5 seconds: {e}")
+                    await asyncio.sleep(5)
         logger.info(f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds")
         tape: WebTape = WebTape(**tape_dict)  # convert http response dict to WebTape object
         t = time.perf_counter()
-        try:
-            actions = await env.a_actions()
-            tools_description = await env.a_tools_description()
-            logger.debug(f"Available tools: {tools_description}")
-            agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
-            agent.llms = {DEFAULT: llm}
-            tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
-        except Exception as e:
-            logger.error(f"Error occurred while running agent: {e}")
+        if no_error:  # only run the agent if the task started successfully
+            logger.info(f"Running agent for task {problem['dataset']}/{problem['task']]}/{problem['seed']}")
+            try:
+                actions = await env.a_actions()
+                tools_description = await env.a_tools_description()
+                logger.debug(f"Available tools: {tools_description}")
+                agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
+                agent.llms = {DEFAULT: llm}
+                tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
+            except Exception as e:
+                logger.error(f"Error occurred while running agent: {e}")
+                no_error = False
+            logger.info(f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds")
         tape.metadata.result = {"execution_time": time.perf_counter() - t}
 
     # save the tape as we go
@@ -99,13 +110,18 @@ async def generate_miniwob_rollout(
         save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape.metadata.id)
 
     # (3) Compute rewards
-    last_obs = [step for step in tape if isinstance(step, Observation)][-1]
-    # in Miniwob, the observation "reward" is defined as RAW_REWARD_GLOBAL > 0
-    # see here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/src/browsergym/miniwob/base.py#L183
-    # Let's take directly the RAW_REWARD_GLOBAL from the metadata
-    # raw_reward = last_obs.metadata.other.get("reward", 0.0)
-    raw_reward = last_obs.metadata.other.get("info", {}).get("task_info", {}).get("REWARD_GLOBAL", -1.0)
-    no_error = not tape_contains_an_error(tape)
+    obs_steps = [step for step in tape if isinstance(step, Observation)]
+    if obs_steps:
+        last_obs = obs_steps[-1]
+        # in Miniwob, the observation "reward" is defined as RAW_REWARD_GLOBAL > 0
+        # see here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/src/browsergym/miniwob/base.py#L183
+        # Let's take directly the RAW_REWARD_GLOBAL from the metadata
+        # raw_reward = last_obs.metadata.other.get("reward", 0.0)
+        raw_reward = last_obs.metadata.other.get("info", {}).get("task_info", {}).get("REWARD_GLOBAL", -1.0)
+    else:
+        raw_reward = -1.0
+
+    no_error = no_error and not tape_contains_an_error(tape)
     # get the number of LLMOutputParsingFailureAction in the tape
     n_step_errors = len([step for step in tape.steps if isinstance(step, LLMOutputParsingFailureAction)])
     # get the number of PageObservation steps in the tape
