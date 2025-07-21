@@ -56,20 +56,24 @@ def load_tasks(dataset_names: list[str], train_split: float = 0.6, seeds: list[i
     for name in dataset_names:
         if name == "debug":
             tasks.extend([
-                {"dataset": "miniwob.debug", "task": task, "seed": 0} for task in DEBUG_SPLIT
+                # {"dataset": "miniwob.debug", "task": task, "seed": 0} for task in DEBUG_SPLIT
+                {"dataset": task, "task": task, "seed": 0} for task in DEBUG_SPLIT
             ])
         elif name == "easy":
             tasks.extend([
-                {"dataset": "miniwob.easy", "task": task, "seed": 0} for task in EASY_SPLIT
+                # {"dataset": "miniwob.easy", "task": task, "seed": 0} for task in EASY_SPLIT
+                {"dataset": task, "task": task, "seed": 0} for task in EASY_SPLIT
             ])
         elif name == "train":
             tasks.extend([
-                {"dataset": "miniwob.train", "task": task, "seed": seed}
+                # {"dataset": "miniwob.train", "task": task, "seed": seed}
+                {"dataset": task, "task": task, "seed": seed}
                 for task in TRAIN_SPLIT for seed in seeds
             ])
         elif name == "test":
             tasks.extend([
-                {"dataset": "miniwob.test", "task": task, "seed": seed}
+                # {"dataset": "miniwob.test", "task": task, "seed": seed}
+                {"dataset": task, "task": task, "seed": seed}
                 for task in TEST_SPLIT for seed in seeds
             ])
     return tasks
