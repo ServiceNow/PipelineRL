@@ -22,7 +22,7 @@ from typing import Dict, List
 
 import wandb
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
-from pipelinerl.rollouts import RolloutResult
+from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from pipelinerl.shared_memory_array import SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import (
