@@ -157,7 +157,6 @@ environment:
   miniwob_url: ???
   n_envs: 8
   host: "0.0.0.0"
-  max_session_inactivity_secs: 600  # kill session after 10 minutes of inactivity
   env_call_timeout: 120  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
   exp_path: ${output_dir}/env_server
