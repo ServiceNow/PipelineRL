@@ -1,9 +1,5 @@
-"""TIR Environment implementations for secure Python code execution."""
-
 import asyncio
 import logging
-import os
-from typing import Union
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -19,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class MCPPythonEnvironment(Environment):
-    """Environment using MCP Run Python server for secure code execution."""
+    """Environment using (Pydantic) MCP Run Python server for sandboxed code execution."""
     
     def __init__(self):
         super().__init__()
@@ -62,12 +58,9 @@ class MCPPythonEnvironment(Environment):
             try:
                 logger.info(f"Executing Python code via MCP: {repr(action.code[:100])}...")
                 
-                # Execute code using MCP - handle async properly
                 try:
-                    loop = asyncio.get_running_loop()
-                    # Run in thread to avoid event loop conflicts
+                    asyncio.get_running_loop()
                     import concurrent.futures
-                    import threading
                     
                     def run_in_thread():
                         return asyncio.run(self._execute_python_code(action.code))
@@ -77,7 +70,6 @@ class MCPPythonEnvironment(Environment):
                         result = future.result(timeout=30)
                         
                 except RuntimeError:
-                    # No running loop
                     result = asyncio.run(self._execute_python_code(action.code))
                 
                 logger.info(f"MCP execution result: {repr(result[:200])}...")
@@ -110,7 +102,6 @@ class MCPPythonEnvironment(Environment):
     
     def _parse_mcp_result(self, mcp_output: str) -> tuple[str, bool]:
         """Parse MCP output to extract result and determine success."""
-        # Check for error status
         if "<status>error</status>" in mcp_output:
             if "<stderr>" in mcp_output and "</stderr>" in mcp_output:
                 start = mcp_output.find("<stderr>") + len("<stderr>")
@@ -120,37 +111,31 @@ class MCPPythonEnvironment(Environment):
             else:
                 return "Error: Code execution failed", False
         
-        # Look for successful output in <o> tags
         if "<o>" in mcp_output and "</o>" in mcp_output:
             start = mcp_output.find("<o>") + len("<o>")
             end = mcp_output.find("</o>")
             output = mcp_output[start:end].strip()
             
-            # Remove list brackets if present
             if output.startswith("[") and output.endswith("]"):
                 output = output[1:-1].strip()
             
             return output if output else "No output produced", True
         
-        # Try return_value format
         elif "<return_value>" in mcp_output and "</return_value>" in mcp_output:
             start = mcp_output.find("<return_value>") + len("<return_value>")
             end = mcp_output.find("</return_value>")
             return_value = mcp_output[start:end].strip()
             
-            # Remove list brackets
             if return_value.startswith("[") and return_value.endswith("]"):
                 return_value = return_value[1:-1].strip()
             
             return return_value, True
         
-        # Check for stderr errors
         elif "<stderr>" in mcp_output and "</stderr>" in mcp_output:
             start = mcp_output.find("<stderr>") + len("<stderr>")
             end = mcp_output.find("</stderr>")
             error_msg = mcp_output[start:end].strip()
             
-            # Clean up Python tracebacks
             if "Traceback" in error_msg:
                 lines = error_msg.split('\n')
                 last_line = lines[-1] if lines else error_msg
@@ -159,6 +144,5 @@ class MCPPythonEnvironment(Environment):
                 return f"Error: {error_msg}", False
         
         else:
-            # No structured output - return raw
             clean_output = mcp_output.strip()
             return clean_output if clean_output else "No output produced", True

@@ -216,7 +216,7 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
 
     if "math_train" in dataset_names:
         # math_dataset = load_math("train")
-        dataset = load_dataset("hendrycks/competition_math", split="train", trust_remote_code=True)
+        dataset = load_dataset("hendrycks/competition_math", "default", split="train", trust_remote_code=True)
         samples = [s for s in process_math(dataset, "math_train") if s is not None]
         logger.info(f"Loading math train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
@@ -260,7 +260,7 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
 
     if "math_test" in dataset_names:
         # math_dataset = load_math("test")
-        dataset = load_dataset("hendrycks/competition_math", split="test", trust_remote_code=True)
+        dataset = load_dataset("hendrycks/competition_math", "default", split="test", trust_remote_code=True)
         samples = [s for s in process_math(dataset, "math_test") if s is not None]
         logger.info(f"Loading math test dataset: {len(samples)} samples")
         datasets += add_ids(samples)
