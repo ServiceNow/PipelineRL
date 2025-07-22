@@ -1,5 +1,3 @@
-"""Rollout generation for TIR domain."""
-
 import logging
 import time
 import json

@@ -1,5 +1,3 @@
-"""Dataset loading and processing for TIR domain."""
-
 import logging
 import re
 from typing import Dict, Any, List, Union

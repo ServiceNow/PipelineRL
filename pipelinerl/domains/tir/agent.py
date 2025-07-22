@@ -1,12 +1,10 @@
-"""TIR Math Agent implementation for Tool Integrated Reasoning."""
-
 import logging
 import re
 from typing import Any, Generator, Union, Literal
 from pydantic import Field
 
 from tapeagents.agent import Agent
-from tapeagents.core import Action, Prompt, Step, Tape, Observation, LLMOutputParsingFailureAction, SetNextNode, AgentStep, StopStep
+from tapeagents.core import Prompt, Step, Tape, Observation, LLMOutputParsingFailureAction, SetNextNode, StopStep
 from tapeagents.llms import LLM
 from tapeagents.nodes import Node
 from tapeagents.steps import ActionExecutionFailure
