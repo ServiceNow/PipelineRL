@@ -1,18 +1,32 @@
+"""Rollout generation for TIR domain."""
+
 import logging
 import time
 import json
 import os
-from typing import Dict, Any, List, Union
+from typing import Any, List, Union
 from collections import Counter
 import aiohttp
 from omegaconf import DictConfig
 from tapeagents.llms import TrainableLLM
-from pipelinerl.rollouts import RolloutResult
+from pipelinerl.rollouts import RolloutResult, BaseMetrics
 
 logger = logging.getLogger(__name__)
 
-# Cache environments globally
+# Cache environments globally to avoid recreating them
 _cached_environments = {}
+
+
+class TIRMetrics(BaseMetrics):
+    """TIR-specific metrics extending the base metrics."""
+    overflow: int = 0  # Whether max_loops was hit
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    mode_sc_tir: int = 0  # 0=fast mode, 1=sc_tir mode
+    num_candidates: int = 1
+    candidates_with_answers: int = 0
+    agreement_rate: float = 0.0  # How often candidates agree
+
 
 async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict, session: aiohttp.ClientSession) -> RolloutResult:
     """Generate a rollout for TIR domain with fast or sc_tir modes."""
@@ -23,6 +37,7 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     
     time_start = time.time()
     
+    # Create or reuse env
     env_key = str(cfg.environment)
     if env_key not in _cached_environments:
         _cached_environments[env_key] = MCPPythonEnvironment()
@@ -167,21 +182,20 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     else:
         agreement_rate = 1.0 if valid_answers else 0.0
     
-    metrics = {
-        "reward": reward,
-        "success": 1 if success else 0,
-        "no_error": 1 if not has_errors else 0,
-        "no_answer": 1 if answer_status == "no_answer" else 0,
-        "overflow": 0,  # TODO: detect max_loops
-        "prompt_tokens": sum(llm_call.prompt_length_tokens for llm_call in all_llm_calls) if all_llm_calls else 0,
-        "output_tokens": sum(llm_call.output_length_tokens for llm_call in all_llm_calls) if all_llm_calls else 0,
-        "mode": mode,
-        "num_candidates": num_candidates,
-        "candidates_with_answers": len(valid_answers),
-        "agreement_rate": agreement_rate,
-        "majority_answer": final_answer,
-        "candidate_answers": candidate_answers,
-    }
+    # Create TIRMetrics instance with all TIR-specific metrics
+    metrics = TIRMetrics(
+        reward=reward,
+        success=success,
+        no_error=not has_errors,
+        no_answer=(answer_status == "no_answer"),
+        overflow=0,  # TODO: detect if max_loops was hit
+        prompt_tokens=sum(llm_call.prompt_length_tokens for llm_call in all_llm_calls) if all_llm_calls else 0,
+        output_tokens=sum(llm_call.output_length_tokens for llm_call in all_llm_calls) if all_llm_calls else 0,
+        mode_sc_tir=1 if mode == 'sc_tir' else 0,
+        num_candidates=num_candidates,
+        candidates_with_answers=len(valid_answers),
+        agreement_rate=agreement_rate,
+    )
     
     return RolloutResult(
         training_texts=all_training_samples,
