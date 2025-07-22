@@ -348,6 +348,7 @@ class ActorLoop:
             self.latency_list.append(result.latency)
             self.model_versions_list.append(result.model_version)
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
+            assert isinstance(result.metrics, BaseMetrics), "Metrics should be an instance of BaseMetrics"
             all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
             for k, v in all_metrics.items():
                 if isinstance(v, list):
