@@ -35,6 +35,9 @@ class MiniwobMetrics(BaseMetrics):
     n_step_errors: int
     n_page_observations: int
     n_steps: int
+    total_execution_time: float
+    agent_execution_time: float
+    environment_execution_time: float
 
 
 def tape_contains_an_error(tape: WebTape) -> bool:
@@ -115,7 +118,7 @@ async def generate_miniwob_rollout(
                 logger.error(f"Error occurred while running agent: {e}")
                 no_error = False
             logger.info(f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds")
-        tape.metadata.result = {"execution_time": time.perf_counter() - t}
+        tape.metadata.result.update({"total_execution_time": time.perf_counter() - t})
 
     # save the tape as we go
     if cfg.save_tapes:
@@ -171,6 +174,9 @@ async def generate_miniwob_rollout(
         n_step_errors=n_step_errors,
         n_page_observations=n_page_observations,
         n_steps=len(tape.steps),
+        total_execution_time=tape.metadata.result.get("total_execution_time", -1.0),
+        agent_execution_time=tape.metadata.result.get("agent_execution_time", -1.0),
+        environment_execution_time=tape.metadata.result.get("environment_execution_time", -1.0),
     )
 
     return RolloutResult(
