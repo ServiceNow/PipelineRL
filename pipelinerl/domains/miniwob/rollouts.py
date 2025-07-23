@@ -10,7 +10,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.rollouts import RolloutResult
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.world import Job
 from tapeagents.agent import Agent, DEFAULT
 from tapeagents.core import LLMOutputParsingFailureAction, Observation, LLMCall
