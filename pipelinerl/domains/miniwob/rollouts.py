@@ -25,6 +25,18 @@ from examples.rl_webagent.steps import WebTape
 logger = logging.getLogger(__name__)
 
 
+class MiniwobMetrics(BaseMetrics):
+    reward: float
+    success: bool
+    no_error: bool
+    no_answer: bool
+    overflow: bool
+    n_llm_calls: int
+    n_step_errors: int
+    n_page_observations: int
+    n_steps: int
+
+
 def tape_contains_an_error(tape: WebTape) -> bool:
     """
     Returns true if the tape ends with an error, ie if one of the following is true:
@@ -149,17 +161,17 @@ async def generate_miniwob_rollout(
 
     latency = time.time() - start_time
 
-    metrics = {
-        "reward": reward,
-        "success": 1 if reward > 0.5 else 0,
-        "no_error": no_error,
-        "no_answer": 1 if reward < 0 else 0,
-        "overflow": 0 if all_finished else 1,
-        "n_llm_calls": n_llm_calls,
-        "n_step_errors": n_step_errors,
-        "n_page_observations": n_page_observations,
-        "n_steps": len(tape.steps),
-    }
+    metrics = MiniwobMetrics(
+        reward=reward,
+        success=reward > 0.5,
+        no_error=no_error,
+        no_answer=reward < 0,
+        overflow=not all_finished,
+        n_llm_calls=n_llm_calls,
+        n_step_errors=n_step_errors,
+        n_page_observations=n_page_observations,
+        n_steps=len(tape.steps),
+    )
 
     return RolloutResult(
         training_texts=training_texts,
