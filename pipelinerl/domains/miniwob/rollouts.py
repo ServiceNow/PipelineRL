@@ -1,26 +1,24 @@
-
 import asyncio
 import logging
 import os
 import random
 import time
+
 import aiohttp
-from fastapi import HTTPException
+from examples.rl_webagent.steps import WebTape
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-
-from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.rollouts import BaseMetrics, RolloutResult
-from pipelinerl.world import Job
-from tapeagents.agent import Agent, DEFAULT
-from tapeagents.core import LLMOutputParsingFailureAction, Observation, LLMCall
+from tapeagents.agent import DEFAULT, Agent
+from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
+from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
+from tapeagents.orchestrator import async_execute_agent
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 from tapeagents.tools.simple_browser import PageObservation
-from tapeagents.orchestrator import async_execute_agent
-from tapeagents.io import save_json_tape
-from examples.rl_webagent.steps import WebTape
 
+from pipelinerl.async_llm import make_training_text
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
+from pipelinerl.world import Job
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +36,8 @@ class MiniwobMetrics(BaseMetrics):
     total_execution_time: float
     agent_execution_time: float
     environment_execution_time: float
+    env_step_time: float
+    agent_step_time: float
 
 
 def tape_contains_an_error(tape: WebTape) -> bool:
@@ -102,7 +102,9 @@ async def generate_miniwob_rollout(
                 else:
                     logger.warning(f"retry after 5 seconds: {e}")
                     await asyncio.sleep(5)
-        logger.info(f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds")
+        logger.info(
+            f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds"
+        )
         tape: WebTape = WebTape(**tape_dict)  # convert http response dict to WebTape object
         t = time.perf_counter()
         if no_error:  # only run the agent if the task started successfully
@@ -117,7 +119,9 @@ async def generate_miniwob_rollout(
             except Exception as e:
                 logger.error(f"Error occurred while running agent: {e}")
                 no_error = False
-            logger.info(f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds")
+            logger.info(
+                f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds"
+            )
         tape.metadata.result.update({"total_execution_time": time.perf_counter() - t})
 
     # save the tape as we go
@@ -148,7 +152,8 @@ async def generate_miniwob_rollout(
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
     n_llm_calls = len(llm_calls)
     llm_calls: list[LLMCall] = [
-        LLMCall(**step.metadata.other["llm_call"]) if isinstance(step.metadata.other["llm_call"], dict)
+        LLMCall(**step.metadata.other["llm_call"])
+        if isinstance(step.metadata.other["llm_call"], dict)
         else step.metadata.other["llm_call"]
         for step in llm_calls
     ]
@@ -163,7 +168,10 @@ async def generate_miniwob_rollout(
         all_finished &= 1 if text.input_ids[-1] == llm.tokenizer.eos_token_id else 0
 
     latency = time.time() - start_time
-
+    agent_time = tape.metadata.result.get("agent_execution_time", -1.0)
+    env_time = tape.metadata.result.get("environment_execution_time", -1.0)
+    n_observations = len([s for s in tape.steps if isinstance(s, Observation)])
+    n_other_steps = len(tape.steps) - n_observations
     metrics = MiniwobMetrics(
         reward=reward,
         success=reward > 0.5,
@@ -175,8 +183,10 @@ async def generate_miniwob_rollout(
         n_page_observations=n_page_observations,
         n_steps=len(tape.steps),
         total_execution_time=tape.metadata.result.get("total_execution_time", -1.0),
-        agent_execution_time=tape.metadata.result.get("agent_execution_time", -1.0),
-        environment_execution_time=tape.metadata.result.get("environment_execution_time", -1.0),
+        agent_execution_time=agent_time,
+        environment_execution_time=env_time,
+        env_step_time=env_time / n_observations if env_time > 0 and n_observations > 0 else -1.0,
+        agent_step_time=agent_time / n_other_steps if agent_time > 0 and n_other_steps > 0 else -1.0,
     )
 
     return RolloutResult(
@@ -187,4 +197,3 @@ async def generate_miniwob_rollout(
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
     )
-
