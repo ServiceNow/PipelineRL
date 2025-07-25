@@ -23,9 +23,9 @@ preprocess:
   input: actor
   output: training_data
   n_workers: 8
-  chunk_n_groups: 2
+  chunk_n_groups: 8
   # queue for loaded raw groups
-  raw_queue_size: 8
+  raw_queue_size: 128
   # queue for processed chunks of multiple groups  
   input_queue_size: 32
   # queue for ready chunks for multiple groups
