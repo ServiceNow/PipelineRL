@@ -169,6 +169,6 @@ dataset_loader_params:
   train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
   seeds: [0, 42, 1337, 900, 103]
 train_dataset_names:
-  - debug
+  - train
 test_dataset_names:
-  - debug
+  - test
