@@ -170,7 +170,6 @@ def run_dataset_loader(
     check_group_size: int,
     chunk_n_groups: int,
     pop_old_data: bool,
-    wandb_run,
 ):
     old_and_dropped = 0
     last_time_notice = 0
@@ -197,8 +196,6 @@ def run_dataset_loader(
                             if old_and_dropped // 100 != last_time_notice:
                                 logger.info(f"So far removed {old_and_dropped} old elements from preprocessor queue")
                                 last_time_notice = old_and_dropped // 100
-                                if wandb_run is not None:
-                                    wandb_run.log({"preprocessor/dropped_before_preprocessing": old_and_dropped})
                         except Empty:
                             pass
                     # Put new element in now that we made space
@@ -385,7 +382,6 @@ def run_preprocessing_loop(
         check_group_size=cfg.attempts,
         chunk_n_groups=cfg.preprocess.chunk_n_groups,
         pop_old_data=pop_old_data,
-        wandb_run=wandb_run,
     )
     # Start the dataset loader thread using Thread
     dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn)
