@@ -1,8 +1,9 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 import os
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
+import json
 import logging
 import multiprocessing as mp
 import queue
@@ -12,9 +13,8 @@ from functools import partial
 from multiprocessing import Process, Queue
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Full
 from typing import List
-import random
 
 import datasets
 import transformers
@@ -22,6 +22,7 @@ from litellm import BaseModel, Field
 
 from pipelinerl.finetune.logging_ import flatten_dict_config
 from pipelinerl.shared_memory_array import SharedMemoryArray, SharedMemoryQueue
+from pipelinerl.state import TrainerState
 from pipelinerl.utils import setup_logging, wait_for_inference_servers, init_wandb
 from pipelinerl.world import WorldMap
 
@@ -33,19 +34,24 @@ from tapeagents.llms import TrainableLLM
 
 from pipelinerl.finetune.checkpoints import (
     load_tokenizer,
+    load_training_checkpoint,
 )
-from pipelinerl.finetune.data import preprocess_fn
+from pipelinerl.finetune.types import PipelineBatchEncoding, TrainingMetrics
+from pipelinerl.finetune.data import preprocess_fn, collate, collate_packed
+from pipelinerl.finetune.utils import create_sentinel_batch
 from pipelinerl.finetune.rl import RL_DATA_COLUMNS, RLConfig, populate_rl_data
 import traceback
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamRangeSpec,
+    StreamWriter,
     read_stream,
     set_streams_backend,
     write_to_streams,
 )
 
 logger = logging.getLogger(__name__)
+
 
 
 def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
@@ -317,24 +323,42 @@ def filter_zero_advantage_groups(dataset: list[dict], epsilon: float = 1e-6) -> 
     
     return filtered_entries, num_filtered_out
 
+
+def write_micro_batch_slices(
+    lead_trainer_id: int,
+    data_writer: StreamWriter,
+    micro_batch: PipelineBatchEncoding,
+    seq_parallel: int
+):
+    if seq_parallel > 1:
+        # make micro batch slices and write each to the corresponding trainer
+        for index, micro_slice in enumerate(micro_batch.make_slices(seq_parallel)):
+            data_writer.write(micro_slice, lead_trainer_id + index)
+    else:
+        data_writer.write(micro_batch, lead_trainer_id)
+
+
 def run_preprocessing_loop(
+    
     cfg: DictConfig,
 ):
     set_streams_backend(**cfg.streams)
 
     world_map = WorldMap(cfg, verbose=True)
     exp_root_dir = Path(cfg.output_dir)
-    setup_logging(exp_root_dir / "preprocessor", "preprocessor")
+    preprocess_dir = exp_root_dir / "preprocess"
+    preprocess_dir.mkdir(parents=True, exist_ok=True)
+    setup_logging(preprocess_dir, "preprocessor")
 
     if cfg.wandb.use_wandb:
-        wandb_run = init_wandb(cfg, exp_root_dir / "preprocessor", flatten_dict_config(cfg))
+        wandb_run = init_wandb(cfg, preprocess_dir, flatten_dict_config(cfg))
         if wandb_run is None:
             raise ValueError("Failed to initialize wandb run")
     else:
         wandb_run = None
 
     tokenizer = load_tokenizer(cfg.finetune.config_name)
-
+    
     llm_urls = str(cfg.me.llm_urls).split("+") if cfg.me.llm_urls else []
     if llm_urls:
         wait_for_inference_servers(llm_urls)
@@ -350,19 +374,34 @@ def run_preprocessing_loop(
 
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
+    pop_old_data = cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode
     dataset_loader_worker_fn = partial(
         run_dataset_loader,
         raw_chunk_queue=raw_chunk_queue,
         data_stream=input_stream,
         check_group_size=cfg.attempts,
         chunk_n_groups=cfg.preprocess.chunk_n_groups,
-        pop_old_data=cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode,
+        pop_old_data=pop_old_data,
     )
     # Start the dataset loader thread using Thread
     dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn)
     dataset_loader_thread.start()
+    
+    # Initialize TrainerState
+    trainer_state = TrainerState(exp_root_dir)
+    if cfg.debug.mode == "preprocessor":
+        logger.info("Debug mode: preprocessor")
+        trainer_state.debug_mode_init()
+    elif cfg.debug.mode == "finetune+preprocessor":
+        logger.info("Debug mode: finetune+preprocessor")
+        trainer_state.start_listening()
+        trainer_state.wait_for_processed_samples()
+    else:
+        logger.info("Normal mode, waiting for finetune loop to start")
+        trainer_state.start_listening()
+        trainer_state.wait_for_model_version()
 
-    published_samples = 0
+    # Load published samples from state file
     llms = [
         TrainableLLM(
             base_url=url,
@@ -377,12 +416,42 @@ def run_preprocessing_loop(
     processed_chunks = 0
     worker_pool_size = cfg.preprocess.n_workers
     next_llm_index = 0
+    processed_entries_queue_popped_data = 0
+    last_time_notice = 0
+    trainer_id = 0
+    published_samples = None
+    batch_done = False
 
     stats_aggregator = SlidingWindowAggregator(window_size=max(10, 1000 // cfg.preprocess.chunk_n_groups))
 
-    buffer = []
+    buffer = deque()
+    
+    # Sequence packing configuration
+    num_trainers = world_map.total_finetune_gpus
+    num_lead_trainers = world_map.total_finetune_gpus // cfg.finetune.seq_parallel
+    gradient_accumulation_passes_per_lead = cfg.finetune.gradient_accumulation_passes // num_lead_trainers
+    samples_per_lead_per_step = cfg.finetune.train_batch_size * gradient_accumulation_passes_per_lead
+    train_batch_size = samples_per_lead_per_step * num_lead_trainers
+    processed_entries_queue = deque(maxlen=cfg.preprocess.ring_buffer_size)
+    published_samples = trainer_state.wait_for_processed_samples()
+    last_published_samples = published_samples
+    assert published_samples % num_lead_trainers == 0
+    samples_per_trainer = {
+        idx: published_samples // num_trainers 
+        for idx in range(0, num_trainers, cfg.finetune.seq_parallel)
+    }
+
+    max_model_version = None
+    time_to_write = False
+    current_batch = []
+    current_length = 0
+    batch_boundary = published_samples + train_batch_size
+    target_samples_per_lead = samples_per_trainer[0] + samples_per_lead_per_step
+    
+    # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
-    with write_to_streams(output_stream) as writer, write_to_streams(stats_streams) as stats_writer:
+
+    with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
@@ -411,6 +480,10 @@ def run_preprocessing_loop(
                 workers.append(worker)
             
             try:
+                start_processing = time.time()
+                fetching_took = 0
+                writing_took = 0
+                num_filtered_out = 0
                 while True:
                     llm = llms[next_llm_index] if llms else None
                     if not input_queue.full():
@@ -426,73 +499,164 @@ def run_preprocessing_loop(
                         except Empty:
                             pass
 
-                    start_processing = time.time()
+                    dataset = None
                     try:
                         # Try to write the next dataset to the output stream, if it is ready
+                        start_fetching = time.time()
                         dataset = output_queue.get(timeout=0.001)
-                        fetching_took = time.time() - start_processing
+                        if isinstance(dataset, Exception):
+                            raise dataset
+                        if rl_config.filter_zero_advantage_groups:
+                            dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
+                            total_filtered_out += num_filtered_out
+                            if num_filtered_out > 0:
+                                logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
+                        fetching_took += time.time() - start_fetching
                     except Empty:
-                        continue
+                        pass
                     
-                    if isinstance(dataset, dict) and "error" in dataset:
-                        logger.error(f"Got exception from the result queue: {dataset['error']}")
-                        logger.error(f"Traceback: {dataset['traceback']}")
-                        raise Exception(dataset['error'])
-                    
-                    start_writing = time.time()
-                    for entry in dataset:
-                        buffer.append(entry)
-                    processed_chunks += 1
+                    if dataset:
+                        if isinstance(dataset, dict) and "error" in dataset:
+                            logger.error(f"Got exception from the result queue: {dataset['error']}")
+                            logger.error(f"Traceback: {dataset['traceback']}")
+                            raise Exception(dataset['error'])
+                        for entry in dataset:
+                            buffer.append(entry)
+                        processed_chunks += 1
 
-                    if len(buffer) < cfg.preprocess.buffer_size:
+                    if len(buffer) < cfg.preprocess.dataset_buffer_size:
                         continue
-                    if cfg.preprocess.buffer_size:
+                    if cfg.preprocess.dataset_buffer_size:
                         # If buffer size is not set, no point in logging
                         logger.info(f"Buffer is full with {len(buffer)} samples, start writing")
-                        random.shuffle(buffer)
 
-                    # Conditionally filter out groups where all advantages are zero
-                    if rl_config.filter_zero_advantage_groups:
-                        filtered_buffer, num_filtered_out = filter_zero_advantage_groups(buffer)
-                        total_filtered_out += num_filtered_out
+                    while len(buffer) > 0:
+                        if len(processed_entries_queue) == processed_entries_queue.maxlen:
+                            if not pop_old_data:
+                                break 
+                            else:
+                                processed_entries_queue_popped_data += 1
+                                if processed_entries_queue_popped_data % 100 == 0 and last_time_notice != processed_entries_queue_popped_data // 100:
+                                    logger.warning(f"Popped {processed_entries_queue_popped_data} old entries from processed entries queue")
+                                    last_time_notice = processed_entries_queue_popped_data // 100
+                        entry = buffer.popleft()
+                        processed_entries_queue.append(entry) # drop from the left if full
+
+                        stats_aggregator.update([len(entry["input_ids"]) for entry in processed_entries_queue])
+                        max_model_version = max([entry["model_version"] for entry in processed_entries_queue]) if processed_entries_queue else 0
+                    
+                    max_unconsumed_samples = cfg.preprocess.max_ready_samples_per_lead * num_trainers
+
+                    assert isinstance(trainer_state.samples_processed, int)
+                    if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
+                        # wait for the finetune loop to finish processing data
+                        continue
+
+                    batch_done = False
+                    start_writing = time.time()
+                    while (len(processed_entries_queue) > 0 and not batch_done) or (cfg.preprocess.dataset_buffer_size and not batch_done):
+                        logger.debug(f"[inner loop] trainer {trainer_id} has {samples_per_trainer[trainer_id]} samples, target is {target_samples_per_lead}")
+                        if cfg.finetune.seq_packing:
+                            if samples_per_trainer[trainer_id] == target_samples_per_lead:
+                                logger.debug(f"[inner loop] trainer {trainer_id} has all {target_samples_per_lead} samples, creating sentinel batch")
+                                sentinel_batch = create_sentinel_batch(
+                                    device=None,
+                                    tokenizer=tokenizer,
+                                    model_version=max_model_version
+                                )
+                                write_micro_batch_slices(trainer_id, data_writer, sentinel_batch, cfg.finetune.seq_parallel)
+                                trainer_id = (trainer_id + cfg.finetune.seq_parallel) % num_trainers
+                            else:
+                                
+                                while len(processed_entries_queue) > 0:
+                                    entry = processed_entries_queue[0]  # Peek at next entry
+                                    sample_length = len(entry["input_ids"])
+
+                                    if current_length + sample_length > cfg.finetune.seq_length:
+                                        time_to_write = True
+                                        break  # Current micro batch is full
+                                    
+                                    # Add sample to current micro batch
+                                    current_batch.append(processed_entries_queue.popleft())
+                                    current_length += sample_length
+                                    
+                                    # Check if we've reached the sample limit per step
+                                    if len(current_batch) + samples_per_trainer[trainer_id] == target_samples_per_lead:
+                                        time_to_write = True
+                                        break
+                            
+                                if time_to_write:
+                                    assert len(current_batch) > 0, "Current batch should not be empty when writing"
+                                    batch_encoding = collate_packed(current_batch, tokenizer, cfg.finetune.seq_parallel)
+                                    write_micro_batch_slices(trainer_id, data_writer, batch_encoding, cfg.finetune.seq_parallel)
+                                    published_samples += len(current_batch)
+                                    samples_per_trainer[trainer_id] += len(current_batch)
+                                    # Reset batch state for this trainer
+                                    trainer_id = (trainer_id + cfg.finetune.seq_parallel) % num_trainers
+                                    time_to_write = False
+                                    current_batch = []
+                                    current_length = 0
+                                    logger.debug(f"[inner loop] Packed microbatch with {len(current_batch)} samples for trainer {trainer_id}")
+                        else:
+                            batch_entries = []
+                            for _ in range(cfg.finetune.train_batch_size ):
+                                batch_entries.append(processed_entries_queue.popleft())
+                            batch_encoding = collate(batch_entries, tokenizer=tokenizer)
+                            write_micro_batch_slices(trainer_id, data_writer, batch_encoding, cfg.finetune.seq_parallel)
+                            published_samples += len(batch_entries)
+                            samples_per_trainer[trainer_id] += len(batch_entries)
+                            logger.debug(f"[inner loop] Packed microbatch with {len(batch_entries)} samples for trainer {trainer_id}")
+                            trainer_id = (trainer_id + cfg.finetune.seq_parallel) % num_trainers
+
+                        batch_done = published_samples == batch_boundary and trainer_id == 0
+                        if batch_done:
+                            batch_boundary += train_batch_size
+                            target_samples_per_lead += samples_per_lead_per_step
+                            if cfg.preprocess.dataset_buffer_size and len(processed_entries_queue) > 0:
+                                # There is enough data in the processed entries queue to write multiple batches
+                                batch_done = False
+                                
+                        logger.debug(
+                            f"[inner loop] wrote {published_samples} samples, "
+                            f"trainer {trainer_id} is at {samples_per_trainer[trainer_id]} samples, "
+                            f"batch done: {batch_done}"
+                        )
+                    writing_took += time.time() - start_writing
+                            
+                    if (
+                        published_samples > last_published_samples 
+                        and (cfg.debug.mode or batch_done or (published_samples - last_published_samples > cfg.preprocess.log_every_n_samples))
+                    ):
+                        samples_in_output_queue = output_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts
+                        stats = {
+                            "preprocessor/published_samples": published_samples,
+                            "preprocessor/published_model_version": max_model_version,
+                            "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts,
+                            "preprocessor/queue/raw": raw_chunk_queue.qsize(),
+                            "preprocessor/queue/output_samples": samples_in_output_queue,
+                            "preprocessor/queue/output": output_queue.qsize(),
+                            "preprocessor/filtered_out_samples": num_filtered_out,
+                            "preprocessor/total_filtered_out_samples": total_filtered_out,
+                        }
+                        if stats_aggregator.has_enough_data():
+                            stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
+                        if wandb_run is not None:
+                            wandb_run.log(stats)
+                        stats_writer.write(stats)
                         
-                        if num_filtered_out > 0:
-                            logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
-                    else:
-                        filtered_buffer = buffer
+                        processing_took = time.time() - start_processing
+                        processed_samples = published_samples - last_published_samples
+                        last_published_samples = published_samples
+                        logger.info(
+                            f"Processed {processed_samples} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
+                            f" (fetching took {fetching_took:.3f} and writing took {writing_took:.3f})"
+                            f" and wrote to {output_stream}, total {published_samples} samples so far,"
+                            f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
+                        )
+                        start_processing = time.time()
+                        fetching_took = 0
+                        writing_took = 0
                         num_filtered_out = 0
-
-                    # Write the entries (filtered or unfiltered based on config)
-                    for entry in filtered_buffer:
-                        writer.write(entry)
-                    writing_took = time.time() - start_writing
-                    stats_aggregator.update([len(entry["input_ids"]) for entry in filtered_buffer])
-                    published_samples += len(filtered_buffer)  # Count only written samples
-                    max_model_version = max([entry["model_version"] for entry in filtered_buffer]) if filtered_buffer else 0
-                    samples_in_output_queue = output_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts
-                    stats = {
-                        "preprocessor/published_samples": published_samples,
-                        "preprocessor/published_model_version": max_model_version,
-                        "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts,
-                        "preprocessor/queue/raw": raw_chunk_queue.qsize(),
-                        "preprocessor/queue/output_samples": samples_in_output_queue,
-                        "preprocessor/queue/output": output_queue.qsize(),
-                        "preprocessor/filtered_out_samples": num_filtered_out,
-                        "preprocessor/total_filtered_out_samples": total_filtered_out,
-                    }
-                    if stats_aggregator.has_enough_data():
-                        stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
-                    if wandb_run is not None:
-                        wandb_run.log(stats)
-                    stats_writer.write(stats)
-                    processing_took = time.time() - start_processing
-                    logger.info(
-                        f"Processed {len(filtered_buffer)} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
-                        f" (last fetching took {fetching_took:.3f}, all writing took {writing_took:.3f})"
-                        f" and wrote to {output_stream}, total {published_samples} samples so far,"
-                        f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
-                    )
-                    buffer = []
             finally:
                 # Clean up worker processes
                 for worker in workers:

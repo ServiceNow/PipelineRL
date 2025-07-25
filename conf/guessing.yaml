@@ -18,6 +18,7 @@ train_dataset_names:
 test_dataset_names:
     - test
 world:
-    actor_fraction: 1
-    preprocessor_fraction: 3
+    actor_fraction: 2
+    finetune_fraction: 6
 eval_every_n_versions: 20000
+model_path: Qwen/Qwen2.5-7B-Instruct

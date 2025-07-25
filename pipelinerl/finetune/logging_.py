@@ -61,12 +61,22 @@ def setup_logging(cfg: DictConfig, output_dir: Path, run: wandb_run.Run | None =
     transformers.utils.logging.set_verbosity_error()
 
 
+def format_metric_value(value: Any) -> str:
+    """Format metric value, using scientific notation for very small numbers."""
+    if isinstance(value, (int, float)):
+        if abs(value) < 1e-3 and value != 0:
+            return f"{value:.3e}"
+        else:
+            return f"{value:.3f}"
+    return str(value)
+
+
 def log_metrics(logger: logging.Logger, completed_steps: int, metrics: dict[str, Any]):
     if not get_accelerator().is_main_process:
         return
 
-    # Print metrics with 3 decimals
-    metrics_pretty = {k: f"{v:.3f}" for k, v in metrics.items()}
+    # Print metrics with appropriate formatting
+    metrics_pretty = {k: format_metric_value(v) for k, v in metrics.items()}
     logger.info(f"Completed steps {completed_steps}: {metrics_pretty}")
     try:
         metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}

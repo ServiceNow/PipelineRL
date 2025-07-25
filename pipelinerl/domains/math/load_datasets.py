@@ -194,7 +194,7 @@ def add_ids(dataset: list[dict]):
     return dataset
 
 
-def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict]]:
+def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None) -> List[Tuple[str, Dict]]:
     if dataset_names is None:
         return []
 
@@ -246,7 +246,8 @@ def load_datasets(dataset_names: List[str] | str | None) -> List[Tuple[str, Dict
             trust_remote_code=True,
         )
         samples = [s for s in process_math(dataset, "math_simplerl_subset") if s is not None]
-        random.seed(42)
+        if seed is not None:
+            random.seed(seed)
         random.shuffle(samples)
         samples = samples[:1000]
         logger.info(f"Loading math simplerl subset test dataset: {len(samples)} samples")

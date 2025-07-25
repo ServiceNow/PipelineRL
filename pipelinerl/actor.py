@@ -1,5 +1,4 @@
 import asyncio
-import itertools
 import logging
 import math
 import multiprocessing as mp
@@ -555,7 +554,9 @@ class ActorLoop:
 def run_actor_loop(cfg: DictConfig):
     set_streams_backend(**cfg.streams)
 
-    random.seed(42)
+    # set seed for reproducibility (mostly intended for dataset loading)
+    random.seed(cfg.seed)
+
     exp_path = Path(cfg.output_dir)
     setup_logging(exp_path / "actor", "actor")
     logger.info(f"Current dir: {os.getcwd()}, experiment root dir: {cfg.output_dir}")
@@ -616,7 +617,7 @@ def run_actor_loop(cfg: DictConfig):
     wait_for_environments(cfg)
     trainer_state = TrainerState(exp_path)
     if cfg.debug.mode:
-        trainer_state.propagated_weight_version = 0
+        trainer_state.debug_mode_init()
     else:
         trainer_state.start_listening()
         trainer_state.wait_for_model_version()

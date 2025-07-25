@@ -1,44 +1,14 @@
 defaults:
-  - finetune: base 
+  - finetune: actor_critic
   - rewards: pure_success
   - streams: files
   - _self_
 
+seed: 42
+
 finetune:
-  use_flash_attention: true
-  attn_implementation: flash_attention_2
-  config_name: ${..model_path}
-  output_dir: ${..output_dir}/finetune
-  seq_length: 12000
-  seq_packing: true
-  rl:
-    algo: reinforce
-    divide_advantage_by_std: false
-    kl_coef: 0.0
-    entropy_bonus: 0.0
-    reward_minus_kl_coef: 0.0
-    epsilon: 4
-    use_advantages: true
-    relu_log_p_weights: false
-    clamp_log_ratio_ref_new_value: 5
-    temperature: ${...llm.parameters.temperature}
-    aggregate_loss: sum
-  train_batch_size: 1
-  gradient_accumulation_passes: 1024
-  gradient_checkpointing: true
-  gradient_clipping_threshold: 0.3
-  # see https://medium.com/pytorch/how-activation-checkpointing-enables-scaling-up-training-deep-learning-models-7a93ae01ff2d
-  # for the motivation to this false by default
-  reentrant_checkpointing: false
-  learning_rate: 1e-6
-  save_checkpoint_steps: 100
-  log_each_n_steps: 1
-  input: training_data
-  send_weight_updates: true
-  queue_size: 32
-  max_lag: ${..max_lag}
-  weight_update_interval: 1
-  pop_old_data: ${..pop_old_data}
+  seed: ${..seed}
+
 actor:
   log_each_n_secs: 0
   llm_max_rollouts: 64
@@ -53,14 +23,22 @@ preprocess:
   input: actor
   output: training_data
   n_workers: 8
-  raw_queue_size: 8
-  input_queue_size: 32
-  output_queue_size: 32
   chunk_n_groups: 2
-  submit_delay: 0.
+  # queue for loaded raw groups
+  raw_queue_size: 8
+  # queue for processed chunks of multiple groups  
+  input_queue_size: 32
+  # queue for ready chunks for multiple groups
+  output_queue_size: 32
+  # queue for accumulating samples before further processing
+  dataset_buffer_size: 0
+  # ring buffer to replace old samples with new ones when training is slow
+  ring_buffer_size: 128
+  # "virtual" sample queue per lead trainer
+  max_ready_samples_per_lead: 64
   pop_old_data: ${..pop_old_data} 
-  buffer_size: 0
   shared_memory_entry_size: 100000000
+  log_every_n_samples: 128
 llm:
   parameters:
     # changed
@@ -123,7 +101,7 @@ output_dir: ???
 force_restart: false
 pop_old_data: true
 max_lag: null
-attempts: 8
+attempts: ${finetune.attempts}
 train_subset: null
 debug:
   mode: ""

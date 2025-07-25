@@ -1,6 +1,7 @@
 import logging
 import os
 from functools import partial
+from typing import Any
 from pydantic import BaseModel, Field
 
 import numpy as np
@@ -8,7 +9,8 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
-from transformers import BatchEncoding, PreTrainedModel
+from transformers import PreTrainedModel
+from pipelinerl.finetune.types import PipelineBatchEncoding
 
 from .utils import (
     sum_sum,
@@ -23,9 +25,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = logging.getLogger(__name__)
 
 RL_DATA_COLUMNS = [
-    "reward",
     "overflow",
     "group_tokens",
+    "num_labels",
     "rewards",
     "advantages",
     "old_logprobs",
@@ -34,10 +36,10 @@ RL_DATA_COLUMNS = [
 
 
 class RLConfig(BaseModel):
-    algo: str = Field(
-        default="grpo",
-        description="Algorithm to use for RL",
-        choices=["grpo", "reinforce"],
+    policy_loss: str = Field(
+        default="ppo",
+        description="Policy Loss to use for RL",
+        choices=["ppo", "reinforce"],
     )
     use_advantages: bool = Field(
         default=True,
@@ -91,6 +93,10 @@ class RLConfig(BaseModel):
         default=False,
         description="Filter out groups where all advantages are zero during preprocessing",
     )
+    value_loss_coef: float = Field(
+        default=0.0,
+        description="Coefficient for the value loss in the final loss",
+    )
 
 
 def make_rl_data_callback(args, current_dir, rl_config, model):
@@ -123,7 +129,7 @@ def linear_decay_coef(current_step: int, max_step: int, initial_coef: float, fin
 
 def rl_step(
     model: PreTrainedModel,
-    batch: dict,
+    batch: PipelineBatchEncoding,
     current_step: int,
     max_step: int,
     config: RLConfig,
@@ -134,7 +140,7 @@ def rl_step(
 
     Args:
         model (PreTrainedModel): The model to train
-        batch (dict): Batch of data containing rewards, advantages, masks, input_ids etc.
+        batch (PipelineBatchEncoding): Batch of data containing rewards, advantages, masks, input_ids etc.
         current_step (int): Current training step
         max_step (int): Maximum number of training steps
         config (RLConfig): Configuration for the RL training
@@ -143,15 +149,19 @@ def rl_step(
         tuple[torch.Tensor, dict[str, float]]: Loss tensor and metrics dictionary
     """
     # pre-compute masks
-    masks = batch["labels"] != -100
+    masks = batch.labels != -100
     masks_shifted = masks[:, 1:]
 
+    has_value_head = hasattr(model, 'value_head')
+
     # if we have position_ids, we are packing
-    is_packed = "position_ids" in batch
-    if is_packed:
-        position_ids = batch["position_ids"][0]
-        # sequence boundary computation
-        sequence_starts = torch.where(position_ids == 0)[0]
+    if batch.is_packed:
+        position_ids = batch.position_ids[0]
+        is_sequence_start = position_ids == 0
+        # For computing the loss we will consider the first token the beginning of the sequence,
+        # even if currently we are in the middle of a sequence.
+        is_sequence_start[0] = True 
+        sequence_starts = torch.where(is_sequence_start)[0]
         seq_boundaries = torch.cat(
             [
                 sequence_starts,
@@ -171,19 +181,19 @@ def rl_step(
         segments = None
 
     model_inputs = {
-        "input_ids": batch["input_ids"],
-        "attention_mask": batch["attention_mask"],
-        "labels": batch["labels"],
+        "input_ids": batch.input_ids,
+        "attention_mask": batch.attention_mask,
+        "labels": batch.labels,
     }
-    if is_packed:
-        model_inputs["position_ids"] = batch["position_ids"]
+    if batch.is_packed:
+        model_inputs["position_ids"] = batch.position_ids
     
     # Add visual features if present (for multimodal models)
-    if "pixel_values" in batch and batch["pixel_values"] is not None:
-        model_inputs["pixel_values"] = batch["pixel_values"]
-    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
-        model_inputs["image_grid_thw"] = batch["image_grid_thw"].reshape((1, 3))
-
+    if hasattr(batch, 'pixel_values') and batch.pixel_values is not None:
+        model_inputs["pixel_values"] = batch.pixel_values
+    if hasattr(batch, 'image_grid_thw') and batch.image_grid_thw is not None:
+        model_inputs["image_grid_thw"] = batch.image_grid_thw #torch.tensor(.reshape((1, 3))
+    
     outputs = model(**model_inputs)
 
     # compute log probs and entropy
@@ -193,19 +203,19 @@ def rl_step(
     probs = F.softmax(logits, dim=-1)
     entropy = -(probs * logprobs).sum(dim=-1)
     del logits, probs
-
+    
     # get log probs for actual tokens
-    new_logprobs = torch.gather(logprobs, dim=2, index=batch["input_ids"][:, 1:].unsqueeze(2)).squeeze(2)
+    new_logprobs = torch.gather(logprobs, dim=2, index=batch.input_ids[:, 1:].unsqueeze(2)).squeeze(2)
     assert torch.isfinite(new_logprobs).all(), f"new_logprobs is not finite: {new_logprobs}"
     del logprobs
 
     # get shifted values and compute ratios
-    rewards = batch.pop("rewards")[:, 1:]
-    advantages = batch.pop("advantages")[:, 1:]
-    ref_logprobs = batch["ref_logprobs"][:, 1:]
-    old_logprobs = batch["old_logprobs"][:, 1:]
-    group_tokens = batch["group_tokens"][:, 1:]
-    overflow = batch["overflow"][:, 1:]
+    rewards = batch.rewards[:, 1:]
+    ref_logprobs = batch.ref_logprobs[:, 1:]
+    old_logprobs = batch.old_logprobs[:, 1:]
+    group_tokens = batch.group_tokens[:, 1:]
+    num_labels_in_seq = batch.num_labels[:, 1:] # sequence dependent normalization
+    overflow = batch.overflow[:, 1:]
 
     if config.group_normalization:
         # assert that group_tokens is not zero
@@ -225,8 +235,19 @@ def rl_step(
     ratio_new_old = torch.exp(log_ratio_new_old)
     log_ratio_ref_new = ref_logprobs - new_logprobs
     assert torch.isfinite(log_ratio_ref_new).all(), f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
-    # compute weights and KL divergence
-    log_p_weights = advantages if config.use_advantages else rewards
+
+    if has_value_head:
+        # Get value predictions if available
+        value_predictions = outputs.value[:, :-1] # no target for the last token 
+        # Compute value-based advantages: A(s,a) = MC_return - V(s)
+        # where MC_return is the Monte Carlo return (rewards) and V(s) is the value prediction
+        #FIXME: if this works better it should be a config
+        #advantages = rewards - torch.clamp(value_predictions, 0, 1)
+        advantages = rewards - value_predictions
+    else:
+        advantages = batch.advantages[:, 1:]
+
+    log_p_weights = advantages.detach() if config.use_advantages else rewards
     if config.relu_log_p_weights:
         log_p_weights = torch.clamp(log_p_weights, min=0)
 
@@ -245,8 +266,8 @@ def rl_step(
     kl_coef = linear_decay_coef(current_step, max_step, config.kl_coef, config.final_kl_coef)
 
     # compute algorithm-specific losses
-    match config.algo:
-        case "grpo":
+    match config.policy_loss:
+        case "ppo":
             surr1 = ratio_new_old * log_p_weights
             clamped_ratio = torch.clamp(ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
             clamp_log_ratio_new_old_indicators = clamped_ratio != ratio_new_old
@@ -259,7 +280,7 @@ def rl_step(
             ratio_new_old = torch.clamp(ratio_new_old, 0, 1 + config.epsilon)
             policy_loss = new_logprobs * log_p_weights * ratio_new_old.detach()
         case _:
-            raise ValueError(f"Unknown algorithm {config.algo}")
+            raise ValueError(f"Unknown algorithm {config.policy_loss}")
 
     # combine loss components
     loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
@@ -268,58 +289,95 @@ def rl_step(
     )
     loss = loss * tokens_weights  # 1 x (BxL) x 1
 
-    final_loss = -sum_sum(loss, masks_shifted, segments)
+    policy_loss_total = -sum_sum(loss, masks_shifted, segments)
+    
+    if has_value_head:
+        # Get the value predictions
+        values = outputs.value
+        # Use the already extracted and shifted rewards as value labels
+        value_labels = rewards  # This is already shifted (from line 216)
+        values = values[:, :-1]
+        values_labels = value_labels
+        assert values.shape == tokens_weights.shape, (
+            f"Values shape {values.shape} does not match example weights shape {tokens_weights.shape}"
+        )
+        value_loss = 0.5 * torch.square(values - values_labels) * tokens_weights
+        value_loss = sum_sum(value_loss, masks_shifted, segments) 
+        
+        # Combine policy loss and value loss
+        final_loss = policy_loss_total + config.value_loss_coef * value_loss
+    else:
+        final_loss = policy_loss_total
 
     # ensure loss is valid
     assert torch.isfinite(final_loss), f"Non-finite loss detected: {final_loss}"
 
-    # All the stats are average then summed. They will be normalized by the number of sequences at the end of the step
+    if int(masks_shifted.sum().item()) == 0:
+        stats_no_labels = {
+            "input_size": float(batch.input_ids.numel()),
+        }
+        return final_loss, stats_no_labels
+
+    # Metric aggregation behavior:
+    # 1. loss: pre-multiplied by token_weights, reported as sum
+    # 2. min/max values: computed across entire batch
+    # 3. other statistics: averaged per sequence, then averaged across batch
     stats = {
         "loss": final_loss.item(),
         "max_loss": final_loss.item(),
         "min_loss": final_loss.item(),
-        "reward": mean_sum(rewards, masks_shifted, segments).item(),
+        "reward": sum_sum(rewards / num_labels_in_seq, masks_shifted, segments).item(),
         "max_reward": rewards[masks_shifted].max().item(),
         "min_reward": rewards[masks_shifted].min().item(),
-        "entropy": mean_sum(entropy, masks_shifted, segments).item(),
-        "old_logprobs": mean_sum(old_logprobs, masks_shifted, segments).item(),
-        "new_logprobs": mean_sum(new_logprobs, masks_shifted, segments).item(),
-        "ref_logprobs": mean_sum(ref_logprobs, masks_shifted, segments).item(),
-        "advantage": mean_sum(advantages, masks_shifted, segments).item(),
+        "entropy": sum_sum(entropy / num_labels_in_seq, masks_shifted, segments).item(),
+        "old_logprobs": sum_sum(old_logprobs / num_labels_in_seq, masks_shifted, segments).item(),
+        "new_logprobs": sum_sum(new_logprobs / num_labels_in_seq, masks_shifted, segments).item(),
+        "ref_logprobs": sum_sum(ref_logprobs / num_labels_in_seq, masks_shifted, segments).item(),
+        "advantage": sum_sum(advantages / num_labels_in_seq, masks_shifted, segments).item(),
         "max_advantage": advantages[masks_shifted].max().item(),
         "min_advantage": advantages[masks_shifted].min().item(),
-        "kl": mean_sum(approx_kl, masks_shifted, segments).item(),
+        "kl": sum_sum(approx_kl / num_labels_in_seq, masks_shifted, segments).item(),
         "max_kl": approx_kl[masks_shifted].max().item(),
         "min_kl": approx_kl[masks_shifted].min().item(),
-        "policy_loss": mean_sum(policy_loss, masks_shifted, segments).item(),
-        "surr1": mean_sum(surr1, masks_shifted, segments).item(),
-        "surr2": mean_sum(surr2, masks_shifted, segments).item(),
-        "ratio_new_old": mean_sum(ratio_new_old, masks_shifted, segments).item(),
+        "policy_loss": sum_sum(policy_loss / num_labels_in_seq, masks_shifted, segments).item(),
+        "surr1": sum_sum(surr1 / num_labels_in_seq, masks_shifted, segments).item(),
+        "surr2": sum_sum(surr2 / num_labels_in_seq, masks_shifted, segments).item(),
+        "ratio_new_old": sum_sum(ratio_new_old / num_labels_in_seq, masks_shifted, segments).item(),
         "ratio_new_old_sum": sum_sum(ratio_new_old, masks_shifted, segments).item(),
         "ratio_new_old_squared_sum": sum_sum(  # useful to estimate the ESS
             ratio_new_old * ratio_new_old, masks_shifted, segments
         ).item(),
-        "ratio_ref_new": mean_sum(torch.exp(log_ratio_ref_new), masks_shifted, segments).item(),
-        "ratio_ref_old": mean_sum(torch.exp(ref_logprobs - old_logprobs), masks_shifted, segments).item(),
-        "clamp_log_ratio_ref_new_indicator": mean_sum(
-            clamp_log_ratio_ref_new_indicators, masks_shifted, segments
+        "ratio_ref_new": sum_sum(torch.exp(log_ratio_ref_new) / num_labels_in_seq, masks_shifted, segments).item(),
+        "ratio_ref_old": sum_sum(torch.exp(ref_logprobs - old_logprobs) / num_labels_in_seq, masks_shifted, segments).item(),
+        "clamp_log_ratio_ref_new_indicator": sum_sum(
+            clamp_log_ratio_ref_new_indicators / num_labels_in_seq, masks_shifted, segments
         ).item(),
-        "clamp_log_ratio_new_old_indicator": mean_sum(
-            clamp_log_ratio_new_old_indicators, masks_shifted, segments
+        "clamp_log_ratio_new_old_indicator": sum_sum(
+            clamp_log_ratio_new_old_indicators / num_labels_in_seq, masks_shifted, segments
         ).item(),
         "num_nans": torch.isnan(loss).sum().item(),
-        "token_weight": mean_sum(tokens_weights, masks_shifted, segments).item(),
+        "token_weight": sum_sum(tokens_weights / num_labels_in_seq, masks_shifted, segments).item(),
         "max_token_weight": tokens_weights[masks_shifted].max().item(),
         "min_token_weight": tokens_weights[masks_shifted].min().item(),
         "kl_coef": num_sequences * kl_coef,
         "entropy_bonus_coef": num_sequences * entropy_bonus_coef,
         "num_output_tokens_sum": masks_shifted.sum().item(),
+        "input_size": batch.input_ids.numel(), 
     }
+
+    if has_value_head:
+        stats["value_mean"] = sum_sum(value_predictions / num_labels_in_seq, masks_shifted, segments).item()
+        stats["value_max"] = value_predictions[masks_shifted].max().item() if masks_shifted.any() else 0.0
+        stats["value_min"] = value_predictions[masks_shifted].min().item() if masks_shifted.any() else 0.0
+        stats["value_loss"] = value_loss.item()
+        stats["value_mse"] = sum_sum(
+            torch.square(value_predictions - value_labels) / num_labels_in_seq, masks_shifted, segments
+        ).item()
 
     return final_loss, stats
 
 
-def populate_rl_data(dataset: list[BatchEncoding], eos_token_id: int, config: RLConfig) -> list[BatchEncoding]:
+def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
     """
     Populates a dataset with reinforcement learning specific data columns including
     rewards, advantages, and token weights.
@@ -392,24 +450,27 @@ def populate_rl_data(dataset: list[BatchEncoding], eos_token_id: int, config: RL
         axis=1,
     )
     df["group_tokens"] = df.apply(lambda row: [row["group_tokens"]] * len(row["input_ids"]), axis=1)
+    df["num_labels"] = df.apply(lambda row: [sum(1 for label in row["labels"] if label != -100)] * len(row["input_ids"]), axis=1)
 
     # Step 5: move the results back to the dataset
     advantages_list = df["advantages"].tolist()
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()
+    num_labels_list = df["num_labels"].tolist()
     for i, entry in enumerate(dataset):
         entry["advantages"] = advantages_list[i]
         entry["group_tokens"] = group_tokens_list[i]
         entry["overflow"] = overflow_list[i]
+        entry["num_labels"] = num_labels_list[i]
     return dataset
 
 
 def prepare_rl_fields(
-    encoding: BatchEncoding,
+    encoding: dict[str, Any],
     reward: float,
     old_logprobs: list[float],
     ref_logprobs: list[float],
-) -> BatchEncoding:
+) -> dict[str, Any]:
     """
     Convert reward per agent step to reward per token and add returns and advantages placeholders
     """
@@ -424,4 +485,5 @@ def prepare_rl_fields(
     encoding["ref_logprobs"] = [0] * (len(encoding["labels"]) - len(ref_logprobs)) + ref_logprobs
     encoding["overflow"] = [0] * len(encoding["labels"])  # place holder
     encoding["group_tokens"] = [0] * len(encoding["labels"])  # place holder
+    encoding["num_labels"] = [1 if label != -100 else 0 for label in encoding["labels"]]  # count only output tokens
     return encoding

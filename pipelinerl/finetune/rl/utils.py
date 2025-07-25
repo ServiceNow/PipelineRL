@@ -5,14 +5,14 @@ import torch
 from datasets import Dataset
 
 
-def get_avg_rl_stats(rl_stats: dict, num_samples: int):
+def aggregate_rl_stats(rl_stats: dict, num_samples: int):
     avg_rl_stats: dict[str, float] = {}
     for k, v in rl_stats.items():
         if "min" in k:
             op = torch.min
         elif "max" in k:
             op = torch.max
-        elif k == "loss":  # loss is already normalized
+        elif "loss" in k:
             op = torch.sum
         elif "sum" in k:
             op = torch.sum

@@ -47,6 +47,7 @@ model_path: Qwen/Qwen2.5-VL-3B-Instruct
 
 # Override vLLM config for multimodal support
 vllm_config:
+  use_v1: true
   vllm_kwargs:
     max-num-seqs: 64
     max-num-batched-tokens: 32768

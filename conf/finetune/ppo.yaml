@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - _self_
+
+model_class: causal-language-modeling-with-value-head
+attempts: 1
+rl:
+  value_loss_coef: 0.1
+  policy_loss: ppo

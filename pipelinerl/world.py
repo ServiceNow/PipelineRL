@@ -75,10 +75,31 @@ class WorldMap:
             self._place_environments(cfg)
 
         # Place the finetune workers on the remaining gpus, take all remaining GPUs
+        current_finetune_rank = 0
+        finetune_rank_node = {}
         for node, remaining_gpus in self.available_gpus.items():
             gpus = list(remaining_gpus)
             if gpus:
                 self.add_job(node_rank=node, kind="finetune", replica_idx=node, gpus=gpus)
+                for _ in remaining_gpus:
+                    finetune_rank_node[current_finetune_rank] = node
+                    current_finetune_rank += 1
+
+        assert current_finetune_rank == self.total_finetune_gpus
+        if self.total_finetune_gpus % cfg.finetune.seq_parallel != 0:
+            raise ValueError(
+                f"Total finetune GPUs {self.total_finetune_gpus} is not divisible by seq_parallel {cfg.finetune.seq_parallel}"
+            )
+        for leader_idx in range(0, current_finetune_rank, cfg.finetune.seq_parallel):
+            # Check that all workers in the leader's group are on the same node
+            leader_node = finetune_rank_node[leader_idx]
+            for offset in range(cfg.finetune.seq_parallel):
+                if finetune_rank_node[leader_idx + offset] != leader_node:
+                    raise ValueError(
+                        f"Sequence parallel ranks {leader_idx} and {leader_idx + offset} are on different nodes: "
+                        f"{finetune_rank_node[leader_idx]} and {finetune_rank_node[leader_idx + offset]}"
+                    )
+
 
         # Pretty-log the world map
         self._log_info("--- WORLD MAP ---")

@@ -8,6 +8,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from functools import partial
+import numpy as np
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, List, Literal
@@ -23,8 +24,11 @@ from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import MixedPrecision
 from transformers import PreTrainedTokenizerFast, get_scheduler, set_seed
+from ring_flash_attn import substitute_hf_flash_attn, update_ring_flash_attn_params
 
+from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead
 import pipelinerl.torch_utils
+from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.checkpoints import (
     load_model,
     load_tokenizer,
@@ -41,9 +45,9 @@ from pipelinerl.finetune.rl import (
     RLConfig,
     rl_step,
 )
-from pipelinerl.finetune.rl.utils import get_avg_rl_stats
+from pipelinerl.finetune.rl.utils import aggregate_rl_stats
 from pipelinerl.finetune.types import TrainingMetrics
-from pipelinerl.finetune.utils import VersionedTensors, create_sentinel_batch
+from pipelinerl.finetune.utils import create_sentinel_batch
 from pipelinerl.streams import (
     SingleStreamSpec,
     read_stream,
@@ -65,164 +69,53 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
     Returns:
         Dictionary with gathered metrics from all processes
     """
-    # Initialize the result dictionary
-    gathered_rl_metrics = {}
-
-    # Process each metric separately
-    for key, values in rl_metrics.items():
-        if values:
-            # Initialize a list to gather the results from all processes
-            gathered_values = [None] * dist.get_world_size()
-
-            # Gather the values from all processes
-            dist.all_gather_object(gathered_values, values)
-
-            # Flatten the list of lists into a single list
-            combined_values = []
-            for process_values in gathered_values:
-                combined_values.extend(process_values)
-
-            # Store the combined values
-            gathered_rl_metrics[key] = combined_values
-
-    return gathered_rl_metrics
+    # First, gather all metrics dictionaries from all processes
+    all_metrics = [None] * dist.get_world_size()
+    dist.all_gather_object(all_metrics, rl_metrics)
+    
+    # Now aggregate the gathered metrics
+    aggregated_metrics = defaultdict(list)
+    
+    # Process each gathered dictionary
+    for process_metrics in all_metrics:
+        #if process_metrics is None:
+        #    continue
+        for key, values in process_metrics.items():
+            if values:
+                aggregated_metrics[key].extend([v for v in values if np.isfinite(v)])
+    
+    return aggregated_metrics
 
 
-def run_sample_loader(data_stream: SingleStreamSpec, sample_queue: Queue[Dict | Exception], pop_old_data: bool = False):
+
+
+def run_data_loader(
+    data_stream: SingleStreamSpec,
+    batch_queue: Queue[PipelineBatchEncoding | Exception],
+):
+    """Load BatchEncoding objects directly from preprocessor."""
     with read_stream(data_stream) as stream_reader:
-        pop_count = 0  # Counter for popped items
+        logger.info(f"Starting data loader for stream {data_stream.topic} on partition {data_stream.partition}")
         while True:
             try:
-                for data_item in stream_reader.read():
-                    if pop_old_data:
-                        if sample_queue.full():
-                            sample_queue.get()  # Pop old data
-                            pop_count += 1
-                            if pop_count % 100 == 0:
-                                logger.info(f"Popped {pop_count} old items from the sample queue")
-                        sample_queue.put_nowait(data_item)
-                    else:
-                        sample_queue.put(data_item)
+                for batch_encoding in stream_reader.read():
+                    if isinstance(batch_encoding, Exception):
+                        batch_queue.put(batch_encoding)
+                        logger.info(f"Received exception from stream: {batch_encoding}")
+                        break
+
+                    # Convert to PipelineBatchEncoding and move to device
+                    pipeline_batch = PipelineBatchEncoding(**batch_encoding)
+                    pipeline_batch = pipeline_batch.to_device(get_accelerator().device)
+                    batch_queue.put(pipeline_batch)
+
             except Exception as e:
                 logger.error(f"Error in stream reader: {e}")
-                sample_queue.put(e)
+                batch_queue.put(e)
                 break
 
 
-def sample_generator_fn(sample_queue):
-    while True:
-        timeout = 0.1
-        while True:
-            try:
-                sample_or_exc = sample_queue.get(timeout=timeout)
-                break
-            except Empty:
-                logger.info(f"Sample queue is empty, retrying with timeout {timeout}")
-                timeout = min(timeout * 1.5, 5.0)
-                yield None
-        if isinstance(sample_or_exc, Exception):
-            raise sample_or_exc
-        assert isinstance(sample_or_exc, Dict)
-        yield sample_or_exc
-
-
-def run_fixed_batch_data_loader(
-    sample_queue: Queue[Dict | Exception],
-    batch_queue: Queue[VersionedTensors | Exception],
-    batch_size: int,
-    tokenizer: PreTrainedTokenizerFast,
-):
-    """Incrementally load chunks to populate the dataset queue."""
-    sample_generator = sample_generator_fn(sample_queue)
-    while True:
-        try:
-            buffer = []
-            while True:
-                entry = next(sample_generator)
-                if entry is None:
-                    continue
-                buffer.append(entry)
-                if len(buffer) == batch_size:
-                    batch = collate(buffer, tokenizer=tokenizer)
-                    batch = {
-                        k: (v.to(get_accelerator().device) if isinstance(v, torch.Tensor) else v)
-                        for k, v in batch.items()
-                    }
-                    batch = VersionedTensors(
-                        tensors=batch, model_version=min(sample["model_version"] for sample in buffer)
-                    )
-                    batch_queue.put(batch)
-                    logger.debug(f"Loaded {len(buffer)} samples, queue size is now {batch_queue.qsize()}")
-                    break
-
-        except Exception as e:
-            logger.error(f"Error in dataset loader: {e}")
-            batch_queue.put(e)
-            break
-
-
-def run_dynamic_batch_size_data_loader(
-    sample_queue: Queue[Dict | Exception],
-    batch_queue: Queue[VersionedTensors | Exception],
-    max_seq_length: int,
-    samples_per_worker_per_step: int,
-    tokenizer: PreTrainedTokenizerFast,
-):
-    """Incrementally load chunks to populate the dataset queue."""
-
-    current_batch = []
-    current_length = 0
-    samples_in_step = 0
-    sample_generator = sample_generator_fn(sample_queue)
-    skip_count = 0
-    while True:
-        try:
-            while True:
-                # TODO: handle timeout
-                entry = next(sample_generator)
-                sample_length = len(entry["input_ids"]) if entry else 0
-
-                if sample_length > max_seq_length:
-                    skip_count += 1
-                    logger.warning(
-                        f"Sample length {sample_length} > max allowed length {max_seq_length}, skipping. Total {skip_count} samples skipped so far."
-                    )
-                    continue
-
-                # check if adding current sample would exceed max_seq_length or if we've reached sample limit
-                boundary = samples_in_step == samples_per_worker_per_step
-                if (current_length + sample_length > max_seq_length) or boundary:
-                    logger.debug(
-                        f"Adding batch with total sequence length {current_length} and {len(current_batch)} samples"
-                    )
-                    collated_batch = collate_packed(current_batch, tokenizer=tokenizer)
-                    collated_batch = {
-                        k: (v.to(get_accelerator().device) if isinstance(v, torch.Tensor) else v)
-                        for k, v in collated_batch.items()
-                    }
-                    collated_batch = VersionedTensors(
-                        tensors=collated_batch,
-                        model_version=min(sample["model_version"] for sample in current_batch),
-                    )
-                    batch_queue.put(collated_batch)
-
-                    current_batch = []
-                    current_length = 0
-                    if boundary:
-                        samples_in_step = 0
-
-                if entry:
-                    # add sample to current batch
-                    current_batch.append(entry)
-                    current_length += sample_length
-                    samples_in_step += 1
-
-        except Exception as e:
-            logger.error(f"Error in dataset loader: {e}")
-            batch_queue.put(e)
-            break
-
-
+#TODO: should the topic be renamed to trainer_messages since it contains more than just weight updates?
 TRAINER_TOPIC = "weight_update_request"
 
 
@@ -244,14 +137,13 @@ class WeightUpdateSuccess(BaseModel):
     version: int
     timestamp: float = time.time()
 
-
-class WeightBeingSavedToDisk(BaseModel):
-    kind: Literal["weight_being_saved_to_disk"] = "weight_being_saved_to_disk"
-    version: int
+ 
+class SamplesProcessed(BaseModel):
+    kind: Literal["samples_processed"] = "samples_processed"
+    samples_processed: int
     timestamp: float = time.time()
 
-
-TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | WeightBeingSavedToDisk
+TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | SamplesProcessed
 
 
 class WeightUpdateManager:
@@ -289,8 +181,14 @@ class WeightUpdateManager:
         ):
             module = self.accelerated_model.module
             logger.info("Start gathering and sending ZeRO Stage 3 weights")
-            named_parameters = dict(module.named_parameters())
 
+            # Filter out value head parameters and get only the pretrained model parameters
+            named_parameters = (
+                dict(module.pretrained_model.named_parameters())
+                if isinstance(module, AutoModelForCausalLMWithValueHead)
+                else dict(module.named_parameters())
+            )
+            
             if get_accelerator().is_main_process:
                 parameters_info = [
                     # assume DeepSpeed Stage 3
@@ -316,6 +214,11 @@ class WeightUpdateManager:
                 with write_to_streams(self.update_stream) as writer:
                     writer.write(WeightUpdateSuccess(version=version))
         else:
+            if isinstance(self.accelerated_model, AutoModelForCausalLMWithValueHead):
+                raise ValueError(
+                    "AutoModelForCausalLMWithValueHead is not supported with non-Deepspeed training. "
+                    "Please use Deepspeed Stage 3 for weight updates."
+                )
             logger.info("Gather all weights at rank 0")
             if isinstance(self.accelerated_model, FSDP):
                 full_state_dict_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
@@ -355,23 +258,22 @@ class WeightUpdateManager:
 
 def get_batch_token_count(batch):
     """Count actual tokens in batch (excluding padding)"""
-    attention_mask = batch.get("attention_mask")
+    attention_mask = batch.attention_mask
     assert attention_mask is not None, "We need attention_mask for accurate token counting"
     return attention_mask.sum().item()
 
 
-def get_batch_sequence_count(batch):
+def get_batch_sequence_count(batch: PipelineBatchEncoding):
     """Count actual sequences in a batch, accounting for sequence packing"""
-    is_packed = "position_ids" in batch
-    if is_packed:
-        # for packed sequences, count the number of actual sequences by looking at position_ids
-        position_ids = batch["position_ids"][0]  # [1, seq_len]
-        # sequence boundary computation - each position with id 0 starts a new sequence
-        sequence_starts = torch.where(position_ids == 0)[0]
-        return len(sequence_starts)
+    if batch.position_ids is not None:
+        assert batch.seq_boundaries is not None 
+        if batch.padding == 0:
+            return len(batch.seq_boundaries) - 1
+        else:
+            return len(batch.seq_boundaries) - 2
     else:
         # For unpacked sequences, each row is one sample
-        return batch["input_ids"].size(0)
+        return batch.input_ids.size(0)
 
 
 def validate_packing_config(args):
@@ -401,7 +303,7 @@ def run_finetuning_loop(
 
     if not args.gradient_accumulation_passes % num_processes == 0:
         raise ValueError("gradient_accumulation_passes must be divisible by num_processes")
-    gradient_accumulation_passes_per_gpu = args.gradient_accumulation_passes // num_processes
+    gradient_accumulation_passes_per_gpu = args.seq_parallel * (args.gradient_accumulation_passes // num_processes)
     if (ds_plugin := get_accelerator().state.deepspeed_plugin) is not None:
         logger.info("Manual inform Deepspeed about micro batch size and gradient accumulation")
         ds_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = args.train_batch_size
@@ -420,7 +322,8 @@ def run_finetuning_loop(
     if args.force_restart and get_accelerator().is_main_process:
         remove_results(current_dir, intermediate_root_dir, training_state_dir, log_dir)
 
-    # Render-vous with inference servers
+    # Rendez-vous with inference servers
+    #TODO: rename the stream to be more general
     weight_update_stream = SingleStreamSpec(exp_path=exp_root_dir, topic="weight_update_request")
 
     # Logging
@@ -447,16 +350,6 @@ def run_finetuning_loop(
         instance=0,
         partition=get_accelerator().process_index,
     )
-
-    if args.seq_packing:
-        samples_per_worker_per_step = gradient_accumulation_passes_per_gpu * args.train_batch_size
-        run_data_loader = partial(
-            run_dynamic_batch_size_data_loader,
-            max_seq_length=args.seq_length,
-            samples_per_worker_per_step=samples_per_worker_per_step,
-        )
-    else:
-        run_data_loader = partial(run_fixed_batch_data_loader, batch_size=args.train_batch_size)
 
     logger.info(f"Using {'packed' if args.seq_packing else 'unpacked'} collate function")
 
@@ -516,7 +409,7 @@ def run_finetuning_loop(
         logger.info("Actor process group initialized")
     else:
         actor_update_group = None
-        weight_update_stream = None
+        #weight_update_stream = None
     get_accelerator().wait_for_everyone()
 
     training_metrics = TrainingMetrics()
@@ -526,6 +419,12 @@ def run_finetuning_loop(
         training_metrics.lr = optimizer.param_groups[0]["lr"]
         logger.info("LR after loading training state: %.2E" % training_metrics.lr)
         dt = log_time(dt, time_stats, "finetune/training_state_load")
+
+    if get_accelerator().is_main_process:
+        trigger_message = SamplesProcessed(samples_processed=training_metrics.samples)
+        with write_to_streams(weight_update_stream) as writer:
+            writer.write(trigger_message)
+        
 
     if args.send_weight_updates:
         llm_urls = cfg.me.llm_urls.split("+")
@@ -543,29 +442,29 @@ def run_finetuning_loop(
     else:
         weight_update_manager = None
 
-    sample_queue = Queue(maxsize=args.queue_size)
-    sample_loader_worker_fn = partial(
-        run_sample_loader,
-        data_stream=data_stream,
-        sample_queue=sample_queue,
-        pop_old_data=cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode,
-    )
-
-    stream_to_queue_thread = threading.Thread(target=sample_loader_worker_fn, args=())
-    stream_to_queue_thread.start()
-
     batch_queue = Queue(maxsize=1)
     data_loader_worker_fn = partial(
         run_data_loader,
+        data_stream=data_stream,
         batch_queue=batch_queue,
-        sample_queue=sample_queue,
-        tokenizer=tokenizer,
     )
     data_loader_thread = threading.Thread(target=data_loader_worker_fn, args=())
 
     get_accelerator().wait_for_everyone()
     model.train()
     data_loader_thread.start()
+
+    seq_parallel_group = None
+    if cfg.finetune.seq_parallel > 1:
+        assert get_accelerator().state.num_processes % cfg.finetune.seq_parallel == 0
+        for leader_rank in range(0, get_accelerator().state.num_processes, cfg.finetune.seq_parallel):
+            group_ranks = [leader_rank + i for i in range(cfg.finetune.seq_parallel)]
+            logger.info(f"Creating sequence parallel group with ranks: {group_ranks}")
+            group = dist.new_group(group_ranks, backend="nccl")
+            if get_accelerator().process_index in group_ranks:
+                seq_parallel_group = group
+        assert seq_parallel_group is not None
+        substitute_hf_flash_attn(seq_parallel_group, heads_k_stride=1)
 
     try:
         logger.info("Start training")
@@ -577,8 +476,9 @@ def run_finetuning_loop(
             weight_update_manager,
             tokenizer,
             training_metrics,
-            sample_queue,
             batch_queue,
+            weight_update_stream,
+            seq_parallel_group, 
         )
     finally:
         if actor_update_group:
@@ -594,14 +494,15 @@ def rl_finetuning_worker(
     weight_update_manager: WeightUpdateManager | None,
     tokenizer: PreTrainedTokenizerFast,
     training_metrics: TrainingMetrics,
-    sample_queue: Queue[Dict | Exception],
-    batch_queue: Queue[VersionedTensors | Exception],
+    batch_queue: Queue[PipelineBatchEncoding | Exception],
+    weight_update_stream: SingleStreamSpec | None = None,
+    seq_parallel_group = None,
 ):
     local_samples = torch.tensor([0], device=get_accelerator().device)
     # Create a list of tensors with matching dtype (int64)
     all_samples = [
         torch.zeros(1, dtype=torch.int64, device=get_accelerator().device)
-        for _ in range(get_accelerator().state.num_processes)
+        for _ in range(get_accelerator().state.num_processes)  
     ]
     total_samples = 0
 
@@ -617,7 +518,7 @@ def rl_finetuning_worker(
                     timeout = min(timeout * 1.5, 5.0)
             if isinstance(batch_or_exc, Exception):
                 raise batch_or_exc
-            assert isinstance(batch_or_exc, VersionedTensors)
+            assert isinstance(batch_or_exc, PipelineBatchEncoding)
             yield batch_or_exc
 
     data_generator = batch_generator_fn()
@@ -643,15 +544,22 @@ def rl_finetuning_worker(
 
     time_waiting_for_data = 0.0
 
-    gradient_accumulation_passes_per_gpu = args.gradient_accumulation_passes // get_accelerator().state.num_processes
-    samples_per_worker_per_step = gradient_accumulation_passes_per_gpu * args.train_batch_size
-    samples_per_step = samples_per_worker_per_step * get_accelerator().state.num_processes
+    num_trainers = get_accelerator().state.num_processes
+    num_lead_trainers = num_trainers // args.seq_parallel
+    gradient_accumulation_passes_per_lead = args.gradient_accumulation_passes // num_lead_trainers
+    samples_per_lead_per_step = gradient_accumulation_passes_per_lead * args.train_batch_size
+    samples_per_step = samples_per_lead_per_step * num_lead_trainers
     start_samples = training_metrics.samples
-    last_model_version = training_metrics.samples
+    logger.info(
+        f"Starting training with {start_samples} samples, "
+        f"{samples_per_lead_per_step} samples per lead trainer, "
+        f"{samples_per_step} samples per step, "
+        f"{gradient_accumulation_passes_per_lead} gradient accumulation passes per lead trainer"
+    )
     tokens_processed = []
     passes_took = []
     micro_batches_size = []
-    target_samples_per_worker = samples_per_worker_per_step
+    target_samples_per_lead = samples_per_lead_per_step
     target_samples = samples_per_step
     rl_config = RLConfig(**args.rl)
     # samples_per_step will be used to normalize the loss
@@ -665,32 +573,25 @@ def rl_finetuning_worker(
 
         before_getting_next_batch = time.time()
 
-        # check if current worker has process enough data to do a grad step
-        if local_samples[0] == target_samples_per_worker:
-            logger.debug("creating sentinel batch")
-            versioned_batch = create_sentinel_batch(
-                get_accelerator().device, tokenizer, model_version=last_model_version
-            )
-            is_sentinel_batch = True
-        else:
-            versioned_batch = next(data_generator)
-            is_sentinel_batch = False
+        batch = next(data_generator)
+        is_sentinel_batch = batch.sentinel
+        if local_samples[0] == target_samples_per_lead:
+            assert is_sentinel_batch, "We should get a sentinel batch"
+            logger.info("next batch should be a sentinel batch")
 
         time_waiting_for_data += time.time() - before_getting_next_batch
         # check if too old, don't drop but count
         if (
             args.max_lag is not None
-            and training_metrics.last_broadcasted_version - versioned_batch.model_version > args.max_lag
+            and training_metrics.last_broadcasted_version - batch.model_version > args.max_lag
         ):
             training_metrics.samples_too_old_to_train += args.train_batch_size
-        batch = versioned_batch.tensors
         lag_stats["min_version"] = min(
-            lag_stats.get("min_version", versioned_batch.model_version), versioned_batch.model_version
+            lag_stats.get("min_version", batch.model_version), batch.model_version
         )
         lag_stats["max_version"] = max(
-            lag_stats.get("max_version", versioned_batch.model_version), versioned_batch.model_version
+            lag_stats.get("max_version", batch.model_version), batch.model_version
         )
-        last_model_version = versioned_batch.model_version
 
         if not is_sentinel_batch:
             # We exclude time waiting for data from the pass time
@@ -710,7 +611,9 @@ def rl_finetuning_worker(
             torch.cuda.empty_cache()
 
         dist.all_gather(all_samples, local_samples)
-        total_samples = sum(int(tensor.item()) for tensor in all_samples)
+        total_samples_overcounted = sum(int(tensor.item()) for tensor in all_samples)
+        assert total_samples_overcounted % args.seq_parallel == 0
+        total_samples = total_samples_overcounted // args.seq_parallel
         do_optimizer_step = total_samples == target_samples
         using_deepspeed = isinstance(model, deepspeed.DeepSpeedEngine)
 
@@ -752,6 +655,9 @@ def rl_finetuning_worker(
 
         with toggle_sync(do_optimizer_step):
             # Choose RL step function based on seq_packing config
+            if seq_parallel_group is not None:
+                assert batch.seq_boundaries is not None
+                update_ring_flash_attn_params(batch.seq_boundaries, seq_parallel_group)
             loss, this_step_rl_metrics = rl_step(
                 model, batch, training_metrics.completed_steps, final_train_steps, rl_config
             )
@@ -763,18 +669,20 @@ def rl_finetuning_worker(
                 for k, v in this_step_rl_metrics.items():
                     rl_metrics[k].append(v)
 
-                training_metrics.lr = optimizer.param_groups[0]["lr"]
-
             backward(loss, is_final_micro_batch=do_optimizer_step)
 
         if not is_sentinel_batch:
             passes_took.append(time.time() - time_before_pass)
 
-        logger.debug(f"Did a pass, version was {versioned_batch.model_version}")
+        if get_accelerator().is_main_process:
+            trigger_message = SamplesProcessed(samples_processed=start_samples + total_samples)
+            with write_to_streams(weight_update_stream) as writer:
+                writer.write(trigger_message)
+
         if not do_optimizer_step:
             continue
 
-        target_samples_per_worker += samples_per_worker_per_step
+        target_samples_per_lead += samples_per_lead_per_step
         target_samples += samples_per_step
 
         logger.info(f"Stop step at {time.time()}")
@@ -786,6 +694,7 @@ def rl_finetuning_worker(
         training_metrics.samples = start_samples + total_samples
         this_worker_tokens = sum(tokens_processed)
         training_metrics.tokens += this_worker_tokens * get_accelerator().state.num_processes
+        
         try:
             # Synchronize workers before optimizer step
             logger.info("Waiting for all workers to synchronize...")
@@ -805,10 +714,13 @@ def rl_finetuning_worker(
             len(args.also_save_steps) and training_metrics.completed_steps in args.also_save_steps
         )
         time_to_save = time_to_save and not time_to_stop
-        assert sum(micro_batches_size) == samples_per_worker_per_step
+        assert sum(micro_batches_size) == samples_per_lead_per_step
         training_metrics.time_waiting_for_data += time_waiting_for_data
+        
+        
         if time_to_log or time_to_save:
             dt = log_time(dt, time_stats, "finetune/interim_eval")
+            training_metrics.lr = optimizer.param_groups[0]["lr"]
             metrics_dict.update(
                 {
                     "stats/lr": training_metrics.lr,
@@ -822,7 +734,7 @@ def rl_finetuning_worker(
                     "stats/epoch": training_metrics.epoch,
                     "stats/min_actor_version": lag_stats["min_version"],
                     "stats/max_actor_version": lag_stats["max_version"],
-                    "stats/queue/samples": sample_queue.qsize(),
+                    "stats/queue/batches": batch_queue.qsize(),
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
@@ -848,15 +760,13 @@ def rl_finetuning_worker(
                     "throughput/sequences_per_micro_batch": sum(micro_batches_size) / len(micro_batches_size)
                     if micro_batches_size
                     else 0,
-                    "dataset_stats/max_batch_len": training_metrics.max_batch_len,
-                    "dataset_stats/min_batch_len": training_metrics.min_batch_len,
                 }
             )
 
             gathered_rl_metrics = gather_rl_metrics(rl_metrics)
             time_waiting_for_data = 0.0
 
-            average_rl_metrics = get_avg_rl_stats(gathered_rl_metrics, samples_per_step)
+            average_rl_metrics = aggregate_rl_stats(gathered_rl_metrics, samples_per_step)
             ess = (
                 average_rl_metrics["rl/ratio_new_old_sum"] ** 2
                 / average_rl_metrics["rl/ratio_new_old_squared_sum"]

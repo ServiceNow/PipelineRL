@@ -1,0 +1,7 @@
+defaults:
+  - base
+  - _self_
+
+attempts: 8
+rl:
+  policy_loss: ppo
