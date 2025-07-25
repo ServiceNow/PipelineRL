@@ -6,74 +6,77 @@ save_tapes: true
 
 llm:
   parameters:
-    max_tokens: 3000
-    temperature: 0.2
+    max_tokens: 1024
+    temperature: 0.0
+
+test_llm:
+  parameters:
+    max_tokens: 1024
+    temperature: 0.0
 
 actor:
   rollout_policy: pipelinerl.domains.tir.rollouts.generate_tir_rollout
-  # TIR mode: 'fast' (single candidate + iterative reasoning) or 'sc_tir' (multiple candidates + majority voting)
-  mode: fast  # Default to fast mode
-  # SC-TIR parameters (only used when mode=sc_tir)
-  num_candidates: 4  # Width: number of solution candidates to generate  
-  max_reasoning_steps: 8  # Depth: max reasoning iterations per candidate
-  system_prompt: |-
-    You are a mathematical problem-solving assistant. Use Python code to solve problems step by step.
+  max_reasoning_steps: 8  # Max reasoning iterations
+  system_prompt: ""
 
-    Instructions:
-    1. Read the problem carefully
-    2. Write Python code to solve it, showing your work
-    3. Execute the code and analyze the output
-    4. If needed, write more code to refine your solution
-    5. Once you have the final answer, present it in \boxed{} format
+  # system_prompt: |-
+  #   You are a mathematical problem-solving assistant. Use Python code to solve problems step by step.
 
-    Code format:
-    ```python
-    # Your Python code here
-    ```
+  #   Instructions:
+  #   1. Read the problem carefully
+  #   2. Write Python code to solve it, showing your work
+  #   3. Execute the code and analyze the output
+  #   4. If needed, write more code to refine your solution
+  #   5. Once you have the final answer, present it in \boxed{} format
 
-    The code will be executed and you'll see the output like:
-    ```output
-    # Execution results will appear here
-    ```
+  #   Code format:
+  #   ```python
+  #   # Your Python code here
+  #   ```
 
-    You can write multiple code blocks if needed. Use libraries like sympy, numpy, math as needed.
+  #   The code will be executed and you'll see the output like:
+  #   ```output
+  #   # Execution results will appear here
+  #   ```
+
+  #   You can write multiple code blocks if needed. Use libraries like sympy, numpy, math as needed.
     
-    Always end with your final answer in the format: \boxed{answer}
+  #   Always end with your final answer in the format: \boxed{answer}
 
-    Examples:
+  #   Examples:
 
-    Problem: What is 2 + 3?
-    ```python
-    result = 2 + 3
-    print(f"2 + 3 = {result}")
-    ```
-    ```output
-    2 + 3 = 5
-    ```
-    \boxed{5}
+  #   Problem: What is 2 + 3?
+  #   ```python
+  #   result = 2 + 3
+  #   print(f"2 + 3 = {result}")
+  #   ```
+  #   ```output
+  #   2 + 3 = 5
+  #   ```
+  #   \boxed{5}
 
-    Problem: Solve x^2 - 5x + 6 = 0
-    ```python
-    from sympy import symbols, solve, expand
-    x = symbols('x')
-    equation = x**2 - 5*x + 6
-    solutions = solve(equation, x)
-    print(f"Solutions: {solutions}")
+  #   Problem: Solve x^2 - 5x + 6 = 0
+  #   ```python
+  #   from sympy import symbols, solve, expand
+  #   x = symbols('x')
+  #   equation = x**2 - 5*x + 6
+  #   solutions = solve(equation, x)
+  #   print(f"Solutions: {solutions}")
     
-    # Verify by substitution
-    for sol in solutions:
-        check = sol**2 - 5*sol + 6
-        print(f"x = {sol}: {sol}^2 - 5*{sol} + 6 = {check}")
-    ```
-    ```output
-    Solutions: [2, 3]
-    x = 2: 2^2 - 5*2 + 6 = 0
-    x = 3: 3^2 - 5*3 + 6 = 0
-    ```
-    The solutions are x = 2 and x = 3.
-    \boxed{2, 3}
-  task_template: |-
-    {task}
+  #   # Verify by substitution
+  #   for sol in solutions:
+  #       check = sol**2 - 5*sol + 6
+  #       print(f"x = {sol}: {sol}^2 - 5*{sol} + 6 = {check}")
+  #   ```
+  #   ```output
+  #   Solutions: [2, 3]
+  #   x = 2: 2^2 - 5*2 + 6 = 0
+  #   x = 3: 3^2 - 5*3 + 6 = 0
+  #   ```
+  #   The solutions are x = 2 and x = 3.
+  #   \boxed{2, 3}
+  # task_template: |-
+  #   {task}
 
 model_path: /mnt/llmd/base_models/AI-MO-NuminaMath-7B-TIR
 
@@ -82,7 +85,7 @@ output_dir: results/tir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 world:
   env_replicas: 1
 
-max_loops: 10  # extra iterations
+max_loops: 25  # let the agent handle its own termination
 
 environment:
   _target_: pipelinerl.domains.tir.environment.MCPPythonEnvironment
@@ -97,6 +100,5 @@ train_dataset_names:
   - math_train
 
 test_dataset_names:
-  # - math_test
   - aime_2024
-  # - amc_2023
+  # - math_test
