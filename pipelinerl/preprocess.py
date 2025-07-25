@@ -637,6 +637,7 @@ def run_preprocessing_loop(
                             "preprocessor/queue/output": output_queue.qsize(),
                             "preprocessor/filtered_out_samples": num_filtered_out,
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
+                            "preprocessor/popped_entries_queue": processed_entries_queue_popped_data,
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
