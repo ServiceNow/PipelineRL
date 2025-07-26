@@ -483,6 +483,7 @@ def run_finetuning_loop(
     finally:
         if actor_update_group:
             dist.destroy_process_group(actor_update_group)
+        raise RuntimeError("Finetuning loop finished, exiting worker thread")
 
 
 def rl_finetuning_worker(
