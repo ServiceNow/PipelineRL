@@ -498,6 +498,7 @@ class ActorLoop:
                             "finished_groups": finished_groups,
                             "trainer_model_version": trainer_version_to_publish, 
                             "time_since_start": time.time() - loop_start_time,
+                            "groups_in_progress": in_progress,
                         }
                         trainer_version_to_publish = None
                     else:
