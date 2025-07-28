@@ -95,10 +95,6 @@ async def generate_miniwob_rollout(
                     no_error = False
                     tape_dict = {}
                     break
-                    # if isinstance(e, HTTPException):
-                    #     raise RuntimeError(f"HTTPException: {e.status_code} {e.detail}")
-                    # else:
-                    #     raise e
                 else:
                     logger.warning(f"retry after 5 seconds: {e}")
                     await asyncio.sleep(5)

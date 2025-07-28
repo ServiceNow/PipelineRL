@@ -145,6 +145,8 @@ agent:
       # steps_prompt: ${agent.templates.allowed_tools}
       steps_prompt: ${agent.templates.allowed_steps}
       use_known_actions: true
+      steps:
+        - examples.rl_webagent.steps.FinalAnswerAction
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
       next_node: reflect
