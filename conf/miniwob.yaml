@@ -16,7 +16,6 @@ output_dir: results/miniwob_debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: meta-llama/Llama-3.1-8B-Instruct
 
 finetune:
-  save_checkpoint_steps: 10
   seq_length: 8192
   train_batch_size: 1
   gradient_accumulation_passes: 512
