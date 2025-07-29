@@ -301,6 +301,9 @@ def run_finetuning_loop(
     args = cfg.finetune if "finetune" in cfg else cfg
     validate_packing_config(args)
 
+    cumulative_time_to_deduct = 0.0
+    desired_num_of_processes = 128
+
     if not args.gradient_accumulation_passes % num_processes == 0:
         raise ValueError("gradient_accumulation_passes must be divisible by num_processes")
     gradient_accumulation_passes_per_gpu = args.seq_parallel * (args.gradient_accumulation_passes // num_processes)
@@ -581,6 +584,7 @@ def rl_finetuning_worker(
             logger.info("next batch should be a sentinel batch")
 
         time_waiting_for_data += time.time() - before_getting_next_batch
+        after_getting_next_batch = time.time()
         # check if too old, don't drop but count
         if (
             args.max_lag is not None
@@ -683,7 +687,14 @@ def rl_finetuning_worker(
                 writer.write(trigger_message)
 
         if not do_optimizer_step:
+            forward_pass_took = time.time() - after_getting_next_batch
+            forward_pass_took_for_desired_num_of_processes = (
+                forward_pass_took * (desired_num_of_processes / get_accelerator().state.num_processes)
+            )
+            time_to_deduct = forward_pass_took - forward_pass_took_for_desired_num_of_processes
+            cumulative_time_to_deduct += time_to_deduct
             continue
+
 
         target_samples_per_lead += samples_per_lead_per_step
         target_samples += samples_per_step
@@ -710,6 +721,12 @@ def rl_finetuning_worker(
         optimizer_step_and_zero_grad()
         lr_scheduler.step()
 
+        forward_pass_took = time.time() - after_getting_next_batch
+        forward_pass_took_for_desired_num_of_processes = (
+            forward_pass_took * (desired_num_of_processes / get_accelerator().state.num_processes)
+        )
+        time_to_deduct = forward_pass_took - forward_pass_took_for_desired_num_of_processes
+        cumulative_time_to_deduct += time_to_deduct
         metrics_dict = {}
         time_to_stop = training_metrics.completed_steps >= final_train_steps
         time_to_log = training_metrics.completed_steps % args.log_each_n_steps == 0
@@ -739,6 +756,7 @@ def rl_finetuning_worker(
                     "stats/queue/batches": batch_queue.qsize(),
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
+                    "stats/cumulative_time_to_deduct": cumulative_time_to_deduct,
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
                     "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
