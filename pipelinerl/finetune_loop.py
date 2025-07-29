@@ -689,7 +689,7 @@ def rl_finetuning_worker(
         if not do_optimizer_step:
             forward_pass_took = time.time() - after_getting_next_batch
             forward_pass_took_for_desired_num_of_processes = (
-                forward_pass_took * (desired_num_of_processes / get_accelerator().state.num_processes)
+                forward_pass_took * (get_accelerator().state.num_processes / desired_num_of_processes)
             )
             time_to_deduct = forward_pass_took - forward_pass_took_for_desired_num_of_processes
             cumulative_time_to_deduct += time_to_deduct
@@ -723,7 +723,7 @@ def rl_finetuning_worker(
 
         forward_pass_took = time.time() - after_getting_next_batch
         forward_pass_took_for_desired_num_of_processes = (
-            forward_pass_took * (desired_num_of_processes / get_accelerator().state.num_processes)
+            forward_pass_took * (get_accelerator().state.num_processes / desired_num_of_processes)
         )
         time_to_deduct = forward_pass_took - forward_pass_took_for_desired_num_of_processes
         cumulative_time_to_deduct += time_to_deduct
