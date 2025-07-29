@@ -374,6 +374,7 @@ class ActorLoop:
         published_samples = 0
         submitted_groups = 0
         finished_groups = 0
+        cumulative_time_to_deduct = 0
         expected_rollouts = -1 if self.is_training else len(dataset)
         if expected_rollouts > 0:
             logger.info(f"Will stop after {expected_rollouts} rollouts")
@@ -449,10 +450,14 @@ class ActorLoop:
                     # the weights have been updated, publish the stats of the previous trainer version
                     trainer_version_to_publish = last_trainer_version
                     last_trainer_version = self.trainer_state.propagated_weight_version
-                    time_for_desired_num_of_llms = max(times_for_current_num_llms) 
+                    time_for_desired_num_of_llms = max(times_for_current_num_llms)
+                    time_for_current_num_of_llms = sum(times_for_current_num_llms)
+                    time_to_deduct = time_for_current_num_of_llms - time_for_desired_num_of_llms
+                    cumulative_time_to_deduct += time_to_deduct
                     logger.info(
-                        f"Time on current number of llms {sum(times_for_current_num_llms)},"
+                        f"Time on current number of llms {time_for_current_num_of_llms},"
                         f" time on desired number of llms: {time_for_desired_num_of_llms:.2f} seconds"
+                        f" time to deduct {time_to_deduct} seconds. Total time to deduct {cumulative_time_to_deduct:.2f} seconds"
                     )
                     times_for_current_num_llms = []
                     loop_start_time = time.time()
@@ -534,7 +539,7 @@ class ActorLoop:
                             "trainer_model_version": trainer_version_to_publish, 
                             "time_since_start": time.time() - loop_start_time,
                             "groups_in_progress": in_progress,
-                            "time_for_desired_num_of_llms": time_for_desired_num_of_llms,
+                            "cumulative_time_to_deduct": cumulative_time_to_deduct,
                         }
                         trainer_version_to_publish = None
                     else:
