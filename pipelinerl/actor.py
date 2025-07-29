@@ -411,8 +411,8 @@ class ActorLoop:
                 f"Max lag is {self.cfg.finetune.max_lag} samples, that makes {lag_groups} additional starting chunks"
             )
             #TODO: rm conv RL code
-            times_per_current_llms = []
-            time_on_desired_number_of_llms = 0
+            times_for_current_num_llms = []
+            time_for_desired_num_of_llms = 0
             desired_number_of_llms = 128
             current_number_of_llms = len(self.llms) # assumes 1 llm per gpu
             assert (groups_per_update * current_number_of_llms) % desired_number_of_llms == 0, (
@@ -449,12 +449,12 @@ class ActorLoop:
                     # the weights have been updated, publish the stats of the previous trainer version
                     trainer_version_to_publish = last_trainer_version
                     last_trainer_version = self.trainer_state.propagated_weight_version
-                    time_on_desired_number_of_llms = max(times_per_current_llms) 
+                    time_for_desired_num_of_llms = max(times_for_current_num_llms) 
                     logger.info(
-                        f"Time on current number of llms {sum(times_per_current_llms)},"
-                        f" time on desired number of llms: {time_on_desired_number_of_llms:.2f} seconds"
+                        f"Time on current number of llms {sum(times_for_current_num_llms)},"
+                        f" time on desired number of llms: {time_for_desired_num_of_llms:.2f} seconds"
                     )
-                    times_per_current_llms = []
+                    times_for_current_num_llms = []
                     loop_start_time = time.time()
                 elif published_samples == can_submit_before_update and published_samples < can_submit_before_update_non_adjusted:
                     logger.info(
@@ -462,7 +462,7 @@ class ActorLoop:
                         f" will now increment the number of samples that can be submitted before update to {can_submit_before_update+groups_per_update_adjusted}"
                     )
                     end_time = time.time()
-                    times_per_current_llms.append(end_time - loop_start_time)
+                    times_for_current_num_llms.append(end_time - loop_start_time)
                     loop_start_time = end_time
                     if max_lag is not None:
                         can_submit_before_update += groups_per_update_adjusted
@@ -534,7 +534,7 @@ class ActorLoop:
                             "trainer_model_version": trainer_version_to_publish, 
                             "time_since_start": time.time() - loop_start_time,
                             "groups_in_progress": in_progress,
-                            "time_on_desired_number_of_llms": time_on_desired_number_of_llms,
+                            "time_for_desired_num_of_llms": time_for_desired_num_of_llms,
                         }
                         trainer_version_to_publish = None
                     else:
