@@ -568,6 +568,7 @@ def rl_finetuning_worker(
     rl_config = RLConfig(**args.rl)
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
+    desired_num_of_processes = 128
     while training_metrics.completed_steps < final_train_steps:
         # We include time waiting for data in the step time
         if first_pass:
