@@ -301,9 +301,6 @@ def run_finetuning_loop(
     args = cfg.finetune if "finetune" in cfg else cfg
     validate_packing_config(args)
 
-    cumulative_time_to_deduct = 0.0
-    desired_num_of_processes = 128
-
     if not args.gradient_accumulation_passes % num_processes == 0:
         raise ValueError("gradient_accumulation_passes must be divisible by num_processes")
     gradient_accumulation_passes_per_gpu = args.seq_parallel * (args.gradient_accumulation_passes // num_processes)
@@ -569,6 +566,7 @@ def rl_finetuning_worker(
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
     desired_num_of_processes = 128
+    cumulative_time_to_deduct = 0.0
     while training_metrics.completed_steps < final_train_steps:
         # We include time waiting for data in the step time
         if first_pass:
