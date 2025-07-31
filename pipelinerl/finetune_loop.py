@@ -567,6 +567,8 @@ def rl_finetuning_worker(
     rl_config.batch_size = samples_per_step
     desired_num_of_processes = 128
     cumulative_time_to_deduct = 0.0
+    cumulative_time_for_desired_num_of_processes = 0.0
+    cumulative_time_for_current_num_of_processes = 0.0
     while training_metrics.completed_steps < final_train_steps:
         # We include time waiting for data in the step time
         if first_pass:
@@ -692,6 +694,8 @@ def rl_finetuning_worker(
             )
             time_to_deduct = forward_pass_took - forward_pass_took_for_desired_num_of_processes
             cumulative_time_to_deduct += time_to_deduct
+            cumulative_time_for_desired_num_of_processes += forward_pass_took_for_desired_num_of_processes
+            cumulative_time_for_current_num_of_processes += forward_pass_took
             continue
 
 
@@ -726,6 +730,8 @@ def rl_finetuning_worker(
         )
         time_to_deduct = forward_pass_took - forward_pass_took_for_desired_num_of_processes
         cumulative_time_to_deduct += time_to_deduct
+        cumulative_time_for_desired_num_of_processes += forward_pass_took_for_desired_num_of_processes
+        cumulative_time_for_current_num_of_processes += forward_pass_took
         metrics_dict = {}
         time_to_stop = training_metrics.completed_steps >= final_train_steps
         time_to_log = training_metrics.completed_steps % args.log_each_n_steps == 0
@@ -756,6 +762,8 @@ def rl_finetuning_worker(
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
                     "stats/cumulative_time_to_deduct": cumulative_time_to_deduct,
+                    "stats/cumulative_time_for_desired_num_of_processes": cumulative_time_for_desired_num_of_processes,
+                    "stats/cumulative_time_for_current_num_of_processes": cumulative_time_for_current_num_of_processes,
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
                     "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
