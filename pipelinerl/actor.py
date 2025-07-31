@@ -545,7 +545,7 @@ class ActorLoop:
                             "groups_in_progress": in_progress,
                             "cumulative_time_to_deduct": cumulative_time_to_deduct,
                             "cumulative_time_for_current_num_llms": cumulative_time_for_current_num_llms,
-                            "cumulative_time_for_desired_num_llms": cumulative_time_for_desired_num_ll
+                            "cumulative_time_for_desired_num_llms": cumulative_time_for_desired_num_llms,
                         }
                         trainer_version_to_publish = None
                     else:
