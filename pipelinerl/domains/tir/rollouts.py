@@ -4,12 +4,14 @@ import logging
 import time
 import json
 import os
-from typing import Any, List, Union
+from typing import Any, List
 from collections import Counter
 import aiohttp
 from omegaconf import DictConfig
 from tapeagents.llms import TrainableLLM
 from pipelinerl.rollouts import RolloutResult, BaseMetrics
+from pydantic import BaseModel
+from tapeagents.steps import ActionExecutionFailure
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +22,31 @@ _cached_environments = {}
 class TIRMetrics(BaseMetrics):
     """TIR-specific metrics extending the base metrics."""
     overflow: int = 0  # Whether max_loops was hit
+    timeout: int = 0   # Whether problem timed out
     prompt_tokens: int = 0
     output_tokens: int = 0
-    mode_sc_tir: int = 0  # 0=fast mode, 1=sc_tir mode
-    num_candidates: int = 1
-    candidates_with_answers: int = 0
-    agreement_rate: float = 0.0  # How often candidates agree
+
+
+class TIRRewardTable(BaseModel):
+    """Reward table for TIR domain - similar to math domain but adapted for multi-step reasoning."""
+    correct_answer: float = 1.0
+    wrong_answer: float = 0.0
+    no_answer: float = -0.1
+    unparsable: float = -0.1
+    execution_failure: float = -0.05  # When code fails to execute
+    timeout_penalty: float = -0.2
+    buffer_tokens: int = 0  # 0 means no overlong reward shaping
+
+
+def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
+    """Compute the overlong penalty - same as math domain."""
+    if sequence_length > (max_length - buffer_tokens) and sequence_length <= max_length:
+        return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
+    return 0.
 
 
 async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict, session: aiohttp.ClientSession) -> RolloutResult:
-    """Generate a rollout for TIR domain with fast or sc_tir modes."""
+    """Generate a rollout for TIR domain with iterative reasoning."""
     from pipelinerl.async_llm import make_training_text
     from tapeagents.orchestrator import main_loop
     from .agent import Task, TIRMathTape, AnswerAction, TIRMathAgent
@@ -37,89 +54,81 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     
     time_start = time.time()
     
-    # Create or reuse env
+    # Create or reuse environment
     env_key = str(cfg.environment)
     if env_key not in _cached_environments:
         _cached_environments[env_key] = MCPPythonEnvironment()
         logger.info("Created new cached MCP environment")
     environment = _cached_environments[env_key]
     
-    mode = getattr(cfg.actor, 'mode', 'fast')
-    num_candidates = getattr(cfg.actor, 'num_candidates', 4) if mode == 'sc_tir' else 1
     max_reasoning_steps = getattr(cfg.actor, 'max_reasoning_steps', 8)
+    logger.info(f"Running TIR with max {max_reasoning_steps} reasoning steps")
     
-    logger.info(f"Running {mode} mode with {num_candidates} candidates, max {max_reasoning_steps} steps")
+    # Create agent
+    agent = TIRMathAgent(
+        system_prompt=cfg.actor.system_prompt,
+        max_iterations=max_reasoning_steps
+    )
+    agent.llms = {"default": llm}
     
-    all_final_tapes = []
-    all_llm_calls = []
-    all_training_samples = []
-    candidate_answers = []
+    # Use task template if provided
+    task_template = getattr(cfg.actor, 'task_template', '{task}')
+    task_step = Task(task=problem["task"], template=task_template)
+    start_tape = TIRMathTape(steps=[task_step], context=None)
     
-    for candidate_idx in range(num_candidates):
-        logger.info(f"Generating candidate {candidate_idx + 1}/{num_candidates}")
-        
-        agent = TIRMathAgent(
-            system_prompt=cfg.actor.system_prompt,
-            max_iterations=max_reasoning_steps
+    # Run agent-environment interaction
+    final_tape = None
+    
+    for event in main_loop(agent, start_tape, environment, cfg.max_loops):
+        if event.agent_tape:
+            final_tape = event.agent_tape
+        elif event.env_tape:
+            final_tape = event.env_tape
+    
+    if final_tape is None:
+        logger.warning("Failed to generate tape")
+        # Return empty result
+        metrics = TIRMetrics(
+            reward=0.0,
+            success=False,
+            no_error=False,
+            no_answer=True,
         )
-        agent.llms = {"default": llm}
-        
-        task_step = Task(task=problem["task"])
-        start_tape = TIRMathTape(steps=[task_step], context=None)
-        
-        # agent-environment interaction
-        final_tape = None
-        for event in main_loop(agent, start_tape, environment, cfg.max_loops):
-            if event.agent_tape:
-                final_tape = event.agent_tape
-            elif event.env_tape:
-                final_tape = event.env_tape
-        
-        if final_tape is not None:
-            all_final_tapes.append(final_tape)
-            
-            answer_step = None
-            for step in reversed(final_tape.steps):
-                if isinstance(step, AnswerAction):
-                    answer_step = step
-                    break
-            
-            if answer_step is not None:
-                candidate_answers.append(answer_step.value)
-                logger.info(f"Candidate {candidate_idx + 1} answer: {answer_step.value}")
-            else:
-                candidate_answers.append(None)
-                logger.warning(f"Candidate {candidate_idx + 1} produced no answer")
-            
-            candidate_llm_calls = []
-            candidate_samples = []
-            
-            for step in final_tape.steps:
-                if step.metadata and step.metadata.other:
-                    llm_call_data = step.metadata.other.get("llm_call")
-                    if llm_call_data:
-                        training_text = make_training_text(llm, llm_call_data)
-                        candidate_samples.append(training_text)
-                        candidate_llm_calls.append(llm_call_data)
-            
-            if not candidate_llm_calls:
-                _, candidate_llm_calls = agent.reuse(final_tape)
-                candidate_samples = [agent.make_training_text(llm_call) for llm_call in candidate_llm_calls]
-            
-            all_llm_calls.extend(candidate_llm_calls)
-            all_training_samples.extend(candidate_samples)
-        else:
-            candidate_answers.append(None)
-            logger.warning(f"Candidate {candidate_idx + 1} failed")
+        return RolloutResult(
+            training_texts=[],
+            metrics=metrics,
+            latency=time.time() - time_start,
+            dataset_name=problem.get("dataset", "unknown"),
+            prompt_tokens=[],
+            output_tokens=[],
+        )
     
-    # majority voting or single answer
-    if mode == 'sc_tir':
-        final_answer = apply_majority_voting(candidate_answers)
-        logger.info(f"Candidates: {candidate_answers} -> Majority: {final_answer}")
-    else:
-        final_answer = candidate_answers[0] if candidate_answers else None
-        logger.info(f"Fast mode answer: {final_answer}")
+    # Extract final answer if available
+    final_answer = None
+    if final_tape and isinstance(final_tape.steps[-1], AnswerAction):
+        final_answer = final_tape.steps[-1].value
     
+    # Log the predicted vs ground truth for debugging
+    predicted_answer = final_answer if final_answer is not None else "No answer"
+    ground_truth = problem.get("answer", "Unknown")
+    logger.info(f"Problem: {problem.get('id', 'unknown')} | Predicted: {predicted_answer} | Ground truth: {ground_truth}")
+    
+    # Create training text samples for LLM calls
+    training_samples = []
+    llm_calls = []
+    if final_tape:
+        # Extract LLM calls from step metadata (similar to counting domain)
+        for step in final_tape.steps:
+            if step.metadata and step.metadata.other and "llm_call" in step.metadata.other:
+                llm_call = step.metadata.other["llm_call"]
+                llm_calls.append(llm_call)
+                training_sample = make_training_text(llm, llm_call)
+                training_samples.append(training_sample)
+        
+        if not llm_calls:
+            logger.debug("No LLM calls found in step metadata")
+    
+    # Save debug info if requested
     if getattr(cfg, 'save_tapes', False):
         debug_dir = os.path.join(cfg.output_dir, "debug_tapes") 
         os.makedirs(debug_dir, exist_ok=True)
@@ -127,18 +136,15 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         debug_file = os.path.join(debug_dir, f"problem_{problem.get('id', 'unknown')}.json")
         debug_data = {
             "problem": problem,
-            "mode": mode,
-            "num_candidates": num_candidates,
-            "candidate_answers": candidate_answers,
-            "majority_answer": final_answer,
-            "num_tapes": len(all_final_tapes),
-            "total_llm_calls": len(all_llm_calls),
+            "answer": final_answer,
+            "num_llm_calls": len(llm_calls),
             "target_answer": problem.get("answer", ""),
         }
         
         with open(debug_file, "w") as f:
             json.dump(debug_data, f, indent=2)
     
+    # Check if answer is correct
     success = False
     answer_status = "no_answer"
     
@@ -157,53 +163,78 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
             else:
                 answer_status = "unparsable"
     
-    # rewards
-    reward = 1.0 if success else 0.0
-    for sample in all_training_samples:
-        sample.reward = reward
+    # Set rewards using TIR reward table (similar to math domain)
+    rewards = TIRRewardTable(**dict(cfg.get('rewards', {})))
     
-    # discount factor
-    if cfg.actor.discount_factor and all_llm_calls:
-        total_output_tokens = sum(llm_call.output_length_tokens for llm_call in all_llm_calls)
-        reward *= cfg.actor.discount_factor ** total_output_tokens
-        for sample in all_training_samples:
-            sample.reward = reward
+    if training_samples:
+        # Determine base reward based on answer status
+        if answer_status == "correct":
+            base_reward = rewards.correct_answer
+        elif answer_status == "wrong":
+            base_reward = rewards.wrong_answer
+        elif answer_status == "no_answer":
+            base_reward = rewards.no_answer
+        elif answer_status == "unparsable":
+            base_reward = rewards.unparsable
+        else:
+            base_reward = rewards.wrong_answer  # fallback
+        
+        # Check for execution failures and apply penalties
+        has_execution_errors = any(
+            isinstance(step, ActionExecutionFailure) for step in final_tape.steps
+        )
+        if has_execution_errors:
+            base_reward += rewards.execution_failure
+        
+        # All steps get the same reward for RL consistency
+        for sample in training_samples:
+            sample.reward = base_reward
     
+    # Apply discount factor and length penalties (similar to math domain)
+    if cfg.actor.discount_factor and llm_calls:
+        total_output_tokens = sum(llm_call.output_length_tokens for llm_call in llm_calls)
+        discount_multiplier = cfg.actor.discount_factor ** total_output_tokens
+        
+        # Apply length penalty if configured
+        overlong_penalty = 0
+        if rewards.buffer_tokens > 0:
+            # For TIR, apply penalty based on total output across all calls
+            max_tokens = getattr(cfg.actor, 'max_tokens', 4096)
+            overlong_penalty = length_penalty(max_tokens, total_output_tokens, rewards.buffer_tokens)
+        
+        for sample in training_samples:
+            sample.reward *= discount_multiplier
+            sample.reward += overlong_penalty
+        
+        avg_reward = sum(sample.reward for sample in training_samples) / len(training_samples)
+    else:
+        avg_reward = sum(sample.reward for sample in training_samples) / len(training_samples) if training_samples else 0.0
+    
+    # Check for errors
     has_errors = any(
-        any(1 for s in tape.steps if hasattr(s, 'error') and s.error) 
-        for tape in all_final_tapes
+        any(1 for s in final_tape.steps if hasattr(s, 'error') and s.error) 
+        for s in [final_tape]
     )
     
-    valid_answers = [ans for ans in candidate_answers if ans is not None]
-    if mode == 'sc_tir' and len(valid_answers) > 1:
-        answer_counts = Counter(valid_answers)
-        most_common_count = answer_counts.most_common(1)[0][1] if answer_counts else 0
-        agreement_rate = most_common_count / len(valid_answers)
-    else:
-        agreement_rate = 1.0 if valid_answers else 0.0
-    
-    # Create TIRMetrics instance with all TIR-specific metrics
+    # Create TIRMetrics instance
     metrics = TIRMetrics(
-        reward=reward,
+        reward=avg_reward,
         success=success,
         no_error=not has_errors,
         no_answer=(answer_status == "no_answer"),
-        overflow=0,  # TODO: detect if max_loops was hit
-        prompt_tokens=sum(llm_call.prompt_length_tokens for llm_call in all_llm_calls) if all_llm_calls else 0,
-        output_tokens=sum(llm_call.output_length_tokens for llm_call in all_llm_calls) if all_llm_calls else 0,
-        mode_sc_tir=1 if mode == 'sc_tir' else 0,
-        num_candidates=num_candidates,
-        candidates_with_answers=len(valid_answers),
-        agreement_rate=agreement_rate,
+        overflow=0,  # Let the agent handle its own termination
+        timeout=0,  # Timeouts now handled at environment level
+        prompt_tokens=sum(llm_call.prompt_length_tokens for llm_call in llm_calls) if llm_calls else 0,
+        output_tokens=sum(llm_call.output_length_tokens for llm_call in llm_calls) if llm_calls else 0,
     )
     
     return RolloutResult(
-        training_texts=all_training_samples,
+        training_texts=training_samples,
         metrics=metrics,
         latency=time.time() - time_start,
         dataset_name=problem.get("dataset", "unknown"),
-        prompt_tokens=[llm_call.prompt_length_tokens for llm_call in all_llm_calls] if all_llm_calls else [],
-        output_tokens=[llm_call.output_length_tokens for llm_call in all_llm_calls] if all_llm_calls else [],
+        prompt_tokens=[llm_call.prompt_length_tokens for llm_call in llm_calls] if llm_calls else [],
+        output_tokens=[llm_call.output_length_tokens for llm_call in llm_calls] if llm_calls else [],
     )
 
 
@@ -214,7 +245,7 @@ def apply_majority_voting(candidate_answers: List[Any]) -> Any:
     if not valid_answers:
         return None
     
-    # normalise answers
+    # Normalize answers for better comparison
     normalized_answers = []
     for ans in valid_answers:
         if isinstance(ans, (int, float)):

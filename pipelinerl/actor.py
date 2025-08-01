@@ -257,6 +257,8 @@ def rollout_maker_entrypoint(
 
 
 def random_iter(problems: list):
+    if not problems:
+        raise ValueError(f"Cannot iterate over empty problems list. No data was loaded.")
     while True:
         yield random.sample(problems, 1)[0]
 
@@ -529,6 +531,24 @@ class ActorLoop:
                 for agg, sub_stats in calculate_stats(list_of_stats_per_metric_and_dataset).items():
                     stats[f"{dataset_name}/{metric_name}_{agg}"] = sub_stats
 
+        # Add clean dataset-specific pass rates for test evaluation
+        if not self.is_training and "success" in self.stats:
+            dataset_pass_rates = self._calculate_dataset_pass_rates()
+            stats.update(dataset_pass_rates)
+            
+            # Log clean pass rates to console for easy viewing
+            if dataset_pass_rates:
+                logger.info("Dataset Pass Rates:")
+                for key, value in dataset_pass_rates.items():
+                    if key.startswith("pass_rate/"):
+                        dataset_name = key.replace("pass_rate/", "")
+                        logger.info(f"  {dataset_name}: {value:.1f}%")
+                
+                # Debug: log all metrics being sent to wandb
+                logger.info("All dataset metrics being logged to wandb:")
+                for key, value in dataset_pass_rates.items():
+                    logger.info(f"  actor/{key}: {value}")
+
         stats |= (
             {
                 f"{split_name}{k}": v
@@ -550,7 +570,49 @@ class ActorLoop:
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
-        self.init_stats()  # Reset stats for the next iteration
+        
+        # Only reset stats for training (not test evaluation)
+        if self.is_training:
+            self.init_stats()  # Reset stats for the next iteration
+
+    def _calculate_dataset_pass_rates(self) -> Dict[str, float]:
+        """Calculate clean dataset-specific pass rates matching the table format."""
+        pass_rates = {}
+        
+        # Dataset name mapping for clean display
+        dataset_name_mapping = {
+            "gsm8k_test": "GSM8k",
+            "gsm8k_train": "GSM8k", 
+            "math_test": "MATH",
+            "math_train": "MATH",
+            "aime_2024": "AIME 2024",
+            "aime_2023": "AIME 2023", 
+            "aime_2022": "AIME 2022",
+            "amc_2023": "AMC 2023",
+            "amc_2022": "AMC 2022",
+        }
+        
+        success_stats = self.stats.get("success", {})
+        
+        for dataset_name, group_results in success_stats.items():
+            # Flatten all success values for this dataset
+            all_successes = []
+            for group_id, success_list in group_results.items():
+                all_successes.extend(success_list)
+            
+            if all_successes:
+                # Calculate pass rate as percentage
+                pass_rate = (sum(all_successes) / len(all_successes)) * 100
+                
+                # Use clean dataset name if available, otherwise use original
+                clean_name = dataset_name_mapping.get(dataset_name, dataset_name)
+                pass_rates[f"pass_rate/{clean_name}"] = pass_rate
+                
+                # Track total problems attempted for all datasets
+                pass_rates[f"problems_solved/{clean_name}"] = sum(all_successes)
+                pass_rates[f"problems_total/{clean_name}"] = len(all_successes)
+        
+        return pass_rates
 
 
 def run_actor_loop(cfg: DictConfig):
@@ -649,13 +711,22 @@ def run_actor_loop(cfg: DictConfig):
             if last_regular_eval == -1
             else last_regular_eval + cfg.eval_every_n_versions
         )
-        if (
+        
+        # In eval debug mode, run test evaluation immediately and only once
+        should_run_test_eval = False
+        if cfg.debug.mode == "eval" and test_dataset and test_loop_run is None and last_regular_eval == -1:
+            should_run_test_eval = True
+            logger.info("Eval debug mode: Running test evaluation immediately")
+        elif (
             cfg.eval_every_n_versions
             and not cfg.debug.mode
             and trainer_state.propagated_weight_version >= next_regular_eval
             and test_dataset
             and test_loop_run is None
         ):
+            should_run_test_eval = True
+            
+        if should_run_test_eval:
             logger.info("Create test loop")
             test_loop_run = test_loop.run(
                 dataset=test_dataset,
@@ -673,6 +744,11 @@ def run_actor_loop(cfg: DictConfig):
                 last_regular_eval = current_eval
                 train_loop.is_scheduling_paused = False
                 logger.info("Test loop finished")
+                
+                # In eval debug mode, exit after test evaluation completes
+                if cfg.debug.mode == "eval":
+                    logger.info("Eval debug mode: Test evaluation completed, exiting")
+                    break
 
         # 3. Keep running the training loop
         _ = next(train_loop_run)

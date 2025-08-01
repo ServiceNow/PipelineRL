@@ -561,6 +561,8 @@ def main(cfg: DictConfig):
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
     elif cfg.debug.mode == "actor":
         processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm"]))
+    elif cfg.debug.mode == "eval":
+        processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
         processes.extend(launch_jobs(cfg, world_map, ["preprocessor", "preprocessor_llm"]))
     elif cfg.debug.mode == "actor+preprocessor":

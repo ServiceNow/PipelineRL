@@ -236,6 +236,15 @@ def calculate_stats(stats: List | Dict[Any, Any]) -> Dict[str, float]:
         # stats is a dict of list
         stats = dict_to_list(stats)
 
+    if not stats:
+        # Handle empty stats gracefully
+        return {
+            "max": 0.0,
+            "min": 0.0,
+            "var": 0.0,
+            "mean": 0.0,
+        }
+
     if not isinstance(stats, list):
         raise TypeError(f"Expected stats to be a list, got {type(stats)}")
 

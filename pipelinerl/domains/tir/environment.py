@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -19,6 +20,19 @@ class MCPPythonEnvironment(Environment):
     
     def __init__(self):
         super().__init__()
+        
+        # Set up environment variables for Deno to use a writable cache directory
+        import tempfile
+        
+        # Create a temporary directory for Deno cache in a writable location
+        self.deno_cache_dir = tempfile.mkdtemp(prefix="deno_cache_")
+        
+        # Set environment variables for Deno
+        self.env_vars = {
+            'DENO_DIR': self.deno_cache_dir,
+            'DENO_CACHE_DIR': self.deno_cache_dir,
+        }
+        
         self.server_params = StdioServerParameters(
             command='deno',
             args=[
@@ -30,8 +44,19 @@ class MCPPythonEnvironment(Environment):
                 'jsr:@pydantic/mcp-run-python',
                 'stdio',
             ],
+            env=self.env_vars,
         )
-        logger.info("MCP Python environment initialized")
+        logger.info(f"MCP Python environment initialized with cache dir: {self.deno_cache_dir}")
+    
+    def __del__(self):
+        """Clean up temporary cache directory."""
+        try:
+            import shutil
+            if hasattr(self, 'deno_cache_dir') and os.path.exists(self.deno_cache_dir):
+                shutil.rmtree(self.deno_cache_dir)
+                logger.debug(f"Cleaned up Deno cache dir: {self.deno_cache_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up Deno cache dir: {e}")
     
     def launch(self, port: int):
         """Launch the environment as a server."""
@@ -67,12 +92,13 @@ class MCPPythonEnvironment(Environment):
                     
                     with concurrent.futures.ThreadPoolExecutor() as executor:
                         future = executor.submit(run_in_thread)
-                        result = future.result(timeout=30)
+                        result = future.result(timeout=90)
                         
                 except RuntimeError:
                     result = asyncio.run(self._execute_python_code(action.code))
                 
-                logger.info(f"MCP execution result: {repr(result[:200])}...")
+                # logger.info(f"MCP execution result: {repr(result[:200])}...")
+                logger.info(f"MCP execution result: {repr(result)}")
                 
                 output, success = self._parse_mcp_result(result)
                 
@@ -85,6 +111,10 @@ class MCPPythonEnvironment(Environment):
                 
                 tape = tape.append(observation)
                 
+            except TimeoutError as e:
+                logger.warning(f"Code execution timed out: {e}")
+                tape = tape.append(ActionExecutionFailure(error=f"Timeout: {e}"))
+                break
             except Exception as e:
                 logger.error(f"MCP execution failed: {e}")
                 tape = tape.append(ActionExecutionFailure(error=str(e)))
@@ -97,8 +127,18 @@ class MCPPythonEnvironment(Environment):
         async with stdio_client(self.server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.call_tool('run_python_code', {'python_code': code})
-                return result.content[0].text
+                # Add timeout to the actual MCP call
+                try:
+                    result = await asyncio.wait_for(
+                        session.call_tool('run_python_code', {'python_code': code}),
+                        timeout=90.0  # 90 second timeout for individual code execution
+                    )
+                    return result.content[0].text
+                except asyncio.TimeoutError:
+                    raise TimeoutError("Code execution timed out after 90 seconds")
+                except Exception as e:
+                    logger.error(f"MCP execution failed: {e}")
+                    raise e
     
     def _parse_mcp_result(self, mcp_output: str) -> tuple[str, bool]:
         """Parse MCP output to extract result and determine success."""
@@ -110,6 +150,13 @@ class MCPPythonEnvironment(Environment):
                 return f"Error: {error_msg}", False
             else:
                 return "Error: Code execution failed", False
+        
+        # Check for <output> tags first (common in MCP responses)
+        if "<output>" in mcp_output and "</output>" in mcp_output:
+            start = mcp_output.find("<output>") + len("<output>")
+            end = mcp_output.find("</output>")
+            output = mcp_output[start:end].strip()
+            return output if output else "No output produced", True
         
         if "<o>" in mcp_output and "</o>" in mcp_output:
             start = mcp_output.find("<o>") + len("<o>")

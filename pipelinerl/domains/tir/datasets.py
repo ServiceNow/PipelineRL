@@ -20,8 +20,77 @@ def _load_gsm8k_dataset(split: str) -> List[Dict[str, Any]]:
 
 
 def _load_math_dataset(split: str) -> List[Dict[str, Any]]:
-    from pipelinerl.domains.math.load_datasets import load_datasets as math_load_datasets
-    return math_load_datasets([f"math_{split}"])
+    """Load MATH dataset directly with correct config for TIR domain."""
+    from datasets import load_dataset
+    from pipelinerl.domains.math.load_datasets import add_ids
+    
+    # Use "main" config instead of "default" to match cached version
+    dataset = load_dataset("hendrycks/competition_math", "main", split=split, trust_remote_code=True)
+    samples = [s for s in _process_math_for_tir(dataset, f"math_{split}") if s is not None]
+    logger.info(f"Loading math {split} dataset for TIR: {len(samples)} samples")
+    return add_ids(samples)
+
+
+def _process_math_for_tir(dataset, dataset_name):
+    """Process MATH dataset for TIR domain with proper boxed answer extraction."""
+    for item in dataset:
+        if "correctness_math_verify" in item:
+            if not any(item["correctness_math_verify"]):
+                # correctness cannot be verified with math_verify
+                yield None
+                continue
+        if "problem" in item:
+            question = item["problem"]
+        elif "question" in item:
+            question = item["question"]
+        else:
+            yield None
+            continue
+        if "subject" in item and "type" not in item:
+            item["type"] = item["subject"]
+        
+        if "answer" in item:
+            answer = "\\boxed{" + item["answer"] + "}"
+        elif "solution" in item:
+            # Extract boxed answer from solution text for proper comparison
+            solution = item["solution"]
+            answer = _extract_boxed_answer(solution)
+        else:
+            yield None
+            continue
+            
+        sample = {
+            "dataset": dataset_name,
+            "level": item.get("level", ""),
+            "type": item.get("type", ""),
+            "task": question,
+            "answer": answer,
+        }
+        yield sample
+
+
+def _extract_boxed_answer(solution: str) -> str:
+    """Extract the boxed answer from a solution, fallback to full solution if not found."""
+    # Find the last occurrence of \boxed{...} in the solution
+    boxed_start = solution.rfind("\\boxed{")
+    if boxed_start >= 0:
+        # Find the matching closing brace
+        brace_count = 0
+        i = boxed_start + 7  # Start after "\boxed{"
+        while i < len(solution):
+            if solution[i] == '{':
+                brace_count += 1
+            elif solution[i] == '}':
+                if brace_count == 0:
+                    # Found the matching closing brace
+                    boxed_content = solution[boxed_start + 7:i]
+                    return f"\\boxed{{{boxed_content}}}"
+                else:
+                    brace_count -= 1
+            i += 1
+    
+    # No proper \boxed{...} found, use full solution as fallback
+    return solution
 
 
 def _load_aime_dataset(year: int) -> List[Dict[str, Any]]:
@@ -69,6 +138,63 @@ def add_ids(dataset):
     return dataset
 
 
+def _load_openreasoner_dataset(dataset_name: str) -> List[Dict[str, Any]]:
+    """Load OpenReasoner datasets following the math domain pattern."""
+    try:
+        # Map dataset names to their correct data file URLs
+        data_file_urls = {
+            "open_reasoner_zero_57k": "https://raw.githubusercontent.com/Open-Reasoner-Zero/Open-Reasoner-Zero/refs/heads/main/data/orz_math_57k_collected.json",
+            "open_reasoner_zero_extended_72k": "https://raw.githubusercontent.com/Open-Reasoner-Zero/Open-Reasoner-Zero/refs/heads/main/data/orz_math_72k_collection_extended.json",
+            "open_reasoner_zero_hard_13k": "https://raw.githubusercontent.com/Open-Reasoner-Zero/Open-Reasoner-Zero/refs/heads/main/data/orz_math_13k_collection_hard.json",
+        }
+        
+        if dataset_name not in data_file_urls:
+            logger.error(f"Unknown OpenReasoner dataset: {dataset_name}")
+            return []
+        
+        # Load the dataset from the JSON file
+        dataset = load_dataset(
+            "json",
+            data_files=data_file_urls[dataset_name],
+            split="train",
+            trust_remote_code=True,
+        )
+        
+        samples = []
+        for item in dataset:
+            # Process according to OpenReasoner format
+            # Format: item["0"]["value"] = task, item["1"]["ground_truth"]["value"] = answer
+            try:
+                task = item["0"]["value"]
+                answer_value = item["1"]["ground_truth"]["value"]
+                
+                # Ensure answer is in boxed format
+                if not answer_value.startswith("\\boxed"):
+                    answer = f"\\boxed{{{answer_value}}}"
+                else:
+                    answer = answer_value
+                
+                problem = {
+                    "task": task,
+                    "answer": answer,
+                    "dataset": dataset_name,
+                    "level": "",
+                    "type": "reasoning",
+                }
+                samples.append(problem)
+                
+            except (KeyError, TypeError) as e:
+                logger.warning(f"Skipping malformed item in {dataset_name}: {e}")
+                continue
+        
+        logger.info(f"Loaded {dataset_name}: {len(samples)} samples")
+        return samples
+        
+    except Exception as e:
+        logger.error(f"Failed to load {dataset_name}: {e}")
+        return []
+
+
 def load_datasets(dataset_names: List[str], **kwargs) -> List[Dict[str, Any]]:
     """Load datasets for TIR domain."""
     all_problems = []
@@ -84,23 +210,41 @@ def load_datasets(dataset_names: List[str], **kwargs) -> List[Dict[str, Any]]:
         "aime_2022": lambda: _load_aime_dataset(2022),
         "amc_2023": lambda: _load_amc_dataset(2023),
         "amc_2022": lambda: _load_amc_dataset(2022),
+        # Add OpenReasoner datasets
+        "open_reasoner_zero_57k": lambda: _load_openreasoner_dataset("open_reasoner_zero_57k"),
+        "open_reasoner_zero_extended_72k": lambda: _load_openreasoner_dataset("open_reasoner_zero_extended_72k"),
+        "open_reasoner_zero_hard_13k": lambda: _load_openreasoner_dataset("open_reasoner_zero_hard_13k"),
     }
+    
+    logger.info(f"Attempting to load datasets: {dataset_names}")
     
     for name in dataset_names:
         if name in dataset_loaders:
-            samples = dataset_loaders[name]()
-            logger.info(f"Loaded {name}: {len(samples)} samples")
-            
-            # GSM8K dataset needs IDs
-            if name.startswith("gsm8k"):
-                samples = add_ids(samples)
-            
-            all_problems.extend(samples)
+            try:
+                samples = dataset_loaders[name]()
+                logger.info(f"Loaded {name}: {len(samples)} samples")
+                
+                if not samples:
+                    logger.warning(f"Dataset {name} returned 0 samples!")
+                
+                # GSM8K dataset needs IDs
+                if name.startswith("gsm8k"):
+                    samples = add_ids(samples)
+                
+                all_problems.extend(samples)
+            except Exception as e:
+                logger.error(f"Failed to load dataset {name}: {e}")
+                # Continue trying other datasets instead of crashing
+                continue
             
         else:
             logger.warning(f"Unknown dataset: {name}")
     
-    logger.info(f"Loaded {len(all_problems)} problems from {len(dataset_names)} datasets")
+    logger.info(f"Total problems loaded: {len(all_problems)}")
+    
+    if not all_problems:
+        raise ValueError(f"No problems loaded from any datasets: {dataset_names}. Check dataset names and network connectivity.")
+    
     return all_problems
 
 

@@ -38,35 +38,65 @@ class CodeExecutionNode(Node):
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
 
-        # Build conversation with task and previous code/results
         task = tape.steps[0]
         assert isinstance(task, Task), f"Expected a Task, got {task.__class__.__name__}"
         
         conversation_content = task.llm_view()
         
-        # Add previous code execution attempts and results
+        max_recent_steps = 6  # last 3 code blocks + results
+        reasoning_steps = []
+        
         for step in tape.steps[1:]:
+            if isinstance(step, (PythonCodeAction, CodeExecutionResult, ActionExecutionFailure)):
+                reasoning_steps.append(step)
+        
+        if len(reasoning_steps) > max_recent_steps:
+            num_truncated = len(reasoning_steps) - max_recent_steps
+            conversation_content += f"\n\n[Previous {num_truncated} reasoning steps truncated for context management]"
+            reasoning_steps = reasoning_steps[-max_recent_steps:]
+        
+        for step in reasoning_steps:
             if isinstance(step, PythonCodeAction):
-                conversation_content += f"\n\n```python\n{step.code}\n```output\n"
+                conversation_content += f"\n\n```python\n{step.code}\n```"
             elif isinstance(step, CodeExecutionResult):
                 result = step.result.output.strip()
                 if "\n\nstdout:" in result:
                     result = result.split("\n\nstdout:")[0].strip()
-                # Clean up result formatting
                 if result.startswith('"') and result.endswith('"'):
                     result = result[1:-1]
-                conversation_content += f"{result}\n```"
+                # output truncation to prevent context overflow -> try to preserve important info
+                if len(result) > 2000:
+                    lines = result.split('\n')
+                    if len(lines) > 20:
+                        kept_lines = lines[:10] + [f"... [{len(lines)-20} lines omitted] ..."] + lines[-10:]
+                        result = '\n'.join(kept_lines)
+                    else:
+                        result = result[:2000] + "... [output truncated]"
+                conversation_content += f"\n```output\n{result}\n```"
             elif isinstance(step, ActionExecutionFailure):
-                conversation_content += f"Error: {step.error}\n```"
+                conversation_content += f"\n```output\nError: {step.error}\n```"
         
         messages.append({"role": "user", "content": conversation_content})
         
-        # Load tokenizer if needed
         llm = agent.llms.get("default")
         if llm and llm.tokenizer is None:
             llm.load_tokenizer()
         
         if llm and llm.tokenizer:
+            prompt_token_ids = llm.tokenizer.apply_chat_template(
+                messages, add_special_tokens=True, add_generation_prompt=True
+            )
+            
+            max_context_tokens = 3500  # leave room for generation (4096 - 1024 = 3072, with buffer?)
+            if len(prompt_token_ids) > max_context_tokens:
+                logger.warning(f"Context too long ({len(prompt_token_ids)} tokens), emergency truncation")
+                # keep system message, truncate user content
+                if len(messages) > 1:
+                    original_content = messages[-1]["content"]
+                    char_ratio = len(original_content) / len(prompt_token_ids)
+                    target_chars = int(max_context_tokens * char_ratio * 0.8)
+                    truncated_content = original_content[:target_chars] + "\n... [context truncated for length]"
+                    messages[-1]["content"] = truncated_content
             prompt_token_ids = llm.tokenizer.apply_chat_template(
                 messages, add_special_tokens=True, add_generation_prompt=True
             )
@@ -76,65 +106,253 @@ class CodeExecutionNode(Node):
         return Prompt(messages=messages, token_ids=prompt_token_ids)
 
     def generate_steps(self, agent: Any, tape: Tape, llm_stream) -> Generator[Step, None, None]:
-        # Parse LLM output for Python code or final answer
         output_text = llm_stream.get_output().content
         if not output_text:
             yield LLMOutputParsingFailureAction(error="Empty LLM output", llm_output=output_text)
             yield SetNextNode(next_node="code_exec")
             return
         
-        # Check for boxed answer first
-        boxed_pattern = r'\\boxed\{([^}]+)\}'
-        boxed_match = re.search(boxed_pattern, output_text)
-        if boxed_match:
-            value_str = boxed_match.group(1).strip()
-            try:
-                value = float(value_str)
-            except ValueError:
-                value = value_str
-            logger.info(f"Found final boxed answer: {value}")
-            yield AnswerAction(text=f"The answer is {value}", value=value)
-            return
-        
-        # Look for Python code blocks
+        # extract Python code and boxed answer
         python_code_pattern = r'```python\s*\n(.*?)\n```'
         code_matches = re.findall(python_code_pattern, output_text, re.DOTALL)
         
-        if code_matches:
-            # Take the last code block
+        boxed_pattern = r'\\boxed\{([^}]+)\}'
+        boxed_match = re.search(boxed_pattern, output_text)
+        
+        has_execution_results = any(isinstance(step, CodeExecutionResult) for step in tape.steps)
+        last_action_was_verification = False
+        if tape.steps:
+            for step in reversed(tape.steps):
+                if isinstance(step, PythonCodeAction):
+                    last_action_was_verification = step.name == "verification.py"
+                    break
+        
+        # CASE 1: both code and boxed answer present?
+        if code_matches and boxed_match and not last_action_was_verification:
             code = code_matches[-1].strip()
-            logger.info(f"Extracted Python code: {code[:100]}...")
-            yield PythonCodeAction(
-                name="math_solution.py",
-                code=code,
-                input_files=[]
-            )
-            yield SetNextNode(next_node="code_exec")
-        else:
-            # No code or boxed answer - try to extract answer from text
-            has_execution_results = any(isinstance(step, CodeExecutionResult) for step in tape.steps)
+            boxed_value = boxed_match.group(1).strip()
+            logger.info(f"Found complete solution with code and boxed answer: {boxed_value}")
             
-            if has_execution_results:
-                # Look for answer patterns in the output
-                answer_patterns = [
-                    r"(?:answer|result)\s+is\s+([+-]?\d*\.?\d+)",
-                    r"([+-]?\d*\.?\d+)$",
-                    r"(?:final|answer):\s*([+-]?\d*\.?\d+)",
-                ]
-                
-                for pattern in answer_patterns:
-                    match = re.search(pattern, output_text, re.IGNORECASE)
-                    if match:
+            yield PythonCodeAction(name="verification.py", code=code, input_files=[])
+            yield SetNextNode(next_node="code_exec")
+            return
+        
+        # CASE 1b: executed verification code - extract result or use boxed answer?
+        elif last_action_was_verification and has_execution_results:
+            last_result = None
+            for step in reversed(tape.steps):
+                if isinstance(step, CodeExecutionResult):
+                    result = step.result.output.strip()
+                    if result.startswith('"') and result.endswith('"'):
+                        result = result[1:-1]
+                    last_result = result
+                    break
+            
+            if last_result:
+                logger.info(f"Last execution result for answer extraction: '{last_result}'")
+                lines = last_result.strip().split('\n')
+                for i, line in enumerate(reversed(lines)):
+                    line = line.strip()
+                    logger.info(f"Checking line {i}: '{line}'")
+                    if line and re.match(r'^[+-]?\d+$', line):
                         try:
-                            value = float(match.group(1))
-                            logger.info(f"Extracted answer from text: {value}")
+                            value = int(line)
+                            logger.info(f"Using execution result as integer answer: {value}")
                             yield AnswerAction(text=f"The answer is {value}", value=value)
                             return
                         except ValueError:
                             continue
+                    elif line and re.match(r'^[+-]?\d+\.\d+$', line):
+                        try:
+                            value = float(line)
+                            logger.info(f"Using execution result as decimal answer: {value}")
+                            yield AnswerAction(text=f"The answer is {value}", value=value)
+                            return
+                        except ValueError:
+                            continue
+                    elif '/' in line and len(line.split('/')) == 2:
+                        try:
+                            parts = line.split('/')
+                            num = float(parts[0])
+                            den = float(parts[1])
+                            if den != 0:
+                                value = num / den
+                                if abs(value - round(value)) < 0.001:
+                                    value = round(value)
+                                logger.info(f"Using fraction result as answer: {value}")
+                                yield AnswerAction(text=f"The answer is {value}", value=value)
+                                return
+                        except ValueError:
+                            continue
             
-            # Continue iterating
-            yield LLMOutputParsingFailureAction(error="No Python code or clear answer found, continuing", llm_output=output_text)
+            # fallback: find boxed answer from original complete solution in tape history
+            original_boxed_answer = None
+            if hasattr(agent, 'llm_calls') and agent.llm_calls:
+                for llm_call in reversed(agent.llm_calls):
+                    if hasattr(llm_call, 'response') and llm_call.response:
+                        content = llm_call.response.content
+                        if '```python' in content and '\\boxed{' in content:
+                            boxed_match_history = re.search(r'\\boxed\{([^}]+)\}', content)
+                            if boxed_match_history:
+                                original_boxed_answer = boxed_match_history.group(1).strip()
+                                break
+            
+            if original_boxed_answer:
+                logger.info(f"Falling back to original boxed answer: '{original_boxed_answer}'")
+                try:
+                    if '/' in original_boxed_answer and len(original_boxed_answer.split('/')) == 2:
+                        parts = original_boxed_answer.split('/')
+                        value = float(parts[0]) / float(parts[1])
+                    else:
+                        value = float(original_boxed_answer)
+                except ValueError:
+                    value = original_boxed_answer
+                yield AnswerAction(text=f"The answer is {value}", value=value)
+                return
+            
+            # something went wrong?
+            logger.warning("Failed to extract answer from verification step")
+            yield AnswerAction(text="Unable to determine answer", value=0)
+            return
+        
+        # CASE 2: only code present?
+        elif code_matches:
+            code = code_matches[-1].strip()
+            logger.info(f"Extracted Python code for iteration: {code[:100]}...")
+            
+            # why are we still generating code?
+            reasoning_attempts = len([s for s in tape.steps if isinstance(s, PythonCodeAction)])
+            
+            recent_results = []
+            recent_errors = []
+            for step in tape.steps[-8:]:  # last 8 steps
+                if isinstance(step, CodeExecutionResult):
+                    result = step.result.output.strip()
+                    if result.startswith('"') and result.endswith('"'):
+                        result = result[1:-1]
+                    recent_results.append(result.lower())
+                elif isinstance(step, ActionExecutionFailure):
+                    recent_errors.append(step.error)
+            
+            none_outputs = sum(1 for r in recent_results if r in ['none', '', 'null'])
+            same_outputs = len(recent_results) - len(set(recent_results)) if recent_results else 0
+            
+            if (none_outputs >= 2 and reasoning_attempts >= 3) or \
+               (same_outputs >= 2 and reasoning_attempts >= 4) or \
+               reasoning_attempts >= 6:
+                logger.warning(f"Stopping code execution: {reasoning_attempts} attempts, {none_outputs} None outputs, {same_outputs} repeated outputs")
+                
+                # look at previous outputs for an answer
+                all_outputs = []
+                for step in tape.steps:
+                    if isinstance(step, CodeExecutionResult):
+                        output = step.result.output.strip()
+                        if output.startswith('"') and output.endswith('"'):
+                            output = output[1:-1]
+                        all_outputs.append(output)
+                
+                combined_output = "\n".join(all_outputs)
+                number_patterns = [
+                    r'answer[:\s=]+([+-]?\d+(?:\.\d+)?)',
+                    r'result[:\s=]+([+-]?\d+(?:\.\d+)?)',
+                    r'([+-]?\d+(?:\.\d+)?)\s*$',
+                    r'([+-]?\d+(?:\.\d+)?)',
+                ]
+                
+                for pattern in number_patterns:
+                    numbers = re.findall(pattern, combined_output, re.IGNORECASE | re.MULTILINE)
+                    if numbers:
+                        try:
+                            value = float(numbers[-1])
+                            if value != 0:
+                                logger.info(f"Extracted answer from history: {value}")
+                                yield AnswerAction(text=f"The answer is {value}", value=value)
+                                return
+                        except ValueError:
+                            continue
+                
+                # default answer, not good...
+                logger.warning("No clear answer found, providing default")
+                yield AnswerAction(text="Unable to determine answer", value=0)
+                return
+            
+            yield PythonCodeAction(name="math_solution.py", code=code, input_files=[])
+            yield SetNextNode(next_node="code_exec")
+        
+        # CASE 3: only boxed answer present?
+        elif boxed_match:
+            value_str = boxed_match.group(1).strip()
+            logger.info(f"Found direct boxed answer: {value_str}")
+            try:
+                if '/' in value_str and len(value_str.split('/')) == 2:
+                    parts = value_str.split('/')
+                    value = float(parts[0]) / float(parts[1])
+                else:
+                    value = float(value_str)
+            except ValueError:
+                value = value_str
+            yield AnswerAction(text=f"The answer is {value}", value=value)
+            return
+        
+        # CASE 4: neither code nor answer? - keep going
+        else:
+            reasoning_attempts = len([s for s in tape.steps if isinstance(s, PythonCodeAction)])
+            parse_failures = len([s for s in tape.steps if isinstance(s, LLMOutputParsingFailureAction)])
+            
+            # check for "None" outputs or empty results that indicate unproductive loops
+            recent_results = []
+            for step in tape.steps[-6:]:  # last 6 steps
+                if isinstance(step, CodeExecutionResult):
+                    result = step.result.output.strip()
+                    if result.startswith('"') and result.endswith('"'):
+                        result = result[1:-1]
+                    recent_results.append(result.lower())
+            
+            none_outputs = sum(1 for r in recent_results if r in ['none', '', 'null'])
+            
+            should_terminate = (
+                (parse_failures >= 2 and reasoning_attempts >= 4) or
+                (none_outputs >= 2 and reasoning_attempts >= 3) or
+                (reasoning_attempts >= 8)  # hard limit
+            )
+            
+            if should_terminate:
+                logger.warning(f"Terminating: {reasoning_attempts} attempts, {parse_failures} parse failures, {none_outputs} None outputs")
+                # try to extract any numerical answer from the accumulated outputs
+                all_outputs = []
+                for step in tape.steps:
+                    if isinstance(step, CodeExecutionResult):
+                        output = step.result.output.strip()
+                        if output.startswith('"') and output.endswith('"'):
+                            output = output[1:-1]
+                        all_outputs.append(output)
+                
+                combined_output = "\n".join(all_outputs)
+                number_patterns = [
+                    r'answer[:\s=]+([+-]?\d+(?:\.\d+)?)',
+                    r'result[:\s=]+([+-]?\d+(?:\.\d+)?)',
+                    r'([+-]?\d+(?:\.\d+)?)\s*$',  # Number at end
+                    r'([+-]?\d+(?:\.\d+)?)',  # Any number
+                ]
+                
+                for pattern in number_patterns:
+                    numbers = re.findall(pattern, combined_output, re.IGNORECASE | re.MULTILINE)
+                    if numbers:
+                        try:
+                            # Take the last number found
+                            value = float(numbers[-1])
+                            if value != 0:  # Avoid defaulting to 0 unless it's clearly the answer
+                                logger.info(f"Extracting answer from execution history with pattern '{pattern}': {value}")
+                                yield AnswerAction(text=f"The answer is {value}", value=value)
+                                return
+                        except ValueError:
+                            continue
+                
+                logger.warning("No clear numerical answer found, providing default")
+                yield AnswerAction(text="Unable to determine answer", value=0)
+                return
+            
+            yield LLMOutputParsingFailureAction(error="No code or answer found", llm_output=output_text)
             yield SetNextNode(next_node="code_exec")
 
 
@@ -156,7 +374,6 @@ class TIRMathAgent(Agent):
     """TIR (Tool Integrated Reasoning) agent for mathematical problem solving."""
     
     def __init__(self, system_prompt: str = "", max_iterations: int = 8, **kwargs):
-        # Create nodes with the system prompt
         nodes = [
             CodeExecutionNode(
                 name="code_exec",
@@ -184,7 +401,7 @@ class TIRMathAgent(Agent):
 
 def extract_result_value(sample: dict) -> dict:
     """Extract numerical result from dataset sample."""
-    # Compatibility wrapper - actual implementation is in datasets.py
+    # compatibility wrapper - actual implementation is in datasets.py
     from .datasets import extract_result_value as datasets_extract_result_value
     return datasets_extract_result_value(sample)
 
@@ -216,7 +433,6 @@ def solve_task(agent: Agent, env, task: dict, tape_file: str = "") -> Tape:
     
     metadata["solved"] = False
     if isinstance(tape[-1], AnswerAction):
-        # Use same verification logic as generate_tir_rollout
         try:
             from pipelinerl.domains.math.verifier_api import verify_math
             predicted_answer = f"\\boxed{{{tape[-1].value}}}"
@@ -225,7 +441,6 @@ def solve_task(agent: Agent, env, task: dict, tape_file: str = "") -> Tape:
             metadata["solved"] = (answer_status == "correct")
         except Exception as e:
             logger.warning(f"Math verification failed: {e}")
-            # Fallback to numerical comparison
             task_value = task.get("value")
             tape_value = tape[-1].value
             if task_value is not None and tape_value is not None:
