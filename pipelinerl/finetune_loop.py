@@ -565,7 +565,7 @@ def rl_finetuning_worker(
     rl_config = RLConfig(**args.rl)
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
-    desired_num_of_processes = 128
+    desired_num_of_processes = args.desired_num_gpus
     cumulative_time_to_deduct = 0.0
     cumulative_time_for_desired_num_of_processes = 0.0
     cumulative_time_for_current_num_of_processes = 0.0

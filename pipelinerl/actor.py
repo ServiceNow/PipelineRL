@@ -416,7 +416,7 @@ class ActorLoop:
             #TODO: rm conv RL code
             times_for_current_num_llms = []
             time_for_desired_num_of_llms = 0
-            desired_number_of_llms = 128
+            desired_number_of_llms = self.cfg.desired_num_gpus
             current_number_of_llms = len(self.llms) # assumes 1 llm per gpu
             assert (groups_per_update * current_number_of_llms) % desired_number_of_llms == 0, (
                 f"groups_per_update * current_number_of_llms {groups_per_update * current_number_of_llms} "

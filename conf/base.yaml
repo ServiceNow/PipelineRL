@@ -5,6 +5,7 @@ defaults:
   - _self_
 
 seed: 42
+desired_num_gpus: 128
 
 finetune:
   seed: ${..seed}
