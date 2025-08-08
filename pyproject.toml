@@ -13,12 +13,13 @@ authors = [
     { name = "ServiceNow" },
 ]
 dependencies = [
-    "torch>=2.6",
-    "vllm==0.8.3",
+    "torch>=2.7.1",
+    "vllm==0.10.0",
     "accelerate==1.7.0",
-    "Tapeagents[finetune]==0.1.15",
+    "deepspeed==0.17.4",
+    "Tapeagents==0.1.15",
     "transformers==4.55.0",
-    "flash-attn==2.7.4.post1",
+    "flash-attn>=2.8.2",
     "ring-flash-attn==0.1.7",
     "math-verify[antlr4_9_3]==0.7.0",
     "orjson==3.10.16",
