@@ -1,6 +1,7 @@
 defaults:
   - base
   - override streams: redis
+  - override finetune: ppo
   - _self_
 
 world:
@@ -12,24 +13,15 @@ world:
 #   mode: actor
 save_tapes: False
 
-output_dir: results/miniwob_debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+output_dir: results/miniwob/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: meta-llama/Llama-3.1-8B-Instruct
 
 finetune:
-  seq_length: 16384
-  train_batch_size: 1
-  gradient_accumulation_passes: 512
-  learning_rate: 1e-6
-  optim: adamw_torch
-  rl:
-    kl_coef: 0.0  # GRPO beta coefficient
-    reward_minus_kl_coef: 0.0  # RLOO beta coefficient
-    use_advantages: true
-    algo: grpo
+  seq_length: 16384  # input + output tokens
 
 llm:
   parameters:
-    max_tokens: 4096
+    max_tokens: 4096  # output tokens
     temperature: 1.0
 test_llm:
   parameters:
@@ -40,7 +32,7 @@ test_llm:
 
 vllm_config:
   vllm_kwargs:
-    max_model_len: 16384
+    max_model_len: 16384  # input + output tokens
 #     enable-auto-tool-choice: ""
 #     tool-call-parser: llama3_json # use hermes for qwen
 #     chat_template: pipelinerl/domains/miniwob/tool_chat_template_llama3.1_json.jinja  # copy pasted from https://github.com/vllm-project/vllm/blob/main/examples/tool_chat_template_llama3.1_json.jinja
@@ -157,9 +149,9 @@ start_attempts: 3  # number of attempts to start each task
 environment:
   _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
   miniwob_url: ???
-  n_envs: 8
+  n_envs: 32
   host: "0.0.0.0"
-  env_call_timeout: 120  # timeout for each environment call (e.g. start_task, act, etc.)
+  env_call_timeout: 600  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
   exp_path: ${output_dir}/env_server
   headless: true
