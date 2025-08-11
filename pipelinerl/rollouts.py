@@ -25,8 +25,7 @@ class TrainingText(BaseModel):
         finished (bool): Indicates whether the text is finished or not.
         prompt_tokens (int): The number of tokens in the prompt part of the text.
         output_tokens (int): The number of tokens in the output part of the text.
-        pixel_values (Optional[List[float]]): Optional pixel values for image inputs, if applicable.
-        image_thw (Optional[List[int]]): Optional dimensions of the image in height, width, and channels.
+        visual_features (Optional[Dict[str, np.ndarray]]): Optional visual features for vision language models.
         metadata (dict): Additional metadata associated with the training text.
         prompt_text (str): Portion of the text that serves as the prompt (i.e., the text excluding the predicted tokens).
         output_text (str): Portion of the text that represents the predicted output (i.e., the last n_predicted tokens).
