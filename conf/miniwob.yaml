@@ -18,6 +18,7 @@ model_path: meta-llama/Llama-3.1-8B-Instruct
 
 finetune:
   seq_length: 16384  # input + output tokens
+  max_train_steps: 1000
 
 llm:
   parameters:
