@@ -430,7 +430,7 @@ class ActorLoop:
                 f" thus instead of {groups_per_update} groups per update,"
                 f" we can submit {groups_per_update_adjusted} groups per update,"
             )
-            loop_start_time = time.time()
+            start_sampling_time = time.time()
         else:
             groups_per_update = None
             can_submit_before_update = math.inf
@@ -453,6 +453,10 @@ class ActorLoop:
                     trainer_version_to_publish = last_trainer_version
                     last_trainer_version = self.trainer_state.propagated_weight_version
                     time_for_desired_num_of_llms = max(times_for_current_num_llms)
+                    assert len(times_for_current_num_llms) == current_number_of_llms // desired_number_of_llms, (
+                        f"Expected {current_number_of_llms // desired_number_of_llms} times for current number of llms,"
+                        f" but got {len(times_for_current_num_llms)}"
+                    )
                     time_for_current_num_of_llms = sum(times_for_current_num_llms)
                     time_to_deduct = time_for_current_num_of_llms - time_for_desired_num_of_llms
                     cumulative_time_to_deduct += time_to_deduct
@@ -464,17 +468,26 @@ class ActorLoop:
                         f" time to deduct {time_to_deduct} seconds. Total time to deduct {cumulative_time_to_deduct:.2f} seconds"
                     )
                     times_for_current_num_llms = []
-                    loop_start_time = time.time()
+                    start_sampling_time = time.time()
                 elif published_samples == can_submit_before_update and published_samples < can_submit_before_update_non_adjusted:
+                    end_time = time.time()
+                    time_for_current_num_of_llms = end_time - start_sampling_time
                     logger.info(
-                        f"Published {published_samples} samples which is less than {can_submit_before_update_non_adjusted},"
+                        f"Published {published_samples} samples which is less than {can_submit_before_update_non_adjusted}, took {time_for_current_num_of_llms:.2f} seconds."
                         f" will now increment the number of samples that can be submitted before update to {can_submit_before_update+groups_per_update_adjusted}"
                     )
-                    end_time = time.time()
-                    times_for_current_num_llms.append(end_time - loop_start_time)
-                    loop_start_time = end_time
+                    times_for_current_num_llms.append(time_for_current_num_of_llms)
+                    start_sampling_time = end_time
                     if max_lag is not None:
                         can_submit_before_update += groups_per_update_adjusted
+                elif published_samples == can_submit_before_update:
+                    end_time = time.time()
+                    time_for_current_num_of_llms = end_time - start_sampling_time
+                    logger.info(
+                        f"Published {published_samples} samples which is equal to {can_submit_before_update}, took {time_for_current_num_of_llms:.2f} seconds."
+                        f" will now increment the number of samples that can be submitted before update to {can_submit_before_update+groups_per_update_adjusted}"
+                    )
+                    times_for_current_num_llms.append(time_for_current_num_of_llms)
 
                 # First, submit all problems you can until the problem queue is full
                 if not self.is_scheduling_paused:
