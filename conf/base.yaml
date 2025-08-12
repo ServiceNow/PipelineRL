@@ -9,6 +9,7 @@ desired_num_gpus: 128
 
 finetune:
   seed: ${..seed}
+  desired_num_gpus: ${..desired_num_gpus}
 
 actor:
   log_each_n_secs: 0
