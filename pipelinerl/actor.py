@@ -481,13 +481,14 @@ class ActorLoop:
                     if max_lag is not None:
                         can_submit_before_update += groups_per_update_adjusted
                 elif published_samples == can_submit_before_update:
-                    end_time = time.time()
-                    time_for_current_num_of_llms = end_time - start_sampling_time
-                    logger.info(
-                        f"Published {published_samples} samples which is equal to {can_submit_before_update}, took {time_for_current_num_of_llms:.2f} seconds."
-                        f" will now increment the number of samples that can be submitted before update to {can_submit_before_update+groups_per_update_adjusted}"
-                    )
-                    times_for_current_num_llms.append(time_for_current_num_of_llms)
+                    if len(times_for_current_num_llms) < current_number_of_llms // desired_number_of_llms:
+                        end_time = time.time()
+                        time_for_current_num_of_llms = end_time - start_sampling_time
+                        logger.info(
+                            f"Published {published_samples} samples which is equal to {can_submit_before_update}, took {time_for_current_num_of_llms:.2f} seconds."
+                            f" will now increment the number of samples that can be submitted before update to {can_submit_before_update+groups_per_update_adjusted}"
+                        )
+                        times_for_current_num_llms.append(time_for_current_num_of_llms)
 
                 # First, submit all problems you can until the problem queue is full
                 if not self.is_scheduling_paused:
