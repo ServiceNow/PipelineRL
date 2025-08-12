@@ -447,6 +447,7 @@ def run_preprocessing_loop(
     current_length = 0
     batch_boundary = published_samples + train_batch_size
     target_samples_per_lead = samples_per_trainer[0] + samples_per_lead_per_step
+    cumulative_writing_took = 0.0
     
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
@@ -622,6 +623,7 @@ def run_preprocessing_loop(
                             f"batch done: {batch_done}"
                         )
                     writing_took += time.time() - start_writing
+                    cumulative_writing_took += writing_took
                             
                     if (
                         published_samples > last_published_samples 
@@ -638,6 +640,7 @@ def run_preprocessing_loop(
                             "preprocessor/filtered_out_samples": num_filtered_out,
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
                             "preprocessor/dropped_after_preprocessing": processed_entries_queue_popped_data,
+                            "preprocessor/cumulative_writing_took": cumulative_writing_took,
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
