@@ -484,6 +484,11 @@ class ActorLoop:
                         cumulative_time_to_deduct += time_to_deduct
                         cumulative_time_for_current_num_llms += time_for_current_num_of_llms
                         cumulative_time_for_desired_num_llms += time_for_desired_num_of_llms
+                        wandb.log({
+                            "actor/cumulative_time_for_current_num_llms2": cumulative_time_for_current_num_llms,
+                            "actor/cumulative_time_for_desired_num_llms2": cumulative_time_for_desired_num_llms,
+                            "actor/cumulative_time_to_deduct2": cumulative_time_to_deduct,
+                        })
                         logger.info(
                             f"Time on current number of llms {time_for_current_num_of_llms},"
                             f" time on desired number of llms: {time_for_desired_num_of_llms:.2f} seconds"
