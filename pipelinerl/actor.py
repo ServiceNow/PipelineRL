@@ -453,6 +453,7 @@ class ActorLoop:
                     trainer_version_to_publish = last_trainer_version
                     last_trainer_version = self.trainer_state.propagated_weight_version
                     start_sampling_time = time.time()
+                    times_for_current_num_llms = []
                 elif published_samples == can_submit_before_update and published_samples < can_submit_before_update_non_adjusted:
                     end_time = time.time()
                     time_for_current_num_of_llms = end_time - start_sampling_time
@@ -462,7 +463,6 @@ class ActorLoop:
                     )
                     times_for_current_num_llms.append(time_for_current_num_of_llms)
                     start_sampling_time = end_time
-                    times_for_current_num_llms = []
                     if max_lag is not None:
                         can_submit_before_update += groups_per_update_adjusted
                 elif published_samples == can_submit_before_update_non_adjusted:
