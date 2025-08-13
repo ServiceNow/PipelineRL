@@ -452,22 +452,6 @@ class ActorLoop:
                     # the weights have been updated, publish the stats of the previous trainer version
                     trainer_version_to_publish = last_trainer_version
                     last_trainer_version = self.trainer_state.propagated_weight_version
-                    time_for_desired_num_of_llms = max(times_for_current_num_llms)
-                    assert len(times_for_current_num_llms) == current_number_of_llms // desired_number_of_llms, (
-                        f"Expected {current_number_of_llms // desired_number_of_llms} times for current number of llms,"
-                        f" but got {len(times_for_current_num_llms)}"
-                    )
-                    time_for_current_num_of_llms = sum(times_for_current_num_llms)
-                    time_to_deduct = time_for_current_num_of_llms - time_for_desired_num_of_llms
-                    cumulative_time_to_deduct += time_to_deduct
-                    cumulative_time_for_current_num_llms += time_for_current_num_of_llms
-                    cumulative_time_for_desired_num_llms += time_for_desired_num_of_llms
-                    logger.info(
-                        f"Time on current number of llms {time_for_current_num_of_llms},"
-                        f" time on desired number of llms: {time_for_desired_num_of_llms:.2f} seconds"
-                        f" time to deduct {time_to_deduct} seconds. Total time to deduct {cumulative_time_to_deduct:.2f} seconds"
-                    )
-                    times_for_current_num_llms = []
                     start_sampling_time = time.time()
                 elif published_samples == can_submit_before_update and published_samples < can_submit_before_update_non_adjusted:
                     end_time = time.time()
@@ -480,8 +464,8 @@ class ActorLoop:
                     start_sampling_time = end_time
                     if max_lag is not None:
                         can_submit_before_update += groups_per_update_adjusted
-                elif published_samples == can_submit_before_update:
-                    if len(times_for_current_num_llms) < current_number_of_llms // desired_number_of_llms:
+                elif published_samples == can_submit_before_update_non_adjusted:
+                    if len(times_for_current_num_llms) < desired_number_of_llms // current_number_of_llms:
                         end_time = time.time()
                         time_for_current_num_of_llms = end_time - start_sampling_time
                         logger.info(
@@ -489,6 +473,22 @@ class ActorLoop:
                             f" will now increment the number of samples that can be submitted before update to {can_submit_before_update+groups_per_update_adjusted}"
                         )
                         times_for_current_num_llms.append(time_for_current_num_of_llms)
+                        time_for_desired_num_of_llms = max(times_for_current_num_llms)
+                        assert len(times_for_current_num_llms) == desired_number_of_llms // current_number_of_llms , (
+                            f"Expected {desired_number_of_llms // current_number_of_llms} times for current number of llms,"
+                            f" but got {len(times_for_current_num_llms)}"
+                        )
+                        time_for_current_num_of_llms = sum(times_for_current_num_llms)
+                        time_to_deduct = time_for_current_num_of_llms - time_for_desired_num_of_llms
+                        cumulative_time_to_deduct += time_to_deduct
+                        cumulative_time_for_current_num_llms += time_for_current_num_of_llms
+                        cumulative_time_for_desired_num_llms += time_for_desired_num_of_llms
+                        logger.info(
+                            f"Time on current number of llms {time_for_current_num_of_llms},"
+                            f" time on desired number of llms: {time_for_desired_num_of_llms:.2f} seconds"
+                            f" time to deduct {time_to_deduct} seconds. Total time to deduct {cumulative_time_to_deduct:.2f} seconds"
+                        )
+                        times_for_current_num_llms = []
 
                 # First, submit all problems you can until the problem queue is full
                 if not self.is_scheduling_paused:
