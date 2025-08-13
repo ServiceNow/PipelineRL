@@ -462,6 +462,7 @@ class ActorLoop:
                     )
                     times_for_current_num_llms.append(time_for_current_num_of_llms)
                     start_sampling_time = end_time
+                    times_for_current_num_llms = []
                     if max_lag is not None:
                         can_submit_before_update += groups_per_update_adjusted
                 elif published_samples == can_submit_before_update_non_adjusted:
@@ -488,7 +489,6 @@ class ActorLoop:
                             f" time on desired number of llms: {time_for_desired_num_of_llms:.2f} seconds"
                             f" time to deduct {time_to_deduct} seconds. Total time to deduct {cumulative_time_to_deduct:.2f} seconds"
                         )
-                        times_for_current_num_llms = []
 
                 # First, submit all problems you can until the problem queue is full
                 if not self.is_scheduling_paused:
