@@ -15,7 +15,7 @@ from pathlib import Path
 import aiohttp
 import hydra
 import uvloop
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 from tapeagents.llms import TrainableLLM
 from typing import Dict, List
@@ -655,7 +655,7 @@ def run_actor_loop(cfg: DictConfig):
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
-            parameters=cfg.llm.parameters,
+            parameters=OmegaConf.to_container(cfg.llm.parameters, resolve=True),
             use_cache=False,
             collect_logprobs=True,
             observe_llm_calls=False,
@@ -667,7 +667,7 @@ def run_actor_loop(cfg: DictConfig):
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
-            parameters=cfg.test_llm.parameters,
+            parameters=OmegaConf.to_container(cfg.test_llm.parameters, resolve=True),
             use_cache=False,
             collect_logprobs=True,
             observe_llm_calls=False,

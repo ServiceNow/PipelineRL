@@ -226,6 +226,7 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         output_tokens=sum(llm_call.output_length_tokens for llm_call in llm_calls) if llm_calls else 0,
     )
     
+    assert training_samples[0].text in training_samples[1].text, "rollout should be consistent"
     return RolloutResult(
         training_texts=training_samples,
         metrics=metrics,
