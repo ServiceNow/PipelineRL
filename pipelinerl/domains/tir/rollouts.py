@@ -15,31 +15,33 @@ from tapeagents.steps import ActionExecutionFailure
 
 logger = logging.getLogger(__name__)
 
-# Cache environments globally to avoid recreating them
+# cache environments globally to avoid recreating them
 _cached_environments = {}
 
 
 class TIRMetrics(BaseMetrics):
     """TIR-specific metrics extending the base metrics."""
-    overflow: int = 0  # Whether max_loops was hit
-    timeout: int = 0   # Whether problem timed out
+    overflow: int = 0
+    timeout: int = 0
     prompt_tokens: int = 0
     output_tokens: int = 0
+    reached_answer_action: int = 0
 
 
 class TIRRewardTable(BaseModel):
-    """Reward table for TIR domain - similar to math domain but adapted for multi-step reasoning."""
+    """Reward table for TIR domain"""
     correct_answer: float = 1.0
     wrong_answer: float = 0.0
     no_answer: float = -0.1
     unparsable: float = -0.1
-    execution_failure: float = -0.05  # When code fails to execute
+    execution_failure: float = -0.05
     timeout_penalty: float = -0.2
-    buffer_tokens: int = 0  # 0 means no overlong reward shaping
+    buffer_tokens: int = 0
+    iteration_penalty: float = -0.02
 
 
 def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
-    """Compute the overlong penalty - same as math domain."""
+    """Compute the overlong penalty"""
     if sequence_length > (max_length - buffer_tokens) and sequence_length <= max_length:
         return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
     return 0.
@@ -48,7 +50,7 @@ def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) ->
 async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict, session: aiohttp.ClientSession) -> RolloutResult:
     """Generate a rollout for TIR domain with iterative reasoning."""
     from pipelinerl.async_llm import make_training_text
-    from tapeagents.orchestrator import main_loop
+    from tapeagents.orchestrator import async_execute_agent
     from .agent import Task, TIRMathTape, AnswerAction, TIRMathAgent
     from .environment import MCPPythonEnvironment
     
@@ -71,23 +73,27 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     )
     agent.llms = {"default": llm}
     
+    # Debug: Check what tokenizer is being used
+    if hasattr(llm, 'tokenizer') and llm.tokenizer:
+        logger.info(f"LLM using tokenizer: {llm.tokenizer.__class__.__name__} from {llm.tokenizer.name_or_path}")
+        logger.info(f"LLM tokenizer vocab size: {llm.tokenizer.vocab_size}")
+    else:
+        logger.warning("LLM has no tokenizer loaded")
+    
     # Use task template if provided
     task_template = getattr(cfg.actor, 'task_template', '{task}')
     task_step = Task(task=problem["task"], template=task_template)
     start_tape = TIRMathTape(steps=[task_step], context=None)
     
-    # Run agent-environment interaction
-    final_tape = None
-    
-    for event in main_loop(agent, start_tape, environment, cfg.max_loops):
-        if event.agent_tape:
-            final_tape = event.agent_tape
-        elif event.env_tape:
-            final_tape = event.env_tape
+    # Run agent-environment interaction using async_execute_agent
+    try:
+        final_tape = await async_execute_agent(agent, start_tape, environment, session, max_loops=cfg.max_loops)
+    except Exception as e:
+        logger.error(f"Error occurred while running agent: {e}")
+        final_tape = None
     
     if final_tape is None:
         logger.warning("Failed to generate tape")
-        # Return empty result
         metrics = TIRMetrics(
             reward=0.0,
             success=False,
@@ -103,32 +109,47 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
             output_tokens=[],
         )
     
-    # Extract final answer if available
     final_answer = None
+    reached_answer_action = False
     if final_tape and isinstance(final_tape.steps[-1], AnswerAction):
         final_answer = final_tape.steps[-1].value
+        reached_answer_action = True
     
-    # Log the predicted vs ground truth for debugging
     predicted_answer = final_answer if final_answer is not None else "No answer"
     ground_truth = problem.get("answer", "Unknown")
-    logger.info(f"Problem: {problem.get('id', 'unknown')} | Predicted: {predicted_answer} | Ground truth: {ground_truth}")
+    logger.info(f"Problem: {problem.get('id', 'unknown')} | Predicted: {predicted_answer} | Ground truth: {ground_truth} | Reached AnswerAction: {reached_answer_action}")
     
-    # Create training text samples for LLM calls
     training_samples = []
+
     llm_calls = []
-    if final_tape:
-        # Extract LLM calls from step metadata (similar to counting domain)
+
+    if getattr(agent, "llm_calls", None):
+        llm_calls.extend(agent.llm_calls)
+
+    if final_tape and not llm_calls:
         for step in final_tape.steps:
-            if step.metadata and step.metadata.other and "llm_call" in step.metadata.other:
-                llm_call = step.metadata.other["llm_call"]
-                llm_calls.append(llm_call)
-                training_sample = make_training_text(llm, llm_call)
-                training_samples.append(training_sample)
-        
-        if not llm_calls:
-            logger.debug("No LLM calls found in step metadata")
+            if (
+                step.metadata
+                and step.metadata.other
+                and "llm_call" in step.metadata.other
+            ):
+                llm_calls.append(step.metadata.other["llm_call"])
+
+    for llm_call in llm_calls:
+        if isinstance(llm_call, dict):
+            from tapeagents.core import LLMCall
+            llm_call = LLMCall(**llm_call)
+
+        training_samples.append(make_training_text(llm, llm_call))
+
+    if not llm_calls:
+        logger.warning(
+            "No LLM calls were captured for this rollout; no training samples will be produced. "
+            "Check that `agent.store_llm_calls=True` and that the orchestrator "
+            "is not stripping metadata."
+        )
     
-    # Save debug info if requested
+    # save debug info if requested
     if getattr(cfg, 'save_tapes', False):
         debug_dir = os.path.join(cfg.output_dir, "debug_tapes") 
         os.makedirs(debug_dir, exist_ok=True)
@@ -144,7 +165,6 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         with open(debug_file, "w") as f:
             json.dump(debug_data, f, indent=2)
     
-    # Check if answer is correct
     success = False
     answer_status = "no_answer"
     
@@ -163,11 +183,24 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
             else:
                 answer_status = "unparsable"
     
-    # Set rewards using TIR reward table (similar to math domain)
+    if training_samples:
+        import numpy as np
+        avg_prompt_tokens = np.mean([t.prompt_tokens for t in training_samples])
+        avg_output_tokens = np.mean([t.output_tokens for t in training_samples])
+        logger.info(
+            f"🎓 Generated {len(training_samples)} training samples | "
+            f"avg prompt={avg_prompt_tokens:.0f} tokens | "
+            f"avg output={avg_output_tokens:.0f} tokens | "
+            f"answer_status={answer_status} | "
+            f"reached_answer={reached_answer_action}"
+        )
+    
     rewards = TIRRewardTable(**dict(cfg.get('rewards', {})))
     
+    num_llm_calls = len(llm_calls)
+    iteration_penalty_total = num_llm_calls * rewards.iteration_penalty
+    
     if training_samples:
-        # Determine base reward based on answer status
         if answer_status == "correct":
             base_reward = rewards.correct_answer
         elif answer_status == "wrong":
@@ -179,26 +212,23 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         else:
             base_reward = rewards.wrong_answer  # fallback
         
-        # Check for execution failures and apply penalties
         has_execution_errors = any(
             isinstance(step, ActionExecutionFailure) for step in final_tape.steps
         )
         if has_execution_errors:
             base_reward += rewards.execution_failure
         
-        # All steps get the same reward for RL consistency
+        base_reward += iteration_penalty_total
+        
         for sample in training_samples:
             sample.reward = base_reward
     
-    # Apply discount factor and length penalties (similar to math domain)
     if cfg.actor.discount_factor and llm_calls:
         total_output_tokens = sum(llm_call.output_length_tokens for llm_call in llm_calls)
         discount_multiplier = cfg.actor.discount_factor ** total_output_tokens
         
-        # Apply length penalty if configured
         overlong_penalty = 0
         if rewards.buffer_tokens > 0:
-            # For TIR, apply penalty based on total output across all calls
             max_tokens = getattr(cfg.actor, 'max_tokens', 4096)
             overlong_penalty = length_penalty(max_tokens, total_output_tokens, rewards.buffer_tokens)
         
@@ -210,22 +240,32 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     else:
         avg_reward = sum(sample.reward for sample in training_samples) / len(training_samples) if training_samples else 0.0
     
-    # Check for errors
+    if training_samples:
+        reward_values = [sample.reward for sample in training_samples]
+        logger.info(
+            f"🏆 Final rewards: mean={np.mean(reward_values):.3f} | "
+            f"min={np.min(reward_values):.3f} | max={np.max(reward_values):.3f} | "
+            f"base_reward={base_reward:.3f} | "
+            f"iter_penalty={iteration_penalty_total:.3f} | "
+            f"llm_calls={num_llm_calls} | "
+            f"discount_factor={cfg.actor.discount_factor if cfg.actor.discount_factor else 'N/A'}"
+        )
+    
     has_errors = any(
         any(1 for s in final_tape.steps if hasattr(s, 'error') and s.error) 
         for s in [final_tape]
     )
     
-    # Create TIRMetrics instance
     metrics = TIRMetrics(
         reward=avg_reward,
         success=success,
         no_error=not has_errors,
         no_answer=(answer_status == "no_answer"),
-        overflow=0,  # Let the agent handle its own termination
-        timeout=0,  # Timeouts now handled at environment level
+        overflow=0,
+        timeout=0,
         prompt_tokens=sum(llm_call.prompt_length_tokens for llm_call in llm_calls) if llm_calls else 0,
         output_tokens=sum(llm_call.output_length_tokens for llm_call in llm_calls) if llm_calls else 0,
+        reached_answer_action=int(reached_answer_action),
     )
     
     return RolloutResult(
@@ -245,7 +285,6 @@ def apply_majority_voting(candidate_answers: List[Any]) -> Any:
     if not valid_answers:
         return None
     
-    # Normalize answers for better comparison
     normalized_answers = []
     for ans in valid_answers:
         if isinstance(ans, (int, float)):

@@ -20,11 +20,10 @@ def _load_gsm8k_dataset(split: str) -> List[Dict[str, Any]]:
 
 
 def _load_math_dataset(split: str) -> List[Dict[str, Any]]:
-    """Load MATH dataset directly with correct config for TIR domain."""
+    """Load MATH dataset directly"""
     from datasets import load_dataset
     from pipelinerl.domains.math.load_datasets import add_ids
     
-    # Use "main" config instead of "default" to match cached version
     dataset = load_dataset("hendrycks/competition_math", "main", split=split, trust_remote_code=True)
     samples = [s for s in _process_math_for_tir(dataset, f"math_{split}") if s is not None]
     logger.info(f"Loading math {split} dataset for TIR: {len(samples)} samples")
@@ -36,7 +35,6 @@ def _process_math_for_tir(dataset, dataset_name):
     for item in dataset:
         if "correctness_math_verify" in item:
             if not any(item["correctness_math_verify"]):
-                # correctness cannot be verified with math_verify
                 yield None
                 continue
         if "problem" in item:
@@ -52,7 +50,6 @@ def _process_math_for_tir(dataset, dataset_name):
         if "answer" in item:
             answer = "\\boxed{" + item["answer"] + "}"
         elif "solution" in item:
-            # Extract boxed answer from solution text for proper comparison
             solution = item["solution"]
             answer = _extract_boxed_answer(solution)
         else:
@@ -71,25 +68,21 @@ def _process_math_for_tir(dataset, dataset_name):
 
 def _extract_boxed_answer(solution: str) -> str:
     """Extract the boxed answer from a solution, fallback to full solution if not found."""
-    # Find the last occurrence of \boxed{...} in the solution
     boxed_start = solution.rfind("\\boxed{")
     if boxed_start >= 0:
-        # Find the matching closing brace
         brace_count = 0
-        i = boxed_start + 7  # Start after "\boxed{"
+        i = boxed_start + 7
         while i < len(solution):
             if solution[i] == '{':
                 brace_count += 1
             elif solution[i] == '}':
                 if brace_count == 0:
-                    # Found the matching closing brace
                     boxed_content = solution[boxed_start + 7:i]
                     return f"\\boxed{{{boxed_content}}}"
                 else:
                     brace_count -= 1
             i += 1
     
-    # No proper \boxed{...} found, use full solution as fallback
     return solution
 
 
@@ -141,7 +134,6 @@ def add_ids(dataset):
 def _load_openreasoner_dataset(dataset_name: str) -> List[Dict[str, Any]]:
     """Load OpenReasoner datasets following the math domain pattern."""
     try:
-        # Map dataset names to their correct data file URLs
         data_file_urls = {
             "open_reasoner_zero_57k": "https://raw.githubusercontent.com/Open-Reasoner-Zero/Open-Reasoner-Zero/refs/heads/main/data/orz_math_57k_collected.json",
             "open_reasoner_zero_extended_72k": "https://raw.githubusercontent.com/Open-Reasoner-Zero/Open-Reasoner-Zero/refs/heads/main/data/orz_math_72k_collection_extended.json",
@@ -162,7 +154,6 @@ def _load_openreasoner_dataset(dataset_name: str) -> List[Dict[str, Any]]:
         
         samples = []
         for item in dataset:
-            # Process according to OpenReasoner format
             # Format: item["0"]["value"] = task, item["1"]["ground_truth"]["value"] = answer
             try:
                 task = item["0"]["value"]
@@ -199,7 +190,6 @@ def load_datasets(dataset_names: List[str], **kwargs) -> List[Dict[str, Any]]:
     """Load datasets for TIR domain."""
     all_problems = []
     
-    # Dataset loading map for cleaner logic
     dataset_loaders = {
         "gsm8k_train": lambda: _load_gsm8k_dataset("train"),
         "gsm8k_test": lambda: _load_gsm8k_dataset("test"),
@@ -210,7 +200,6 @@ def load_datasets(dataset_names: List[str], **kwargs) -> List[Dict[str, Any]]:
         "aime_2022": lambda: _load_aime_dataset(2022),
         "amc_2023": lambda: _load_amc_dataset(2023),
         "amc_2022": lambda: _load_amc_dataset(2022),
-        # Add OpenReasoner datasets
         "open_reasoner_zero_57k": lambda: _load_openreasoner_dataset("open_reasoner_zero_57k"),
         "open_reasoner_zero_extended_72k": lambda: _load_openreasoner_dataset("open_reasoner_zero_extended_72k"),
         "open_reasoner_zero_hard_13k": lambda: _load_openreasoner_dataset("open_reasoner_zero_hard_13k"),
@@ -227,14 +216,12 @@ def load_datasets(dataset_names: List[str], **kwargs) -> List[Dict[str, Any]]:
                 if not samples:
                     logger.warning(f"Dataset {name} returned 0 samples!")
                 
-                # GSM8K dataset needs IDs
                 if name.startswith("gsm8k"):
                     samples = add_ids(samples)
                 
                 all_problems.extend(samples)
             except Exception as e:
                 logger.error(f"Failed to load dataset {name}: {e}")
-                # Continue trying other datasets instead of crashing
                 continue
             
         else:

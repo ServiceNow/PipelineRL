@@ -16,7 +16,7 @@ test_llm:
 
 actor:
   rollout_policy: pipelinerl.domains.tir.rollouts.generate_tir_rollout
-  max_reasoning_steps: 8  # Max reasoning iterations
+  max_reasoning_steps: 6  # Reduced from 8 to encourage concise reasoning
   system_prompt: ""
 
   # system_prompt: |-

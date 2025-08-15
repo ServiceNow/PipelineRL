@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 from typing import Any, Generator, Union, Literal
 from pydantic import Field
@@ -33,6 +34,116 @@ class CodeExecutionNode(Node):
     
     system_prompt: str = Field(default="", description="System prompt for the node")
     
+    def _extract_numerical_value(self, text: str):
+        """Extract numerical value from text using multiple parsing strategies."""
+        if not text or not isinstance(text, str):
+            return None
+            
+        text = text.strip()
+        if not text:
+            return None
+        
+        # option 1: Simple integer
+        if re.match(r'^[+-]?\d+$', text):
+            try:
+                return int(text)
+            except ValueError:
+                pass
+        
+        # option 2: Simple float
+        if re.match(r'^[+-]?\d+\.\d+$', text):
+            try:
+                return float(text)
+            except ValueError:
+                pass
+        
+        # option 3: Scientific notation
+        if re.match(r'^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$', text):
+            try:
+                return float(text)
+            except ValueError:
+                pass
+        
+        # option 4: Simple fraction
+        if '/' in text and len(text.split('/')) == 2:
+            try:
+                parts = text.split('/')
+                num = float(parts[0].strip())
+                den = float(parts[1].strip())
+                if den != 0:
+                    value = num / den
+                    if abs(value - round(value)) < 0.001:
+                        return round(value)
+                    return value
+            except ValueError:
+                pass
+        
+        # option 5: Try to evaluate as Python expression (MCP)
+        try:
+            import math
+            import numpy as np
+            
+            safe_dict = {
+                "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+                "pi": math.pi, "e": math.e, "log": math.log, "exp": math.exp,
+                "abs": abs, "Abs": abs,
+                "__builtins__": {}
+            }
+            
+            safe_text = text.replace("Abs(", "abs(").replace("Pi", "pi")
+            
+            if re.match(r'^[0-9+\-*/().piesco sqrtablnxyfg_]+$', safe_text.lower()):
+                result = eval(safe_text, safe_dict)
+                if isinstance(result, (int, float)) and not (math.isnan(result) or math.isinf(result)):
+                    if abs(result - round(result)) < 0.001:
+                        return round(result)
+                    return result
+        except Exception as e:
+            logger.warning(f"Error evaluating Python expression: {e}")
+            pass
+        
+        # option 6: Try SymPy parsing (if available)
+        try:
+            import sympy as sp
+            
+            expr = sp.sympify(text)
+            
+            if expr.is_number:
+                result = float(expr.evalf())
+                if not (math.isnan(result) or math.isinf(result)):
+                    if abs(result - round(result)) < 0.001:
+                        return round(result)
+                    return result
+            
+            elif expr.free_symbols:
+                substitutions = {}
+                for symbol in expr.free_symbols:
+                    var_name = str(symbol)
+                    if var_name in ['x', 'y', 'z']:
+                        substitutions[symbol] = 1
+                    elif var_name in ['t', 'time']:
+                        substitutions[symbol] = 1
+                    elif var_name in ['n', 'i', 'j', 'k']:
+                        substitutions[symbol] = 1
+                
+                if substitutions:
+                    try:
+                        substituted = expr.subs(substitutions)
+                        if substituted.is_number:
+                            result = float(substituted.evalf())
+                            if not (math.isnan(result) or math.isinf(result)):
+                                if abs(result - round(result)) < 0.001:
+                                    return round(result)
+                                return result
+                    except Exception as e:
+                        logger.warning(f"Error evaluating SymPy expression: {e}")
+                        pass
+        except Exception as e:
+            logger.warning(f"Error evaluating SymPy expression: {e}")
+            pass
+        
+        return None
+    
     def make_prompt(self, agent: Any, tape: Tape) -> Prompt:
         messages = []
         if self.system_prompt:
@@ -43,7 +154,7 @@ class CodeExecutionNode(Node):
         
         conversation_content = task.llm_view()
         
-        max_recent_steps = 6  # last 3 code blocks + results
+        max_recent_steps = 6
         reasoning_steps = []
         
         for step in tape.steps[1:]:
@@ -64,7 +175,6 @@ class CodeExecutionNode(Node):
                     result = result.split("\n\nstdout:")[0].strip()
                 if result.startswith('"') and result.endswith('"'):
                     result = result[1:-1]
-                # output truncation to prevent context overflow -> try to preserve important info
                 if len(result) > 2000:
                     lines = result.split('\n')
                     if len(lines) > 20:
@@ -154,36 +264,12 @@ class CodeExecutionNode(Node):
                 for i, line in enumerate(reversed(lines)):
                     line = line.strip()
                     logger.info(f"Checking line {i}: '{line}'")
-                    if line and re.match(r'^[+-]?\d+$', line):
-                        try:
-                            value = int(line)
-                            logger.info(f"Using execution result as integer answer: {value}")
-                            yield AnswerAction(text=f"The answer is {value}", value=value)
-                            return
-                        except ValueError:
-                            continue
-                    elif line and re.match(r'^[+-]?\d+\.\d+$', line):
-                        try:
-                            value = float(line)
-                            logger.info(f"Using execution result as decimal answer: {value}")
-                            yield AnswerAction(text=f"The answer is {value}", value=value)
-                            return
-                        except ValueError:
-                            continue
-                    elif '/' in line and len(line.split('/')) == 2:
-                        try:
-                            parts = line.split('/')
-                            num = float(parts[0])
-                            den = float(parts[1])
-                            if den != 0:
-                                value = num / den
-                                if abs(value - round(value)) < 0.001:
-                                    value = round(value)
-                                logger.info(f"Using fraction result as answer: {value}")
-                                yield AnswerAction(text=f"The answer is {value}", value=value)
-                                return
-                        except ValueError:
-                            continue
+                    
+                    extracted_value = self._extract_numerical_value(line)
+                    if extracted_value is not None:
+                        logger.info(f"Using execution result as answer: {extracted_value}")
+                        yield AnswerAction(text=f"The answer is {extracted_value}", value=extracted_value)
+                        return
             
             # fallback: find boxed answer from original complete solution in tape history
             original_boxed_answer = None
@@ -262,18 +348,23 @@ class CodeExecutionNode(Node):
                 for pattern in number_patterns:
                     numbers = re.findall(pattern, combined_output, re.IGNORECASE | re.MULTILINE)
                     if numbers:
-                        try:
-                            value = float(numbers[-1])
-                            if value != 0:
-                                logger.info(f"Extracted answer from history: {value}")
-                                yield AnswerAction(text=f"The answer is {value}", value=value)
-                                return
-                        except ValueError:
-                            continue
+                        extracted_value = self._extract_numerical_value(numbers[-1])
+                        if extracted_value is not None and extracted_value != 0:
+                            logger.info(f"Extracted answer from history: {extracted_value}")
+                            yield AnswerAction(text=f"The answer is {extracted_value}", value=extracted_value)
+                            return
                 
-                # default answer, not good...
-                logger.warning("No clear answer found, providing default")
-                yield AnswerAction(text="Unable to determine answer", value=0)
+                all_numbers = re.findall(r'([+-]?\d+(?:\.\d+)?)', combined_output)
+                if all_numbers:
+                    for num_str in reversed(all_numbers):  # Try from last to first
+                        extracted_value = self._extract_numerical_value(num_str)
+                        if extracted_value is not None and extracted_value != 0:
+                            logger.info(f"Extracted fallback answer: {extracted_value}")
+                            yield AnswerAction(text=f"Best guess answer: {extracted_value}", value=extracted_value)
+                            return
+                
+                logger.warning("No numerical answer found in outputs")
+                yield AnswerAction(text="Unable to determine answer", value=None)
                 return
             
             yield PythonCodeAction(name="math_solution.py", code=code, input_files=[])
@@ -283,16 +374,14 @@ class CodeExecutionNode(Node):
         elif boxed_match:
             value_str = boxed_match.group(1).strip()
             logger.info(f"Found direct boxed answer: {value_str}")
-            try:
-                if '/' in value_str and len(value_str.split('/')) == 2:
-                    parts = value_str.split('/')
-                    value = float(parts[0]) / float(parts[1])
-                else:
-                    value = float(value_str)
-            except ValueError:
-                value = value_str
-            yield AnswerAction(text=f"The answer is {value}", value=value)
-            return
+            
+            extracted_value = self._extract_numerical_value(value_str)
+            if extracted_value is not None:
+                yield AnswerAction(text=f"The answer is {extracted_value}", value=extracted_value)
+                return
+            else:
+                yield AnswerAction(text=f"The answer is {value_str}", value=value_str)
+                return
         
         # CASE 4: neither code nor answer? - keep going
         else:
@@ -338,15 +427,12 @@ class CodeExecutionNode(Node):
                 for pattern in number_patterns:
                     numbers = re.findall(pattern, combined_output, re.IGNORECASE | re.MULTILINE)
                     if numbers:
-                        try:
-                            # Take the last number found
-                            value = float(numbers[-1])
-                            if value != 0:  # Avoid defaulting to 0 unless it's clearly the answer
-                                logger.info(f"Extracting answer from execution history with pattern '{pattern}': {value}")
-                                yield AnswerAction(text=f"The answer is {value}", value=value)
-                                return
-                        except ValueError:
-                            continue
+                        # Try the improved extraction on the last found number
+                        extracted_value = self._extract_numerical_value(numbers[-1])
+                        if extracted_value is not None and extracted_value != 0:
+                            logger.info(f"Extracting answer from execution history with pattern '{pattern}': {extracted_value}")
+                            yield AnswerAction(text=f"The answer is {extracted_value}", value=extracted_value)
+                            return
                 
                 logger.warning("No clear numerical answer found, providing default")
                 yield AnswerAction(text="Unable to determine answer", value=0)

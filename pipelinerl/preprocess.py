@@ -333,7 +333,27 @@ def run_preprocessing_loop(
     else:
         wandb_run = None
 
-    tokenizer = load_tokenizer(cfg.finetune.config_name)
+    # Use same model selection logic as actor: prefer finetuned model if available
+    finetune_model_path = exp_root_dir / "finetune" / "current"
+    if finetune_model_path.exists():
+        tokenizer_path = str(finetune_model_path)
+        logger.info(f"Using finetuned model tokenizer from: {tokenizer_path}")
+    else:
+        tokenizer_path = cfg.finetune.config_name
+        logger.info(f"Using base model tokenizer from config: {tokenizer_path}")
+    
+    logger.info(f"Loading tokenizer from: {tokenizer_path}")
+    tokenizer = load_tokenizer(tokenizer_path)
+    logger.info(f"Loaded tokenizer: {tokenizer.__class__.__name__} from {tokenizer.name_or_path}")
+    logger.info(f"Tokenizer vocab size: {tokenizer.vocab_size}")
+    
+    # Check if Qwen special tokens are in vocab
+    qwen_tokens = {"<|im_start|>": 151644, "<|im_end|>": 151645, "<|endoftext|>": 151643}
+    for token_name, token_id in qwen_tokens.items():
+        if token_id in tokenizer.get_vocab().values():
+            logger.info(f"Found Qwen token {token_name} (id: {token_id}) in tokenizer vocab")
+        else:
+            logger.warning(f"Qwen token {token_name} (id: {token_id}) NOT found in tokenizer vocab")
 
     llm_urls = str(cfg.me.llm_urls).split("+") if cfg.me.llm_urls else []
     if llm_urls:
