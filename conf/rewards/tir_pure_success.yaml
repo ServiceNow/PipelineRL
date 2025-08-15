@@ -1,0 +1,8 @@
+correct_answer: 1.0
+wrong_answer: 0.0
+no_answer: -0.1
+unparsable: -0.1
+execution_failure: -0.05
+timeout_penalty: -0.2
+buffer_tokens: 0
+iteration_penalty: -0.02
