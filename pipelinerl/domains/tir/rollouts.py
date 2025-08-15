@@ -48,16 +48,16 @@ def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) ->
 async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict, session: aiohttp.ClientSession) -> RolloutResult:
     """Generate a rollout for TIR domain with iterative reasoning."""
     from pipelinerl.async_llm import make_training_text
-    from tapeagents.orchestrator import main_loop
+    from tapeagents.orchestrator import async_main_loop
     from .agent import Task, TIRMathTape, AnswerAction, TIRMathAgent
-    from .environment import MCPPythonEnvironment
+    from .environment import AsyncMCPPythonEnvironment
     
     time_start = time.time()
     
     # Create or reuse environment
     env_key = str(cfg.environment)
     if env_key not in _cached_environments:
-        _cached_environments[env_key] = MCPPythonEnvironment()
+        _cached_environments[env_key] = AsyncMCPPythonEnvironment()
         logger.info("Created new cached MCP environment")
     environment = _cached_environments[env_key]
     
@@ -79,7 +79,7 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     # Run agent-environment interaction
     final_tape = None
     
-    for event in main_loop(agent, start_tape, environment, cfg.max_loops):
+    async for event in async_main_loop(agent, start_tape, environment, session, cfg.max_loops):
         if event.agent_tape:
             final_tape = event.agent_tape
         elif event.env_tape:
@@ -99,8 +99,6 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
             metrics=metrics,
             latency=time.time() - time_start,
             dataset_name=problem.get("dataset", "unknown"),
-            prompt_tokens=[],
-            output_tokens=[],
         )
     
     # Extract final answer if available
