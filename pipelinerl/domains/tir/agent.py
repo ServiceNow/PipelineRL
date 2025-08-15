@@ -152,23 +152,21 @@ class CodeExecutionNode(Node):
         task = tape.steps[0]
         assert isinstance(task, Task), f"Expected a Task, got {task.__class__.__name__}"
         
-        conversation_content = task.llm_view()
+        messages.append(
+            {"role": "user", "content": task.llm_view()}
+        )
         
         max_recent_steps = 6
         reasoning_steps = []
+        assistant_output_content = ""
         
         for step in tape.steps[1:]:
             if isinstance(step, (PythonCodeAction, CodeExecutionResult, ActionExecutionFailure)):
                 reasoning_steps.append(step)
         
-        if len(reasoning_steps) > max_recent_steps:
-            num_truncated = len(reasoning_steps) - max_recent_steps
-            conversation_content += f"\n\n[Previous {num_truncated} reasoning steps truncated for context management]"
-            reasoning_steps = reasoning_steps[-max_recent_steps:]
-        
         for step in reasoning_steps:
             if isinstance(step, PythonCodeAction):
-                conversation_content += f"\n\n```python\n{step.code}\n```"
+                assistant_output_content += f"\n\n```python\n{step.code}\n```"
             elif isinstance(step, CodeExecutionResult):
                 result = step.result.output.strip()
                 if "\n\nstdout:" in result:
@@ -182,34 +180,26 @@ class CodeExecutionNode(Node):
                         result = '\n'.join(kept_lines)
                     else:
                         result = result[:2000] + "... [output truncated]"
-                conversation_content += f"\n```output\n{result}\n```"
+                assistant_output_content += f"\n```output\n{result}\n```"
             elif isinstance(step, ActionExecutionFailure):
-                conversation_content += f"\n```output\nError: {step.error}\n```"
+                assistant_output_content += f"\n```output\nError: {step.error}\n```"
         
-        messages.append({"role": "user", "content": conversation_content})
+        if assistant_output_content:
+            messages.append({"role": "assistant", "content": assistant_output_content})
         
         llm = agent.llms.get("default")
         if llm and llm.tokenizer is None:
             llm.load_tokenizer()
         
         if llm and llm.tokenizer:
-            prompt_token_ids = llm.tokenizer.apply_chat_template(
-                messages, add_special_tokens=True, add_generation_prompt=True
-            )
-            
-            max_context_tokens = 3500  # leave room for generation (4096 - 1024 = 3072, with buffer?)
-            if len(prompt_token_ids) > max_context_tokens:
-                logger.warning(f"Context too long ({len(prompt_token_ids)} tokens), emergency truncation")
-                # keep system message, truncate user content
-                if len(messages) > 1:
-                    original_content = messages[-1]["content"]
-                    char_ratio = len(original_content) / len(prompt_token_ids)
-                    target_chars = int(max_context_tokens * char_ratio * 0.8)
-                    truncated_content = original_content[:target_chars] + "\n... [context truncated for length]"
-                    messages[-1]["content"] = truncated_content
-            prompt_token_ids = llm.tokenizer.apply_chat_template(
-                messages, add_special_tokens=True, add_generation_prompt=True
-            )
+            if messages[-1]["role"] == "user":
+                prompt_token_ids = llm.tokenizer.apply_chat_template(
+                    messages, add_special_tokens=True, add_generation_prompt=True
+                )
+            else:
+                prompt_token_ids = llm.tokenizer.apply_chat_template(
+                    messages, add_special_tokens=True, add_generation_prompt=False
+                )
         else:
             prompt_token_ids = None
         

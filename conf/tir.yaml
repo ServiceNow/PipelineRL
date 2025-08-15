@@ -8,16 +8,22 @@ llm:
   parameters:
     max_tokens: 1024
     temperature: 0.2
+    stop:
+      - "```output"
 
 test_llm:
   parameters:
     max_tokens: 1024
     temperature: 0.2
+    stop:
+      - "```output"
 
 actor:
   rollout_policy: pipelinerl.domains.tir.rollouts.generate_tir_rollout
   max_reasoning_steps: 6  # Reduced from 8 to encourage concise reasoning
   system_prompt: ""
+  #TODO: rm debug code
+  llm_max_rollouts: 1
 
   # system_prompt: |-
   #   You are a mathematical problem-solving assistant. Use Python code to solve problems step by step.
@@ -88,7 +94,7 @@ world:
 max_loops: 25  # let the agent handle its own termination
 
 environment:
-  _target_: pipelinerl.domains.tir.environment.MCPPythonEnvironment
+  _target_: pipelinerl.domains.tir.environment.AsyncMCPPythonEnvironment
 
 agent:
   _target_: pipelinerl.domains.tir.agent.TIRMathAgent

@@ -50,16 +50,16 @@ def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) ->
 async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict, session: aiohttp.ClientSession) -> RolloutResult:
     """Generate a rollout for TIR domain with iterative reasoning."""
     from pipelinerl.async_llm import make_training_text
-    from tapeagents.orchestrator import async_execute_agent
+    from tapeagents.orchestrator import async_main_loop
     from .agent import Task, TIRMathTape, AnswerAction, TIRMathAgent
-    from .environment import MCPPythonEnvironment
+    from .environment import AsyncMCPPythonEnvironment
     
     time_start = time.time()
     
     # Create or reuse environment
     env_key = str(cfg.environment)
     if env_key not in _cached_environments:
-        _cached_environments[env_key] = MCPPythonEnvironment()
+        _cached_environments[env_key] = AsyncMCPPythonEnvironment()
         logger.info("Created new cached MCP environment")
     environment = _cached_environments[env_key]
     
@@ -85,12 +85,14 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     task_step = Task(task=problem["task"], template=task_template)
     start_tape = TIRMathTape(steps=[task_step], context=None)
     
-    # Run agent-environment interaction using async_execute_agent
-    try:
-        final_tape = await async_execute_agent(agent, start_tape, environment, session, max_loops=cfg.max_loops)
-    except Exception as e:
-        logger.error(f"Error occurred while running agent: {e}")
-        final_tape = None
+    # Run agent-environment interaction
+    final_tape = None
+    
+    async for event in async_main_loop(agent, start_tape, environment, session, cfg.max_loops):
+        if event.agent_tape:
+            final_tape = event.agent_tape
+        elif event.env_tape:
+            final_tape = event.env_tape
     
     if final_tape is None:
         logger.warning("Failed to generate tape")
@@ -105,8 +107,6 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
             metrics=metrics,
             latency=time.time() - time_start,
             dataset_name=problem.get("dataset", "unknown"),
-            prompt_tokens=[],
-            output_tokens=[],
         )
     
     final_answer = None
@@ -268,6 +268,7 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         reached_answer_action=int(reached_answer_action),
     )
     
+    assert training_samples[0].text in training_samples[1].text, "rollout should be consistent"
     return RolloutResult(
         training_texts=training_samples,
         metrics=metrics,
