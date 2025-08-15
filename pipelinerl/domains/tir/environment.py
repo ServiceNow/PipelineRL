@@ -214,7 +214,7 @@ class AsyncMCPPythonEnvironment(AsyncEnvironment):
         }
         
         self.server_params = StdioServerParameters(
-            command='deno',
+            command='/home/toolkit/.deno/bin/deno',
             args=[
                 'run',
                 '-N',
