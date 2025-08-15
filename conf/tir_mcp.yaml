@@ -1,0 +1,119 @@
+defaults:
+    - base
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.tir_mcp.generate_math_rollout2
+  system_prompt: Please reason step by step, and put your final answer within \boxed{}.
+  task_template: |-
+    {task}
+
+dataset_loader: pipelinerl.domains.math.load_datasets
+train_dataset_names:
+- open_reasoner_zero_57k
+- open_reasoner_zero_extended_72k 
+test_dataset_names:
+  - aime_2024
+  - amc_2023
+  - math_500
+
+vllm_config:
+  use_v1: true
+  vllm_kwargs:
+    enable-auto-tool-choice: ""
+    tool-call-parser: hermes
+
+environment:
+  _target_: pipelinerl.domains.tir_mcp.env_server.MCPEnvironmentServer
+  n_envs: 8
+  n_envs_mcp: 7
+  n_envs_math: 1
+  host: localhost
+  exp_path: ${output_dir}/env_server
+  mcp_target: tapeagents.mcp.MCPEnvironment
+  mcp_config_path: /home/toolkit/research-now-reasoner/pipelinerl/conf/mcp/python.json
+  mcp_tools_whitelist:
+    - run_python_code
+  math_target: pipelinerl.domains.math.MathEnvironment
+
+
+agent_max_loops: 2
+agent:
+  _target_: tapeagents.agent.Agent
+  name : mcp_agent
+  max_iterations: 2
+  templates:
+    system_prompt: |
+      You are an expert AI Agent trained to assist users with complex information processing tasks.
+      Your role is to understand user queries and respond in a helpful and accurate manner.
+      Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
+      Do not express emotions or opinions about user questions.
+    allowed_tools: |
+      You have access to the following tools:
+      {tools_description}
+    thought_format: |
+      Important! Respond with the plain text, do not include any JSON or code.
+      Do not output anything besides what I asked in this message.
+    allowed_steps: |
+      You have access to the following tools:
+      {tools_description}
+    format: >
+      Output only a single JSON dict.
+      Do not repeat the last thought again.
+      If the last action does not change the observation, do not repeat it!
+      DO NOT OUTPUT ANYTHING BESIDES THE JSON! DO NOT PLACE ANY COMMENTS INSIDE THE JSON. 
+      It will break the system that processes the output.
+
+  nodes:
+    - _target_: tapeagents.nodes.StandardNode
+      name: plan
+      system_prompt: ${agent.templates.system_prompt}
+      guidance: |
+        Write a concise multi-step plan explaining which steps should be performed to find the answer for the given task.
+        Be specific about how each step should be performed. Only describe the intended actions here, do not perform them yet.
+        Consider that next steps may depend on results of previous steps, so include conditional branching using "if" statements where needed.
+        Start with the title "Plan". Every step should have short name and description.
+        ${agent.templates.thought_format}
+      steps_prompt: ${agent.templates.allowed_tools}
+
+    - _target_: tapeagents.nodes.StandardNode
+      name: select
+      system_prompt: ${agent.templates.system_prompt}
+      trim_obs_except_last_n: 1
+      guidance: |
+        Select the next step to do to move forward with the plan. Describe the expected effect of the proposed action.
+        ${agent.templates.thought_format}
+      steps_prompt: ${agent.templates.allowed_tools}
+
+    - _target_: tapeagents.nodes.StandardNode
+      name: act
+      system_prompt: ${agent.templates.system_prompt}
+      trim_obs_except_last_n: 1
+      guidance: Then produce single function call for the next step. If the answer is ready, call GaiaAnswer.
+      steps:
+        - examples.gaia_agent.steps.GaiaAnswer
+      use_known_actions: true
+      use_function_calls: true
+
+    - _target_: tapeagents.nodes.StandardNode
+      name: summarize
+      system_prompt: ${agent.templates.system_prompt}
+      trim_obs_except_last_n: 1
+      guidance: |
+        Summarize last observation. If its an image, thoroughly describe it with all details.
+        Describe the results of the last action and observed changes
+        Do not hallucinate or make up any information, only describe what you see in the observation.
+        Do not guess or assume action effects, describe only visible changes.
+        ${agent.templates.thought_format}
+
+    - _target_: tapeagents.nodes.StandardNode
+      name: reflect
+      system_prompt: ${agent.templates.system_prompt}
+      trim_obs_except_last_n: 1
+      guidance: |
+        1. Evaluate the action's success, explain its effect on current step, overall plan and task solution.
+        2. If the last action was not successful, describe errors and the possible reasons for failure.
+        3. Check if the current plan step is finished. 
+        4. If the step is finished, update the following steps of the plan with new information and choose the next step.
+        ${agent.templates.thought_format}
+      next_node: select
