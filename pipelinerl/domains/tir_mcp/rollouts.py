@@ -15,6 +15,7 @@ from tapeagents.agent import DEFAULT, Agent
 from hydra.utils import instantiate
 from tapeagents.core import StopStep, Tape
 from tapeagents.dialog_tape import UserStep
+from tapeagents.core import LLMCall
 
 from pipelinerl.domains.math import verify_answer_rpc, RewardTable, get_reward
 from pipelinerl.rollouts import RolloutResult, BaseMetrics
@@ -32,7 +33,7 @@ async def generate_math_rollout2(
     # (1) Choose a random environment server
     start = time.perf_counter()
     env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
-    math_job, mcp_jobs = env_jobs[:1], env_jobs[1:]
+    math_job, mcp_jobs = env_jobs[0], env_jobs[1:]
     # choose the env job randomly
     mcp_job = random.choice(mcp_jobs)
     assert mcp_job.port is not None
@@ -48,15 +49,31 @@ async def generate_math_rollout2(
         tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
 
     reward_table = RewardTable(**dict(cfg.rewards))
+
+
+    llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
+    llm_calls: list[LLMCall] = [
+        LLMCall(**step.metadata.other["llm_call"])
+        if isinstance(step.metadata.other["llm_call"], dict)
+        else step.metadata.other["llm_call"]
+        for step in llm_calls
+    ]
+    assert len(llm_calls) > 0, "No LLM calls found"
+    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     answer_status = await verify_answer_rpc(
         session=session,
         host=math_job.hostname,
         port=math_job.port,
-        prediction=llm_call.output.content,
+        prediction=llm_calls[-1].output.content,
         gold=problem["answer"],
         strict=True,
     )
-    reward = get_reward(answer_status, tape.finished, reward_table)
+    tape_finished = True # TODO
+    reward = get_reward(answer_status, tape_finished, reward_table)
+    for text in training_texts:
+        text.reward = reward
+
+    latency = time.perf_counter() - start
 
     metrics = BaseMetrics(
         reward=reward,
@@ -64,11 +81,6 @@ async def generate_math_rollout2(
         no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
     )
-
-    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
-    for text in training_texts:
-        text.reward = reward
-    latency = time.perf_counter() - start
     return RolloutResult(
         training_texts=training_texts,
         metrics=metrics,

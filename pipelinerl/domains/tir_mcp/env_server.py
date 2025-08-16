@@ -3,6 +3,9 @@ from tapeagents.remote_environment import EnvironmentServer
 from omegaconf import OmegaConf
 from typing import List
 
+
+from pipelinerl.domains.math import MathEnvironment
+
 class MCPEnvironmentServer:
 
     def __init__(self,
@@ -40,5 +43,5 @@ class MCPEnvironmentServer:
                 "tools_whitelist": self.mcp_tools_whitelist,
             }))
         else:
-            MathEnvironment.launch(port)
+            MathEnvironment().launch(port)
 

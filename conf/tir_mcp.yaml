@@ -42,12 +42,11 @@ agent:
   _target_: tapeagents.agent.Agent
   name : mcp_agent
   max_iterations: 2
+  store_llm_calls: true
   templates:
     system_prompt: |
-      You are an expert AI Agent trained to assist users with complex information processing tasks.
-      Your role is to understand user queries and respond in a helpful and accurate manner.
-      Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
-      Do not express emotions or opinions about user questions.
+      You are an math and code expert AI Agent.
+      Please reason step by step, and put your final answer within \boxed{}.
     allowed_tools: |
       You have access to the following tools:
       {tools_description}
@@ -117,3 +116,5 @@ agent:
         4. If the step is finished, update the following steps of the plan with new information and choose the next step.
         ${agent.templates.thought_format}
       next_node: select
+
+model_path: Qwen/Qwen3-8B
