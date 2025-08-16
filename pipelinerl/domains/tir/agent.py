@@ -78,28 +78,42 @@ class CodeExecutionNode(Node):
             except ValueError:
                 pass
         
-        # option 5: Try to evaluate as Python expression (MCP)
+        # option 5: Try to evaluate simple arithmetic expressions
         try:
-            import math
-            import numpy as np
+            import ast
+            import operator
             
-            safe_dict = {
-                "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
-                "pi": math.pi, "e": math.e, "log": math.log, "exp": math.exp,
-                "abs": abs, "Abs": abs,
-                "__builtins__": {}
+            # Simple arithmetic operators
+            ops = {
+                ast.Add: operator.add,
+                ast.Sub: operator.sub,
+                ast.Mult: operator.mul,
+                ast.Div: operator.truediv,
+                ast.Pow: operator.pow,
+                ast.USub: operator.neg,
+                ast.UAdd: operator.pos,
             }
             
-            safe_text = text.replace("Abs(", "abs(").replace("Pi", "pi")
+            def safe_eval(node):
+                if isinstance(node, ast.Constant):  # Python 3.8+
+                    return node.value
+                elif isinstance(node, ast.Num):  # Python < 3.8
+                    return node.n
+                elif isinstance(node, ast.BinOp):
+                    return ops[type(node.op)](safe_eval(node.left), safe_eval(node.right))
+                elif isinstance(node, ast.UnaryOp):
+                    return ops[type(node.op)](safe_eval(node.operand))
+                else:
+                    raise ValueError(f"Unsupported operation: {type(node)}")
             
-            if re.match(r'^[0-9+\-*/().piesco sqrtablnxyfg_]+$', safe_text.lower()):
-                result = eval(safe_text, safe_dict)
+            if re.match(r'^[0-9+\-*/().\s]+$', text):
+                tree = ast.parse(text, mode='eval')
+                result = safe_eval(tree.body)
                 if isinstance(result, (int, float)) and not (math.isnan(result) or math.isinf(result)):
                     if abs(result - round(result)) < 0.001:
                         return round(result)
                     return result
-        except Exception as e:
-            logger.warning(f"Error evaluating Python expression: {e}")
+        except Exception:
             pass
         
         # option 6: Try SymPy parsing (if available)
@@ -156,7 +170,6 @@ class CodeExecutionNode(Node):
             {"role": "user", "content": task.llm_view()}
         )
         
-        max_recent_steps = 6
         reasoning_steps = []
         assistant_output_content = ""
         
@@ -213,7 +226,7 @@ class CodeExecutionNode(Node):
             return
         
         # extract Python code and boxed answer
-        python_code_pattern = r'```python\s*\n(.*?)\n```'
+        python_code_pattern = r'```python\s*\n(.*?)```'
         code_matches = re.findall(python_code_pattern, output_text, re.DOTALL)
         
         boxed_pattern = r'\\boxed\{([^}]+)\}'
@@ -339,7 +352,7 @@ class CodeExecutionNode(Node):
                     numbers = re.findall(pattern, combined_output, re.IGNORECASE | re.MULTILINE)
                     if numbers:
                         extracted_value = self._extract_numerical_value(numbers[-1])
-                        if extracted_value is not None and extracted_value != 0:
+                        if extracted_value is not None:
                             logger.info(f"Extracted answer from history: {extracted_value}")
                             yield AnswerAction(text=f"The answer is {extracted_value}", value=extracted_value)
                             return
@@ -348,7 +361,7 @@ class CodeExecutionNode(Node):
                 if all_numbers:
                     for num_str in reversed(all_numbers):  # Try from last to first
                         extracted_value = self._extract_numerical_value(num_str)
-                        if extracted_value is not None and extracted_value != 0:
+                        if extracted_value is not None:
                             logger.info(f"Extracted fallback answer: {extracted_value}")
                             yield AnswerAction(text=f"Best guess answer: {extracted_value}", value=extracted_value)
                             return
@@ -419,7 +432,7 @@ class CodeExecutionNode(Node):
                     if numbers:
                         # Try the improved extraction on the last found number
                         extracted_value = self._extract_numerical_value(numbers[-1])
-                        if extracted_value is not None and extracted_value != 0:
+                        if extracted_value is not None:
                             logger.info(f"Extracting answer from execution history with pattern '{pattern}': {extracted_value}")
                             yield AnswerAction(text=f"The answer is {extracted_value}", value=extracted_value)
                             return
@@ -489,7 +502,7 @@ def solve_task(agent: Agent, env, task: dict, tape_file: str = "") -> Tape:
     import os
     
     tmp_tape_file = f"{tape_file}.tmp" if tape_file else None
-    start_step = Task(task=task["question"])
+    start_step = Task(task=task["task"])
     tape = TIRMathTape(steps=[start_step], context=None)
     metadata = task.copy()
 
