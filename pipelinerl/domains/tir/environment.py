@@ -18,6 +18,61 @@ from tapeagents.tools.container_executor import CommandLineCodeResult
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_mcp_result(mcp_output: str) -> tuple[str, bool]:
+    """Parse MCP output to extract result and determine success."""
+    if "<status>error</status>" in mcp_output:
+        if "<stderr>" in mcp_output and "</stderr>" in mcp_output:
+            start = mcp_output.find("<stderr>") + len("<stderr>")
+            end = mcp_output.find("</stderr>")
+            error_msg = mcp_output[start:end].strip()
+            return f"Error: {error_msg}", False
+        else:
+            return "Error: Code execution failed", False
+    
+    # Check for <output> tags first (common in MCP responses)
+    if "<output>" in mcp_output and "</output>" in mcp_output:
+        start = mcp_output.find("<output>") + len("<output>")
+        end = mcp_output.find("</output>")
+        output = mcp_output[start:end].strip()
+        return output if output else "No output produced", True
+    
+    if "<o>" in mcp_output and "</o>" in mcp_output:
+        start = mcp_output.find("<o>") + len("<o>")
+        end = mcp_output.find("</o>")
+        output = mcp_output[start:end].strip()
+        
+        if output.startswith("[") and output.endswith("]"):
+            output = output[1:-1].strip()
+        
+        return output if output else "No output produced", True
+    
+    elif "<return_value>" in mcp_output and "</return_value>" in mcp_output:
+        start = mcp_output.find("<return_value>") + len("<return_value>")
+        end = mcp_output.find("</return_value>")
+        return_value = mcp_output[start:end].strip()
+        
+        if return_value.startswith("[") and return_value.endswith("]"):
+            return_value = return_value[1:-1].strip()
+        
+        return return_value, True
+    
+    elif "<stderr>" in mcp_output and "</stderr>" in mcp_output:
+        start = mcp_output.find("<stderr>") + len("<stderr>")
+        end = mcp_output.find("</stderr>")
+        error_msg = mcp_output[start:end].strip()
+        
+        if "Traceback" in error_msg:
+            lines = error_msg.split('\n')
+            last_line = lines[-1] if lines else error_msg
+            return f"Error: {last_line}", False
+        else:
+            return f"Error: {error_msg}", False
+    
+    else:
+        clean_output = mcp_output.strip()
+        return clean_output if clean_output else "No output produced", True
+
 # Global shared Deno setup to avoid per-environment complexity
 _global_deno_setup_lock = threading.Lock()
 _global_deno_setup_done = False
@@ -184,8 +239,16 @@ class MCPPythonEnvironment(Environment):
             logger.info(f"MCP Python environment setup completed with work dir: {self.work_dir}")
     
     def __del__(self):
-        """No cleanup needed - using global shared directory."""
-        pass
+        """Clean up instance-specific temporary directory."""
+        try:
+            import shutil
+            if hasattr(self, 'work_dir') and self.work_dir and os.path.exists(self.work_dir):
+                # don't clean up the global deno work dir
+                if self.work_dir != _global_deno_work_dir:
+                    shutil.rmtree(self.work_dir)
+                    logger.debug(f"Cleaned up work dir: {self.work_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up work dir: {e}")
     
     def launch(self, port: int):
         """Launch the environment as a server."""
@@ -229,7 +292,7 @@ class MCPPythonEnvironment(Environment):
                 
                 logger.info(f"MCP execution result: {repr(result)}")
                 
-                output, success = self._parse_mcp_result(result)
+                output, success = _parse_mcp_result(result)
                 
                 observation = CodeExecutionResult(
                     result=CommandLineCodeResult(
@@ -265,7 +328,7 @@ class MCPPythonEnvironment(Environment):
                 result = await self._execute_python_code(action.code)
                 logger.info(f"MCP execution result: {repr(result)}")
                 
-                output, success = self._parse_mcp_result(result)
+                output, success = _parse_mcp_result(result)
                 
                 observation = CodeExecutionResult(
                     result=CommandLineCodeResult(
@@ -347,58 +410,7 @@ class MCPPythonEnvironment(Environment):
                 backoff_time = 0.5 + attempt * 0.5
                 await asyncio.sleep(backoff_time)
     
-    def _parse_mcp_result(self, mcp_output: str) -> tuple[str, bool]:
-        """Parse MCP output to extract result and determine success."""
-        if "<status>error</status>" in mcp_output:
-            if "<stderr>" in mcp_output and "</stderr>" in mcp_output:
-                start = mcp_output.find("<stderr>") + len("<stderr>")
-                end = mcp_output.find("</stderr>")
-                error_msg = mcp_output[start:end].strip()
-                return f"Error: {error_msg}", False
-            else:
-                return "Error: Code execution failed", False
-        
-        if "<output>" in mcp_output and "</output>" in mcp_output:
-            start = mcp_output.find("<output>") + len("<output>")
-            end = mcp_output.find("</output>")
-            output = mcp_output[start:end].strip()
-            return output if output else "No output produced", True
-        
-        if "<o>" in mcp_output and "</o>" in mcp_output:
-            start = mcp_output.find("<o>") + len("<o>")
-            end = mcp_output.find("</o>")
-            output = mcp_output[start:end].strip()
-            
-            if output.startswith("[") and output.endswith("]"):
-                output = output[1:-1].strip()
-            
-            return output if output else "No output produced", True
-        
-        elif "<return_value>" in mcp_output and "</return_value>" in mcp_output:
-            start = mcp_output.find("<return_value>") + len("<return_value>")
-            end = mcp_output.find("</return_value>")
-            return_value = mcp_output[start:end].strip()
-            
-            if return_value.startswith("[") and return_value.endswith("]"):
-                return_value = return_value[1:-1].strip()
-            
-            return return_value, True
-        
-        elif "<stderr>" in mcp_output and "</stderr>" in mcp_output:
-            start = mcp_output.find("<stderr>") + len("<stderr>")
-            end = mcp_output.find("</stderr>")
-            error_msg = mcp_output[start:end].strip()
-            
-            if "Traceback" in error_msg:
-                lines = error_msg.split('\n')
-                last_line = lines[-1] if lines else error_msg
-                return f"Error: {last_line}", False
-            else:
-                return f"Error: {error_msg}", False
-        
-        else:
-            clean_output = mcp_output.strip()
-            return clean_output if clean_output else "No output produced", True
+
 
 
 class AsyncMCPPythonEnvironment(AsyncEnvironment):
@@ -414,19 +426,27 @@ class AsyncMCPPythonEnvironment(AsyncEnvironment):
         self.deno_cache_dir = tempfile.mkdtemp(prefix="deno_cache_")
         
         # Set environment variables for Deno
+        deno_install_dir = os.environ.get('DENO_INSTALL', os.path.expanduser('~/.deno'))
+        deno_bin_dir = os.path.join(deno_install_dir, 'bin')
+        current_path = os.environ.get('PATH', '')
+        if deno_bin_dir not in current_path:
+            new_path = f"{deno_bin_dir}:{current_path}"
+        else:
+            new_path = current_path
+            
         self.env_vars = {
             'DENO_DIR': self.deno_cache_dir,
             'DENO_CACHE_DIR': self.deno_cache_dir,
+            'PATH': new_path,
+            'DENO_NO_UPDATE_CHECK': '1',
         }
         
         self.server_params = StdioServerParameters(
-            command='/home/toolkit/.deno/bin/deno',
+            command='deno',
             args=[
                 'run',
-                '-N',
-                '-R=node_modules',
-                '-W=node_modules',
-                '--node-modules-dir=auto',
+                '-A',
+                '--quiet',
                 'jsr:@pydantic/mcp-run-python',
                 'stdio',
             ],
@@ -472,24 +492,12 @@ class AsyncMCPPythonEnvironment(AsyncEnvironment):
             try:
                 logger.info(f"Executing Python code via MCP: {repr(action.code[:100])}...")
                 
-                try:
-                    asyncio.get_running_loop()
-                    import concurrent.futures
-                    
-                    def run_in_thread():
-                        return asyncio.run(self._execute_python_code(action.code))
-                    
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(run_in_thread)
-                        result = future.result(timeout=90)
-                        
-                except RuntimeError:
-                    result = asyncio.run(self._execute_python_code(action.code))
+                result = await self._execute_python_code(action.code)
                 
                 # logger.info(f"MCP execution result: {repr(result[:200])}...")
                 logger.info(f"MCP execution result: {repr(result)}")
                 
-                output, success = self._parse_mcp_result(result)
+                output, success = _parse_mcp_result(result)
                 
                 observation = CodeExecutionResult(
                     result=CommandLineCodeResult(
@@ -529,56 +537,4 @@ class AsyncMCPPythonEnvironment(AsyncEnvironment):
                     logger.error(f"MCP execution failed: {e}")
                     raise e
     
-    def _parse_mcp_result(self, mcp_output: str) -> tuple[str, bool]:
-        """Parse MCP output to extract result and determine success."""
-        if "<status>error</status>" in mcp_output:
-            if "<stderr>" in mcp_output and "</stderr>" in mcp_output:
-                start = mcp_output.find("<stderr>") + len("<stderr>")
-                end = mcp_output.find("</stderr>")
-                error_msg = mcp_output[start:end].strip()
-                return f"Error: {error_msg}", False
-            else:
-                return "Error: Code execution failed", False
-        
-        # Check for <output> tags first (common in MCP responses)
-        if "<output>" in mcp_output and "</output>" in mcp_output:
-            start = mcp_output.find("<output>") + len("<output>")
-            end = mcp_output.find("</output>")
-            output = mcp_output[start:end].strip()
-            return output if output else "No output produced", True
-        
-        if "<o>" in mcp_output and "</o>" in mcp_output:
-            start = mcp_output.find("<o>") + len("<o>")
-            end = mcp_output.find("</o>")
-            output = mcp_output[start:end].strip()
-            
-            if output.startswith("[") and output.endswith("]"):
-                output = output[1:-1].strip()
-            
-            return output if output else "No output produced", True
-        
-        elif "<return_value>" in mcp_output and "</return_value>" in mcp_output:
-            start = mcp_output.find("<return_value>") + len("<return_value>")
-            end = mcp_output.find("</return_value>")
-            return_value = mcp_output[start:end].strip()
-            
-            if return_value.startswith("[") and return_value.endswith("]"):
-                return_value = return_value[1:-1].strip()
-            
-            return return_value, True
-        
-        elif "<stderr>" in mcp_output and "</stderr>" in mcp_output:
-            start = mcp_output.find("<stderr>") + len("<stderr>")
-            end = mcp_output.find("</stderr>")
-            error_msg = mcp_output[start:end].strip()
-            
-            if "Traceback" in error_msg:
-                lines = error_msg.split('\n')
-                last_line = lines[-1] if lines else error_msg
-                return f"Error: {last_line}", False
-            else:
-                return f"Error: {error_msg}", False
-        
-        else:
-            clean_output = mcp_output.strip()
-            return clean_output if clean_output else "No output produced", True
+
