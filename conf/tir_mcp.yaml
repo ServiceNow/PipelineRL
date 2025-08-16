@@ -45,8 +45,11 @@ agent:
   store_llm_calls: true
   templates:
     system_prompt: |
-      You are an math and code expert AI Agent.
-      Please reason step by step, and put your final answer within \boxed{}.
+      You are an expert AI Agent trained to assist users with complex information processing tasks.
+      Your role is to understand user queries and respond in a helpful and accurate manner.
+      Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
+      Do not express emotions or opinions about user questions.
+      Put your final answer within \boxed{}.
     allowed_tools: |
       You have access to the following tools:
       {tools_description}
