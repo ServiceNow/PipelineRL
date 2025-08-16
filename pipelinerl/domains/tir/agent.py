@@ -367,7 +367,7 @@ class CodeExecutionNode(Node):
                             return
                 
                 logger.warning("No numerical answer found in outputs")
-                yield AnswerAction(text="Unable to determine answer", value=None)
+                yield AnswerAction(text="Unable to determine answer", value="No answer")
                 return
             
             yield PythonCodeAction(name="math_solution.py", code=code, input_files=[])
