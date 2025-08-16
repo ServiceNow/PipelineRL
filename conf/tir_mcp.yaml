@@ -48,8 +48,7 @@ agent:
       You are an expert AI Agent trained to assist users with complex information processing tasks.
       Your role is to understand user queries and respond in a helpful and accurate manner.
       Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
-      Do not express emotions or opinions about user questions.
-      Put your final answer within \boxed{}.
+      Do not express emotions or opinions about user questions. You must use the python tool for computation.
     allowed_tools: |
       You have access to the following tools:
       {tools_description}
@@ -65,23 +64,20 @@ agent:
       If the last action does not change the observation, do not repeat it!
       DO NOT OUTPUT ANYTHING BESIDES THE JSON! DO NOT PLACE ANY COMMENTS INSIDE THE JSON. 
       It will break the system that processes the output.
+      
 
   nodes:
     - _target_: tapeagents.nodes.StandardNode
       name: plan
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
-        Write a concise multi-step plan explaining which steps should be performed to find the answer for the given task.
-        Be specific about how each step should be performed. Only describe the intended actions here, do not perform them yet.
-        Consider that next steps may depend on results of previous steps, so include conditional branching using "if" statements where needed.
-        Start with the title "Plan". Every step should have short name and description.
-        ${agent.templates.thought_format}
+        Use python to compute the correct answer
       steps_prompt: ${agent.templates.allowed_tools}
 
     - _target_: tapeagents.nodes.StandardNode
       name: select
       system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 1
+      trim_obs_except_last_n: 100
       guidance: |
         Select the next step to do to move forward with the plan. Describe the expected effect of the proposed action.
         ${agent.templates.thought_format}
@@ -90,8 +86,8 @@ agent:
     - _target_: tapeagents.nodes.StandardNode
       name: act
       system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 1
-      guidance: Then produce single function call for the next step. If the answer is ready, call GaiaAnswer.
+      trim_obs_except_last_n: 100
+      guidance: Then produce single function call for the next step. If the answer is ready, call GaiaAnswer. Put your final answer within \boxed{}.
       steps:
         - examples.gaia_agent.steps.GaiaAnswer
       use_known_actions: true
@@ -100,7 +96,7 @@ agent:
     - _target_: tapeagents.nodes.StandardNode
       name: summarize
       system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 1
+      trim_obs_except_last_n: 100
       guidance: |
         Summarize last observation. If its an image, thoroughly describe it with all details.
         Describe the results of the last action and observed changes
@@ -111,7 +107,7 @@ agent:
     - _target_: tapeagents.nodes.StandardNode
       name: reflect
       system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 1
+      trim_obs_except_last_n: 100
       guidance: |
         1. Evaluate the action's success, explain its effect on current step, overall plan and task solution.
         2. If the last action was not successful, describe errors and the possible reasons for failure.

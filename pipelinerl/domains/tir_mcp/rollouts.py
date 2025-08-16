@@ -45,18 +45,20 @@ async def generate_math_rollout2(
         logger.debug(f"Available tools: {tools_description}")
         agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
         agent.llms = {DEFAULT: llm}
-        tape = Tape(steps=[UserStep(content=problem["task"])])
+
+        tape = Tape(steps=[
+            #UserStep(content=f"{problem['task']}. You have access to the following tools: {tools_description}")
+            UserStep(content=f"Use run_python_code to compute 32+45")
+            ])
         tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
 
     reward_table = RewardTable(**dict(cfg.rewards))
 
-
-    llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
     llm_calls: list[LLMCall] = [
         LLMCall(**step.metadata.other["llm_call"])
         if isinstance(step.metadata.other["llm_call"], dict)
         else step.metadata.other["llm_call"]
-        for step in llm_calls
+        for step in tape.steps if step.metadata.other.get("llm_call") is not None
     ]
     assert len(llm_calls) > 0, "No LLM calls found"
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
