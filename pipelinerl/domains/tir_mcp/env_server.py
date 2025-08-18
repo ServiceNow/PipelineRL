@@ -19,6 +19,7 @@ class MCPEnvironmentServer:
         math_target: str,
         exp_path: str,
         env_call_timeout: int = 60,
+        mcp_read_timeout_seconds: int = 10,
     ):
         # Remote environment server configuration
         self.n_envs = n_envs
@@ -29,6 +30,7 @@ class MCPEnvironmentServer:
         self.mcp_config_path = mcp_config_path
         self.mcp_tools_whitelist = mcp_tools_whitelist
         self.exp_path = exp_path
+        self.mcp_read_timeout_seconds = mcp_read_timeout_seconds
 
 
     def launch(self, port: int):
@@ -41,6 +43,7 @@ class MCPEnvironmentServer:
                 "_target_": self.mcp_target,
                 "config_path": self.mcp_config_path,
                 "tools_whitelist": self.mcp_tools_whitelist,
+                "read_timeout_seconds": self.mcp_read_timeout_seconds,
             }))
         else:
             MathEnvironment().launch(port)

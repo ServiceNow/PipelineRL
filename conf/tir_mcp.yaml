@@ -39,6 +39,7 @@ environment:
   mcp_tools_whitelist:
     - run_python_code
   math_target: pipelinerl.domains.math.MathEnvironment
+  mcp_read_timeout_seconds: 300
 
 
 agent_max_loops: 1
