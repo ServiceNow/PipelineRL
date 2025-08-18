@@ -5,12 +5,13 @@
             "args": [
                 "run",
                 "-N",
-                "-R=.mcp_node_modules_$$",
-                "-W=.mcp_node_modules_$$",
-                "--node-modules-dir=.mcp_node_modules_$$",
+                "--node-modules-dir=auto",
                 "jsr:@pydantic/mcp-run-python",
                 "stdio"
-            ]
+            ],
+            "env": {
+                "DENO_DIR": "/tmp/deno_cache_mcp_python_$$"
+            }
         }
     }
 }
