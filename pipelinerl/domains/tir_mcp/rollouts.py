@@ -1,6 +1,8 @@
 import time
 import random
 import logging 
+from collections import Counter
+from typing import List, Dict
 
 import aiohttp
 from omegaconf import DictConfig
@@ -23,9 +25,29 @@ from pipelinerl.rollouts import RolloutResult, BaseMetrics
 logger = logging.getLogger(__name__)
 
 
+def count_tool_calls_by_category(llm_calls: List[LLMCall]) -> Dict[str, int]:
+    """
+    Count the number of tool calls for each function name category.
+    
+    Args:
+        llm_calls: List of LLMCall objects
+        
+    Returns:
+        Dictionary mapping function names to their counts
+    """
+    tool_call_names = []
+    
+    for llm_call in llm_calls:
+        if llm_call.output.tool_calls:
+            for tool_call in llm_call.output.tool_calls:
+                tool_call_names.append(tool_call.function.name)
+    
+    return dict(Counter(tool_call_names))
+
+
 class Metrics(BaseMetrics):
-    num_tool_calls: int
-    num_python_calls: int
+    num_python_calls: int = 0
+    num_steps: int = 0
 
 async def generate_math_rollout2(
     cfg: DictConfig,
@@ -62,14 +84,13 @@ async def generate_math_rollout2(
         else step.metadata.other["llm_call"]
         for step in tape.steps if step.metadata.other.get("llm_call") is not None
     ]
-    num_tool_call = len([llm_call for llm_call in llm_calls if llm_call.output.tool_calls])
     assert len(llm_calls) > 0, "No LLM calls found"
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     answer_status = await verify_answer_rpc(
         session=session,
         host=math_job.hostname,
-        port=math_job.port,
-        prediction=llm_calls[-1].output.content,
+        port=math_job.port, # type: ignore
+        prediction=llm_calls[-1].output.content, # type: ignore
         gold=problem["answer"],
         strict=True,
     )
@@ -80,13 +101,15 @@ async def generate_math_rollout2(
 
     latency = time.perf_counter() - start
 
+    tool_call_counts = count_tool_calls_by_category(llm_calls)
+    
     metrics = Metrics(
         reward=reward,
         success=answer_status == "correct",
         no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
-        num_tool_calls=num_tool_call,
-        num_python_calls=len([llm_call for llm_call in llm_calls if llm_call.output.tool_calls and llm_call.output.tool_calls[0].function.name != "GaiaAnswer"])
+        num_steps=len(tape.steps),
+        num_python_calls=tool_call_counts.get("run_python_code", 0),
     )
 
     return RolloutResult(
