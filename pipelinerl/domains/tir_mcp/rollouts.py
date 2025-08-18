@@ -23,6 +23,9 @@ from pipelinerl.rollouts import RolloutResult, BaseMetrics
 logger = logging.getLogger(__name__)
 
 
+class Metrics(BaseMetrics):
+    num_tool_calls: int
+    num_python_calls: int
 
 async def generate_math_rollout2(
     cfg: DictConfig,
@@ -47,8 +50,7 @@ async def generate_math_rollout2(
         agent.llms = {DEFAULT: llm}
 
         tape = Tape(steps=[
-            #UserStep(content=f"{problem['task']}. You have access to the following tools: {tools_description}")
-            UserStep(content=f"Use run_python_code to compute 32+45")
+            UserStep(content=f"{problem['task']}. You have access to the following tools: {tools_description}")
             ])
         tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
 
@@ -60,6 +62,7 @@ async def generate_math_rollout2(
         else step.metadata.other["llm_call"]
         for step in tape.steps if step.metadata.other.get("llm_call") is not None
     ]
+    num_tool_call = len([llm_call for llm_call in llm_calls if llm_call.output.tool_calls])
     assert len(llm_calls) > 0, "No LLM calls found"
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     answer_status = await verify_answer_rpc(
@@ -77,12 +80,15 @@ async def generate_math_rollout2(
 
     latency = time.perf_counter() - start
 
-    metrics = BaseMetrics(
+    metrics = Metrics(
         reward=reward,
         success=answer_status == "correct",
         no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
+        num_tool_calls=num_tool_call,
+        num_python_calls=len([llm_call for llm_call in llm_calls if llm_call.output.tool_calls and llm_call.output.tool_calls[0].function.name != "GaiaAnswer"])
     )
+
     return RolloutResult(
         training_texts=training_texts,
         metrics=metrics,

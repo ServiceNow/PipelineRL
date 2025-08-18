@@ -37,11 +37,11 @@ environment:
   math_target: pipelinerl.domains.math.MathEnvironment
 
 
-agent_max_loops: 2
+agent_max_loops: 3
 agent:
   _target_: tapeagents.agent.Agent
   name : mcp_agent
-  max_iterations: 2
+  max_iterations: 5
   store_llm_calls: true
   templates:
     system_prompt: |

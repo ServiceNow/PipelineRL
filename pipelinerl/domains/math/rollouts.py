@@ -33,17 +33,17 @@ def get_reward(answer_status: str, finished: bool, reward_table: RewardTable) ->
         case ("wrong", True):
             return reward_table.wrong_answer_finished
         case ("no_answer", False):
-            reward = reward_table.no_answer_not_finished
+            return reward_table.no_answer_not_finished
         case ("no_answer", True):
-            reward = reward_table.no_answer_finished
+            return reward_table.no_answer_finished
         case ("unparsable", False):
-            reward = reward_table.unparsable_not_finished
+            return reward_table.unparsable_not_finished
         case ("unparsable", True):
-            reward = reward_table.unparsable_finished
+            return reward_table.unparsable_finished
         case ("correct", False):
-            reward = reward_table.correct_answer_not_finished
+            return reward_table.correct_answer_not_finished
         case ("correct", True):
-            reward = reward_table.correct_answer_finished
+            return reward_table.correct_answer_finished
         case _:
             raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{trace.finished}")
 
