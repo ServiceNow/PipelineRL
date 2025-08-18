@@ -43,7 +43,7 @@ environment:
   mcp_tools_whitelist:
     - run_python_code
   math_target: pipelinerl.domains.math.MathEnvironment
-  mcp_read_timeout_seconds: 300
+  mcp_read_timeout_seconds: 3000
 
 
 agent_max_loops: 1
@@ -57,7 +57,7 @@ agent:
       You are an expert AI Agent trained to assist users with complex information processing tasks.
       Your role is to understand user queries and respond in a helpful and accurate manner.
       Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
-      Do not express emotions or opinions about user questions. You must use the python tool for computation.
+      Do not express emotions or opinions about user questions. 
     allowed_tools: |
       You have access to the following tools:
       {tools_description}
@@ -80,7 +80,11 @@ agent:
       name: plan
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
-        Use python to compute the correct answer
+        Write a concise multi-step plan explaining which steps should be performed to find the answer for the given task.
+        Be specific about how each step should be performed. Only describe the intended actions here, do not perform them yet.
+        Consider that next steps may depend on results of previous steps, so include conditional branching using "if" statements where needed.
+        Start with the title "Plan". Every step should have short name and description.
+        ${agent.templates.thought_format}
       steps_prompt: ${agent.templates.allowed_tools}
 
     - _target_: tapeagents.nodes.StandardNode
