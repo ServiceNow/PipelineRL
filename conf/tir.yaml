@@ -94,7 +94,7 @@ world:
 max_loops: 25  # let the agent handle its own termination
 
 environment:
-  _target_: pipelinerl.domains.tir.environment.AsyncMCPPythonEnvironment
+  _target_: pipelinerl.domains.tir.environment.MCPPythonEnvironment
 
 agent:
   _target_: pipelinerl.domains.tir.agent.TIRMathAgent
