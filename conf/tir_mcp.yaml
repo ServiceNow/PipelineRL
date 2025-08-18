@@ -33,7 +33,7 @@ vllm_config:
 
 environment:
   _target_: pipelinerl.domains.tir_mcp.env_server.MCPEnvironmentServer
-  n_envs: 8
+  n_envs: 16
   n_envs_mcp: 7
   n_envs_math: 1
   host: localhost
