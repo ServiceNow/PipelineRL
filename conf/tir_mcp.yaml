@@ -5,7 +5,7 @@ defaults:
 actor:
   rollout_policy: pipelinerl.domains.tir_mcp.generate_math_rollout2
   system_prompt: Please reason step by step, and put your final answer within \boxed{}.
-  llm_max_rollouts: 8
+  llm_max_rollouts: 64
   task_template: |-
     {task}
 
