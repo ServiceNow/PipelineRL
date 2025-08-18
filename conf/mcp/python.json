@@ -5,9 +5,9 @@
             "args": [
                 "run",
                 "-N",
-                "-R=node_modules",
-                "-W=node_modules",
-                "--node-modules-dir=auto",
+                "-R=.mcp_node_modules_$$",
+                "-W=.mcp_node_modules_$$",
+                "--node-modules-dir=.mcp_node_modules_$$",
                 "jsr:@pydantic/mcp-run-python",
                 "stdio"
             ]

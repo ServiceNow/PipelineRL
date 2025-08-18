@@ -23,7 +23,7 @@ test_dataset_names:
   - math_500
 
 world:
-  env_replicas: 16
+  env_replicas: 64
 
 vllm_config:
   use_v1: true
