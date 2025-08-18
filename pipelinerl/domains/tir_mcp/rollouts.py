@@ -1,3 +1,4 @@
+import asyncio
 import time
 import random
 import logging 
@@ -74,7 +75,12 @@ async def generate_math_rollout2(
         tape = Tape(steps=[
             UserStep(content=f"{problem['task']}. You have access to the following tools: {tools_description}")
             ])
-        tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
+        while True:
+            try:
+                tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
+                break
+            except Exception as e:
+                await asyncio.sleep(5)
 
     reward_table = RewardTable(**dict(cfg.rewards))
 
