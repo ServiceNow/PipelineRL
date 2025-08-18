@@ -9,6 +9,10 @@ actor:
   task_template: |-
     {task}
 
+finetune:
+  seq_length: 50000
+  seq_parallel: 4
+
 dataset_loader: pipelinerl.domains.math.load_datasets
 train_dataset_names:
 - open_reasoner_zero_57k

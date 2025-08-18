@@ -573,6 +573,10 @@ def run_preprocessing_loop(
                                     sample_length = len(entry["input_ids"])
 
                                     if current_length + sample_length > cfg.finetune.seq_length:
+                                        if len(current_batch) == 0:
+                                            raise ValueError(
+                                                f"sample_length is {sample_length}, but cfg.finetune.seq_length is {cfg.finetune.seq_length}"
+                                            )
                                         time_to_write = True
                                         break  # Current micro batch is full
                                     
