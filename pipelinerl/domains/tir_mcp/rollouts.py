@@ -58,10 +58,11 @@ async def generate_math_rollout2(
 ) -> RolloutResult:
     # (1) Choose a random environment server
     start = time.perf_counter()
-    env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
-    math_job, mcp_jobs = env_jobs[0], env_jobs[1:]
+    mcp_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] != 7777]
+    math_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] == 7777]
     # choose the env job randomly
     mcp_job = random.choice(mcp_jobs)
+    math_job = random.choice(math_jobs)
     assert mcp_job.port is not None
     mcp_job_url = f"http://{mcp_job.hostname}:{mcp_job.port}"
     environment = AsyncRemoteEnvironment(server_url=mcp_job_url)  # type: ignore
