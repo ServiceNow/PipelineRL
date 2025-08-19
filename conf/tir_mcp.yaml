@@ -10,7 +10,7 @@ actor:
     {task}
 
 finetune:
-  seq_length: 60000
+  seq_length: 48000
   seq_parallel: 4
 
 dataset_loader: pipelinerl.domains.math.load_datasets
@@ -23,7 +23,7 @@ test_dataset_names:
   - math_500
 
 world:
-  env_replicas: 64
+  env_replicas: 5
 
 vllm_config:
   use_v1: true
@@ -33,7 +33,7 @@ vllm_config:
 
 environment:
   _target_: pipelinerl.domains.tir_mcp.env_server.MCPEnvironmentServer
-  n_envs: 16
+  n_envs: 8
   n_envs_mcp: 7
   n_envs_math: 1
   host: localhost
@@ -43,6 +43,7 @@ environment:
   mcp_tools_whitelist:
     - run_python_code
   math_target: pipelinerl.domains.math.MathEnvironment
+  env_call_timeout: 600  # Increased from default 60s to 10 minutes
   mcp_read_timeout_seconds: 3000
 
 
