@@ -5,9 +5,9 @@ defaults:
   - _self_
 
 world:
-  actor_fraction: 2
+  actor_fraction: 3
   preprocessor_fraction: 0
-  finetune_fraction: 6
+  finetune_fraction: 5
 
 # debug:
 #   mode: actor
