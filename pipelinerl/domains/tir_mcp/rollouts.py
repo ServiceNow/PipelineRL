@@ -58,14 +58,12 @@ async def generate_math_rollout2(
 ) -> RolloutResult:
     # (1) Choose a random environment server
     start = time.perf_counter()
-    mcp_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] != 7778]
-    math_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] == 7778]
+    env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
     # choose the env job randomly
-    mcp_job = random.choice(mcp_jobs)
-    math_job = random.choice(math_jobs)
-    assert mcp_job.port is not None
-    mcp_job_url = f"http://{mcp_job.hostname}:{mcp_job.port}"
-    environment = AsyncRemoteEnvironment(server_url=mcp_job_url)  # type: ignore
+    env_job = random.choice(env_jobs)
+    assert env_job.port is not None
+    env_job_url = f"http://{env_job.hostname}:{env_job.port}"
+    environment = AsyncRemoteEnvironment(server_url=env_job_url)  # type: ignore
     async with environment.acontext(session, wait_for_env=True) as env:
         actions = await env.a_actions()
         tools_description = await env.a_tools_description()
@@ -95,8 +93,8 @@ async def generate_math_rollout2(
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     answer_status = await verify_answer_rpc(
         session=session,
-        host=math_job.hostname,
-        port=math_job.port, # type: ignore
+        host=env_job.hostname,
+        port=env_job.port, # type: ignore
         prediction=llm_calls[-1].output.content, # type: ignore
         gold=problem["answer"],
         strict=True,

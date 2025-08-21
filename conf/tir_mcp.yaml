@@ -2,6 +2,14 @@ defaults:
     - base
     - _self_
 
+llm:
+ stop:
+    - "</tool_call>"
+
+test_llm:
+  stop:
+    - "</tool_call>"
+
 actor:
   rollout_policy: pipelinerl.domains.tir_mcp.generate_math_rollout2
   system_prompt: Please reason step by step, and put your final answer within \boxed{}.
@@ -29,7 +37,8 @@ vllm_config:
   use_v1: true
   vllm_kwargs:
     enable-auto-tool-choice: ""
-    tool-call-parser: hermes
+    tool-call-parser: rl_tool
+    tool-parser-plugin: /home/toolkit/research-now-reasoner/pipelinerl/pipelinerl/rl_tool_parser_plugin.py
 
 environment:
   _target_: pipelinerl.domains.tir_mcp.env_server.MCPEnvironmentServer
