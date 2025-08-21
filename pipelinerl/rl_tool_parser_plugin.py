@@ -85,15 +85,10 @@ class HermesRLToolParser(ToolParser):
                 except json.JSONDecodeError:
                     continue
             
-            # Extract content before first tool call
-            content = model_output#[:model_output.find(self.tool_call_end_token)].strip()
-            if not content:
-                content = None
-                
             return ExtractedToolCallInformation(
                 tools_called=bool(tool_calls),
                 tool_calls=tool_calls,
-                content=content
+                content=model_output
             )
             
         except Exception:
@@ -103,39 +98,3 @@ class HermesRLToolParser(ToolParser):
                 content=model_output
             )
     
-    def extract_tool_calls_streaming(
-        self, 
-        previous_text: str, 
-        current_text: str, 
-        delta_text: str, 
-        request
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Extract tool calls in streaming mode.
-        
-        Args:
-            previous_text: The previous text
-            current_text: The current complete text
-            delta_text: The new text delta
-            request: The request object
-            
-        Returns:
-            Dictionary with streaming tool call information
-        """
-        # Simple streaming implementation
-        if self.tool_call_start_token not in current_text:
-            return {"content": delta_text}
-        
-        # Check if we're starting a new tool call
-        if self.tool_call_start_token in delta_text:
-            self.current_tool_id += 1
-            return {
-                "tool_calls": [{
-                    "index": self.current_tool_id,
-                    "type": "function",
-                    "id": f"call_{self.current_tool_id}",
-                    "function": {"name": ""}
-                }]
-            }
-        
-        return {"content": delta_text}
