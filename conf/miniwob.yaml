@@ -47,7 +47,7 @@ agent_max_loops: 10  # max number of agent - environment interactions for each t
 agent:
   _target_: tapeagents.agent.Agent
   name : web_agent
-  max_iterations: 4  # max number of iterations (make_prompt + llm? + generate_steps) for each loop
+  max_iterations: 4  # max number of iterations (make_prompt + llm + generate_steps) for each loop
   store_llm_calls: true
   templates:
     system_prompt: |
@@ -56,16 +56,10 @@ agent:
       Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
       You will be provided with the content of the current page and a task from the user.
       Do not express your emotions or opinions about the user question.
-    allowed_tools: |
-      You have access to the following tools:
-      {tools_description}
     allowed_steps: |
       You are allowed to produce ONLY steps with the following json schemas:
       {allowed_steps}
       Do not reproduce schema when producing the steps, use it as a reference.
-    thought_format: |
-      Important! Respond with the plain text, do not include any JSON or code.
-      Do not output anything besides what I asked in this message.
     json_format: |
       Important! Respond with parsable JSON, do not include any text or code.
       Do not output anything besides one JSON object.
@@ -73,12 +67,6 @@ agent:
     - _target_: examples.rl_webagent.agent.WebNode
       name: set_goal
       system_prompt: ${agent.templates.system_prompt}
-      # guidance: |
-      #   Produce the thought that describes the intended solution to the task. In the reasoning lines:
-      #   - review the instructions from the user and the content of the page.
-      #   - outline the main task to be accomplished and the steps to be taken to achieve it.
-      #   - produce definiton of done, that will be checked later to verify if the task was completed.
-      #   ${agent.templates.thought_format}
       guidance: |
         Produce the reasoning_thought step that describes the intended solution to the task. In the reasoning lines:
         - review the instructions from the user and the content of the page.
@@ -86,7 +74,6 @@ agent:
         - produce definiton of done, that will be checked later to verify if the task was completed.
         Produce only one reasoning_thought step!
         ${agent.templates.json_format}
-      # steps_prompt: ${agent.templates.allowed_tools}
       steps_prompt: ${agent.templates.allowed_steps}
       steps:
         - tapeagents.steps.ReasoningThought
@@ -96,29 +83,22 @@ agent:
       name: reflect
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
-        Review the current state of the page and previous steps to find the best possible next action to accomplish the task.
-        Produce the reflection_thought to describe the current page state, reflect on your last action, describe what is left to do, and what will be the immediate next action.
-        Produce only one reflection_thought step!
+        Produce the reasoning_thought step that describes the current state of the page, the previous actions, and what should be the next best action to accomplish the task. In the reasoning lines:
+        - think about which information could be relevant to the given task, note relevant BIDs and coordinates.
+        - describe the last action taken, what were its expected effects on the page, versus the actual effects you can observe. Are they the same or not? if not, what could have gone wrong?
+        - check if you are stuck with repeating the same action over and over again, if so, try something else and change the action.
+        - check if you think the task is done, if not give a detailed list of actions to do next to accomplish the task.
+        - finally, if the task is not done, describe the immediate next action to be performed and its expected effect on the page.
+        Produce only one reasoning_thought step!
         ${agent.templates.json_format}
-      #   ${agent.templates.thought_format}
-      # steps_prompt: ${agent.templates.allowed_tools}
       steps_prompt: ${agent.templates.allowed_steps}
       steps:
-        - examples.rl_webagent.steps.ReflectionThought
+        - tapeagents.steps.ReasoningThought
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
     - _target_: examples.rl_webagent.agent.WebNode
       name: act
       system_prompt: ${agent.templates.system_prompt}
-      # guidance: |
-      #   Produce the single next tool call to be performed with the current page.
-      #   If you think that the task is solved, call the FinalAnswer.
-      #   You can interact with the page elements using their BIDs or coordinates as arguments for actions.
-      #   HINTS:
-      #   - You can use the BIDs of the elements or the mouse position in x, y coordinates to interact with them.
-      #   - To select value in a dropdown or combobox, ALWAYS use SelectOption tool.
-      #   - To click on a checkbox or radio button, ALWAYS use BID (or coordinates) of the corresponding Text and not the BID (or coordinates) of the element itself.
-      #   - Press enter key to submit the search query.
       guidance: |
         Produce the next action to be performed with the current page.
         If you think that the task is solved, produce the final_answer_action.
@@ -131,7 +111,6 @@ agent:
         - Always produce only one step at a time.
         - Step kind is always lowercase and underscore separated.
         ${agent.templates.json_format}
-      # steps_prompt: ${agent.templates.allowed_tools}
       steps_prompt: ${agent.templates.allowed_steps}
       use_known_actions: true
       steps:
