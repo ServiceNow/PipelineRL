@@ -38,7 +38,7 @@ vllm_config:
   vllm_kwargs:
     enable-auto-tool-choice: ""
     tool-call-parser: rl_tool
-    tool-parser-plugin: /home/toolkit/research-now-reasoner/pipelinerl/pipelinerl/rl_tool_parser_plugin.py
+    tool-parser-plugin: pipelinerl/rl_tool_parser_plugin.py
 
 environment:
   _target_: pipelinerl.domains.tir_mcp.env_server.MCPEnvironmentServer
