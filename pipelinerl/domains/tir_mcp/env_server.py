@@ -37,7 +37,7 @@ class MCPEnvironmentServer:
         """
         Serve the environment in TapeAgent.
         """
-        if port != 7777:
+        if port != 7778:
             env_server = EnvironmentServer(n_envs=self.n_envs, host=self.host, port=port, env_call_timeout=self.env_call_timeout)
             env_server.launch(OmegaConf.create({
                 "_target_": self.mcp_target,

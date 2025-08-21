@@ -58,8 +58,8 @@ async def generate_math_rollout2(
 ) -> RolloutResult:
     # (1) Choose a random environment server
     start = time.perf_counter()
-    mcp_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] != 7777]
-    math_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] == 7777]
+    mcp_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] != 7778]
+    math_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment" and job["port"] == 7778]
     # choose the env job randomly
     mcp_job = random.choice(mcp_jobs)
     math_job = random.choice(math_jobs)
