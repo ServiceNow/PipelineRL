@@ -45,7 +45,7 @@ def get_reward(answer_status: str, finished: bool, reward_table: RewardTable) ->
         case ("correct", True):
             return reward_table.correct_answer_finished
         case _:
-            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{trace.finished}")
+            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{finished}")
 
 
 def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:

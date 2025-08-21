@@ -8,6 +8,7 @@ from typing import List, Dict
 import aiohttp
 from omegaconf import DictConfig
 from pydantic import BaseModel
+from pipelinerl.domains.tir_mcp.steps import MathAnswer
 from pipelinerl.world import Job
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
@@ -50,7 +51,7 @@ class Metrics(BaseMetrics):
     num_python_calls: int = 0
     num_steps: int = 0
 
-async def generate_math_rollout2(
+async def generate_mcp_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
     problem: dict,
@@ -90,6 +91,7 @@ async def generate_math_rollout2(
         for step in tape.steps if step.metadata.other.get("llm_call") is not None
     ]
     assert len(llm_calls) > 0, "No LLM calls found"
+    tool_call_counts = count_tool_calls_by_category(llm_calls)
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     answer_status = await verify_answer_rpc(
         session=session,
@@ -99,14 +101,14 @@ async def generate_math_rollout2(
         gold=problem["answer"],
         strict=True,
     )
-    tape_finished = True # TODO
+    # Tape should finish with an answer
+    tape_finished = True if isinstance(tape.steps[-1], MathAnswer) else False
     reward = get_reward(answer_status, tape_finished, reward_table)
     for text in training_texts:
         text.reward = reward
 
     latency = time.perf_counter() - start
 
-    tool_call_counts = count_tool_calls_by_category(llm_calls)
     
     metrics = Metrics(
         reward=reward,

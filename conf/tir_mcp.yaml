@@ -11,7 +11,7 @@ test_llm:
     - "</tool_call>"
 
 actor:
-  rollout_policy: pipelinerl.domains.tir_mcp.generate_math_rollout2
+  rollout_policy: pipelinerl.domains.tir_mcp.generate_mcp_rollout
   system_prompt: Please reason step by step, and put your final answer within \boxed{}.
   llm_max_rollouts: 64
   task_template: |-
@@ -41,7 +41,7 @@ vllm_config:
     tool-parser-plugin: pipelinerl/rl_tool_parser_plugin.py
 
 environment:
-  _target_: pipelinerl.domains.tir_mcp.env_server.MCPEnvironmentServer
+  _target_: pipelinerl.domains.tir_mcp.MCPEnvironmentServer
   n_envs: 8
   n_envs_mcp: 7
   n_envs_math: 1
@@ -56,11 +56,11 @@ environment:
   mcp_read_timeout_seconds: 3000
 
 
-agent_max_loops: 1
+agent_max_loops: 3
 agent:
   _target_: tapeagents.agent.Agent
   name : mcp_agent
-  max_iterations: 4
+  max_iterations: 3
   store_llm_calls: true
   templates:
     system_prompt: |
@@ -110,9 +110,9 @@ agent:
       name: act
       system_prompt: ${agent.templates.system_prompt}
       trim_obs_except_last_n: 100
-      guidance: Then produce single function call for the next step. If the answer is ready, call GaiaAnswer. Put your final answer within \boxed{}.
+      guidance: Then produce single function call for the next step. If the answer is ready, call MathAnswer. Put your final answer within \boxed{}.
       steps:
-        - examples.gaia_agent.steps.GaiaAnswer
+        - pipelinerl.domains.tir_mcp.steps.MathAnswer
       use_known_actions: true
       use_function_calls: true
 
