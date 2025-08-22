@@ -11,7 +11,7 @@ test_llm:
     - "</tool_call>"
 
 actor:
-  rollout_policy: pipelinerl.domains.tir_mcp.generate_mcp_rollout
+  rollout_policy: pipelinerl.domains.mcp.generate_mcp_rollout
   system_prompt: Please reason step by step, and put your final answer within \boxed{}.
   llm_max_rollouts: 64
   task_template: |-
@@ -41,7 +41,7 @@ vllm_config:
     tool-parser-plugin: pipelinerl/rl_tool_parser_plugin.py
 
 environment:
-  _target_: pipelinerl.domains.tir_mcp.MCPEnvironmentServer
+  _target_: pipelinerl.domains.mcp.MCPEnvironmentServer
   n_envs: 8
   n_envs_mcp: 7
   n_envs_math: 1
@@ -112,7 +112,7 @@ agent:
       trim_obs_except_last_n: 100
       guidance: Then produce single function call for the next step. If the answer is ready, call MathAnswer. Put your final answer within \boxed{}.
       steps:
-        - pipelinerl.domains.tir_mcp.steps.MathAnswer
+        - pipelinerl.domains.mcp.steps.MathAnswer
       use_known_actions: true
       use_function_calls: true
 

@@ -8,7 +8,7 @@ from typing import List, Dict
 import aiohttp
 from omegaconf import DictConfig
 from pydantic import BaseModel
-from pipelinerl.domains.tir_mcp.steps import MathAnswer
+from pipelinerl.domains.mcp.steps import MathAnswer
 from pipelinerl.world import Job
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
@@ -66,6 +66,7 @@ async def generate_mcp_rollout(
     env_job_url = f"http://{env_job.hostname}:{env_job.port}"
     environment = AsyncRemoteEnvironment(server_url=env_job_url)  # type: ignore
     async with environment.acontext(session, wait_for_env=True) as env:
+        await env.start_task(problem)
         actions = await env.a_actions()
         tools_description = await env.a_tools_description()
         logger.debug(f"Available tools: {tools_description}")
@@ -79,7 +80,7 @@ async def generate_mcp_rollout(
             try:
                 tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
                 break
-            except Exception as e:
+            except Exception:
                 await asyncio.sleep(5)
 
     reward_table = RewardTable(**dict(cfg.rewards))
