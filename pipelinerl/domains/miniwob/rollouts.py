@@ -129,7 +129,7 @@ async def generate_miniwob_rollout(
     if obs_steps:
         last_obs = obs_steps[-1]
         # in Miniwob, the observation "reward" is defined as RAW_REWARD_GLOBAL > 0
-        # see here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/src/browsergym/miniwob/base.py#L183
+        # see here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/src/browsergym/miniwob/base.py#L188
         # Let's take directly the RAW_REWARD_GLOBAL from the metadata
         # raw_reward = last_obs.metadata.other.get("reward", 0.0)
         raw_reward = last_obs.metadata.other.get("info", {}).get("task_info", {}).get("REWARD_GLOBAL", -1.0)
@@ -142,7 +142,12 @@ async def generate_miniwob_rollout(
     # get the number of PageObservation steps in the tape
     n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
 
-    reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
+    #reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
+    # massimo's setup:
+    reward = float(raw_reward>0)
+    if reward == 0.0:
+        reward = -1.0
+    reward *= 0.98 ** n_page_observations
 
     # (3) Get LLM calls from Tape
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
@@ -166,7 +171,7 @@ async def generate_miniwob_rollout(
     latency = time.time() - start_time
     agent_time = tape.metadata.result.get("agent_execution_time", -1.0)
     env_time = tape.metadata.result.get("environment_execution_time", -1.0)
-    n_observations = len([s for s in tape.steps if isinstance(s, Observation)])
+    n_observations = len([s for s in tape.steps if isinstance(s, Observation)])  # TODO: is this not the same n_page_observations??
     n_other_steps = len(tape.steps) - n_observations
     metrics = MiniwobMetrics(
         reward=reward,
