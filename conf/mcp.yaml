@@ -31,7 +31,7 @@ test_dataset_names:
   - math_500
 
 world:
-  env_replicas: 5
+  env_replicas: 16
 
 vllm_config:
   use_v1: true
@@ -42,7 +42,7 @@ vllm_config:
 
 environment:
   _target_: pipelinerl.domains.mcp.MCPEnvironmentServer
-  n_envs: 8
+  n_envs: 16
   n_envs_mcp: 7
   n_envs_math: 1
   host: "0.0.0.0"
