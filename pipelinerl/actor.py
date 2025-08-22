@@ -21,7 +21,7 @@ from typing import Dict, List
 
 import wandb
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
-from pipelinerl.rollouts import RolloutResult
+from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from pipelinerl.shared_memory_array import SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import (
@@ -342,6 +342,7 @@ class ActorLoop:
     def update_stats(self, rollout_results: List[RolloutResult]):
         for result in rollout_results:
             assert result.model_version is not None
+            assert isinstance(result.metrics, BaseMetrics), "Metrics should be an instance of BaseMetrics"
             dataset_name = result.dataset_name
             group_id = result.group_id
             self.latency_list.append(result.latency)
