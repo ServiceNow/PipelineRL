@@ -30,19 +30,17 @@ test_dataset_names:
   - amc_2023
   - math_500
 
-world:
-  env_replicas: 8
-
 vllm_config:
   use_v1: true
   vllm_kwargs:
     enable-auto-tool-choice: ""
     tool-call-parser: rl_tool
     tool-parser-plugin: pipelinerl/rl_tool_parser_plugin.py
+    max_model_len: 48000
 
 environment:
   _target_: pipelinerl.domains.mcp.MCPEnvironmentServer
-  n_envs: 32
+  n_envs: ${actor.llm_max_rollouts}
   n_envs_mcp: 7
   n_envs_math: 1
   host: "0.0.0.0"
