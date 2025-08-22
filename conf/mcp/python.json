@@ -4,7 +4,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "mkdir -p /tmp/mcp_work_$$ && cd /tmp/mcp_work_$$ && /home/toolkit/.deno/bin/deno run -N -R=node_modules -W=node_modules --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"
+                "mkdir -p /tmp/mcp_work_$$ && cd /tmp/mcp_work_$$ && /home/toolkit/.deno/bin/deno run -N -R=node_modules -W=node_modules --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio && rm -rf /tmp/mcp_work_$$"
             ]
         }
     }
