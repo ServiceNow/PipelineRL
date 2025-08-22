@@ -463,6 +463,9 @@ class ActorLoop:
 
                 assert isinstance(rollout_results, list)
                 assert isinstance(rollout_results[0], RolloutResult)
+                assert len(rollout_results) == attempts, (
+                    f"Expected {attempts} rollouts, got {len(rollout_results)}"
+                )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
                 published_samples += group_samples
