@@ -133,6 +133,7 @@ def rl_step(
     current_step: int,
     max_step: int,
     config: RLConfig,
+    running_avg_reward: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Perform a single RL step on the model using the given batch and config.
@@ -211,6 +212,8 @@ def rl_step(
 
     # get shifted values and compute ratios
     rewards = batch.rewards[:, 1:]
+    # Center rewards using running average
+    rewards = rewards - running_avg_reward
     ref_logprobs = batch.ref_logprobs[:, 1:]
     old_logprobs = batch.old_logprobs[:, 1:]
     group_tokens = batch.group_tokens[:, 1:]
