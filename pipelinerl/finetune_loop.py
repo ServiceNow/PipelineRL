@@ -672,7 +672,10 @@ def rl_finetuning_worker(
                 # Update running average reward
                 current_reward = this_step_rl_metrics.get('reward', 0.0)
                 alpha = 0.1  # Exponential moving average coefficient
-                training_metrics.running_avg_reward = (1 - alpha) * training_metrics.running_avg_reward + alpha * current_reward
+                if training_metrics.running_avg_reward is None:
+                    training_metrics.running_avg_reward = current_reward
+                else:
+                    training_metrics.running_avg_reward = (1 - alpha) * training_metrics.running_avg_reward + alpha * current_reward
 
             backward(loss, is_final_micro_batch=do_optimizer_step)
 

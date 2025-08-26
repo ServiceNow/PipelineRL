@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
+from tapeagents.tapeagents.finetune.rl.utils import masked_mean
 
 from .utils import (
     sum_sum,
@@ -213,6 +214,8 @@ def rl_step(
     # get shifted values and compute ratios
     rewards = batch.rewards[:, 1:]
     # Center rewards using running average
+    if running_avg_reward is None:
+        running_avg_reward = masked_mean(rewards, masks_shifted).item()
     rewards = rewards - running_avg_reward
     ref_logprobs = batch.ref_logprobs[:, 1:]
     old_logprobs = batch.old_logprobs[:, 1:]
