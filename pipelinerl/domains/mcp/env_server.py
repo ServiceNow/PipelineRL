@@ -62,13 +62,10 @@ class MCPEnvironmentServer:
 
     def __init__(self,
         n_envs: int,
-        n_envs_mcp: int,
-        n_envs_math: int,
         host: str,
         mcp_target: str,
         mcp_config_path: str,
         mcp_tools_whitelist: List[str],
-        math_target: str,
         exp_path: str,
         env_call_timeout: int = 60,
         mcp_read_timeout_seconds: int = 10,

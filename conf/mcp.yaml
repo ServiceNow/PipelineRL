@@ -2,13 +2,6 @@ defaults:
     - base
     - _self_
 
-llm:
- stop:
-    - "</tool_call>"
-
-test_llm:
-  stop:
-    - "</tool_call>"
 
 actor:
   rollout_policy: pipelinerl.domains.mcp.generate_mcp_rollout
@@ -40,19 +33,19 @@ vllm_config:
 
 environment:
   _target_: pipelinerl.domains.mcp.MCPEnvironmentServer
-  n_envs: ${actor.llm_max_rollouts}
-  n_envs_mcp: 7
-  n_envs_math: 1
+  n_envs: 32
   host: "0.0.0.0"
   exp_path: ${output_dir}/env_server
   mcp_target: tapeagents.mcp.MCPEnvironment
   mcp_config_path: /home/toolkit/research-now-reasoner/pipelinerl/conf/mcp/python.json
   mcp_tools_whitelist:
     - run_python_code
-  math_target: pipelinerl.domains.math.MathEnvironment
   env_call_timeout: 600  # Increased from default 60s to 10 minutes
   mcp_read_timeout_seconds: 3000
 
+
+world:
+  env_replicas_per_actor: 8
 
 agent_max_loops: 3
 agent:
