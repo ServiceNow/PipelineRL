@@ -54,14 +54,14 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     from pipelinerl.async_llm import make_training_text
     from tapeagents.orchestrator import async_main_loop
     from .agent import Task, TIRMathTape, AnswerAction, TIRMathAgent
-    from .environment import AsyncMCPPythonEnvironment
+    from .environment import MCPPythonEnvironment
     
     time_start = time.time()
     
     # Create or reuse environment
     env_key = str(cfg.environment)
     if env_key not in _cached_environments:
-        _cached_environments[env_key] = AsyncMCPPythonEnvironment()
+        _cached_environments[env_key] = MCPPythonEnvironment()
         logger.info("Created new cached MCP environment")
     environment = _cached_environments[env_key]
     

@@ -10,7 +10,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from tapeagents.remote_environment import EnvironmentServer
 
-from tapeagents.environment import AsyncEnvironment, Environment
+from tapeagents.environment import AsyncEnvironment
 from tapeagents.core import Action
 from tapeagents.tools.code_executor import PythonCodeAction, CodeExecutionResult
 from tapeagents.steps import ActionExecutionFailure
@@ -184,7 +184,7 @@ def _ensure_global_deno_setup():
                     return None
 
 
-class MCPPythonEnvironment(Environment):
+class MCPPythonEnvironment(AsyncEnvironment):
     """Environment using (Pydantic) MCP Run Python server for sandboxed code execution."""
     
     # Class-level lock to serialize Deno session creation within each Python worker
@@ -409,132 +409,3 @@ class MCPPythonEnvironment(Environment):
                         logger.error(f"Failed to clear Deno cache: {clear_e}")
                 backoff_time = 0.5 + attempt * 0.5
                 await asyncio.sleep(backoff_time)
-    
-
-
-
-class AsyncMCPPythonEnvironment(AsyncEnvironment):
-    """Async Environment using (Pydantic) MCP Run Python server for sandboxed code execution."""
-    
-    def __init__(self):
-        super().__init__()
-        
-        # Set up environment variables for Deno to use a writable cache directory
-        import tempfile
-        
-        # Create a temporary directory for Deno cache in a writable location
-        self.deno_cache_dir = tempfile.mkdtemp(prefix="deno_cache_")
-        
-        # Set environment variables for Deno
-        deno_install_dir = os.environ.get('DENO_INSTALL', os.path.expanduser('~/.deno'))
-        deno_bin_dir = os.path.join(deno_install_dir, 'bin')
-        current_path = os.environ.get('PATH', '')
-        if deno_bin_dir not in current_path:
-            new_path = f"{deno_bin_dir}:{current_path}"
-        else:
-            new_path = current_path
-            
-        self.env_vars = {
-            'DENO_DIR': self.deno_cache_dir,
-            'DENO_CACHE_DIR': self.deno_cache_dir,
-            'PATH': new_path,
-            'DENO_NO_UPDATE_CHECK': '1',
-        }
-        
-        self.server_params = StdioServerParameters(
-            command='deno',
-            args=[
-                'run',
-                '-A',
-                '--quiet',
-                'jsr:@pydantic/mcp-run-python',
-                'stdio',
-            ],
-            env=self.env_vars,
-        )
-        logger.info(f"Async MCP Python environment initialized with cache dir: {self.deno_cache_dir}")
-    
-    def __del__(self):
-        """Clean up temporary cache directory."""
-        try:
-            import shutil
-            if hasattr(self, 'deno_cache_dir') and os.path.exists(self.deno_cache_dir):
-                shutil.rmtree(self.deno_cache_dir)
-                logger.debug(f"Cleaned up Deno cache dir: {self.deno_cache_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up Deno cache dir: {e}")
-    
-    def launch(self, port: int):
-        """Launch the environment as a server."""
-        from omegaconf import OmegaConf
-        
-        env_server = EnvironmentServer(
-            n_envs=1,
-            host="0.0.0.0",
-            port=port,
-            max_session_inactivity_secs=600
-        )
-        
-        env_server.launch(OmegaConf.create({
-            "_target_": "pipelinerl.domains.tir.environment.AsyncMCPPythonEnvironment"
-        }))
-
-    def react(self, tape):
-        raise NameError("react not supported in async env, use areact")
-
-    async def areact(self, tape):
-        actions = [step for step in tape.steps[-tape.metadata.n_added_steps :] if isinstance(step, Action)]
-        
-        for action in actions:
-            if not isinstance(action, PythonCodeAction):
-                continue
-                
-            try:
-                logger.info(f"Executing Python code via MCP: {repr(action.code[:100])}...")
-                
-                result = await self._execute_python_code(action.code)
-                
-                # logger.info(f"MCP execution result: {repr(result[:200])}...")
-                logger.info(f"MCP execution result: {repr(result)}")
-                
-                output, success = _parse_mcp_result(result)
-                
-                observation = CodeExecutionResult(
-                    result=CommandLineCodeResult(
-                        output=output,
-                        exit_code=0 if success else 1
-                    )
-                )
-                
-                tape = tape.append(observation)
-                
-            except TimeoutError as e:
-                logger.warning(f"Code execution timed out: {e}")
-                tape = tape.append(ActionExecutionFailure(error=f"Timeout: {e}"))
-                break
-            except Exception as e:
-                logger.error(f"MCP execution failed: {e}")
-                tape = tape.append(ActionExecutionFailure(error=str(e)))
-                break
-                
-        return tape
-    
-    async def _execute_python_code(self, code: str) -> str:
-        """Execute Python code using MCP Run Python server"""
-        async with stdio_client(self.server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                # Add timeout to the actual MCP call
-                try:
-                    result = await asyncio.wait_for(
-                        session.call_tool('run_python_code', {'python_code': code}),
-                        timeout=90.0  # 90 second timeout for individual code execution
-                    )
-                    return result.content[0].text
-                except asyncio.TimeoutError:
-                    raise TimeoutError("Code execution timed out after 90 seconds")
-                except Exception as e:
-                    logger.error(f"MCP execution failed: {e}")
-                    raise e
-    
-
