@@ -6,14 +6,14 @@ save_tapes: true
 
 llm:
   parameters:
-    max_tokens: 1024
+    max_tokens: 512  # Reduced from 1024 to help stay within context limits
     temperature: 0.2
     stop:
       - "```output"
 
 test_llm:
   parameters:
-    max_tokens: 1024
+    max_tokens: 512  # Reduced from 1024 to help stay within context limits
     temperature: 0.2
     stop:
       - "```output"
@@ -99,6 +99,9 @@ environment:
 agent:
   _target_: pipelinerl.domains.tir.agent.TIRMathAgent
   system_prompt: ${actor.system_prompt}
+  max_reasoning_pairs: 3  # Number of recent code-execution pairs to keep in context
+  max_code_chars: 800     # Maximum characters of code per step
+  max_output_chars: 2000  # Maximum characters of execution output per step
 
 dataset_loader: pipelinerl.domains.tir.datasets.load_datasets
 

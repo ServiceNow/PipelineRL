@@ -33,6 +33,9 @@ class CodeExecutionNode(Node):
     """Node that generates Python code to solve math problems with iterative reasoning."""
     
     system_prompt: str = Field(default="", description="System prompt for the node")
+    max_reasoning_pairs: int = Field(default=3, description="Number of recent code-exec pairs to include in prompt")
+    max_code_chars: int = Field(default=800, description="Maximum characters of code to include per step")
+    max_output_chars: int = Field(default=2000, description="Maximum characters of execution output per step")
     
     def _extract_numerical_value(self, text: str):
         """Extract numerical value from text using multiple parsing strategies."""
@@ -170,33 +173,42 @@ class CodeExecutionNode(Node):
             {"role": "user", "content": task.llm_view()}
         )
         
-        reasoning_steps = []
-        assistant_output_content = ""
-        
+        # Collect all reasoning steps first
+        all_reasoning_steps = []
         for step in tape.steps[1:]:
             if isinstance(step, (PythonCodeAction, CodeExecutionResult, ActionExecutionFailure)):
-                reasoning_steps.append(step)
-        
+                all_reasoning_steps.append(step)
+
+        # Deterministic last-k pairs
+        max_items = self.max_reasoning_pairs * 2
+        reasoning_steps = all_reasoning_steps[-max_items:] if len(all_reasoning_steps) > max_items else all_reasoning_steps
+
+        assistant_output_content = ""
         for step in reasoning_steps:
             if isinstance(step, PythonCodeAction):
-                assistant_output_content += f"\n\n```python\n{step.code}\n```"
+                code = step.code
+                if len(code) > self.max_code_chars:
+                    head = code[: int(self.max_code_chars * 0.7)]
+                    tail = code[-int(self.max_code_chars * 0.3):]
+                    code = f"{head}\n# ... [code truncated] ...\n{tail}"
+                assistant_output_content += f"\n\n```python\n{code}\n```"
             elif isinstance(step, CodeExecutionResult):
                 result = step.result.output.strip()
                 if "\n\nstdout:" in result:
                     result = result.split("\n\nstdout:")[0].strip()
                 if result.startswith('"') and result.endswith('"'):
                     result = result[1:-1]
-                if len(result) > 2000:
+                if len(result) > self.max_output_chars:
                     lines = result.split('\n')
                     if len(lines) > 20:
                         kept_lines = lines[:10] + [f"... [{len(lines)-20} lines omitted] ..."] + lines[-10:]
                         result = '\n'.join(kept_lines)
                     else:
-                        result = result[:2000] + "... [output truncated]"
+                        result = result[: self.max_output_chars] + "... [output truncated]"
                 assistant_output_content += f"\n```output\n{result}\n```"
             elif isinstance(step, ActionExecutionFailure):
                 assistant_output_content += f"\n```output\nError: {step.error}\n```"
-        
+
         if assistant_output_content:
             messages.append({"role": "assistant", "content": assistant_output_content})
         
@@ -462,22 +474,32 @@ TIRMathTape = Tape[
 class TIRMathAgent(Agent):
     """TIR (Tool Integrated Reasoning) agent for mathematical problem solving."""
     
-    def __init__(self, system_prompt: str = "", max_iterations: int = 8, **kwargs):
+    def __init__(self, system_prompt: str = "", max_iterations: int = 8, 
+                 max_reasoning_pairs: int = 3, max_code_chars: int = 800, 
+                 max_output_chars: int = 2000, **kwargs):
         nodes = [
             CodeExecutionNode(
                 name="code_exec",
-                system_prompt=system_prompt
+                system_prompt=system_prompt,
+                max_reasoning_pairs=max_reasoning_pairs,
+                max_code_chars=max_code_chars,
+                max_output_chars=max_output_chars
             ),
         ]
         super().__init__(nodes=nodes, max_iterations=max_iterations, **kwargs)
         self.store_llm_calls = True
     
     @classmethod
-    def create(cls, system_prompt: str, llm: LLM, max_prompt_length: int, max_iterations: int = 8):
+    def create(cls, system_prompt: str, llm: LLM, max_prompt_length: int, max_iterations: int = 8,
+               max_reasoning_pairs: int = 3, max_code_chars: int = 800, 
+               max_output_chars: int = 2000):
         agent = cls(
             system_prompt=system_prompt,
             llms={"default": llm},
             max_iterations=max_iterations,
+            max_reasoning_pairs=max_reasoning_pairs,
+            max_code_chars=max_code_chars,
+            max_output_chars=max_output_chars,
         )
         agent.store_llm_calls = True
         if agent.llms["default"].tokenizer is None:

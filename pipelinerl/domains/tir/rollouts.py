@@ -12,6 +12,7 @@ from tapeagents.llms import TrainableLLM
 from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from pydantic import BaseModel
 from tapeagents.steps import ActionExecutionFailure
+from tapeagents.tools.code_executor import CodeExecutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +31,15 @@ class TIRMetrics(BaseMetrics):
 
 class TIRRewardTable(BaseModel):
     """Reward table for TIR domain"""
-    correct_answer: float = 1.0
-    wrong_answer: float = 0.0
-    no_answer: float = -0.1
-    unparsable: float = -0.1
-    execution_failure: float = -0.05
-    timeout_penalty: float = -0.2
-    buffer_tokens: int = 0
-    iteration_penalty: float = -0.02
+    correct_answer: float
+    wrong_answer: float
+    no_answer: float
+    unparsable: float
+    execution_failure: float
+    successful_code_execution: float
+    timeout_penalty: float
+    buffer_tokens: int
+    iteration_penalty: float
 
 
 def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
@@ -140,7 +142,12 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
             from tapeagents.core import LLMCall
             llm_call = LLMCall(**llm_call)
 
-        training_samples.append(make_training_text(llm, llm_call))
+        training_sample = make_training_text(llm, llm_call)
+        training_samples.append(training_sample)
+
+    if reached_answer_action and training_samples:
+        for text in training_samples:
+            text.finished = True
 
     if not llm_calls:
         logger.warning(
@@ -217,6 +224,9 @@ async def generate_tir_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         )
         if has_execution_errors:
             base_reward += rewards.execution_failure
+
+        successful_executions = sum(1 for step in final_tape.steps if isinstance(step, CodeExecutionResult))
+        base_reward += successful_executions * rewards.successful_code_execution
         
         base_reward += iteration_penalty_total
         
