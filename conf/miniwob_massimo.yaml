@@ -1,6 +1,6 @@
 defaults:
   - miniwob
-  - override finetune: grpo
+  - override finetune: ppo
   - _self_
 
 train_dataset_names:
