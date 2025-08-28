@@ -4,7 +4,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "DIR=$(mktemp -d -p /tmp mcp_XXXXXXXX) && cd \"$DIR\" && /home/toolkit/.deno/bin/deno run -N -R=node_modules -W=node_modules --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio; EC=$?; sleep 7200; cd /; rm -rf \"$DIR\"; exit $EC"
+                "DIR=$(mktemp -d -p /tmp/mcp_XXXXXXXX) && cd \"$DIR\" && /home/toolkit/.deno/bin/deno run -N -R=node_modules -W=node_modules --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio; EC=$?; cd /; rm -rf \"$DIR\"; exit $EC"
                 ]
         }
     }
