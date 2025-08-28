@@ -142,7 +142,7 @@ async def generate_miniwob_rollout(
     # get the number of PageObservation steps in the tape
     n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
 
-    #reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
+    # reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
     # massimo's setup:
     reward = float(raw_reward>0)
     if reward == 0.0:
