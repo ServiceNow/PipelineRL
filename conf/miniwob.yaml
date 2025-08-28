@@ -18,7 +18,7 @@ model_path: meta-llama/Llama-3.1-8B-Instruct
 
 finetune:
   seq_length: 16384  # input + output tokens
-  max_train_steps: 1000
+  max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
 
 llm:
   parameters:
@@ -125,7 +125,7 @@ start_attempts: 3  # number of attempts to start each task
 environment:
   _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
   miniwob_url: ???
-  n_envs: 32
+  n_envs: ${actor.llm_max_rollouts}
   host: "0.0.0.0"
   env_call_timeout: 600  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
