@@ -37,7 +37,7 @@ environment:
   host: "0.0.0.0"
   exp_path: ${output_dir}/env_server
   mcp_target: tapeagents.mcp.MCPEnvironment
-  mcp_config_path: /home/toolkit/research-now-reasoner/pipelinerl/conf/mcp/python.json
+  mcp_config_path: /home/toolkit/PipelineRL/conf/mcp/python.json
   mcp_tools_whitelist:
     - run_python_code
   env_call_timeout: 600  # Increased from default 60s to 10 minutes
