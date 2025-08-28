@@ -33,7 +33,7 @@ vllm_config:
 
 environment:
   _target_: pipelinerl.domains.mcp.MCPEnvironmentServer
-  n_envs: 8
+  n_envs: 64
   host: "0.0.0.0"
   exp_path: ${output_dir}/env_server
   mcp_target: tapeagents.mcp.MCPEnvironment
