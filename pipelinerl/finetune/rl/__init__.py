@@ -11,12 +11,11 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
-from tapeagents.tapeagents.finetune.rl.utils import masked_mean
 
 from .utils import (
     sum_sum,
-    mean_sum,
-    replace_dataset_column,
+    mask_mean,
+    mask_stddev
 )
 
 # FIXME: remove a warnings, but might be worth investigating
@@ -134,7 +133,8 @@ def rl_step(
     current_step: int,
     max_step: int,
     config: RLConfig,
-    running_avg_reward: float = 0.0,
+    running_avg_advantage: float = 0.0,
+    running_stddev_advantage: float = 1.0
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Perform a single RL step on the model using the given batch and config.
@@ -213,10 +213,6 @@ def rl_step(
 
     # get shifted values and compute ratios
     rewards = batch.rewards[:, 1:]
-    # Center rewards using running average
-    if running_avg_reward is None:
-        running_avg_reward = masked_mean(rewards, masks_shifted).item()
-    rewards = rewards - running_avg_reward
     ref_logprobs = batch.ref_logprobs[:, 1:]
     old_logprobs = batch.old_logprobs[:, 1:]
     group_tokens = batch.group_tokens[:, 1:]
@@ -250,6 +246,10 @@ def rl_step(
         #FIXME: if this works better it should be a config
         #advantages = rewards - torch.clamp(value_predictions, 0, 1)
         advantages = rewards - value_predictions
+        if running_stddev_advantage is None:
+            running_avg_advantage = mask_mean(advantages, masks_shifted).item()
+            running_stddev_advantage = mask_stddev(advantages, masks_shifted).item()
+        advantages = (advantages - running_avg_advantage) / (running_stddev_advantage + 1e-8)
     else:
         advantages = batch.advantages[:, 1:]
 
