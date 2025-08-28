@@ -15,7 +15,6 @@ from pipelinerl.finetune.types import PipelineBatchEncoding
 from .utils import (
     sum_sum,
     mask_mean,
-    mask_stddev
 )
 
 # FIXME: remove a warnings, but might be worth investigating
