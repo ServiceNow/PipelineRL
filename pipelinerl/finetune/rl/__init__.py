@@ -248,13 +248,13 @@ def rl_step(
         #advantages = rewards - torch.clamp(value_predictions, 0, 1)
         advantages = rewards - value_predictions
         if running_avg_advantage is None:
-            advantages -= masked_mean(advantages, masks_shifted, segments)
+            normalized_advantages = advantages - masked_mean(advantages, masks_shifted, segments)
         else:
-            advantages -= running_avg_advantage
+            normalized_advantages = advantages - running_avg_advantage
     else:
-        advantages = batch.advantages[:, 1:]
+        normalized_advantages = batch.advantages[:, 1:]
 
-    log_p_weights = advantages.detach() if config.use_advantages else rewards
+    log_p_weights = normalized_advantages.detach() if config.use_advantages else rewards
     if config.relu_log_p_weights:
         log_p_weights = torch.clamp(log_p_weights, min=0)
 
@@ -341,6 +341,7 @@ def rl_step(
         "new_logprobs": sum_sum(new_logprobs / num_labels_in_seq, masks_shifted, segments).item(),
         "ref_logprobs": sum_sum(ref_logprobs / num_labels_in_seq, masks_shifted, segments).item(),
         "advantage": sum_sum(advantages / num_labels_in_seq, masks_shifted, segments).item(),
+        "normalized_advantage": sum_sum(normalized_advantages / num_labels_in_seq, masks_shifted, segments).item(),
         "max_advantage": advantages[masks_shifted].max().item(),
         "min_advantage": advantages[masks_shifted].min().item(),
         "kl": sum_sum(approx_kl / num_labels_in_seq, masks_shifted, segments).item(),
