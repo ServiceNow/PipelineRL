@@ -28,7 +28,7 @@ vllm_config:
   vllm_kwargs:
     enable-auto-tool-choice: ""
     tool-call-parser: rl_tool
-    tool-parser-plugin: pipelinerl/rl_tool_parser_plugin.py
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
     max_model_len: 40960
 
 environment:

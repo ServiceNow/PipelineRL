@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
-from tapeagents.tapeagents.finetune.rl.utils import masked_mean
+from tapeagents.finetune.rl.utils import masked_mean
 
 from .utils import (
     sum_sum,
