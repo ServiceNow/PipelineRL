@@ -11,12 +11,10 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
-from tapeagents.finetune.rl.utils import masked_mean
 
 from .utils import (
     sum_sum,
-    mean_sum,
-    replace_dataset_column,
+    mask_mean
 )
 
 # FIXME: remove a warnings, but might be worth investigating
@@ -248,7 +246,7 @@ def rl_step(
         #advantages = rewards - torch.clamp(value_predictions, 0, 1)
         advantages = rewards - value_predictions
         if running_avg_advantage is None:
-            normalized_advantages = advantages - masked_mean(advantages, masks_shifted, segments)
+            normalized_advantages = advantages - mask_mean(advantages, masks_shifted, segments)
         else:
             normalized_advantages = advantages - running_avg_advantage
     else:
