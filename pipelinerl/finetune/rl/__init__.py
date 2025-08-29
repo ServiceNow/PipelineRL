@@ -134,7 +134,7 @@ def rl_step(
     current_step: int,
     max_step: int,
     config: RLConfig,
-    running_avg_reward: float = 0.0,
+    running_avg_advantage: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Perform a single RL step on the model using the given batch and config.
@@ -214,9 +214,6 @@ def rl_step(
     # get shifted values and compute ratios
     rewards = batch.rewards[:, 1:]
     # Center rewards using running average
-    if running_avg_reward is None:
-        running_avg_reward = masked_mean(rewards, masks_shifted).item()
-    rewards = rewards - running_avg_reward
     ref_logprobs = batch.ref_logprobs[:, 1:]
     old_logprobs = batch.old_logprobs[:, 1:]
     group_tokens = batch.group_tokens[:, 1:]
@@ -250,6 +247,10 @@ def rl_step(
         #FIXME: if this works better it should be a config
         #advantages = rewards - torch.clamp(value_predictions, 0, 1)
         advantages = rewards - value_predictions
+        if running_avg_advantage is None:
+            advantages -= masked_mean(advantages, masks_shifted, segments)
+        else:
+            advantages -= running_avg_advantage
     else:
         advantages = batch.advantages[:, 1:]
 
