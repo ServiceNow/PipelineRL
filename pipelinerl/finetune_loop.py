@@ -669,14 +669,6 @@ def rl_finetuning_worker(
                 for k, v in this_step_rl_metrics.items():
                     rl_metrics[k].append(v)
                 
-                # Update running average advantage
-                current_advantage = this_step_rl_metrics.get('advantage', 0.0)
-                alpha = 0.1  # Exponential moving average coefficient
-                if training_metrics.running_avg_advantage is None:
-                    training_metrics.running_avg_advantage = current_advantage
-                else:
-                    training_metrics.running_avg_advantage = (1 - alpha) * training_metrics.running_avg_advantage + alpha * current_advantage
-
             backward(loss, is_final_micro_batch=do_optimizer_step)
 
         if not is_sentinel_batch:
@@ -786,6 +778,14 @@ def rl_finetuning_worker(
                     "rl/ess": ess,
                 }
             )
+
+            # Update running average advantage
+            current_advantage = average_rl_metrics['rl/advantage']
+            alpha = 0.1  # Exponential moving average coefficient
+            if training_metrics.running_avg_advantage is None:
+                training_metrics.running_avg_advantage = current_advantage
+            else:
+                training_metrics.running_avg_advantage = (1 - alpha) * training_metrics.running_avg_advantage + alpha * current_advantage
 
             rl_metrics = defaultdict(list)
             time_stats = {}
