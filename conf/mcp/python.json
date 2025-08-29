@@ -4,7 +4,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "JOB_TAG=${JOB_ID:-${PROCID:-$(hostname)-$$-$(date +%s%N)}} && BASE=/home/toolkit/.cache && mkdir -p \"$BASE/mcp_tmp/$JOB_TAG\" \"$BASE/deno_mcp/$JOB_TAG\" \"$BASE/tmp/$JOB_TAG\" && export DENO_DIR=\"$BASE/deno_mcp/$JOB_TAG\" TMPDIR=\"$BASE/tmp/$JOB_TAG\" && DIR=$(mktemp -d -p \"$BASE/mcp_tmp/$JOB_TAG\" mcp_XXXXXXXX) && cd \"$DIR\" && /home/toolkit/.deno/bin/deno run -N -R=node_modules -W=node_modules --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio; EC=$?; cd /; rm -rf \"$DIR\"; exit $EC"
+                "JOB_TAG=${MCP_JOB_TAG:-${SLURM_JOB_ID:-$HOSTNAME}} && BASE=/home/toolkit/.cache && mkdir -p \"$BASE/mcp_tmp/$JOB_TAG\" \"$BASE/deno_mcp/$JOB_TAG\" \"$BASE/tmp/$JOB_TAG\" && export DENO_DIR=\"$BASE/deno_mcp/$JOB_TAG\" TMPDIR=\"$BASE/tmp/$JOB_TAG\" && /home/toolkit/.deno/bin/deno cache jsr:@pydantic/mcp-run-python >/dev/null 2>&1 || true; DIR=$(mktemp -d -p \"$BASE/mcp_tmp/$JOB_TAG\" mcp_XXXXXXXX) && cd \"$DIR\" && /home/toolkit/.deno/bin/deno run -N -R=node_modules -W=node_modules --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio; EC=$?; cd /; rm -rf \"$DIR\"; exit $EC"
                 ]
         }
     }
