@@ -659,7 +659,7 @@ def rl_finetuning_worker(
                 assert batch.seq_boundaries is not None
                 update_ring_flash_attn_params(batch.seq_boundaries, seq_parallel_group)
             loss, this_step_rl_metrics = rl_step(
-                model, batch, training_metrics.completed_steps, final_train_steps, rl_config, training_metrics.running_avg_reward
+                model, batch, training_metrics.completed_steps, final_train_steps, rl_config
             )
             if is_sentinel_batch:
                 # zero out the loss and do not update the metrics
@@ -668,14 +668,6 @@ def rl_finetuning_worker(
                 # update the metrics
                 for k, v in this_step_rl_metrics.items():
                     rl_metrics[k].append(v)
-                
-                # Update running average reward
-                current_reward = this_step_rl_metrics.get('reward', 0.0)
-                alpha = 0.1  # Exponential moving average coefficient
-                if training_metrics.running_avg_reward is None:
-                    training_metrics.running_avg_reward = current_reward
-                else:
-                    training_metrics.running_avg_reward = (1 - alpha) * training_metrics.running_avg_reward + alpha * current_reward
 
             backward(loss, is_final_micro_batch=do_optimizer_step)
 

@@ -41,7 +41,6 @@ class TrainingMetrics:
     best_completed_steps: int = 0
     lr: float = 0.0
     time_waiting_for_data: float = 0.0
-    running_avg_reward: float | None = None
 
 
 class PipelineBatchEncoding(BaseModel):
