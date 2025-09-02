@@ -19,6 +19,10 @@ model_path: meta-llama/Llama-3.1-8B-Instruct
 finetune:
   seq_length: 16384  # input + output tokens
   max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
+  train_batch_size: 1
+  gradient_accumulation_passes: 1024
+
+eval_every_n_versions: 10240  # 1024 effective bs * 10 "optim steps"
 
 llm:
   parameters:
@@ -44,6 +48,7 @@ preprocess:
 
 # AGENT CONFIGURATION
 agent_max_loops: 10  # max number of agent - environment interactions for each task
+reward_computation: nico
 agent:
   _target_: tapeagents.agent.Agent
   name : web_agent

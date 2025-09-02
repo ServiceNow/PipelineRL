@@ -1,12 +1,13 @@
 defaults:
-  - miniwob
-  - override finetune: ppo
+  - miniwob_grpo
   - _self_
 
 train_dataset_names:
   - massimo_train
 test_dataset_names:
   - massimo_test
+
+reward_computation: massimo
 
 finetune:
   seq_length: 16384  # input + output tokens

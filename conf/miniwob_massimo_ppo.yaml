@@ -1,0 +1,18 @@
+defaults:
+  - miniwob_ppo
+  - _self_
+
+train_dataset_names:
+  - massimo_train
+test_dataset_names:
+  - massimo_test
+
+reward_computation: massimo
+
+finetune:
+  seq_length: 16384  # input + output tokens
+  max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
+  train_batch_size: 1
+  gradient_accumulation_passes: 512
+
+eval_every_n_versions: 5120  # 512 effective bs * 10 "optim steps"
