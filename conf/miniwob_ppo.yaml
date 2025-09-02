@@ -48,6 +48,7 @@ preprocess:
 
 # AGENT CONFIGURATION
 agent_max_loops: 10  # max number of agent - environment interactions for each task
+agent_attempts: 3  # number of attempts to run the agent (retry on timeout/errors)
 reward_computation: nico
 agent:
   _target_: tapeagents.agent.Agent

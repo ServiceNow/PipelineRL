@@ -84,7 +84,7 @@ async def generate_miniwob_rollout(
     async with environment.acontext(session, wait_for_env=True) as env:
         start_attempts = cfg.start_attempts
         t = time.perf_counter()
-        while True:
+        while start_attempts > 0:
             try:
                 tape_dict, _ = await env.start_task(problem)
                 break
@@ -92,11 +92,12 @@ async def generate_miniwob_rollout(
                 logger.warning(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']}")
                 start_attempts -= 1
                 if start_attempts <= 0:
+                    logger.error("Failed to start task after all retry attempts")
                     no_error = False
                     tape_dict = {}
                     break
                 else:
-                    logger.warning(f"retry after 5 seconds: {e}")
+                    logger.warning(f"retry after 5 seconds: {e}, {start_attempts} attempts remaining")
                     await asyncio.sleep(5)
         logger.info(
             f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds"
@@ -105,16 +106,39 @@ async def generate_miniwob_rollout(
         t = time.perf_counter()
         if no_error:  # only run the agent if the task started successfully
             logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
-            try:
-                actions = await env.a_actions()
-                tools_description = await env.a_tools_description()
-                logger.debug(f"Available tools: {tools_description}")
-                agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
-                agent.llms = {DEFAULT: llm}
-                tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
-            except Exception as e:
-                logger.error(f"Error occurred while running agent: {e}")
-                no_error = False
+            agent_attempts = cfg.agent_attempts
+            while agent_attempts > 0:
+                try:
+                    actions = await env.a_actions()
+                    tools_description = await env.a_tools_description()
+                    agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
+                    agent.llms = {DEFAULT: llm}
+                    tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
+                    # Check if the tape has an error from the orchestrator (e.g., SocketTimeoutError)
+                    if tape.metadata.error:
+                        logger.warning(f"Agent execution failed with error: {tape.metadata.error}")
+                        agent_attempts -= 1
+                        if agent_attempts <= 0:
+                            logger.error("Agent execution failed after all retry attempts")
+                            no_error = False
+                            break
+                        else:
+                            logger.warning(f"Retrying agent execution after 5 seconds, {agent_attempts} attempts remaining")
+                            await asyncio.sleep(5)
+                            continue
+                    else:
+                        # Success - break out of retry loop
+                        break
+                except Exception as e:
+                    logger.warning(f"Error occurred while running agent: {e}")
+                    agent_attempts -= 1
+                    if agent_attempts <= 0:
+                        logger.error("Agent execution failed after all retry attempts")
+                        no_error = False
+                        break
+                    else:
+                        logger.warning(f"Retrying agent execution after 5 seconds, {agent_attempts} attempts remaining")
+                        await asyncio.sleep(5)
             logger.info(
                 f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds"
             )
