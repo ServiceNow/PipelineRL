@@ -70,7 +70,29 @@ async def generate_miniwob_rollout(
     # get training text from llm calls
 
     start_time = time.time()
+    
+    # Overall timeout for the entire rollout to prevent hanging
+    rollout_timeout = getattr(cfg, 'rollout_timeout', 1800)  # 30 minutes default
 
+    try:
+        # Execute the entire rollout with a timeout
+        return await asyncio.wait_for(
+            _execute_rollout_with_timeout(cfg, llm, problem, session, start_time),
+            timeout=rollout_timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Rollout timed out after {rollout_timeout} seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
+        # Return a failed rollout result
+        return _create_failed_rollout_result(problem, start_time, "timeout")
+
+
+async def _execute_rollout_with_timeout(
+    cfg: DictConfig,
+    llm: TrainableLLM,
+    problem: dict,
+    session: aiohttp.ClientSession,
+    start_time: float,
+) -> RolloutResult:
     # (1) Choose a random environment server
     env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
     # choose the env job randomly
@@ -224,4 +246,36 @@ async def generate_miniwob_rollout(
         dataset_name=problem["dataset"],
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
+    )
+
+
+def _create_failed_rollout_result(problem: dict, start_time: float, error_type: str) -> RolloutResult:
+    """Create a failed rollout result for timeout or other errors."""
+    latency = time.time() - start_time
+    
+    # Create empty training texts and metrics for failed rollout
+    metrics = MiniwobMetrics(
+        reward=-1.0,
+        success=False,
+        no_error=False,
+        no_answer=True,
+        overflow=False,
+        n_llm_calls=0,
+        n_step_errors=0,
+        n_page_observations=0,
+        n_steps=0,
+        total_execution_time=latency,
+        agent_execution_time=-1.0,
+        environment_execution_time=-1.0,
+        env_step_time=-1.0,
+        agent_step_time=-1.0,
+    )
+    
+    return RolloutResult(
+        training_texts=[],
+        metrics=metrics,
+        latency=latency,
+        dataset_name=problem["dataset"],
+        prompt_tokens=[],
+        output_tokens=[],
     )
