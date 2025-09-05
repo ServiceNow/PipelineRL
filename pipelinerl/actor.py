@@ -135,7 +135,7 @@ async def schedule_rollouts(
     # Track rollouts per problem group
     group_rollouts = {}
     rollout_policy = hydra.utils.get_method(cfg.actor.rollout_policy)
-    logger.info(f"Use rollout policy: {rollout_policy}")
+    logger.info(f"Use rollout policy: {rollout_policy.__name__}")
 
     async def rollout_and_maybe_produce_result(
         problem: dict,
