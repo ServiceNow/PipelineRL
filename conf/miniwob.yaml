@@ -42,6 +42,7 @@ vllm_config:
 actor:
   rollout_policy: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
   shared_memory_entry_size: 100000000
+  llm_max_rollouts: 32
 
 preprocess:
   shared_memory_entry_size: 1000000000
@@ -68,7 +69,7 @@ agent:
       {allowed_steps}
       Do not reproduce schema when producing the steps, use it as a reference.
     json_format: |
-      Important! Respond with parsable JSON, do not include any text or code.
+      Important! Respond with parsable JSON, do not include any special characters or code.
       Do not output anything besides one JSON object.
   nodes:
     - _target_: examples.rl_webagent.agent.WebNode
@@ -96,7 +97,7 @@ agent:
         - check if you are stuck with repeating the same action over and over again, if so, try something else and change the action.
         - check if you think the task is done, if not give a detailed list of actions to do next to accomplish the task.
         - finally, if the task is not done, describe the immediate next action to be performed and its expected effect on the page.
-        Produce only one reasoning_thought step!
+        Produce only one reasoning_thought step! Be brief and to the point. You can skip some details if they are not relevant for this step.
         ${agent.templates.json_format}
       steps_prompt: ${agent.templates.allowed_steps}
       steps:
@@ -132,7 +133,7 @@ start_attempts: 3  # number of attempts to start each task
 environment:
   _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
   miniwob_url: ???
-  n_envs: ${actor.llm_max_rollouts}
+  n_envs: 64
   host: "0.0.0.0"
   env_call_timeout: 120  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
