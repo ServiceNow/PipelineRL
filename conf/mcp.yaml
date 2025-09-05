@@ -19,6 +19,7 @@ train_dataset_names:
 - open_reasoner_zero_57k
 - open_reasoner_zero_extended_72k 
 test_dataset_names:
+  - aime_2025
   - aime_2024
   - amc_2023
   - math_500
