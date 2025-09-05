@@ -69,8 +69,9 @@ agent:
       {allowed_steps}
       Do not reproduce schema when producing the steps, use it as a reference.
     json_format: |
-      Important! Respond with parsable JSON, do not include any special characters or code.
-      Do not output anything besides one JSON object.
+      Important! Respond with very simple parsable JSON!
+      Do not use any special characters or code. Do not use new lines, tabs, or any other formatting inside the JSON.
+      Do not output anything besides one simple JSON object.
   nodes:
     - _target_: examples.rl_webagent.agent.WebNode
       name: set_goal

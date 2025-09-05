@@ -1,5 +1,5 @@
 defaults:
-  - miniwob_ppo
+  - miniwob
   - _self_
 
 train_dataset_names:
