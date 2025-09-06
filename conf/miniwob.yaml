@@ -134,7 +134,7 @@ start_attempts: 3  # number of attempts to start each task
 environment:
   _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
   miniwob_url: ???
-  n_envs: 64
+  n_envs: 32
   host: "0.0.0.0"
   env_call_timeout: 120  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
