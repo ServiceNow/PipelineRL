@@ -53,8 +53,6 @@ preprocess:
   input_queue_size: 64    # Increase from 32
   # queue for ready chunks for multiple groups
   output_queue_size: 64   # Increase from 32
-  # queue for accumulating samples before further processing
-  dataset_buffer_size: 512  # Enable buffering (was 0)
   # ring buffer to replace old samples with new ones when training is slow
   ring_buffer_size: 1024  # Increase from 128
   # "virtual" sample queue per lead trainer
