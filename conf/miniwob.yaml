@@ -45,10 +45,10 @@ actor:
   llm_max_rollouts: 32
 
 preprocess:
-  n_workers: 16  # Increase from 8
-  chunk_n_groups: 4  # Increase from 2 for better throughput
+  n_workers: 32  # Increase from 8
+  chunk_n_groups: 8  # Increase from 2 for better throughput
   # queue for loaded raw groups
-  raw_queue_size: 16      # Increase from 8
+  raw_queue_size: 32      # Increase from 8
   # queue for processed chunks of multiple groups
   input_queue_size: 64    # Increase from 32
   # queue for ready chunks for multiple groups
