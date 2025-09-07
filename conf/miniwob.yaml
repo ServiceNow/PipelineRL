@@ -150,7 +150,7 @@ environment:
   host: "0.0.0.0"
   env_call_timeout: 120  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
-  exp_path: ${output_dir}/env_server
+  exp_path: null
   headless: true
   observation_format: html
 
