@@ -111,7 +111,7 @@ async def _execute_rollout_with_timeout(
                 start_result = await env.start_task(problem)
                 if isinstance(start_result, dict) and "error" in start_result:
                     raise ValueError(start_result['error'])
-                elif isinstance(start_result, tuple):
+                elif isinstance(start_result, list):
                     tape_dict, _ = start_result
                 else:
                     raise ValueError(f"Invalid start result: {start_result}")
