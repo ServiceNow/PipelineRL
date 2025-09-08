@@ -108,18 +108,24 @@ async def _execute_rollout_with_timeout(
         t = time.perf_counter()
         while start_attempts > 0:
             try:
-                tape_dict, _ = await env.start_task(problem)
+                start_result = await env.start_task(problem)
+                if isinstance(start_result, dict) and "error" in start_result:
+                    raise ValueError(start_result['error'])
+                elif isinstance(start_result, tuple):
+                    tape_dict, _ = start_result
+                else:
+                    raise ValueError(f"Invalid start result: {start_result}")
                 break
             except Exception as e:
-                logger.warning(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']}")
                 start_attempts -= 1
+                logger.warning(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']}. {start_attempts} attempts remaining. Error: {e}")
                 if start_attempts <= 0:
-                    logger.error("Failed to start task after all retry attempts")
+                    logger.error(f"Failed to start task after all retry attempts: {e}")
                     no_error = False
                     tape_dict = {}
                     break
                 else:
-                    logger.warning(f"retry after 5 seconds: {e}, {start_attempts} attempts remaining")
+                    logger.warning("Retry start task after 5 seconds.")
                     await asyncio.sleep(5)
         logger.info(
             f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds"
@@ -138,28 +144,19 @@ async def _execute_rollout_with_timeout(
                     tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
                     # Check if the tape has an error from the orchestrator (e.g., SocketTimeoutError)
                     if tape.metadata.error:
-                        logger.warning(f"Agent execution failed with error: {tape.metadata.error}")
-                        agent_attempts -= 1
-                        if agent_attempts <= 0:
-                            logger.error("Agent execution failed after all retry attempts")
-                            no_error = False
-                            break
-                        else:
-                            logger.warning(f"Retrying agent execution after 5 seconds, {agent_attempts} attempts remaining")
-                            await asyncio.sleep(5)
-                            continue
+                        raise ValueError(tape.metadata.error)
                     else:
                         # Success - break out of retry loop
                         break
                 except Exception as e:
-                    logger.warning(f"Error occurred while running agent: {e}")
                     agent_attempts -= 1
+                    logger.warning(f"Error occurred while running agent. {agent_attempts} attempts remaining. Error: {e}")
                     if agent_attempts <= 0:
-                        logger.error("Agent execution failed after all retry attempts")
+                        logger.error(f"Agent execution failed after all retry attempts: {e}")
                         no_error = False
                         break
                     else:
-                        logger.warning(f"Retrying agent execution after 5 seconds, {agent_attempts} attempts remaining")
+                        logger.warning("Retry agent execution after 5 seconds.")
                         await asyncio.sleep(5)
             logger.info(
                 f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds"
