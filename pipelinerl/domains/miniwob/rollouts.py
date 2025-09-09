@@ -72,7 +72,7 @@ async def generate_miniwob_rollout(
     start_time = time.time()
     
     # Overall timeout for the entire rollout to prevent hanging
-    rollout_timeout = getattr(cfg, 'rollout_timeout', 1800)  # 30 minutes default
+    rollout_timeout = getattr(cfg, 'rollout_timeout', 600)  # 10 minutes default
 
     try:
         # Execute the entire rollout with a timeout

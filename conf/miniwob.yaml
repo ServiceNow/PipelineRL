@@ -61,8 +61,8 @@ preprocess:
 
 # AGENT CONFIGURATION
 agent_max_loops: 10  # max number of agent - environment interactions for each task
-agent_attempts: 3  # number of attempts to run the agent (retry on timeout/errors)
-rollout_timeout: 1800  # overall timeout for entire rollout in seconds (30 minutes)
+agent_attempts: 3  # number of attempts to run the agent (retry on errors)
+rollout_timeout: 600  # overall timeout for entire rollout in seconds (10 minutes)
 reward_computation: nico
 agent:
   _target_: tapeagents.agent.Agent
@@ -148,7 +148,7 @@ environment:
   miniwob_url: ???
   n_envs: 32
   host: "0.0.0.0"
-  env_call_timeout: 120  # timeout for each environment call (e.g. start_task, act, etc.)
+  env_call_timeout: 60  # timeout for each environment call (e.g. start_task, act, etc.)
   web_env_target: examples.rl_webagent.environment.WebEnvironment
   exp_path: null
   headless: true
