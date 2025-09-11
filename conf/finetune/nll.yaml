@@ -2,5 +2,6 @@ defaults:
   - base
   - _self_
 
+attempts: 1
 rl:
   policy_loss: nll
