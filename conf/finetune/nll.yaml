@@ -1,0 +1,6 @@
+defaults:
+  - base
+  - _self_
+
+rl:
+  policy_loss: nll

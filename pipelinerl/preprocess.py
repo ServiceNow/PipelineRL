@@ -396,6 +396,10 @@ def run_preprocessing_loop(
         logger.info("Debug mode: finetune+preprocessor")
         trainer_state.start_listening()
         trainer_state.wait_for_processed_samples()
+    elif cfg.debug.mode == "finetune+preprocessor+sft":
+        logger.info("Debug mode: finetune+preprocessor+sft")
+        trainer_state.start_listening()
+        trainer_state.wait_for_processed_samples()
     else:
         logger.info("Normal mode, waiting for finetune loop to start")
         trainer_state.start_listening()

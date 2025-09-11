@@ -1,3 +1,4 @@
+from cgitb import text
 import logging
 import os
 import random
@@ -61,35 +62,49 @@ class SFTDataLoop:
         self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.loop_start_time = time.time()
 
-    def process_dataset_sample(self, input_text, output_text) -> TrainingText:
+    def process_dataset_sample(self, input_text, output_text, sample_id: int) -> TrainingText | None:
         """
         Process a single dataset sample into TrainingText format.
         
         Args:
-            sample: A dictionary containing the dataset sample
+            input_text: The input text for the sample
+            output_text: The output text for the sample
+            sample_id: Unique identifier for this sample
             
         Returns:
-            List of TrainingText objects ready for training
+            TrainingText object ready for training
         """
         
         # Extract text content from the sample
         # This assumes the dataset has 'text' field - adjust based on your dataset format
         input_ids = self.tokenizer.encode(input_text, add_special_tokens=False)
         text_ids = self.tokenizer.encode(input_text + output_text, add_special_tokens=False)
+        if len(text_ids) > self.cfg.finetune.seq_length:
+            if len(input_ids) >= self.cfg.finetune.seq_length:
+                logger.error(f"Sample {sample_id} input too long ({len(input_ids)} tokens), skipping")
+                return None
+            logger.warning(f"Truncating sample {sample_id} to fit seq_len {self.cfg.finetune.seq_length}")
+            text_ids = text_ids[:self.cfg.finetune.seq_length] 
+
+        num_output_tokens = len(text_ids) - len(input_ids)
         training_text = TrainingText(
             text=input_text + output_text,
             n_predicted=len(output_text),
             reward=0.0,
-            logprobs=[],
-            ref_logprobs=[],
+            logprobs=[0.0]*num_output_tokens,
+            ref_logprobs=[0.0]*num_output_tokens,
             input_ids=text_ids,
             labels=[MASKED_TOKEN_ID] * len(input_ids) + text_ids[len(input_ids):],
-            group_id=None,
+            group_id=f"sft_group_{sample_id}",
             finished=True,
             prompt_tokens=len(input_ids),
-            output_tokens=len(text_ids) - len(input_ids),
+            output_tokens=num_output_tokens,
             visual_features=None,
-            metadata={}
+            metadata={
+                "rollout_index": sample_id,
+                "step_index": 0,
+                "model_version": 0
+            }
         )
         
         return training_text
@@ -116,26 +131,32 @@ class SFTDataLoop:
         batch_size = 1 #self.cfg.get('batch_size', 100)
         
         logger.info(f"Starting SFT data processing with {len(dataset)} samples")
+        logger.info(f"Writing data to stream: {self.data_stream}")
         
         with (
             write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
         ):
+            logger.info("Stream writers initialized successfully")
+            
             # Process dataset in batches
             for i in range(0, len(dataset), batch_size):
                 batch = dataset[i:i + batch_size]
                 batch_training_texts = []
                 
                 # Process each sample in the batch
-                for input_text, output_text in zip(batch['inputs_pretokenized'], batch['targets_pretokenized']):
-                    training_text = self.process_dataset_sample(input_text, output_text)
-                    batch_training_texts.append(training_text)
+                for idx, (input_text, output_text) in enumerate(zip(batch['inputs_pretokenized'], batch['targets_pretokenized'])):
+                    sample_id = i + idx  # Generate unique sample ID
+                    training_text = self.process_dataset_sample(input_text, output_text, sample_id)
+                    if training_text is not None:
+                        batch_training_texts.append(training_text)
                 
                 if batch_training_texts:
                     # Convert to dict format for streaming
                     text_dumps = [text.model_dump() for text in batch_training_texts]
                     
                     # Write to data stream
+                    logger.debug(f"Writing {len(text_dumps)} samples to data stream")
                     data_stream_writer.write(text_dumps)
                     
                     # Update stats
@@ -143,10 +164,9 @@ class SFTDataLoop:
                     
                     published_samples += len(batch_training_texts)
                     
-                    logger.info(
-                        f"Published {len(batch_training_texts)} samples to {self.data_stream}, "
-                        f"total {published_samples} samples so far"
-                    )
+                    # Log progress every 100 samples
+                    if published_samples % 100 == 0 or published_samples == len(dataset):
+                        logger.info(f"Processed {published_samples}/{len(dataset)} samples")
                 
                 # Publish stats periodically
                 if (i + batch_size) % (batch_size * 10) == 0 or i + batch_size >= len(dataset):
@@ -190,42 +210,52 @@ def run_sft_data_loop(cfg: DictConfig):
     Args:
         cfg: Hydra configuration object
     """
+    logger.info("Starting SFT data processing...")
+    
+    # Initialize streams backend
     set_streams_backend(**cfg.streams)
     
     # Set seed for reproducibility
     random.seed(cfg.seed)
     
+    # Setup logging and experiment path
     exp_path = Path(cfg.output_dir)
     setup_logging(exp_path / "sft_data", "sft_data")
-    logger.info(f"Current dir: {os.getcwd()}, experiment root dir: {cfg.output_dir}")
+    logger.info(f"Output directory: {cfg.output_dir}")
     
+    # Initialize wandb if enabled
     if cfg.wandb.use_wandb:
         run = init_wandb(cfg, exp_path / "sft_data", flatten_dict_config(cfg))
         if run is None:
             raise ValueError("Failed to initialize wandb run")
+        logger.info(f"Wandb initialized: {run.name}")
     
-    # Load dataset using the same pattern as actor
+    # Load dataset
+    logger.info(f"Loading dataset: {HF_DATASET}")
     dataset_dict = datasets.load_dataset(HF_DATASET, 'short_context_replay')
-    
-    # Access the training split
     train_dataset = dataset_dict['train']
-    
     logger.info(f"Loaded {len(train_dataset)} training samples")
     
     # Create stream specifications
     stats_stream = SingleStreamSpec(exp_path=exp_path, topic="sft_stats")
     data_stream = SingleStreamSpec(exp_path=exp_path, topic="sft_data")
     
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
+    logger.info(f"Tokenizer loaded (vocab size: {len(tokenizer)})")
+    
     # Create and run training data loop
     train_loop = SFTDataLoop(
         data_stream=data_stream,
         stats_stream=stats_stream,
-        tokenizer=AutoTokenizer.from_pretrained(cfg.model_path),
+        tokenizer=tokenizer,
         cfg=cfg,
         is_training=True,
     )
     
+    # Run the processing loop
     train_loop.run(dataset=train_dataset)
+    logger.info("SFT data processing completed")
     
 
 

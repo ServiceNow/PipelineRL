@@ -186,6 +186,11 @@ class WorldMap:
             node = self.get_least_busy_node()
             self.add_job(kind="actor", replica_idx=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
             self.add_job(kind="preprocessor", replica_idx=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
+        
+        # Add sft_data job if in debug mode that includes sft
+        if cfg.debug.mode and "sft" in cfg.debug.mode:
+            node = self.get_least_busy_node()
+            self.add_job(kind="sft_data", replica_idx=0, node_rank=node, gpus=[], cpu_heavy=True)
 
     def _place_environments(self, cfg):
         for worker_idx in range(cfg.world.env_replicas):

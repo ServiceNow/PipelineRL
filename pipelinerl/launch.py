@@ -594,8 +594,6 @@ def main(cfg: DictConfig):
             debug_link_streams(cfg, [cfg.preprocess.input])
         elif cfg.debug.mode == "finetune+preprocessor":
             debug_link_streams(cfg, [cfg.preprocess.input])
-        elif cfg.debug.mode == "finetune+preprocessor+sft":
-            debug_link_streams(cfg, [cfg.preprocess.input])
     else:
         with read_stream(lead_launcher_stream) as stream:
             if (msg := next(stream.read())) != init_msg:

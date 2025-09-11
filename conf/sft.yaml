@@ -4,5 +4,16 @@ defaults:
 
 model_path: Qwen/Qwen3-4B-Instruct-2507
 output_dir: results/sft_debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+pop_old_data: false
+
+finetune:
+  send_weight_updates: false
+  seq_length: 4096
+  seq_parallel: 1
+
+preprocess:
+  input: sft_data
+
 debug:
-  mode: sft
+  mode: finetune+preprocessor+sft
+  place_inference_workers: false
