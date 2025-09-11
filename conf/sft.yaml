@@ -1,6 +1,7 @@
 defaults:
   - base
   - override finetune: nll
+  - override streams: redis
   - _self_
 
 model_path: Qwen/Qwen3-4B-Instruct-2507
@@ -9,9 +10,10 @@ pop_old_data: false
 
 finetune:
   send_weight_updates: false
-  seq_length: 12000 # max seq length
+  seq_length: 48000 # max seq length
   seq_parallel: 4 # number of gpus for seq parallelism
   gradient_accumulation_passes: 16 # batch size
+  learning_rate: 1e-6
 
 preprocess:
   input: sft_data
