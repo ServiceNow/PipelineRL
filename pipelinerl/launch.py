@@ -19,7 +19,7 @@ from pipelinerl.world import Job, WorldMap
 logger = logging.getLogger(__name__)
 
 # All the launch commands in this file pass the environment to child processes
-os.environ["PYTHONPATH"] = f"/home/toolkit/TapeAgents"
+os.environ["PYTHONPATH"] = "/home/toolkit/TapeAgents"
 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -345,6 +345,30 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
     )
 
 
+def run_sft_data(world_map: WorldMap, sft_data_idx: int, exp_dir: Path):
+    if sft_data_idx != 0:
+        raise NotImplementedError("Can only do 1 sft_data yet")
+    llm_urls = "+".join(world_map.get_actor_urls())  # Use actor URLs for tokenization
+    cmd = [
+        "python",
+        "-m",
+        "pipelinerl.entrypoints.run_sft_data",
+        "--config-dir",
+        f"{exp_dir}/conf",
+        "--config-name",
+        "exp_config",
+        f"output_dir={exp_dir}",
+        f"hydra.run.dir={exp_dir}/sft_data",
+        f"+me.llm_urls={llm_urls}",
+    ]
+    logger.info(f"Running sft_data with command: {' '.join(cmd)}")
+    save_command(exp_dir / "sft_data", cmd)
+    yield _popen(
+        cmd,
+        env=dict(os.environ),
+    )
+
+
 def run_redis(cfg: DictConfig):
     # Launch redis-server
     cmd = [
@@ -425,7 +449,7 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
         # if just one dies, stop all
         while True:
             for proc in processes:
-                if (return_code := proc.poll()) is not None:
+                if proc.poll() is not None:
                     # print which process terminate and with what code
                     logger.error(f"Process {proc.args} terminated with code {proc.returncode}")
                     gently_stop_all_processes()
@@ -460,7 +484,7 @@ def debug_link_streams(cfg: DictConfig, topics: list[str]):
 def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | None = None):
     exp_dir = Path(cfg.output_dir)
     processes = []
-    all_job_kinds = ["actor", "environment", "actor_llm", "preprocessor", "preprocessor_llm", "finetune"]
+    all_job_kinds = ["actor", "environment", "actor_llm", "preprocessor", "preprocessor_llm", "finetune", "sft_data"]
     if job_kind_filter is None:
         job_kind_filter = all_job_kinds
     for job in world_map.my_jobs():
@@ -484,6 +508,8 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
             processes.extend(run_ref_llm(cfg, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "finetune":
             processes.extend(run_finetune(cfg, world_map, job.gpus, exp_dir))
+        elif job.kind == "sft_data":
+            processes.extend(run_sft_data(world_map, job.replica_idx, exp_dir))
         else:
             raise ValueError(f"Unknown job kind {job.kind}")
     return processes
@@ -568,6 +594,8 @@ def main(cfg: DictConfig):
             debug_link_streams(cfg, [cfg.preprocess.input])
         elif cfg.debug.mode == "finetune+preprocessor":
             debug_link_streams(cfg, [cfg.preprocess.input])
+        elif cfg.debug.mode == "finetune+preprocessor+sft":
+            debug_link_streams(cfg, [cfg.preprocess.input])
     else:
         with read_stream(lead_launcher_stream) as stream:
             if (msg := next(stream.read())) != init_msg:
@@ -584,6 +612,10 @@ def main(cfg: DictConfig):
         processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm", "preprocessor", "preprocessor_llm"]))       
     elif cfg.debug.mode == "finetune+preprocessor":
         processes.extend(launch_jobs(cfg, world_map, ["finetune", "preprocessor", "preprocessor_llm"]))
+    elif cfg.debug.mode == "sft":
+        processes.extend(launch_jobs(cfg, world_map, ["sft_data"]))
+    elif cfg.debug.mode == "finetune+preprocessor+sft":
+        processes.extend(launch_jobs(cfg, world_map, ["finetune", "preprocessor", "preprocessor_llm", "sft_data"]))
     elif cfg.debug.mode in ["", "open_loop"]:
         processes.extend(launch_jobs(cfg, world_map))
     else:

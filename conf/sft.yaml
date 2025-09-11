@@ -1,0 +1,8 @@
+defaults:
+  - base
+  - _self_
+
+model_path: Qwen/Qwen3-4B-Instruct-2507
+output_dir: results/sft_debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+debug:
+  mode: sft
