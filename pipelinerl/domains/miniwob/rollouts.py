@@ -70,9 +70,9 @@ async def check_env_server_health(env_job: Job, session: aiohttp.ClientSession) 
                     "stopped_workers": health_data.get("stopped_workers", 0)
                 }
             else:
-                return {"healthy": False, "error": f"HTTP {response.status}"}
+                return {"healthy": False, "error_status": f"HTTP {response.status}", "error_message": response.text}
     except Exception as e:
-        return {"healthy": False, "error": str(e)}
+        return {"healthy": False, "error_status": "Unknown", "error_message": str(e)}
 
 
 async def reset_env_server(env_job: Job, session: aiohttp.ClientSession) -> bool:
