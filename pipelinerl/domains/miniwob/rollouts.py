@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import random
@@ -55,6 +56,41 @@ def tape_contains_an_error(tape: WebTape) -> bool:
     )
 
 
+async def check_env_server_health(env_job: Job, session: aiohttp.ClientSession) -> dict:
+    """Check environment server health via HTTP API."""
+    try:
+        url = f"http://{env_job.hostname}:{env_job.port}/health"
+        async with session.get(url, timeout=5) as response:
+            if response.status == 200:
+                health_data = await response.json()
+                return {
+                    "healthy": True,
+                    "active_workers": health_data.get("active_workers", 0),
+                    "max_workers": health_data.get("max_workers", 0),
+                    "stopped_workers": health_data.get("stopped_workers", 0)
+                }
+            else:
+                return {"healthy": False, "error": f"HTTP {response.status}"}
+    except Exception as e:
+        return {"healthy": False, "error": str(e)}
+
+
+async def reset_env_server(env_job: Job, session: aiohttp.ClientSession) -> bool:
+    """Reset environment server via HTTP API."""
+    try:
+        url = f"http://{env_job.hostname}:{env_job.port}/reset_all"
+        async with session.post(url, timeout=10) as response:
+            if response.status == 200:
+                logger.info(f"Reset environment server {env_job.hostname}:{env_job.port}")
+                return True
+            else:
+                logger.error(f"Reset failed: HTTP {response.status}")
+                return False
+    except Exception as e:
+        logger.error(f"Reset failed: {e}")
+        return False
+
+
 async def generate_miniwob_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -74,16 +110,52 @@ async def generate_miniwob_rollout(
     # Overall timeout for the entire rollout to prevent hanging
     rollout_timeout = getattr(cfg, 'rollout_timeout', 600)  # 10 minutes default
 
-    try:
-        # Execute the entire rollout with a timeout
-        return await asyncio.wait_for(
-            _execute_rollout_with_timeout(cfg, llm, problem, session, start_time),
-            timeout=rollout_timeout
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"Rollout timed out after {rollout_timeout} seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
-        # Return a failed rollout result
-        return _create_failed_rollout_result(problem, start_time, "timeout")
+    env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
+    env_jobs_url_tried = []
+
+    # Try each environment server with health checks until one of them returns a rollout result
+    for _ in range(len(env_jobs)):
+        # Choose the next environment server to try randomly from the ones that have not been tried yet
+        env_job = random.choice([job for job in env_jobs if f"http://{job.hostname}:{job.port}" not in env_jobs_url_tried])
+        env_job_url = f"http://{env_job.hostname}:{env_job.port}"
+        env_jobs_url_tried.append(env_job_url)
+
+        # Check server health before using
+        health = await check_env_server_health(env_job, session)
+        if not health["healthy"]:
+            logger.warning(f"Environment server {env_job_url} is unhealthy: {json.dumps(health, indent=2)}")
+            # Try to reset the server
+            if await reset_env_server(env_job, session):
+                logger.info(f"Reset environment server {env_job_url} successfully, retrying health check")
+                await asyncio.sleep(5)  # Wait for server to restart
+                health = await check_env_server_health(env_job, session)
+                if not health["healthy"]:
+                    logger.error(f"Environment server {env_job_url} still unhealthy after reset: {json.dumps(health, indent=2)}")
+                    continue
+            else:
+                logger.error(f"Failed to reset environment server {env_job_url}")
+                continue
+        # Log health status for monitoring
+        if health["healthy"]:
+            logger.info(f"Using healthy environment server {env_job_url}: {json.dumps(health, indent=2)}")
+
+        try:
+            # Execute the entire rollout with a timeout
+            return await asyncio.wait_for(
+                _execute_rollout_with_timeout(cfg, llm, problem, session, start_time, env_job_url),
+                timeout=rollout_timeout
+            )
+        except asyncio.TimeoutError:
+            health = await check_env_server_health(env_job, session)
+            logger.warning(f"Rollout timed out after {rollout_timeout} seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {json.dumps(health, indent=2)}. Trying next server.")
+            continue
+        except Exception as e:
+            health = await check_env_server_health(env_job, session)
+            logger.warning(f"Rollout failed for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {json.dumps(health, indent=2)}. Trying next server.")
+            continue
+    # If all servers failed
+    logger.error(f"All environment servers failed for task {problem['dataset']}/{problem['task']}/{problem['seed']}. Returning a failed rollout result.")
+    return _create_failed_rollout_result(problem, start_time, "all environment servers failed")
 
 
 async def _execute_rollout_with_timeout(
@@ -92,14 +164,8 @@ async def _execute_rollout_with_timeout(
     problem: dict,
     session: aiohttp.ClientSession,
     start_time: float,
+    env_job_url: str,
 ) -> RolloutResult:
-    # (1) Choose a random environment server
-    env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
-    # choose the env job randomly
-    env_job = random.choice(env_jobs)
-    assert env_job.port is not None
-    env_job_url = f"http://{env_job.hostname}:{env_job.port}"
-
     # (2) Generate environment, TapeAgent, and run them to get a Tape
     no_error = True  # track if there was an error in the tape
     environment = AsyncRemoteEnvironment(server_url=env_job_url)  # type: ignore
