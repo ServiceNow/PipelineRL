@@ -196,6 +196,7 @@ async def schedule_rollouts(
                     f"groups in progress: {len(group_rollouts)}, "
                     f"rollouts started so far: {started_rollouts}, "
                     f"rollouts finished so far: {finished_rollouts}, "
+                    f"groups finished so far: {group_id}, "
                     f"max group size in bytes: {result_queue.max_actual_entry_size()}, "
                 )
                 last_logged = time.time()
@@ -482,7 +483,6 @@ class ActorLoop:
                     f" {in_progress} groups in progress"
                 )
 
-                    
                 self.update_stats(rollout_results=rollout_results)
 
                 finished_groups += 1
