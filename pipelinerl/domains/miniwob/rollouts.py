@@ -70,7 +70,8 @@ async def check_env_server_health(env_job: Job, session: aiohttp.ClientSession) 
                     "stopped_workers": health_data.get("stopped_workers", 0)
                 }
             else:
-                return {"healthy": False, "error_status": f"HTTP {response.status}", "error_message": response.text}
+                error_text = await response.text()
+                return {"healthy": False, "error_status": f"HTTP {response.status}", "error_message": error_text}
     except Exception as e:
         return {"healthy": False, "error_status": "Unknown", "error_message": str(e)}
 
@@ -123,21 +124,21 @@ async def generate_miniwob_rollout(
         # Check server health before using
         health = await check_env_server_health(env_job, session)
         if not health["healthy"]:
-            logger.warning(f"Environment server {env_job_url} is unhealthy: {json.dumps(health, indent=2)}")
+            logger.warning(f"Environment server {env_job_url} is unhealthy: {health}")
             # Try to reset the server
             if await reset_env_server(env_job, session):
                 logger.info(f"Reset environment server {env_job_url} successfully, retrying health check")
                 await asyncio.sleep(5)  # Wait for server to restart
                 health = await check_env_server_health(env_job, session)
                 if not health["healthy"]:
-                    logger.error(f"Environment server {env_job_url} still unhealthy after reset: {json.dumps(health, indent=2)}")
+                    logger.error(f"Environment server {env_job_url} still unhealthy after reset: {health}")
                     continue
             else:
                 logger.error(f"Failed to reset environment server {env_job_url}")
                 continue
         # Log health status for monitoring
         if health["healthy"]:
-            logger.info(f"Using healthy environment server {env_job_url}: {json.dumps(health, indent=2)}")
+            logger.info(f"Using healthy environment server {env_job_url}: {health}")
 
         try:
             # Execute the entire rollout with a timeout
@@ -147,11 +148,11 @@ async def generate_miniwob_rollout(
             )
         except asyncio.TimeoutError:
             health = await check_env_server_health(env_job, session)
-            logger.warning(f"Rollout timed out after {rollout_timeout} seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {json.dumps(health, indent=2)}. Trying next server.")
+            logger.warning(f"Rollout timed out after {rollout_timeout} seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {health}. Trying next server.")
             continue
         except Exception as e:
             health = await check_env_server_health(env_job, session)
-            logger.warning(f"Rollout failed for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {json.dumps(health, indent=2)}. Trying next server.")
+            logger.warning(f"Rollout failed for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {health}. Trying next server.")
             continue
     # If all servers failed
     logger.error(f"All environment servers failed for task {problem['dataset']}/{problem['task']}/{problem['seed']}. Returning a failed rollout result.")
