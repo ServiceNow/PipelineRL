@@ -260,6 +260,7 @@ def rl_step(
     )
 
     approx_kl = torch.exp(log_ratio_ref_new_clamp) - log_ratio_ref_new_clamp - 1  # Schulman KL approx
+    approx_kl_new_old = torch.exp(log_ratio_new_old) - log_ratio_new_old - 1  # Schulman KL approx
 
     assert torch.isfinite(approx_kl).all(), f"approx_kl is not finite: {approx_kl}"
     entropy_bonus_coef = linear_decay_coef(current_step, max_step, config.entropy_bonus, config.final_entropy_bonus)
@@ -337,6 +338,7 @@ def rl_step(
         "max_advantage": advantages[masks_shifted].max().item(),
         "min_advantage": advantages[masks_shifted].min().item(),
         "kl": sum_sum(approx_kl / num_labels_in_seq, masks_shifted, segments).item(),
+        "kl_new_old": sum_sum(approx_kl_new_old / num_labels_in_seq, masks_shifted, segments).item(),
         "max_kl": approx_kl[masks_shifted].max().item(),
         "min_kl": approx_kl[masks_shifted].min().item(),
         "policy_loss": sum_sum(policy_loss / num_labels_in_seq, masks_shifted, segments).item(),
