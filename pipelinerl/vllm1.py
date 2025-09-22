@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from pipelinerl.finetune_loop import WeightUpdateRequest
 from typing import Any, Protocol, runtime_checkable
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # noqa: F401 - registers custom quantization configs
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign

@@ -36,6 +36,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 import torch.distributed as dist
 from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # noqa: F401 - registers custom quantization configs
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign

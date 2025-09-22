@@ -67,7 +67,8 @@ vllm_config:
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
-    max_model_len: 16000
+    max_model_len: 12000
+    quantization: bf16_last_layer_fp32 
 
 world:
   replicas: 1
