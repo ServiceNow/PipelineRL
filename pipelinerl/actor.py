@@ -349,6 +349,8 @@ class ActorLoop:
             self.model_versions_list.append(result.model_version)
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
             all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
+            all_metrics["used_python"] = int(all_metrics.get("used_python", False))
+            all_metrics["used_math_answer"] = int(all_metrics.get("used_math_answer", False))
             for k, v in all_metrics.items():
                 if isinstance(v, list):
                     self.stats[k][dataset_name][group_id] += v
@@ -549,6 +551,21 @@ class ActorLoop:
         stats |= loop_stats
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
+
+        rename_suffixes = {
+            "num_python_calls_mean": "python_calls_mean",
+            "used_python_mean": "python_usage_rate",
+            "num_math_answer_calls_mean": "math_answer_calls_mean",
+            "used_math_answer_mean": "math_answer_usage_rate",
+        }
+
+        for key in list(stats.keys()):
+            for old_suffix, new_suffix in rename_suffixes.items():
+                if key.endswith(old_suffix):
+                    prefix = key[: -len(old_suffix)]
+                    stats[f"{prefix}{new_suffix}"] = stats[key]
+                    break
+
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
@@ -592,11 +609,18 @@ def run_actor_loop(cfg: DictConfig):
     else:
         actor_model_path = cfg.model_path
     
+    # Align client-side context size with vLLM server max_model_len when available
+    try:
+        _context_size = int(cfg.vllm_config.vllm_kwargs.max_model_len)
+    except Exception:
+        _context_size = 32000
+
     train_llms = [
         TrainableLLM(
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
+            context_size=_context_size,
             parameters=cfg.llm.parameters,
             use_cache=False,
             collect_logprobs=True,
@@ -609,6 +633,7 @@ def run_actor_loop(cfg: DictConfig):
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
+            context_size=_context_size,
             parameters=cfg.test_llm.parameters,
             use_cache=False,
             collect_logprobs=True,
