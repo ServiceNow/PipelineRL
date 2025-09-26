@@ -73,7 +73,10 @@ async def check_env_server_health(env_job: Job, session: aiohttp.ClientSession) 
                 error_text = await response.text()
                 return {"healthy": False, "error_status": f"HTTP {response.status}", "error_message": error_text}
     except Exception as e:
-        return {"healthy": False, "error_status": "Unknown", "error_message": str(e)}
+        exception_type = type(e).__name__
+        exception_message = str(e) if str(e) else "No message available"
+        logger.exception(f"Error checking environment server health: {exception_type}: {exception_message}", stack_info=True)
+        return {"healthy": False, "error_status": f"Exception: {exception_type}", "error_message": exception_message}
 
 
 async def reset_env_server(env_job: Job, session: aiohttp.ClientSession) -> bool:
