@@ -65,34 +65,17 @@ async def check_env_server_health(env_job: Job, session: aiohttp.ClientSession) 
                 health_data = await response.json()
                 return {
                     "healthy": True,
-                    "active_workers": health_data.get("active_workers", 0),
-                    "max_workers": health_data.get("max_workers", 0),
-                    "stopped_workers": health_data.get("stopped_workers", 0)
+                    "health_data": health_data,
+                    "last_check": time.time()
                 }
             else:
                 error_text = await response.text()
-                return {"healthy": False, "error_status": f"HTTP {response.status}", "error_message": error_text}
+                return {"healthy": False, "error_message": f"HTTP {response.status}: {error_text}", "last_check": time.time()}
     except Exception as e:
         exception_type = type(e).__name__
         exception_message = str(e) if str(e) else "No message available"
         logger.exception(f"Error checking environment server health: {exception_type}: {exception_message}", stack_info=True)
-        return {"healthy": False, "error_status": f"Exception: {exception_type}", "error_message": exception_message}
-
-
-async def reset_env_server(env_job: Job, session: aiohttp.ClientSession) -> bool:
-    """Reset environment server via HTTP API."""
-    try:
-        url = f"http://{env_job.hostname}:{env_job.port}/reset_all"
-        async with session.post(url, timeout=10) as response:
-            if response.status == 200:
-                logger.info(f"Reset environment server {env_job.hostname}:{env_job.port}")
-                return True
-            else:
-                logger.error(f"Reset failed: HTTP {response.status}")
-                return False
-    except Exception as e:
-        logger.error(f"Reset failed: {e}")
-        return False
+        return {"healthy": False, "error_message": f"Exception: {exception_type}: {exception_message}", "last_check": time.time()}
 
 
 async def generate_miniwob_rollout(
@@ -128,17 +111,7 @@ async def generate_miniwob_rollout(
         health = await check_env_server_health(env_job, session)
         if not health["healthy"]:
             logger.warning(f"Environment server {env_job_url} is unhealthy: {health}")
-            # Try to reset the server
-            if await reset_env_server(env_job, session):
-                logger.info(f"Reset environment server {env_job_url} successfully, retrying health check")
-                await asyncio.sleep(5)  # Wait for server to restart
-                health = await check_env_server_health(env_job, session)
-                if not health["healthy"]:
-                    logger.error(f"Environment server {env_job_url} still unhealthy after reset: {health}")
-                    continue
-            else:
-                logger.error(f"Failed to reset environment server {env_job_url}")
-                continue
+            continue
         # Log health status for monitoring
         if health["healthy"]:
             logger.info(f"Using healthy environment server {env_job_url}: {health}")
@@ -198,38 +171,54 @@ async def _execute_rollout_with_timeout(
                     logger.warning("Retry start task after 5 seconds.")
                     await asyncio.sleep(5)
         logger.info(
-            f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds"
+            f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds. Worker ID: {env.worker_id}. Tape dict: {tape_dict}"
         )
         tape: WebTape = WebTape(**tape_dict)  # convert http response dict to WebTape object
         t = time.perf_counter()
         if no_error:  # only run the agent if the task started successfully
-            logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
+            logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}")
             agent_attempts = cfg.agent_attempts
             while agent_attempts > 0:
+                # check if the worker is alive.
+                try:
+                    # this will either raise RuntimeError if worker is not alive anymore, or return a dictionary with the worker status
+                    worker_status = await env.check_worker_alive()
+                    if worker_status.get("status") == "starting":
+                        logger.warning(f"Worker {env.worker_id} for task {problem['dataset']}/{problem['task']}/{problem['seed']} and tape ID {tape.metadata.id} is starting, waiting 5 seconds for it to be fully started.")
+                        await asyncio.sleep(5)
+                        continue
+                except Exception as e:
+                    # if worker is dead, no need to retry
+                    logger.exception(f"Worker {env.worker_id} for task {problem['dataset']}/{problem['task']}/{problem['seed']} and tape ID {tape.metadata.id} is dead. Error: {e}", stack_info=True)
+                    no_error = False
+                    break
+                # if worker is alive, run the agent
                 try:
                     actions = await env.a_actions()
                     tools_description = await env.a_tools_description()
                     agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
                     agent.llms = {DEFAULT: llm}
                     tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
-                    # Check if the tape has an error from the orchestrator (e.g., SocketTimeoutError)
+                    # Check if the tape has an error from the orchestrator (e.g., SocketTimeoutError, RuntimeError: Worker is not alive, etc.)
                     if tape.metadata.error:
+                        logger.error(f"Agent execution for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id} returned a tape with error: {tape.metadata.error}")
                         raise ValueError(tape.metadata.error)
                     else:
                         # Success - break out of retry loop
+                        logger.info(f"Agent execution for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id} finished successfully")
                         break
                 except Exception as e:
                     agent_attempts -= 1
-                    logger.warning(f"Error occurred while running agent. {agent_attempts} attempts remaining. Error: {e}")
+                    logger.warning(f"Error occurred while running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}. {agent_attempts} attempts remaining. Error: {e}")
                     if agent_attempts <= 0:
-                        logger.error(f"Agent execution failed after all retry attempts: {e}")
+                        logger.error(f"Agent execution failed after all retry attempts for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}: {e}")
                         no_error = False
                         break
                     else:
-                        logger.warning("Retry agent execution after 5 seconds.")
+                        logger.warning(f"Retry agent execution after 5 seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}.")
                         await asyncio.sleep(5)
             logger.info(
-                f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds"
+                f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds with worker ID: {env.worker_id} and tape ID {tape.metadata.id}"
             )
         tape.metadata.result.update({"total_execution_time": time.perf_counter() - t})
 
