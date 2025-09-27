@@ -43,7 +43,7 @@ async def generate_math_rollout(
     messages = []
     if cfg.actor.system_prompt:
         messages.append({"role": "system", "content": cfg.actor.system_prompt})
-    messages.append({"role": "user", "content": f"{problem['task']}\n{cfg.actor.task_prompt}"})
+    messages.append({"role": "user", "content": f"{problem['task']} \n{cfg.actor.task_prompt}"})
     prompt = Prompt(messages=messages)
 
     time_start = time.time()
