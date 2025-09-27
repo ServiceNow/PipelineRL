@@ -39,7 +39,7 @@ class RLConfig(BaseModel):
     policy_loss: str = Field(
         default="ppo",
         description="Policy Loss to use for RL",
-        choices=["ppo", "reinforce"],
+        choices=["ppo", "reinforce", "gspo"],
     )
     use_advantages: bool = Field(
         default=True,
@@ -280,17 +280,46 @@ def rl_step(
             clamp_log_ratio_new_old_indicators = ratio_new_old > 1 + config.epsilon
             ratio_new_old = torch.clamp(ratio_new_old, 0, 1 + config.epsilon)
             policy_loss = new_logprobs * log_p_weights * ratio_new_old.detach()
+        case "gspo":
+            if segments is None:
+                raise ValueError("GSPO loss requires packed sequences with segments")
+            # Aggregate per-sequence means over valid (labeled) tokens only.
+            # Skip sequences with zero labeled tokens to avoid NaNs from mean([]).
+            group_log_ratio_new_old: list[torch.Tensor] = []
+            group_advantages: list[torch.Tensor] = []
+            for i in range(num_sequences):
+                start, end = segments[i]
+                group_mask_id = masks_shifted[0, start:end]
+                if not torch.any(group_mask_id):
+                    continue  # no output tokens in this segment; skip it entirely
+                grp_lrn = log_ratio_new_old[0, start:end][group_mask_id]
+                grp_adv = advantages[0, start:end][group_mask_id]
+                # means are well-defined because we ensured at least one element
+                group_log_ratio_new_old.append(grp_lrn.mean())
+                group_advantages.append(grp_adv.mean())
+            if len(group_log_ratio_new_old) == 0:
+                # No valid groups in this batch; define zero loss on current step
+                policy_loss_total = torch.zeros((), device=new_logprobs.device, dtype=new_logprobs.dtype)
+            else:
+                group_ratio_new_old = torch.exp(torch.stack(group_log_ratio_new_old)).unsqueeze(1).unsqueeze(2)
+                group_advantages_t = torch.stack(group_advantages).unsqueeze(1).unsqueeze(2)
+                surr1 = group_ratio_new_old * group_advantages_t
+                clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
+                clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
+                surr2 = clamped_group_ratio * group_advantages_t
+                policy_loss_total = torch.min(surr1, surr2).sum()
         case _:
             raise ValueError(f"Unknown algorithm {config.policy_loss}")
 
     # combine loss components
-    loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
-    assert loss.shape == tokens_weights.shape, (
-        f"Loss shape {loss.shape} does not match example weights shape {tokens_weights.shape}"
-    )
-    loss = loss * tokens_weights  # 1 x (BxL) x 1
+    if config.policy_loss != "gspo":
+        loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
+        assert loss.shape == tokens_weights.shape, (
+            f"Loss shape {loss.shape} does not match example weights shape {tokens_weights.shape}"
+        )
+        loss = loss * tokens_weights  # 1 x (BxL) x 1
 
-    policy_loss_total = -sum_sum(loss, masks_shifted, segments)
+        policy_loss_total = -sum_sum(loss, masks_shifted, segments)
     
     if has_value_head:
         # Get the value predictions
@@ -341,9 +370,9 @@ def rl_step(
         "kl_new_old": sum_sum(approx_kl_new_old / num_labels_in_seq, masks_shifted, segments).item(),
         "max_kl": approx_kl[masks_shifted].max().item(),
         "min_kl": approx_kl[masks_shifted].min().item(),
-        "policy_loss": sum_sum(policy_loss / num_labels_in_seq, masks_shifted, segments).item(),
-        "surr1": sum_sum(surr1 / num_labels_in_seq, masks_shifted, segments).item(),
-        "surr2": sum_sum(surr2 / num_labels_in_seq, masks_shifted, segments).item(),
+        #"policy_loss": sum_sum(policy_loss / num_labels_in_seq, masks_shifted, segments).item(),
+        #"surr1": sum_sum(surr1 / num_labels_in_seq, masks_shifted, segments).item(),
+        #"surr2": sum_sum(surr2 / num_labels_in_seq, masks_shifted, segments).item(),
         "ratio_new_old": sum_sum(ratio_new_old / num_labels_in_seq, masks_shifted, segments).item(),
         "ratio_new_old_sum": sum_sum(ratio_new_old, masks_shifted, segments).item(),
         "ratio_new_old_squared_sum": sum_sum(  # useful to estimate the ESS
@@ -354,10 +383,10 @@ def rl_step(
         "clamp_log_ratio_ref_new_indicator": sum_sum(
             clamp_log_ratio_ref_new_indicators / num_labels_in_seq, masks_shifted, segments
         ).item(),
-        "clamp_log_ratio_new_old_indicator": sum_sum(
-            clamp_log_ratio_new_old_indicators / num_labels_in_seq, masks_shifted, segments
-        ).item(),
-        "num_nans": torch.isnan(loss).sum().item(),
+        #"clamp_log_ratio_new_old_indicator": sum_sum(
+        #    clamp_log_ratio_new_old_indicators / num_labels_in_seq, masks_shifted, segments
+        #).item(),
+        #"num_nans": torch.isnan(loss).sum().item(),
         "token_weight": sum_sum(tokens_weights / num_labels_in_seq, masks_shifted, segments).item(),
         "max_token_weight": tokens_weights[masks_shifted].max().item(),
         "min_token_weight": tokens_weights[masks_shifted].min().item(),
