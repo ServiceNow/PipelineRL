@@ -129,6 +129,8 @@ def per_segment_sums(
 
     # Slice and unify device/dtypes
     seg = segment_ids[:, 1:].contiguous().squeeze(0).to(dtype=torch.long)
+    if seg.numel() == 0:
+        return (torch.ones(0), torch.ones(0), torch.ones(0))
     local_max = seg.max().to(torch.int64)
 
     if seq_parallel_group is None or not dist.is_available() or not dist.is_initialized():
