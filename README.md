@@ -1,14 +1,30 @@
-# Pipeline RL
+# Pipeline RL: fast LLM agent training
 
 [![Github](https://img.shields.io/badge/HF%20Blog%20Post-0000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Get Started](#get-started)
+- [Setup](#setup)
+- [Run Experiments](#run-experiments)
+- [Architecture and Pipeline Stages](#architecture-and-pipeline-stages)
+  - [1. Orchestrator](#1-orchestrator)
+  - [2. Inference Servers](#2-inference-servers)
+  - [3. Actor Processes](#3-actor-processes)
+  - [4. Preprocessor](#4-preprocessor)
+  - [5. Trainer (Fine-tuner)](#5-trainer-fine-tuner)
+  - [6. Verifier](#6-verifier)
+  - [Streams Backend](#streams-backend)
+  - [Streams & Queues](#streams--queues)
+
+## Overview
 
 A scalable asynchronous reinforcement learning implementation with in-flight weight updates. Designed to maximize GPU utilization while staying as on-policy as possible.
 
 <p align="center">
     <img src="assets/figure1.jpg" alt="Pipeline-RL Architecture" width="600">
 </p>
-
-## Why PipelineRL?
 
 PipelineRL tackles the classic trade-off between **inference throughput** (large batches on many GPUs) and **on-policy data freshness** by performing _inflight weight updates_. After each optimizer step, updated weights are broadcast to the inference servers without halting sampling. This keeps batch sizes optimal and data near on-policy, yielding fast, stable RL for large language models.
 
@@ -19,9 +35,155 @@ PipelineRL tackles the classic trade-off between **inference throughput** (large
 - In experiments on 7B and 32B models (batch size 4096, lr=1e-6, max tokens=8192), PipelineRL matches or exceeds Open-Reasoner-Zero on AIME-2024 and MATH-500.
 - Uses a simplified GRPO algorithm: no value network, no trust-region clamping, no KL or entropy bonuses by default (though KL support is available).
 
+## Get started
 
+PipelineRL is agent framework agnostic, meaning you can use it to train any agent by implementing a `load_problems` and `generate_rollout` functions for your task. For example, we can easily design and train a multi-turn LLM agent that must guess a number between 1 and 1024. After each guess, the agent receives feedback whether the guess was higher or lower than the target number. 
 
+First, we must implement `load_problems` to generate a list of train and test problems. Each problem is a dictionary with an `answer` key and a `dataset` key indicating whether it belongs to the training or testing dataset. 
 
+````python
+def load_problems(dataset_names: list[str]) -> list[dict]:
+    n = 1024
+    c = 191
+    problems = []
+    for name in dataset_names:
+        if name == "train":
+            problems.extend([
+                {"answer": (2 * i * c) % n + 1, "dataset": "train"} for i in range(512)
+            ])
+        elif name == "test":
+            problems.extend([
+                {"answer": ((2 * i + 1) * c) % n + 1, "dataset": "test"} for i in range(512)
+            ])
+    return problems
+````
+
+Then, we must implement a `generate_rollout` function which takes a problem from the `load_problems` function and generate a `RolloutResult`. `RolloutResult` contains the a list of `TrainingText` (token ids, log probs, reward, etc.), `BaseMetrics` (reward, success, etc.), latency of the rollout in seconds, and the `dataset_name` which will be used for grouping the metrics. Here, the function should use an LLM to generate guesses and provide feedback based on the problem's answer.
+
+````python
+async def generate_rollout(
+    cfg: DictConfig,
+    llm: TrainableLLM,
+    problem: dict,
+    session: aiohttp.ClientSession,
+) -> RolloutResult:
+    initial_messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant",
+        },
+        {
+            "role": "user",
+            "content": f"You must guess a number between 1 and 1024. Output the answer as <answer>number</answer>."
+                        " After each guess I will tell you if your answer is higher or lower than the target number."
+        }
+    ]
+    time_start = time.time()
+    llm_calls = []
+    guess_history = []
+    reward = 0
+    success = 0
+    error = 0
+    for i in range(13):
+        messages = initial_messages.copy()
+        if i > 0:
+            last_message = f"Your {i} previous guesses:"
+            for guess in guess_history:
+                relation = "lower" if guess < problem["answer"] else "higher"
+                last_message += f"\n{guess}, which is {relation} than the target number."
+            else:
+                last_message += "\n<wrong output>"
+            messages.append({
+                "role": "user",
+                "content": last_message
+            })
+        llm_call = await llm_async_generate(llm, Prompt(messages=messages), session)
+        llm_calls.append(llm_call)
+
+        output_text = llm_call.output.content or ""
+        answer = re.search("<answer>(\d+)</answer>", output_text)
+        if answer:
+            answer = int(answer.group(1))
+            if answer == problem["answer"]:
+                reward = 2 - i / 10
+                success = 1
+                break
+            else:
+                guess_history.append(answer)                            
+        else:
+            # bonus for using the correct output format in the first turns
+            reward = -2 + i / 10
+            error = 1
+            break
+    latency = time.time() - time_start        
+
+    # TrainingText contains the prompt and output tokens, reward, and the log probs of the output tokens necessary for RL training.
+    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
+    for text in training_texts:
+        text.reward = reward
+
+    metrics = BaseMetrics(
+        reward=reward,
+        success=success,
+        no_error=not error,
+        no_answer=error,
+    )
+
+    return RolloutResult(
+        training_texts=training_texts,
+        metrics=metrics,
+        latency=latency,
+        dataset_name=problem["dataset"],
+    )
+    
+````
+
+Finally you need to create a Hydra config file that points to the rollout function and the dataset loader. Additional hyper-parameters such as model path, learning rate, etc. can also be modified. For example, [`guessing.yaml`](conf/guessing.yaml):
+
+````yaml
+defaults:
+    - base
+    - _self_
+
+actor:
+    rollout_policy: pipelinerl.domains.guessing.generate_guessing_rollout
+environment: null
+dataset_loader: pipelinerl.domains.guessing.load_problems
+train_dataset_names:
+    - train
+test_dataset_names:
+    - test
+````
+
+You can now launch the training with the following command:
+
+```bash
+python -m pipelinerl.launch config_name=guessing output_dir=results/guessing
+```
+
+Once the LLMs are served, the actor will be evaluated on the test dataset before collecting training rollouts.
+
+<p align="center">
+    <img src="assets/actor.png" alt="Actor" width="800">
+</p>
+
+When enough data has been collected, the trainer will perform a RL step and update the actor's weights.
+
+<p align="center">
+    <img src="assets/rl_loss.png" alt="RL loss" width="800">
+</p>
+
+The streaming logs can be overwhelming, and it is therefore easier to debug using the each process log files in the `results/guessing`:
+
+<p align="center">
+    <img src="assets/logs.png" alt="Logs folder" width="800">
+</p>
+
+After roughly 20 minutes, the actor will have learned a strategy to guess the number correctly. The training can be monitored in real-time using WANDB, which will show the training and test metrics:
+
+<p align="center">
+    <img src="assets/guessing_success.png" alt="Logs folder" width="800">
+</p>
 
 ## Setup
 

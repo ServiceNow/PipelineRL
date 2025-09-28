@@ -675,8 +675,6 @@ def rl_finetuning_worker(
                 for k, v in this_step_rl_metrics.items():
                     rl_metrics[k].append(v)
 
-                training_metrics.lr = optimizer.param_groups[0]["lr"]
-
             backward(loss, is_final_micro_batch=do_optimizer_step)
 
         if not is_sentinel_batch:
@@ -728,6 +726,7 @@ def rl_finetuning_worker(
         
         if time_to_log or time_to_save:
             dt = log_time(dt, time_stats, "finetune/interim_eval")
+            training_metrics.lr = optimizer.param_groups[0]["lr"]
             metrics_dict.update(
                 {
                     "stats/lr": training_metrics.lr,
