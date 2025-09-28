@@ -307,7 +307,7 @@ def rl_step(
                 clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
                 clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
                 surr2 = clamped_group_ratio * group_advantages_t
-                policy_loss_total = torch.min(surr1, surr2).sum()
+                policy_loss_total = -torch.min(surr1, surr2).sum()
         case _:
             raise ValueError(f"Unknown algorithm {config.policy_loss}")
 
