@@ -299,7 +299,7 @@ def rl_step(
                 group_advantages.append(grp_adv.mean())
             if len(group_log_ratio_new_old) == 0:
                 # No valid groups in this batch; define zero loss on current step
-                policy_loss_total = torch.zeros((), device=new_logprobs.device, dtype=new_logprobs.dtype)
+                policy_loss_total = 0 * ratio_new_old.sum()
             else:
                 group_ratio_new_old = torch.exp(torch.stack(group_log_ratio_new_old)).unsqueeze(1).unsqueeze(2)
                 group_advantages_t = torch.stack(group_advantages).unsqueeze(1).unsqueeze(2)
