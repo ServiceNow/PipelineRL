@@ -130,7 +130,14 @@ def per_segment_sums(
     # Slice and unify device/dtypes
     seg = segment_ids[:, 1:].contiguous().squeeze(0).to(dtype=torch.long)
     if seg.numel() == 0:
-        return (torch.ones(0), torch.ones(0), torch.ones(0))
+        # keep requires_grad consistent
+        device = log_ratio_new_old.device
+        dtype = log_ratio_new_old.dtype
+        requires_grad = log_ratio_new_old.requires_grad or advantages.requires_grad
+
+        make_zeros = lambda: torch.zeros(0, dtype=dtype, device=device, requires_grad=requires_grad)
+        return make_zeros(), make_zeros(), make_zeros()
+
     local_max = seg.max().to(torch.int64)
 
     if seq_parallel_group is None or not dist.is_available() or not dist.is_initialized():
