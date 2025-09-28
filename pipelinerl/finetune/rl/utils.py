@@ -31,11 +31,19 @@ def mask_sum(values: torch.Tensor, mask: torch.Tensor, axis: Optional[int] = Non
 
 
 def mask_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[int] = None) -> torch.Tensor:
-    """Compute mean of tensor with a masked values."""
+    """Compute mean of tensor with masked values, safely handling empty masks.
+
+    Uses a clamped denominator so the result is 0 when the mask sums to 0,
+    while keeping the computation connected to the graph via the numerator.
+    """
     if axis is not None:
-        return (values * mask).nan_to_num(0).sum(axis=axis) / mask.sum(axis=axis)  # type: ignore
+        num = (values * mask).nan_to_num(0).sum(axis=axis)  # type: ignore
+        den = mask.sum(axis=axis).clamp(min=1).to(dtype=values.dtype)  # type: ignore
+        return num / den
     else:
-        return (values * mask).nan_to_num(0).sum() / mask.sum()
+        num = (values * mask).nan_to_num(0).sum()
+        den = mask.sum().clamp(min=1).to(dtype=values.dtype)
+        return num / den
 
 
 def mean_sum(values: torch.Tensor, masks: torch.Tensor, segments: list | None):
@@ -194,10 +202,15 @@ def per_segment_sums(
         lrn_sum.index_add_(0, seg_v, lrn_v * w_v)
         adv_sum.index_add_(0, seg_v, adv_v * w_v)
     else:
-        # No valid tokens: return zeros
+        # No valid tokens: return zeros, but keep graph connectivity so downstream
+        # losses still "require_grad" (DeepSpeed/PyTorch expect this).
+        # Create zero scalars tied to inputs; gradients will be zero but the graph remains.
+        zero_from_lrn = (lrn * 0).sum()  # requires_grad if lrn requires_grad
+        zero_from_adv = (adv * 0).sum()  # requires_grad if adv requires_grad
         token_count = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
-        lrn_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
-        adv_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
+        # Broadcastable add keeps autograd connection even when n_segments > 0
+        lrn_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device) + zero_from_lrn
+        adv_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device) + zero_from_adv
 
     # Optional all-reduce across sequence-parallel group. Ensure all ranks perform the same
     # number of collectives, even when n_segments == 0 locally (e.g., sentinel micro-batches).

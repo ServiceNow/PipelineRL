@@ -286,7 +286,6 @@ def rl_step(
             if segments is None:
                 raise ValueError("GSPO loss requires packed sequences with segments")
             # Aggregate per-sequence means over valid (labeled) tokens only.
-            # Skip sequences with zero labeled tokens to avoid NaNs from mean([]).
             lrn_sum, adv_sum, tok_count = per_segment_sums(
                 batch.segment_ids,
                 masks_shifted,
@@ -300,7 +299,11 @@ def rl_step(
             clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
             clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
             surr2 = clamped_group_ratio * group_advantages_t
-            policy_loss_total = -torch.min(surr1, surr2).sum() if not batch.sentinel else group_ratio_new_old.sum() * 0.0
+            # If we have a sentinel or no segments, return a zero loss but keep graph
+            if batch.sentinel or surr1.numel() == 0:
+                policy_loss_total = new_logprobs[..., :1].sum() * 0.0
+            else:
+                policy_loss_total = -torch.min(surr1, surr2).sum()
             expanded_indicators = torch.zeros_like(masks_shifted, dtype=torch.float)
             # Expand per-sequence indicators to token-level across segment ranges
             # Flatten to 1-D so single-sequence cases don't produce 0-d tensors
