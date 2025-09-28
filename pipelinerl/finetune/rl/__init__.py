@@ -301,6 +301,10 @@ def rl_step(
             clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
             surr2 = clamped_group_ratio * group_advantages_t
             policy_loss_total = -torch.min(surr1, surr2).sum()
+            expanded_indicators = torch.zeros_like(masks_shifted, dtype=torch.float)
+            for (start, end), val in zip(segments, clamp_log_ratio_new_old_indicators.squeeze()):
+                expanded_indicators[start:end] = float(val)
+            clamp_log_ratio_new_old_indicators = expanded_indicators
         case _:
             raise ValueError(f"Unknown algorithm {config.policy_loss}")
 
@@ -376,9 +380,9 @@ def rl_step(
         "clamp_log_ratio_ref_new_indicator": sum_sum(
             clamp_log_ratio_ref_new_indicators / num_labels_in_seq, masks_shifted, segments
         ).item(),
-        #"clamp_log_ratio_new_old_indicator": sum_sum(
-        #    clamp_log_ratio_new_old_indicators / num_labels_in_seq, masks_shifted, segments
-        #).item(),
+        "clamp_log_ratio_new_old_indicator": sum_sum(
+            clamp_log_ratio_new_old_indicators / num_labels_in_seq, masks_shifted, segments
+        ).item(),
         #"num_nans": torch.isnan(loss).sum().item(),
         "token_weight": sum_sum(tokens_weights / num_labels_in_seq, masks_shifted, segments).item(),
         "max_token_weight": tokens_weights[masks_shifted].max().item(),
