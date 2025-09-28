@@ -131,7 +131,7 @@ def per_segment_sums(
     seg = segment_ids[:, 1:].contiguous().squeeze(0).to(dtype=torch.long)
     if seg.numel() == 0:
         # keep requires_grad consistent
-        return log_ratio_new_old, advantages, torch.ones(0, device=log_ratio_new_old.device, dtype=log_ratio_new_old.dtype)
+        return log_ratio_new_old, advantages, torch.ones_like(log_ratio_new_old, device=log_ratio_new_old.device, dtype=log_ratio_new_old.dtype)
 
     local_max = seg.max().to(torch.int64)
 
