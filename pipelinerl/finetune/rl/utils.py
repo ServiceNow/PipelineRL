@@ -3,7 +3,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from datasets import Dataset
-
+from torch import distributed as dist
 
 def aggregate_rl_stats(rl_stats: dict, num_samples: int):
     avg_rl_stats: dict[str, float] = {}
@@ -96,3 +96,103 @@ def replace_dataset_column(dataset: Dataset, column_name: str, new_column: List[
     dataset = dataset.add_column(name=column_name, column=new_column)  # type: ignore
 
     return dataset
+
+
+
+def per_segment_sums(
+    segment_ids: torch.LongTensor,
+    masks_shifted: torch.Tensor,
+    log_ratio_new_old: torch.Tensor,
+    advantages: torch.Tensor,
+    seq_parallel_group=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Differentiable version of per-segment sums using scatter_add instead of bincount.
+
+    Args:
+        segment_ids: [1, L] integer segment id per token (packed batches). Should align with labels positions.
+        masks_shifted: [1, L-1] boolean mask for valid (non -100) labels excluding first token.
+        log_ratio_new_old: [1, L-1] tensor.
+        advantages: [1, L-1] tensor.
+        n_segments: total number of segments.
+        seq_parallel_group: optional torch.distributed group for seq-parallel; if provided, results are all-reduced.
+
+    Returns:
+        (log_ratio_sum_per_seg, advantages_sum_per_seg, token_count_per_seg), each shaped [n_segments].
+    """
+    if segment_ids is None:
+        raise ValueError("segment_ids must be provided for per-segment reductions")
+
+    # Expect [1, L] -> align to shifted tensors [1, L-1]
+    if segment_ids.dim() != 2 or segment_ids.shape[0] != 1:
+        raise ValueError(f"Expected segment_ids of shape [1, L], got {tuple(segment_ids.shape)}")
+
+    # Slice and unify device/dtypes
+    seg = segment_ids[:, 1:].contiguous().squeeze(0).to(dtype=torch.long)
+    local_max = seg.max().to(torch.int64)
+
+    if seq_parallel_group is None or not dist.is_available() or not dist.is_initialized():
+        n_segments = int(local_max.item()) + 1
+    else:
+        global_max = local_max.clone()
+        dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=seq_parallel_group)
+        n_segments = int(global_max.item()) + 1
+
+    mask = masks_shifted[:, :seg.numel()].contiguous().squeeze(0)
+    lrn  = log_ratio_new_old[:, :seg.numel()].contiguous().squeeze(0)
+    adv  = advantages[:, :seg.numel()].contiguous().squeeze(0)
+
+    # Put everything on same device
+    device = lrn.device
+    seg  = seg.to(device=device)
+    mask = mask.to(device=device, dtype=lrn.dtype)  # float mask is fine for weighting
+    adv  = adv.to(device=device, dtype=lrn.dtype)
+    # lrn already on device
+
+    # Consider only VALID tokens before indexing
+    # Important: this prevents out-of-bounds reads from indices you intended to ignore
+    valid = (mask != 0)
+    if valid.ndim != 1 or valid.shape[0] != seg.shape[0]:
+        raise ValueError("Mask shape mismatch after alignment with segment_ids.")
+
+    if valid.any():
+        seg_v  = seg[valid]                 # indices actually used
+        w_v    = mask[valid]                # weights for counts
+        lrn_v  = lrn[valid]
+        adv_v  = adv[valid]
+
+        # Range check BEFORE scatter to produce a clean error
+        smin = int(seg_v.min())
+        smax = int(seg_v.max())
+        if smin < 0 or smax >= n_segments:
+            raise IndexError(
+                f"per_segment_sums_diff_safe: segment index out of bounds. "
+                f"min(seg)={smin}, max(seg)={smax}, n_segments={n_segments}. "
+                "Likely causes: (1) n_segments too small (compute after packing), "
+                "(2) off-by-one when dropping the first token, "
+                "(3) segment ids are global across workers but you passed local n_segments."
+            )
+
+        # Allocate outputs
+        token_count = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
+        lrn_sum     = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
+        adv_sum     = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
+
+        # index_add_ is equivalent to scatter_add_ for 1D reductions and can be clearer
+        token_count.index_add_(0, seg_v, w_v)
+        lrn_sum.index_add_(0, seg_v, lrn_v * w_v)
+        adv_sum.index_add_(0, seg_v, adv_v * w_v)
+    else:
+        # No valid tokens: return zeros
+        token_count = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
+        lrn_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
+        adv_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
+
+    # Optional all-reduce across sequence-parallel group
+    if seq_parallel_group is not None and dist.is_available() and dist.is_initialized():
+        from torch.distributed.nn.functional import all_reduce
+        token_count = all_reduce(token_count, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+        lrn_sum = all_reduce(lrn_sum, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+        adv_sum = all_reduce(adv_sum, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+
+    return lrn_sum, adv_sum, token_count

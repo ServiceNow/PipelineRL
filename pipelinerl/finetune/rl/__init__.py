@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
+from pipelinerl.finetune.rl.utils import per_segment_sums
 
 from .utils import (
     sum_sum,
@@ -133,6 +134,7 @@ def rl_step(
     current_step: int,
     max_step: int,
     config: RLConfig,
+    seq_parallel_group=None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Perform a single RL step on the model using the given batch and config.
@@ -285,29 +287,20 @@ def rl_step(
                 raise ValueError("GSPO loss requires packed sequences with segments")
             # Aggregate per-sequence means over valid (labeled) tokens only.
             # Skip sequences with zero labeled tokens to avoid NaNs from mean([]).
-            group_log_ratio_new_old: list[torch.Tensor] = []
-            group_advantages: list[torch.Tensor] = []
-            for i in range(num_sequences):
-                start, end = segments[i]
-                group_mask_id = masks_shifted[0, start:end]
-                if not torch.any(group_mask_id):
-                    continue  # no output tokens in this segment; skip it entirely
-                grp_lrn = log_ratio_new_old[0, start:end][group_mask_id]
-                grp_adv = advantages[0, start:end][group_mask_id]
-                # means are well-defined because we ensured at least one element
-                group_log_ratio_new_old.append(grp_lrn.mean())
-                group_advantages.append(grp_adv.mean())
-            if len(group_log_ratio_new_old) == 0:
-                # No valid groups in this batch; define zero loss on current step
-                policy_loss_total = 0 * ratio_new_old.sum()
-            else:
-                group_ratio_new_old = torch.exp(torch.stack(group_log_ratio_new_old)).unsqueeze(1).unsqueeze(2)
-                group_advantages_t = torch.stack(group_advantages).unsqueeze(1).unsqueeze(2)
-                surr1 = group_ratio_new_old * group_advantages_t
-                clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
-                clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
-                surr2 = clamped_group_ratio * group_advantages_t
-                policy_loss_total = -torch.min(surr1, surr2).sum()
+            lrn_sum, adv_sum, tok_count = per_segment_sums(
+                batch.segment_ids,
+                masks_shifted,
+                log_ratio_new_old,
+                advantages,
+                seq_parallel_group=seq_parallel_group,
+            )
+            group_ratio_new_old = torch.exp(lrn_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2)
+            group_advantages_t = (adv_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2)
+            surr1 = group_ratio_new_old * group_advantages_t
+            clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
+            clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
+            surr2 = clamped_group_ratio * group_advantages_t
+            policy_loss_total = -torch.min(surr1, surr2).sum()
         case _:
             raise ValueError(f"Unknown algorithm {config.policy_loss}")
 
