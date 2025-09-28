@@ -302,8 +302,10 @@ def rl_step(
             surr2 = clamped_group_ratio * group_advantages_t
             policy_loss_total = -torch.min(surr1, surr2).sum()
             expanded_indicators = torch.zeros_like(masks_shifted, dtype=torch.float)
-            for (start, end), val in zip(segments, clamp_log_ratio_new_old_indicators.squeeze()):
-                expanded_indicators[start:end] = float(val)
+            # Expand per-sequence indicators to token-level across segment ranges
+            # Flatten to 1-D so single-sequence cases don't produce 0-d tensors
+            for (start, end), val in zip(segments, clamp_log_ratio_new_old_indicators.flatten()):
+                expanded_indicators[0, start:end] = float(val)
             clamp_log_ratio_new_old_indicators = expanded_indicators
         case _:
             raise ValueError(f"Unknown algorithm {config.policy_loss}")
