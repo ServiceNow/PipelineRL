@@ -128,19 +128,26 @@ def per_segment_sums(
         raise ValueError(f"Expected segment_ids of shape [1, L], got {tuple(segment_ids.shape)}")
 
     # Slice and unify device/dtypes
-    seg = segment_ids[:, 1:].contiguous().squeeze(0).to(dtype=torch.long)
-    if seg.numel() == 0:
-        # keep requires_grad consistent
-        return log_ratio_new_old, advantages, torch.ones_like(log_ratio_new_old, device=log_ratio_new_old.device, dtype=log_ratio_new_old.dtype)
+    # Always compute a consistent number of collectives across ranks to avoid NCCL deadlocks.
+    # We cannot call seg.max() on empty tensors, so handle that path explicitly while still
+    # participating in all necessary collectives.
+    seg = segment_ids[:, 1:].contiguous().squeeze(0).to(dtype=torch.long, device=log_ratio_new_old.device)
+    seg_is_empty = seg.numel() == 0
 
-    local_max = seg.max().to(torch.int64)
-
+    # Determine n_segments. For distributed, we first all-reduce the local max (or -1 for empty)
+    # so all ranks agree on a global n_segments. This preserves the collective call even for empty ranks.
     if seq_parallel_group is None or not dist.is_available() or not dist.is_initialized():
-        n_segments = int(local_max.item()) + 1
+        if seg_is_empty:
+            n_segments = 0
+        else:
+            n_segments = int(seg.max().to(torch.int64).item()) + 1
     else:
+        local_max = torch.tensor(-1, dtype=torch.int64, device=log_ratio_new_old.device)
+        if not seg_is_empty:
+            local_max = seg.max().to(torch.int64)
         global_max = local_max.clone()
         dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=seq_parallel_group)
-        n_segments = int(global_max.item()) + 1
+        n_segments = int(global_max.item()) + 1  # will be 0 if all ranks are empty
 
     mask = masks_shifted[:, :seg.numel()].contiguous().squeeze(0)
     lrn  = log_ratio_new_old[:, :seg.numel()].contiguous().squeeze(0)
@@ -159,7 +166,7 @@ def per_segment_sums(
     if valid.ndim != 1 or valid.shape[0] != seg.shape[0]:
         raise ValueError("Mask shape mismatch after alignment with segment_ids.")
 
-    if valid.any():
+    if (not seg_is_empty) and valid.any():
         seg_v  = seg[valid]                 # indices actually used
         w_v    = mask[valid]                # weights for counts
         lrn_v  = lrn[valid]
@@ -192,11 +199,19 @@ def per_segment_sums(
         lrn_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
         adv_sum = torch.zeros(n_segments, dtype=lrn.dtype, device=device)
 
-    # Optional all-reduce across sequence-parallel group
+    # Optional all-reduce across sequence-parallel group. Ensure all ranks perform the same
+    # number of collectives, even when n_segments == 0 locally (e.g., sentinel micro-batches).
     if seq_parallel_group is not None and dist.is_available() and dist.is_initialized():
         from torch.distributed.nn.functional import all_reduce
-        token_count = all_reduce(token_count, op=dist.ReduceOp.SUM, group=seq_parallel_group)
-        lrn_sum = all_reduce(lrn_sum, op=dist.ReduceOp.SUM, group=seq_parallel_group)
-        adv_sum = all_reduce(adv_sum, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+        if n_segments == 0:
+            # Perform three dummy all-reduces to match the non-empty path (token_count, lrn_sum, adv_sum)
+            dummy = torch.zeros(1, dtype=lrn.dtype, device=device)
+            _ = all_reduce(dummy, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+            _ = all_reduce(dummy, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+            _ = all_reduce(dummy, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+        else:
+            token_count = all_reduce(token_count, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+            lrn_sum = all_reduce(lrn_sum, op=dist.ReduceOp.SUM, group=seq_parallel_group)
+            adv_sum = all_reduce(adv_sum, op=dist.ReduceOp.SUM, group=seq_parallel_group)
 
     return lrn_sum, adv_sum, token_count
