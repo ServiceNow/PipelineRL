@@ -186,7 +186,7 @@ async def schedule_rollouts(
     last_logged = time.time()
     logger.info("Starting rollout scheduler")
     connector = aiohttp.TCPConnector(limit=50000, limit_per_host=50000, keepalive_timeout=1.0)
-    timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
+    timeout = aiohttp.ClientTimeout(total=10*3600.0, connect=10*3600.0, sock_read=10*3600.0)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         while True:
             if time.time() - last_logged > 10.0 and sum(active_rollouts):
