@@ -159,13 +159,9 @@ async def _execute_rollout_with_timeout(
         t = time.perf_counter()
         while start_attempts > 0:
             try:
-                start_result = await env.start_task(problem)
-                if isinstance(start_result, dict) and "error" in start_result:
-                    raise ValueError(start_result['error'])
-                elif isinstance(start_result, list):
-                    tape_dict, _ = start_result
-                else:
-                    raise ValueError(f"Invalid start result: {start_result}")
+                tape_dict, info = await env.start_task(problem)
+                if info.get("error"):
+                    raise ValueError(info['error'])
                 break
             except Exception as e:
                 start_attempts -= 1
