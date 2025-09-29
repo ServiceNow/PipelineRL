@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+import traceback
 
 import aiohttp
 from examples.rl_webagent.steps import WebTape
@@ -75,7 +76,7 @@ async def check_env_server_health(env_job: Job, session: aiohttp.ClientSession) 
         exception_type = type(e).__name__
         exception_message = str(e) if str(e) else "No message available"
         logger.exception(f"Error checking environment server health: {exception_type}: {exception_message}", stack_info=True)
-        return {"healthy": False, "error_message": f"Exception: {exception_type}: {exception_message}", "last_check": time.time()}
+        return {"healthy": False, "error_message": f"Exception: {exception_type}: {exception_message}", "last_check": time.time(), "error_stacktrace": traceback.format_exc()}
 
 
 async def generate_miniwob_rollout(
@@ -111,6 +112,7 @@ async def generate_miniwob_rollout(
         health = await check_env_server_health(env_job, session)
         if not health["healthy"]:
             logger.warning(f"Environment server {env_job_url} is unhealthy: {health}")
+            logger.warning(f"Get health error stacktrace: {health['error_stacktrace']}")
             continue
         # Log health status for monitoring
         if health["healthy"]:
@@ -124,10 +126,16 @@ async def generate_miniwob_rollout(
             )
         except asyncio.TimeoutError:
             health = await check_env_server_health(env_job, session)
+            if stack_trace := health.get("error_stacktrace"):
+                logger.warning(f"Get health error stacktrace: {stack_trace}")
+            logger.warning(f"Rollout timeout error stacktrace: {traceback.format_exc()}")
             logger.warning(f"Rollout timed out after {rollout_timeout} seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {health}. Trying next server.")
             continue
         except Exception as e:
             health = await check_env_server_health(env_job, session)
+            if stack_trace := health.get("error_stacktrace"):
+                logger.warning(f"Get health error stacktrace: {stack_trace}")
+            logger.warning(f"Rollout failed error stacktrace: {traceback.format_exc()}")
             logger.warning(f"Rollout failed for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {health}. Trying next server.")
             continue
     # If all servers failed
