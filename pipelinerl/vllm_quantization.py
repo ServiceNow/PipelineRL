@@ -1,3 +1,4 @@
+import os
 import torch
 import logging
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
@@ -86,14 +87,22 @@ class BF16WithLastLayerFP32(QuantizationConfig):
                 tied_unembed = True
 
         if isinstance(layer, VocabParallelEmbedding):
-            if is_last_layer or tied_unembed:
+            if is_last_layer:
                 logger.info(
-                    "Quant config forcing FP32 embedding for %s (%s)%s",
+                    "Quant config forcing FP32 embedding for %s (%s)",
                     prefix,
                     layer.__class__.__name__,
-                    " [tied weights assumed]" if tied_unembed and not is_last_layer else "",
                 )
                 return _ForcedDTypeEmbeddingMethod(torch.float32)
+            if tied_unembed:
+                # Keep BF16 parameters for input embedding, but force logits
+                # matmul to FP32 via a custom apply() used by LogitsProcessor.
+                logger.info(
+                    "Detected tied embedding %s (%s); using FP32 unembedding matmul while keeping BF16 params.",
+                    prefix,
+                    layer.__class__.__name__,
+                )
+                return _FP32UnembedEmbeddingMethod()
             logger.info("Quant config leaving embedding %s (%s) unmodified", prefix, layer.__class__.__name__)
             return None
 
@@ -202,6 +211,29 @@ class _ForcedDTypeEmbeddingMethod(UnquantizedEmbeddingMethod):
                                       output_size,
                                       params_dtype=self._target_dtype,
                                       **extra_weight_attrs)
+
+
+class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
+    """Use BF16 weights in module state, but compute logits matmul in FP32.
+
+    This method does NOT change the dtype of the embedding weights stored in
+    the module (so input token embeddings remain in BF16). It only casts the
+    hidden states and the weight to FP32 inside apply(), which is used by the
+    LogitsProcessor to compute final logits via F.linear.
+    """
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: torch.Tensor | None = None) -> torch.Tensor:  # type: ignore[override]
+        # Log once to avoid spamming per token.
+        if not hasattr(layer, "_pipelinerl_fp32_unembed_logged"):
+            logger.info("Computing unembedding (logits) in FP32 for %s (%s)", layer.__class__.__name__, getattr(layer, 'tp_rank', ''))
+            layer._pipelinerl_fp32_unembed_logged = True
+        x32 = x if x.dtype == torch.float32 else x.to(torch.float32)
+        w32 = layer.weight if layer.weight.dtype == torch.float32 else layer.weight.to(torch.float32)
+        b32 = None if bias is None else (bias if bias.dtype == torch.float32 else bias.to(torch.float32))
+        return torch.nn.functional.linear(x32, w32, b32)
 
 
 def _string_to_dtype(value: str) -> torch.dtype:
