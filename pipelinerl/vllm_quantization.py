@@ -23,6 +23,12 @@ class BF16WithLastLayerFP32(QuantizationConfig):
     def __init__(self, config: object | None = None):
         super().__init__()
         self.default_dtype = self._resolve_default_dtype(config)
+        logger.info(
+            "Initialized quantization config '%s' with default_dtype=%s; last layer forced to %s",
+            self.get_name(),
+            self.default_dtype,
+            torch.float32,
+        )
 
     @staticmethod
     def _resolve_default_dtype(config: object | None) -> torch.dtype:
@@ -67,11 +73,26 @@ class BF16WithLastLayerFP32(QuantizationConfig):
         """Return quantization method for the given layer."""
 
         is_last_layer = prefix.endswith("lm_head") or prefix.endswith(
-            ".lm_head")
+            ".lm_head") or (".lm_head." in prefix) or ("lm_head." in prefix)
+
+        # Heuristic: many models (e.g., LLaMA/Qwen) tie the output projection
+        # (unembedding) to the input token embedding. When weight tying is used,
+        # there is no distinct Linear lm_head module. In that case, force the
+        # embedding weights to float32 so the final logits use FP32 params.
+        tied_unembed = False
+        if isinstance(layer, VocabParallelEmbedding):
+            name = prefix.lower()
+            if any(s in name for s in ["embed_tokens", "tok_embeddings", "word_embeddings", "wte"]):
+                tied_unembed = True
 
         if isinstance(layer, VocabParallelEmbedding):
-            if is_last_layer:
-                logger.info("Quant config forcing FP32 embedding for %s (%s)", prefix, layer.__class__.__name__)
+            if is_last_layer or tied_unembed:
+                logger.info(
+                    "Quant config forcing FP32 embedding for %s (%s)%s",
+                    prefix,
+                    layer.__class__.__name__,
+                    " [tied weights assumed]" if tied_unembed and not is_last_layer else "",
+                )
                 return _ForcedDTypeEmbeddingMethod(torch.float32)
             logger.info("Quant config leaving embedding %s (%s) unmodified", prefix, layer.__class__.__name__)
             return None
@@ -79,11 +100,28 @@ class BF16WithLastLayerFP32(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if is_last_layer:
                 logger.info("Quant config forcing FP32 linear layer for %s (%s)", prefix, layer.__class__.__name__)
+                # Also pin activations to FP32 via a pre-hook for clarity.
+                try:
+                    def _cast_input_to_fp32(_mod, _inp):
+                        if not _inp:
+                            return _inp
+                        args = list(_inp)
+                        if isinstance(args[0], torch.Tensor) and args[0].dtype != torch.float32:
+                            logger.info("Casting input activation to FP32 for %s (%s)", prefix, layer.__class__.__name__)
+                            args[0] = args[0].to(torch.float32)
+                        return tuple(args)
+
+                    # Avoid duplicate hooks on reload
+                    if not hasattr(layer, "_pipelinerl_fp32_hook_installed"):
+                        layer.register_forward_pre_hook(_cast_input_to_fp32)
+                        layer._pipelinerl_fp32_hook_installed = True
+                except Exception as _hook_err:  # pragma: no cover - defensive logging
+                    logger.warning("Failed to install FP32 input hook for %s: %s", prefix, _hook_err)
                 return _ForcedDTypeLinearMethod(torch.float32)
             logger.info("Quant config setting dtype %s for %s (%s)", self.default_dtype, prefix, layer.__class__.__name__)
             return _ForcedDTypeLinearMethod(self.default_dtype)
 
-        logger.debug("Quant config has no override for %s (%s)", prefix, layer.__class__.__name__)
+        logger.info("Quant config leaving module %s (%s) unmodified", prefix, layer.__class__.__name__)
         return None
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
@@ -134,7 +172,7 @@ class _ForcedDTypeLinearMethod(UnquantizedLinearMethod):
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
-        logger.debug("Creating linear weights for %s with dtype %s", layer.__class__.__name__, self._target_dtype)
+        logger.info("Creating linear weights for %s with dtype %s", layer.__class__.__name__, self._target_dtype)
         return super().create_weights(layer,
                                       input_size_per_partition,
                                       output_partition_sizes,
@@ -156,7 +194,7 @@ class _ForcedDTypeEmbeddingMethod(UnquantizedEmbeddingMethod):
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
-        logger.debug("Creating embedding weights for %s with dtype %s", layer.__class__.__name__, self._target_dtype)
+        logger.info("Creating embedding weights for %s with dtype %s", layer.__class__.__name__, self._target_dtype)
         return super().create_weights(layer,
                                       input_size_per_partition,
                                       output_partition_sizes,

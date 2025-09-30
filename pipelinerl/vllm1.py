@@ -39,6 +39,13 @@ formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+# Ensure quantization module logs are visible, too.
+_qlogger = logging.getLogger("pipelinerl.vllm_quantization")
+_qlogger.setLevel(logging.INFO)
+if not _qlogger.handlers:
+    _qlogger.addHandler(handler)
+_qlogger.propagate = False
+
 
 @runtime_checkable
 class LikeWorker(Protocol):

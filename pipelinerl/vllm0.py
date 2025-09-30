@@ -48,6 +48,14 @@ formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+# Ensure quantization module logs are visible, too.
+_qlogger = logging.getLogger("pipelinerl.vllm_quantization")
+_qlogger.setLevel(logging.INFO)
+# Avoid duplicate handlers if this module reloads.
+if not _qlogger.handlers:
+    _qlogger.addHandler(handler)
+_qlogger.propagate = False
+
 
 def make_worker_class(multi_step: bool):
     base_class = MultiStepWorker if multi_step else Worker
