@@ -228,11 +228,36 @@ class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
               bias: torch.Tensor | None = None) -> torch.Tensor:  # type: ignore[override]
         # Log once to avoid spamming per token.
         if not hasattr(layer, "_pipelinerl_fp32_unembed_logged"):
-            logger.info("Computing unembedding (logits) in FP32 for %s (%s)", layer.__class__.__name__, getattr(layer, 'tp_rank', ''))
+            logger.info("Computing unembedding (logits) in FP32 for %s", layer.__class__.__name__)
             layer._pipelinerl_fp32_unembed_logged = True
+
+        # Prepare FP32 inputs and a persistent FP32 copy of the weight on the
+        # correct device to avoid per-call casting and dtype/device mismatches.
         x32 = x if x.dtype == torch.float32 else x.to(torch.float32)
-        w32 = layer.weight if layer.weight.dtype == torch.float32 else layer.weight.to(torch.float32)
-        b32 = None if bias is None else (bias if bias.dtype == torch.float32 else bias.to(torch.float32))
+        target_device = x32.device
+
+        w_attr = "_pipelinerl_fp32_unembed_weight"
+        w_param = layer.weight
+        w32 = getattr(layer, w_attr, None)
+        if (w32 is None
+                or w32.dtype != torch.float32
+                or w32.device != target_device
+                or w32.shape != w_param.shape
+                or w32._version != getattr(w32, "_pipelinerl_src_version", None)):
+            w32 = w_param.to(device=target_device, dtype=torch.float32, copy=True)
+            # Track the source tensor version if available (PyTorch Parameter tracks _version for in-place)
+            try:
+                w32._pipelinerl_src_version = int(w_param._version)  # type: ignore[attr-defined]
+            except Exception:
+                w32._pipelinerl_src_version = None
+            setattr(layer, w_attr, w32)
+
+        b32 = None
+        if bias is not None:
+            b32 = bias if bias.dtype == torch.float32 else bias.to(torch.float32)
+            if b32.device != target_device:
+                b32 = b32.to(target_device)
+
         return torch.nn.functional.linear(x32, w32, b32)
 
 
