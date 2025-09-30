@@ -88,12 +88,15 @@ class BF16WithLastLayerFP32(QuantizationConfig):
 
         if isinstance(layer, VocabParallelEmbedding):
             if is_last_layer:
+                # Final logits matmul should run in FP32. Use a method that
+                # upcasts activations and uses an FP32 weight tensor (reusing
+                # an existing FP32 param if present to avoid copies).
                 logger.info(
-                    "Quant config forcing FP32 embedding for %s (%s)",
+                    "Quant config forcing FP32 logits matmul for %s (%s)",
                     prefix,
                     layer.__class__.__name__,
                 )
-                return _ForcedDTypeEmbeddingMethod(torch.float32)
+                return _FP32UnembedEmbeddingMethod()
             if tied_unembed:
                 # Keep BF16 parameters for input embedding, but force logits
                 # matmul to FP32 via a custom apply() used by LogitsProcessor.
