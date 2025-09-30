@@ -81,6 +81,8 @@ world:
 
   actor_group_port: 9000
   environment_start_port: 7777
+# Remote vs embedded environment execution strategy
+  environment_mode: remote
 # this will be autocreated based on the config
 jobs: []
 

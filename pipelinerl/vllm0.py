@@ -180,6 +180,25 @@ async def run_server(args, **uvicorn_kwargs) -> None:
             f"invalid tool call parser: {args.tool_call_parser} (chose from {{ {','.join(valide_tool_parses)} }})"
         )
 
+    # Choose a unique rendezvous port per actor to avoid torch.distributed
+    # TCPStore collisions across concurrently launched vLLM processes.
+    try:
+        if "VLLM_PORT" not in os.environ:
+            actor_idx = getattr(args, "actor_llm_idx", None)
+            base_str = os.environ.get("VLLM_PORT_BASE", "")
+            stride_str = os.environ.get("VLLM_PORT_STRIDE", "10")
+            if actor_idx is not None and base_str.isdigit():
+                base = int(base_str)
+                stride = int(stride_str) if stride_str.isdigit() else 10
+                port = base + stride * int(actor_idx)
+                os.environ["VLLM_PORT"] = str(port)
+                logger.info(
+                    "Using VLLM_PORT=%s (base=%s stride=%s actor_idx=%s)",
+                    port, base, stride, actor_idx,
+                )
+    except Exception as e:
+        logger.warning("Failed to set VLLM_PORT from actor_idx: %s", e)
+
     # workaround to make sure that we bind the port before the engine is set up.
     # This avoids race conditions with ray.
     # see https://github.com/vllm-project/vllm/issues/8204

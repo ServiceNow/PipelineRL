@@ -1,18 +1,27 @@
 defaults:
     - base
+    - override finetune: grpo
     - _self_
 
+llm:
+  parameters:
+    max_tokens: 8192
+
+test_llm:
+  parameters:
+    max_tokens: 8192
 
 actor:
   rollout_policy: pipelinerl.domains.mcp.generate_mcp_rollout
-  system_prompt: Please reason step by step, and put your final answer within \boxed{}.
+  system_prompt: Please reason step by step, and put your final answer within \boxed{{}}.
   llm_max_rollouts: 64
   task_template: |-
     {task}
+  shared_memory_entry_size: 10000000
 
 finetune:
-  seq_length: 48000
-  seq_parallel: 4
+  seq_length: 128000
+  seq_parallel: 8
 
 dataset_loader: pipelinerl.domains.math.load_datasets
 train_dataset_names:
@@ -20,9 +29,6 @@ train_dataset_names:
 - open_reasoner_zero_extended_72k 
 test_dataset_names:
   - aime_2025
-  - aime_2024
-  - amc_2023
-  - math_500
 
 vllm_config:
   use_v1: false
@@ -30,23 +36,26 @@ vllm_config:
     enable-auto-tool-choice: ""
     tool-call-parser: rl_tool
     tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
-    max_model_len: 40960
+    max-num-seqs: ${actor.llm_max_rollouts}
+    max-num-batched-tokens: 4096
+    max_model_len: 128000
+    gpu-memory-utilization: 0.85
 
 environment:
-  _target_: pipelinerl.domains.mcp.MCPEnvironmentServer
-  n_envs: 8
-  host: "0.0.0.0"
-  exp_path: ${output_dir}/env_server
-  mcp_target: tapeagents.mcp.MCPEnvironment
-  mcp_config_path: ${hydra:runtime.cwd}/conf/mcp/python.json
-  mcp_tools_whitelist:
+  _target_: pipelinerl.domains.mcp.env_server.EmbeddedMCPEnvironment
+  config_path: ${hydra:runtime.cwd}/conf/mcp/python.json
+  tools_whitelist:
     - run_python_code
-  env_call_timeout: 600  # Increased from default 60s to 10 minutes
-  mcp_read_timeout_seconds: 3000
+  read_timeout_seconds: 600
+  use_cache: false
+  runtime_pool_workers: 4
+  offload_tools:
+    - run_python_code
 
 
 world:
   env_replicas_per_actor: 8
+  environment_mode: embedded
 
 agent_max_loops: 3
 agent:
@@ -56,25 +65,44 @@ agent:
   store_llm_calls: true
   templates:
     system_prompt: |
-      You are an expert AI Agent trained to assist users with complex information processing tasks.
-      Your role is to understand user queries and respond in a helpful and accurate manner.
+      You are a math-focused AI Agent. Solve problems by combining clear symbolic reasoning
+      with short, deterministic Python code.
       Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
-      Do not express emotions or opinions about user questions. 
+      Always present the final answer in LaTeX \boxed{{}}.
+      Do not express emotions or opinions about user questions.
+
+      Workflow:
+      1. Draft a brief plan in plain text.
+      2. Execute one run_python_code call to compute or verify the result.
+      3. Finalize by calling MathAnswer with the LaTeX-formatted answer.
+
+      Python execution policy (run_python_code):
+      - Use Python strictly for pure computation to verify and validate the final answer.
+      - No network, file system, OS or environment access.
+      - Keep snippets minimal and self-contained; avoid large outputs and long-running loops; print only the final result.
+
+      Validation:
+      - Cross-check results (alternative derivation, invariants, higher precision) before finalizing.
+      - If execution fails, propose the minimal fix and retry.
+      Keep replies direct and avoid unnecessary text.
     allowed_tools: |
-      You have access to the following tools:
+      You can call the following tools:
       {tools_description}
+      - run_python_code: deterministic math code; print only the final value.
+      - MathAnswer: return the LaTeX \boxed{{}} answer when the solution is verified.
+      Always verify with run_python_code before invoking MathAnswer.
     thought_format: |
       Important! Respond with the plain text, do not include any JSON or code.
       Do not output anything besides what I asked in this message.
     allowed_steps: |
-      You have access to the following tools:
-      {tools_description}
-    format: >
-      Output only a single JSON dict.
-      Do not repeat the last thought again.
-      If the last action does not change the observation, do not repeat it!
-      DO NOT OUTPUT ANYTHING BESIDES THE JSON! DO NOT PLACE ANY COMMENTS INSIDE THE JSON. 
-      It will break the system that processes the output.
+      Workflow summary:
+      - Plan briefly in plain text.
+      - Call run_python_code exactly once per loop to compute/verify.
+      - Finish with a single MathAnswer tool call carrying the \boxed{{}} result.
+    format: |
+      For finalization, reply with a single short sentence that ends in the \boxed{{}} answer,
+      immediately followed by the MathAnswer function call containing the same \boxed{{}} value.
+      Never emit unrelated JSON wrappers or duplicate the final thought.
       
 
   nodes:
@@ -82,53 +110,52 @@ agent:
       name: plan
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
-        Write a concise multi-step plan explaining which steps should be performed to find the answer for the given task.
-        Be specific about how each step should be performed. Only describe the intended actions here, do not perform them yet.
-        Consider that next steps may depend on results of previous steps, so include conditional branching using "if" statements where needed.
-        Start with the title "Plan". Every step should have short name and description.
+        Produce a concise math plan (formulas/checks). You will ALWAYS verify by executing Python code.
         ${agent.templates.thought_format}
       steps_prompt: ${agent.templates.allowed_tools}
+      trim_obs_except_last_n: 2
 
     - _target_: tapeagents.nodes.StandardNode
-      name: select
+      name: code
       system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 100
       guidance: |
-        Select the next step to do to move forward with the plan. Describe the expected effect of the proposed action.
-        ${agent.templates.thought_format}
-      steps_prompt: ${agent.templates.allowed_tools}
+        ALWAYS call run_python_code once to compute/verify the result.
+        Use exact, deterministic code; print only the final scalar or tuple.
+        If code fails, fix minimally and call run_python_code again after reviewing the error.
+      use_known_actions: true
+      use_function_calls: true
+      trim_obs_except_last_n: 2
 
     - _target_: tapeagents.nodes.StandardNode
-      name: act
+      name: finalize
       system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 100
-      guidance: Then produce single function call for the next step. If the answer is ready, call MathAnswer. Put your final answer within \boxed{}.
+      guidance: |
+        Read the last Python stdout value. First, state the answer in one short sentence that ends with LaTeX \boxed{{}}.
+        Immediately after that sentence, call the MathAnswer tool exactly once with:
+          name: MathAnswer
+          arguments: {"answer": "<final answer in LaTeX \\boxed{}>"}
+        Do not add any extra text around the tool call. Once the sentence is emitted, return only the MathAnswer function call.
       steps:
         - pipelinerl.domains.mcp.steps.MathAnswer
       use_known_actions: true
       use_function_calls: true
+      trim_obs_except_last_n: 2
+      next_node: code
 
-    - _target_: tapeagents.nodes.StandardNode
-      name: summarize
-      system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 100
-      guidance: |
-        Summarize last observation. If its an image, thoroughly describe it with all details.
-        Describe the results of the last action and observed changes
-        Do not hallucinate or make up any information, only describe what you see in the observation.
-        Do not guess or assume action effects, describe only visible changes.
-        ${agent.templates.thought_format}
+# model_path: Qwen/Qwen3-8B
+model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
 
-    - _target_: tapeagents.nodes.StandardNode
-      name: reflect
-      system_prompt: ${agent.templates.system_prompt}
-      trim_obs_except_last_n: 100
-      guidance: |
-        1. Evaluate the action's success, explain its effect on current step, overall plan and task solution.
-        2. If the last action was not successful, describe errors and the possible reasons for failure.
-        3. Check if the current plan step is finished. 
-        4. If the step is finished, update the following steps of the plan with new information and choose the next step.
-        ${agent.templates.thought_format}
-      next_node: select
+# Local reward shaping for tool usage
+python_tool_shaping:
+  bonus_on_correct_with_python: 0.2
+  penalty_on_incorrect_without_python: 0.1
+  max_abs: 0.2
 
-model_path: Qwen/Qwen3-8B
+# Encourage concise outputs (penalize long completions)
+length_shaping:
+  target_ratio: 0.1                # 10% of max_tokens; auto scales with max_tokens
+  min_target_tokens: 256           # lower clamp
+  max_target_tokens: 2048          # upper clamp
+  slope: 0.001                     # penalty per token beyond target
+  max_penalty: 0.2                 # clamp absolute penalty
+  bonus_on_short_correct: 0.05     # bonus if correct and concise

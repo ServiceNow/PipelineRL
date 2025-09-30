@@ -1,9 +1,9 @@
 from typing import Any, Literal
 from pydantic import Field
-from tapeagents.core import StopStep
+from tapeagents.core import FinalObservation
 
 
-class MathAnswer(StopStep):
+class MathAnswer(FinalObservation):
     """
     Action that indicates the agent has finished solving a math problem.
     The final answer must be contained within \\boxed{} format.
