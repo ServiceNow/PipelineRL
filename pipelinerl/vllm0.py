@@ -36,6 +36,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 import torch.distributed as dist
 from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # noqa: F401 - registers custom quantization configs
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign
@@ -46,6 +47,14 @@ handler.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+# Ensure quantization module logs are visible, too.
+_qlogger = logging.getLogger("pipelinerl.vllm_quantization")
+_qlogger.setLevel(logging.INFO)
+# Avoid duplicate handlers if this module reloads.
+if not _qlogger.handlers:
+    _qlogger.addHandler(handler)
+_qlogger.propagate = False
 
 
 def make_worker_class(multi_step: bool):

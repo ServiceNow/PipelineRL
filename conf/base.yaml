@@ -47,7 +47,7 @@ llm:
     temperature: 1.0
 test_llm:
   parameters: 
-    max_tokens: 16000
+    max_tokens: 8192
     temperature: 1.0
     top_p: 0.95
     top_k: 50
@@ -67,6 +67,8 @@ vllm_config:
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
+    max_model_len: 12000
+    quantization: bf16_last_layer_fp32 
 
 world:
   replicas: 1
@@ -75,7 +77,8 @@ world:
   preprocessor_fraction: 0
   finetune_fraction: 4
 
-  env_replicas: 2
+  # Number of environment servers per actor VLLM server
+  env_replicas_per_actor: 1
 
   actor_group_port: 9000
   environment_start_port: 7777
