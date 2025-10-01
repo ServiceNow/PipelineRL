@@ -20,7 +20,7 @@ actor:
   shared_memory_entry_size: 10000000
 
 finetune:
-  seq_length: 128000
+  seq_length: 32000
   seq_parallel: 8
 
 dataset_loader: pipelinerl.domains.math.load_datasets
@@ -38,7 +38,7 @@ vllm_config:
     tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
     max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 4096
-    max_model_len: 128000
+    max_model_len: 32000
     gpu-memory-utilization: 0.85
 
 environment:
@@ -142,8 +142,8 @@ agent:
       trim_obs_except_last_n: 2
       next_node: code
 
-# model_path: Qwen/Qwen3-8B
-model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
+model_path: Qwen/Qwen3-8B
+# model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
 
 # Local reward shaping for tool usage
 python_tool_shaping:
