@@ -46,7 +46,8 @@ class RLConfig(BaseModel):
         default=True,
         description="Use advantages instead of rewards to compute the loss",
     )
-    epsilon: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
+    epsilon_low: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
+    epsilon_high: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
     batch_size: int = Field(default=0, description="Batch size is required for normalization")
     reward_minus_kl_coef: float = Field(
         default=0.0,
@@ -272,15 +273,15 @@ def rl_step(
     match config.policy_loss:
         case "ppo":
             surr1 = ratio_new_old * log_p_weights
-            clamped_ratio = torch.clamp(ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
+            clamped_ratio = torch.clamp(ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = clamped_ratio != ratio_new_old
             surr2 = clamped_ratio * log_p_weights
             policy_loss = torch.min(surr1, surr2)
         case "reinforce":
             surr1 = torch.zeros_like(ratio_new_old)
             surr2 = torch.zeros_like(ratio_new_old)
-            clamp_log_ratio_new_old_indicators = ratio_new_old > 1 + config.epsilon
-            ratio_new_old = torch.clamp(ratio_new_old, 0, 1 + config.epsilon)
+            clamp_log_ratio_new_old_indicators = ratio_new_old > 1 + config.epsilon_high
+            ratio_new_old = torch.clamp(ratio_new_old, 0, 1 + config.epsilon_high)
             policy_loss = new_logprobs * log_p_weights * ratio_new_old.detach()
         case "gspo":
             if segments is None:
@@ -296,7 +297,7 @@ def rl_step(
             group_ratio_new_old = torch.exp(lrn_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2)
             group_advantages_t = (adv_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2).detach()
             surr1 = group_ratio_new_old * group_advantages_t
-            clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
+            clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
             surr2 = clamped_group_ratio * group_advantages_t
             # If we have a sentinel or no segments, return a zero loss but keep graph
