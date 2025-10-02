@@ -14,6 +14,7 @@ from .verifier_api import verify_answer_rpc
 
 class Metrics(BaseMetrics):
     penalty: float
+    overflow: bool = False
 
 class RewardTable(BaseModel):
     wrong_answer_not_finished: float
@@ -104,6 +105,11 @@ async def generate_math_rollout(
         no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
         penalty=overlong_penalty,
+        overflow=bool(
+            trace.input_ids
+            and getattr(llm.tokenizer, "eos_token_id", None) is not None
+            and trace.input_ids[-1] != llm.tokenizer.eos_token_id
+        ),
     )
 
     return RolloutResult(
