@@ -189,7 +189,8 @@ async def schedule_rollouts(
     timeout = aiohttp.ClientTimeout(total=10*3600.0, connect=10*3600.0, sock_read=10*3600.0)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         while True:
-            if time.time() - last_logged > 30.0 and sum(active_rollouts):
+            #if time.time() - last_logged > 30.0 and sum(active_rollouts):
+            if int(time.time())%30 == 0 and sum(active_rollouts):
                 logger.info(
                     f"{scheduler_name}: "
                     f"rollouts in progress: {sum(active_rollouts)}, "
