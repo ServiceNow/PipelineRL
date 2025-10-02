@@ -17,7 +17,10 @@ actor:
   llm_max_rollouts: 64
   task_template: |-
     {task}
-  shared_memory_entry_size: 10000000
+  shared_memory_entry_size: 200000000
+
+preprocess:
+  shared_memory_entry_size: 2000000000
 
 finetune:
   seq_length: 128000
