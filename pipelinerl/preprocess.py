@@ -16,6 +16,7 @@ from pathlib import Path
 from queue import Empty, Full
 from typing import List
 
+import random
 import datasets
 import transformers
 from litellm import BaseModel, Field
@@ -555,6 +556,7 @@ def run_preprocessing_loop(
 
                     batch_done = False
                     start_writing = time.time()
+                    random.shuffle(processed_entries_queue)
                     while (len(processed_entries_queue) > 0 and not batch_done) or (cfg.preprocess.dataset_buffer_size and not batch_done):
                         logger.debug(f"[inner loop] trainer {trainer_id} has {samples_per_trainer[trainer_id]} samples, target is {target_samples_per_lead}")
                         if cfg.finetune.seq_packing:
