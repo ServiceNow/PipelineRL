@@ -88,34 +88,41 @@ def verify_answer(prediction: str, gold: str, strict: bool = True, max_predictio
 
 
 def verify_math(prediction: str, gold: str, strict: bool = True, max_prediction_length: int = 1000) -> str:
+    import re
+
     try:
-        # Input Sanitization / Validation (very important)
+        # Input Sanitization / Validation
         if not isinstance(prediction, str) or not isinstance(gold, str):
             raise ValueError("Prediction and gold must be strings")
 
+        # Try extracting from \boxed{...} first
         boxed_start = prediction.rfind("\\boxed{")
 
-        if boxed_start < 0:
-            raise NoAnswerException()
+        if boxed_start >= 0:
+            boxed_prediction = prediction[boxed_start:]
+            if "\\boxed{}" in boxed_prediction:
+                raise EmptyBoxedException()
+            if len(boxed_prediction) > max_prediction_length:
+                raise UnparsableException()
+            extracted_prediction = boxed_prediction
+        else:
+            # Fallback: look for <answer>...</answer> tags
+            answer_match = re.findall(r"<answer>(.*?)</answer>", prediction, re.DOTALL)
+            if answer_match:
+                extracted_prediction = answer_match[-1].strip()  # last one if multiple
+            else:
+                raise NoAnswerException()
 
-        boxed_prediction = prediction[boxed_start:]
-        if "\\boxed{}" in boxed_prediction:
-            raise EmptyBoxedException()
-
-        if len(boxed_prediction) > max_prediction_length:
-            raise UnparsableException()
-
+        # Parse and verify
         gold_parsed = math_verify.parse(gold)
-        boxed_prediction_parsed = math_verify.parse(boxed_prediction)
-        if not boxed_prediction_parsed:
+        pred_parsed = math_verify.parse(extracted_prediction)
+        if not pred_parsed:
             raise ValueError("Failed to parse prediction.")
 
         with timeout(1):
-            equivalent = math_verify.verify(gold_parsed, boxed_prediction_parsed, strict=strict, timeout_seconds=1)
-        if equivalent:
-            answer_status = "correct"
-        else:
-            answer_status = "wrong"
+            equivalent = math_verify.verify(gold_parsed, pred_parsed, strict=strict, timeout_seconds=1)
+
+        answer_status = "correct" if equivalent else "wrong"
 
     except Exception as e:
         match e:
@@ -123,7 +130,9 @@ def verify_math(prediction: str, gold: str, strict: bool = True, max_prediction_
                 answer_status = "no_answer"
             case _:
                 answer_status = "unparsable"
+
     return answer_status
+
 
 
 def verify_countdown(prediction: str, gold: str) -> str:
