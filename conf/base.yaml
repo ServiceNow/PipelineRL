@@ -5,6 +5,7 @@ defaults:
   - _self_
 
 seed: 42
+use_ray: false
 
 finetune:
   seed: ${..seed}
