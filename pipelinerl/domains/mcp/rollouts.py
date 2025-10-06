@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import random
 import time
@@ -10,11 +11,12 @@ import aiohttp
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from tapeagents.agent import DEFAULT, Agent
-from tapeagents.core import LLMCall, Tape
+from tapeagents.core import LLMCall, Tape, TrainingText
 from tapeagents.dialog_tape import UserStep
+from tapeagents.llms import LiteLLM
 from tapeagents.llms.trainable import TrainableLLM
 from tapeagents.mcp import MCPEnvironment
-from tapeagents.orchestrator import async_execute_agent, execute_agent, get_agent_and_env_from_config
+from tapeagents.orchestrator import async_execute_agent, execute_agent, get_agent_and_env_from_config, save_debug_tape
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 
 from pipelinerl.async_llm import make_training_text
@@ -29,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 _embedded_worker: EmbeddedEnvironmentWorker | None = None
 
+class FailedRollout(Exception):
+    pass
 
 def _get_embedded_worker(env_cfg: DictConfig, concurrency: int) -> EmbeddedEnvironmentWorker:
     global _embedded_worker
@@ -294,8 +298,9 @@ def generate_mcp_rollout_with_local_env(
         cfg = OmegaConf.create(cfg)
     agent, _env = get_agent_and_env_from_config(cfg)
     environment: MCPEnvironment = _env
-    logger.info("Agent and environment loaded")
+    logger.info(f"Agent and environment loaded, using llm {llm.model_name} at {llm.get_base_url()}")
     try:
+        t_exec = time.perf_counter()
         start_result = environment.start_task(problem)
         logger.info("Task started")
         tape_metadata = start_result if isinstance(start_result, dict) else {}
@@ -310,12 +315,11 @@ def generate_mcp_rollout_with_local_env(
         if tape_metadata:
             tape.metadata.other.update(tape_metadata)
 
-        t_exec = time.perf_counter()
         logger.info("Running agent..")
         tape = execute_agent(agent, tape, environment, max_loops=cfg.agent_max_loops)
         logger.info("Agent finished")
         tape.metadata.result.update({"total_execution_time": time.perf_counter() - t_exec})
-
+        # save_debug_tape(tape)
         reward_table = RewardTable(**dict(cfg.rewards))
 
         llm_calls: list[LLMCall] = [
@@ -326,6 +330,7 @@ def generate_mcp_rollout_with_local_env(
         ]
         assert len(llm_calls) > 0, "No LLM calls found"
         tool_call_counts = count_tool_calls_by_category(llm_calls)
+        logger.info(f'Use {type(llm)} LLM to generate training texts')
         training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
         n_llm_calls = len(llm_calls)
         answer_status = verify_answer(
@@ -397,6 +402,7 @@ def generate_mcp_rollout_with_local_env(
 
         # Assign identical reward to all steps in the rollout (pipeline expects uniform rollout_reward)
         for text in training_texts:
+            # debug_save_training_text(text)
             text.reward = reward
             text.finished = tape_finished
 
@@ -427,5 +433,16 @@ def generate_mcp_rollout_with_local_env(
             dataset_name=problem["dataset"],
             llm_url=llm.get_base_url(),
         )
+    except Exception as e:
+        err_msg = f"Error generating rollout: {e}"
+        logger.error(err_msg)
+        raise FailedRollout(err_msg)
     finally:
-        environment.close()
+        try:
+            environment.close()
+        except Exception as e:
+            logger.error(f"Error closing environment: {e}")
+
+def debug_save_training_text(text: TrainingText):
+    with open("debug_training_texts.jsonl", "a") as f:
+        f.write(json.dumps({"text": text.text, "n_predicted": text.n_predicted}, ensure_ascii=False) + "\n")
