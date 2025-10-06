@@ -3,39 +3,39 @@ import json
 import logging
 import os
 import signal
-from pydantic import TypeAdapter
+
 import torch
+import torch.distributed as dist
 import uvloop
+from pydantic import TypeAdapter
 from vllm import AsyncLLMEngine
-from vllm.utils import FlexibleArgumentParser, set_ulimit
+from vllm._version import version
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.launcher import serve_http
+from vllm.entrypoints.openai.api_server import (
+    build_app,
+    create_server_socket,
+    init_app_state,
+    run_server,
+)
 from vllm.entrypoints.openai.cli_args import (
     make_arg_parser,
     validate_parsed_serve_args,
 )
-from vllm.entrypoints.launcher import serve_http
-from vllm.entrypoints.openai.api_server import (
-    run_server,
-    create_server_socket,
-    build_app,
-    init_app_state,
-)
-from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-from vllm.logger import init_logger
-from vllm._version import version
-from vllm.worker.worker import Worker
-from vllm.executor.multiproc_worker_utils import ProcessWorkerWrapper
 from vllm.executor.mp_distributed_executor import MultiprocessingDistributedExecutor
+from vllm.executor.multiproc_worker_utils import ProcessWorkerWrapper
+from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
 from vllm.usage.usage_lib import UsageContext
-from vllm.worker.multi_step_worker import MultiStepWorker
+from vllm.utils import FlexibleArgumentParser, set_ulimit
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+from vllm.worker.multi_step_worker import MultiStepWorker
+from vllm.worker.worker import Worker
 
-
-import torch.distributed as dist
-from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
 import pipelinerl.torch_utils
+from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign
@@ -247,8 +247,8 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         await weight_update_manager.receive_weight_update(request)
         return {"status": "ok"}
 
-    model_config = await engine.get_model_config()
-    await init_app_state(engine, model_config, app.state, args)
+    # model_config = await engine.get_model_config()
+    await init_app_state(engine, engine_config, app.state, args)
     shutdown_task = await serve_http(
         app,
         sock,

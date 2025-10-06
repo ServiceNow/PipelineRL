@@ -14,16 +14,17 @@ authors = [
 ]
 dependencies = [
     "torch>=2.6",
-    "vllm==0.8.3",
+    "vllm==0.8.5.post1",
     "accelerate==1.7.0",
     "Tapeagents[finetune]==0.1.15",
-    "transformers==4.51.0",
+    "transformers==4.51.1",
     "flash-attn==2.7.4.post1",
     "ring-flash-attn==0.1.6",
     "math-verify[antlr4_9_3]==0.7.0",
     "orjson==3.10.16",
     "redis==5.2.1",
     "hydra-core>=1.3.2",
+    "ray[default]~=2.47.1",
 ]
 
 [tool.setuptools.packages.find]
