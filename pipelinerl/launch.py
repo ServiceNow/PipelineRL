@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # TODO: rm debug code
 import tapeagents
+
 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -615,6 +616,8 @@ def main(cfg: DictConfig):
 
     if cfg.debug.mode == "finetune":
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
+    elif cfg.debug.mode == "llm":
+        processes.extend(launch_jobs(cfg, world_map, ["actor_llm"]))
     elif cfg.debug.mode == "actor":
         processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
