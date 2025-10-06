@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import time
 
 import numpy as np
@@ -10,13 +11,13 @@ from tapeagents.llms import TrainableLLM
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 llm_url = "http://localhost:8080"
-# llm_model = "Qwen/Qwen3-8B"
-llm_model = "Qwen/Qwen2.5-7B"
-# exp_name = "qwen3-8b"
-exp_name = "qwen2.5-7b"
+llm_model = "Qwen/Qwen3-8B"
+# llm_model = "Qwen/Qwen2.5-7B"
+exp_name = "qwen3-8b-v1"
+# exp_name = "qwen2.5-7b"
+max_tokens = 8192
 
 def llm_quick_response(prompt: str):
-    t = time.perf_counter()
     r = requests.post(
         url=f"{llm_url}/v1/chat/completions",
         json={
@@ -29,15 +30,13 @@ def llm_quick_response(prompt: str):
         verify=False,
     )
     d = r.json()
-    dt = time.perf_counter() - t
-    return d["choices"][0]["message"]["content"], dt
+    return d["choices"][0]["message"]["content"]
 
 
 llm = TrainableLLM(base_url=llm_url, model_name=llm_model)
 response = llm.quick_response("Hello, how are you?")
-response2, _ = llm_quick_response("Hello, how are you?")
+response = llm_quick_response("Hello, how are you?")
 assert len(response) > 0
-assert len(response2) > 0
 assert llm.tokenizer is not None
 print("LLM is ready")
 
@@ -55,10 +54,12 @@ for d in all_dicts:
 print(f"Loaded {len(all_dicts)} texts, total tokens: {total_tokens}")
 
 prompts = [d["text"][:-d["n_predicted"]] for d in all_dicts]
+random.seed(42)
+random.shuffle(prompts)
 chunk_size = 4
 prompts_chunks = [prompts[i:i+chunk_size] for i in range(0, len(prompts), chunk_size)]
 print(f"Chunked to {len(prompts_chunks)} chunks")
-
+too_many_chunks = prompts_chunks * 20
 
 def benchmark_llm(n_workers: int):
     ray.shutdown()
@@ -66,21 +67,24 @@ def benchmark_llm(n_workers: int):
 
     def get_responses(prompts: str):
         responses = []
-        # local_llm = TrainableLLM(base_url=llm_url, model_name=llm_model)
+        # local_llm = TrainableLLM(base_url=llm_url, model_name=llm_model, parameters={"max_tokens": max_tokens})
         for i, prompt in enumerate(prompts):
-            r, dt = llm_quick_response(prompt)
+            t = time.perf_counter()
+            # r = local_llm.quick_response(prompt)
+            r = llm_quick_response(prompt)
+            dt = time.perf_counter() - t
             responses.append((prompt + r, dt))
         return responses
 
     remote_fn = ray.remote(get_responses)
 
-    t = time.perf_counter()
+    start_time = time.perf_counter()
 
-    chunks = prompts_chunks
-    if n_workers > len(chunks):
-        multiplier = n_workers // len(chunks) + 1
-        chunks = chunks * multiplier
-        print(f"Multiplied to {len(chunks)} chunks")
+    n_chunks = max(200, n_workers * 2)
+    chunks = too_many_chunks[:n_chunks]
+    print(f"Multiplied to {len(chunks)} chunks")
+    random.seed(42)
+    random.shuffle(chunks)
     unfinished_tasks = []
     for chunk in chunks:
         unfinished_tasks.append(remote_fn.remote(chunk))
@@ -95,36 +99,41 @@ def benchmark_llm(n_workers: int):
         for finished_task in finished_tasks:
             responses = ray.get(finished_task)
             total_finished += 1
-            for response, dt in responses:
-                latencies.append(dt)
+            for response, latency in responses:
+                latencies.append(latency)
                 tokens = llm.tokenizer.encode(response)
                 total_tokens += len(tokens)
-        dt = time.perf_counter() - t
+        dt = time.perf_counter() - start_time
         if len(finished_tasks) > 0:
-            print(f"t: {dt:.2f}s, {total_finished} finished, Total tokens: {total_tokens}, tokens/sec: {total_tokens / dt:.2f}")
-        # if dt > 600:
-        #     print("Timeout 10 minutes, stopping")
-        #     break
-        time.sleep(1.0)
+            print(f"t: {dt:.2f}s, {total_finished} finished, Total tokens: {total_tokens}, tokens/sec: {total_tokens / dt:.2f}, last 10 latency: {np.mean(latencies[-10:]):.2f}s")
+            with open(f"llm_token_stats_chunk{chunk_size}_{exp_name}_log.jsonl", "a") as f:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                row = json.dumps({"ts": ts, "exp_name": exp_name, "n_workers": n_workers, "tokens": total_tokens, "dt": dt, "mean_latency": np.mean(latencies), "last_10_latency": np.mean(latencies[-10:]), "total_finished": total_finished, "token_speed": total_tokens / dt})
+                f.write(row + "\n")
+        if len(unfinished_tasks) < n_workers:
+            print(f"Saturation mode ended, stopping")
+            break
+        time.sleep(2.0)
 
-    final_time = time.perf_counter() - t
+    final_time = time.perf_counter() - start_time
     print(f"Final, workers:{n_workers}, t:{final_time:.2f}s, total tokens: {total_tokens}, tokens/sec: {total_tokens / final_time:.2f}")
     ray.shutdown()
     mean_latency = np.mean(latencies)
     return total_tokens, final_time, mean_latency
 
 stats = {}
-for n_workers in [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]:
+for n_workers in [128]: #[64, 256, 128, 32, 4, 8, 16, 512, 1024]: # most optimal first
     print(f"Benchmarking {n_workers} workers..")
     tokens, dt, mean_latency = benchmark_llm(n_workers)
     print(f"Done {n_workers} workers: {tokens} tokens, {dt:.2f}s, speed {tokens / dt:.2f} tokens/sec, mean latency: {mean_latency:.2f}s")
     stats[n_workers] = {"tokens": tokens, "dt": dt, "mean_latency": mean_latency}
-    with open(f"llm_token_stats_chunk{chunk_size}_{exp_name}.jsonl", "a") as f:
+    with open(f"llm_token_stats_ray_chunk{chunk_size}_{exp_name}.jsonl", "a") as f:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         row = json.dumps({"ts": ts, "n_workers": n_workers, "tokens": tokens, "dt": dt, "mean_latency": mean_latency})
         f.write(row + "\n")
+    time.sleep(3.0)
 
 print("Benchmarking done")
-with open(f"llm_token_stats_all_chunk{chunk_size}_{exp_name}.json", "w") as f:
+with open(f"llm_token_stats_ray_all_chunk{chunk_size}_{exp_name}.json", "w") as f:
     json.dump(stats, f, indent=4)
 print("All stats saved")
