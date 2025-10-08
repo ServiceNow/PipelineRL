@@ -495,7 +495,7 @@ class ActorLoop:
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
                 published_samples += group_samples
-                samples_in_queue = self.result_queue.qsize() * attempts
+                samples_in_queue = self.results_ready_to_publish()
                 all_text_dumps = []
                 for r in rollout_results:
                     for text in r.training_texts:
@@ -609,6 +609,9 @@ class ActorLoop:
     def get_new_results(self) -> list[RolloutResult]:
         return self.result_queue.get(block=False)
 
+    def results_ready_to_publish(self) -> int:
+        return self.result_queue.qsize() * self.cfg.attempts
+
 
 class ActorLoopRay(ActorLoop):
     """
@@ -623,6 +626,7 @@ class ActorLoopRay(ActorLoop):
         self.llms_by_url = {llm.get_base_url(): llm for llm in self.llms}
         self.llms_utilization = {llm.get_base_url(): 0 for llm in self.llms}
         self.problem_id = 0
+        self.attempts = self.cfg.attempts if self.is_training else 1
         self.unfinished_problems = defaultdict(list) # up to `attempts` rollout results for each problem
         self.finished_problems = []
         self.token_count = 0
@@ -644,28 +648,28 @@ class ActorLoopRay(ActorLoop):
             start_ts = time.monotonic()
             rollout_result: RolloutResult = rollout_policy(cfg, llm, problem)
             ts = time.monotonic()
+            logger.info(f"Problem {problem_id} finished in {ts - start_ts:.2f} seconds")
             return rollout_result, llm.get_base_url(), problem_id, ts, start_ts
         self.ray_remote = ray.remote(rollout_wrapper)
         self.start_time = time.time()
 
     def have_capacity(self) -> bool:
         have_capacity = len(self.unfinished_tasks) < self.cfg.actor.problem_queue_size
-        have_llm = any(self.llms_utilization[llm_url] < self.cfg.actor.llm_max_rollouts for llm_url in self.llms_utilization)
-        have_capacity = have_capacity and have_llm
+        have_llm_capacity = any(self.llms_utilization[llm_url] < (self.cfg.actor.llm_max_rollouts - self.attempts) for llm_url in self.llms_utilization)
+        have_capacity = have_capacity and have_llm_capacity
         if not have_capacity:
             time.sleep(0.1) # sleep for a while to avoid quick loops when no capacity
         return have_capacity
 
     def submit_problem(self, problem: dict):
-        attempts = self.cfg.attempts if self.is_training else 1
-        for attempt_number in range(attempts):
+        for attempt_number in range(self.attempts):
             llm_url, task_count = min(self.llms_utilization.items(), key=lambda x: x[1])
-            logger.info(f"Submitting problem attempt {attempt_number} to the least busy LLM {llm_url} with {task_count} tasks")
+            logger.info(f"Submitting problem {self.problem_id} attempt {attempt_number}/{self.attempts} to the least busy LLM {llm_url} with {task_count} tasks")
             llm = self.llms_by_url[llm_url]
             task_ref = self.ray_remote.remote(self.cfg_dict, llm, problem, self.problem_id)
-            self.problem_id += 1
             self.llms_utilization[llm_url] += 1
             self.unfinished_tasks.append(task_ref)
+        self.problem_id += 1
 
     def stop_tasks(self):
         ray.shutdown()
@@ -701,7 +705,7 @@ class ActorLoopRay(ActorLoop):
             self.unfinished_problems[problem_id].append(rollout_result)
             logger.info(f"Problem {problem_id} has {len(self.unfinished_problems[problem_id])} rollout results")
             if len(self.unfinished_problems[problem_id]) == self.cfg.attempts:
-                logger.info(f"Group for problem {problem_id} finished")
+                logger.info(f"Problem {problem_id} group finished")
                 self.finished_problems.append(self.unfinished_problems[problem_id])
                 del self.unfinished_problems[problem_id]
                 logger.info(f"{len(self.finished_problems)} finished problems ready to return")
@@ -733,6 +737,9 @@ class ActorLoopRay(ActorLoop):
             logger.info(f"have {len(self.finished_problems)} finished problems, pop one")
             return self.finished_problems.pop(0)
         return []
+
+    def results_ready_to_publish(self) -> int:
+        return len(self.finished_problems) * self.cfg.attempts
 
 
 def run_actor_loop(cfg: DictConfig):
