@@ -627,6 +627,8 @@ class ActorLoopRay(ActorLoop):
         self.finished_problems = []
         self.token_count = 0
         self.finished_rollouts_count = 0
+        self.task_latencies = []
+        self.ray_result_latencies = []
 
     def start_backend(self):
         if not self.ray_ready:
@@ -639,9 +641,10 @@ class ActorLoopRay(ActorLoop):
 
         rollout_policy: Callable[[DictConfig, TrainableLLM, dict], RolloutResult] = hydra.utils.get_method(self.cfg.actor.rollout_policy)
         def rollout_wrapper(cfg: DictConfig, llm: TrainableLLM, problem: dict, problem_id: int) -> RolloutResult:
+            start_ts = time.monotonic()
             rollout_result: RolloutResult = rollout_policy(cfg, llm, problem)
             ts = time.monotonic()
-            return rollout_result, llm.get_base_url(), problem_id, ts
+            return rollout_result, llm.get_base_url(), problem_id, ts, start_ts
         self.ray_remote = ray.remote(rollout_wrapper)
         self.start_time = time.time()
 
@@ -678,13 +681,14 @@ class ActorLoopRay(ActorLoop):
             logger.info(f"Found {len(finished_tasks)} finished tasks, {len(unfinished_tasks)} unfinished tasks left")
         self.unfinished_tasks = unfinished_tasks
         dt = time.time() - self.start_time
-        ray_result_latencies = []
         for finished_task in finished_tasks:
             try:
-                rollout_result, llm_url, problem_id, inner_ts = ray.get(finished_task)
+                rollout_result, llm_url, problem_id, stop_ts, start_ts = ray.get(finished_task)
+                task_dt = stop_ts - start_ts
+                self.task_latencies.append(task_dt)
                 outer_ts = time.monotonic()
-                ray_result_latency = outer_ts - inner_ts
-                ray_result_latencies.append(ray_result_latency)
+                ray_result_latency = outer_ts - stop_ts
+                self.ray_result_latencies.append(ray_result_latency)
             except Exception as e:
                 logger.error(f"Error getting finished ray task: {e}")
                 continue
@@ -708,7 +712,8 @@ class ActorLoopRay(ActorLoop):
                 f"rollouts finished: {self.finished_rollouts_count}, "
                 f"total tokens: {self.token_count}, "
                 f"gen speed: {self.token_count / dt:.2f} tokens/sec, "
-                f"ray latency: {np.mean(ray_result_latencies):.4f} seconds"
+                f"task latency: {np.mean(self.task_latencies[-10:]):.2f} sec, "
+                f"ray delay: {np.mean(self.ray_result_latencies[-10:]):.4f} sec"
             )
             save_debug_line({
                 "rollouts_finished": self.finished_rollouts_count,
@@ -717,7 +722,8 @@ class ActorLoopRay(ActorLoop):
                 "tokens_produced": self.token_count,
                 "dt": dt,
                 "token_speed": self.token_count / dt,
-                "ray_latency": np.mean(ray_result_latencies),
+                "ray_latency": np.mean(self.ray_result_latencies[-10:]),
+                "task_latency": np.mean(self.task_latencies[-10:]),
             })
             logger.info(f"LLMs utilization: {self.llms_utilization}")
         
