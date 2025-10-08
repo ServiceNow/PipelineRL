@@ -314,8 +314,8 @@ class ActorLoop:
         self.smm.start()
 
         # Use SharedMemoryQueue instead of separate problem_queue, result_queue, and io_buffer
-        self.problem_queue = SharedMemoryQueue(self.smm, self.cfg.actor.problem_queue_size, cfg.actor.shared_memory_entry_size)
-        self.result_queue = SharedMemoryQueue(self.smm, self.cfg.actor.result_queue_size, cfg.actor.shared_memory_entry_size)
+        self.problem_queue = SharedMemoryQueue(self.smm, self.cfg.actor.problem_queue_size, self.cfg.actor.shared_memory_entry_size)
+        self.result_queue = SharedMemoryQueue(self.smm, self.cfg.actor.result_queue_size, self.cfg.actor.shared_memory_entry_size)
 
         logger.info(f"Problem queue size: {self.problem_queue.max_size}, result queue size: {self.result_queue.max_size}")
         logger.info(f"Result queue buffer size: {self.result_queue.get_memory_size() / 2**30} Gb")
@@ -523,8 +523,8 @@ class ActorLoop:
                     if self.is_training:
                         loop_stats = {
                             "published_samples": published_samples,
-                            "problem_queue_size": self.problem_queue.qsize(),
-                            "result_queue_size": self.result_queue.qsize(),
+                            "problem_queue_size": self.problem_queue_size(),
+                            "result_queue_size": self.result_queue_size(),
                             "finished_groups": finished_groups,
                             "trainer_model_version": trainer_version_to_publish,
                             "time_since_start": time.time() - loop_start_time,
@@ -610,7 +610,13 @@ class ActorLoop:
         return self.result_queue.get(block=False)
 
     def results_ready_to_publish(self) -> int:
-        return self.result_queue.qsize() * self.cfg.attempts
+        return self.result_queue_size() * self.cfg.attempts
+
+    def problem_queue_size(self) -> int:
+        return self.problem_queue.qsize()
+
+    def result_queue_size(self) -> int:
+        return self.result_queue.qsize()
 
 
 class ActorLoopRay(ActorLoop):
@@ -643,6 +649,7 @@ class ActorLoopRay(ActorLoop):
         else:
             logger.info("Ray already initialized")
 
+        assert self.trainer_state.propagated_weight_version is not None
         rollout_policy: Callable[[DictConfig, TrainableLLM, dict], RolloutResult] = hydra.utils.get_method(self.cfg.actor.rollout_policy)
         def rollout_wrapper(cfg: DictConfig, llm: TrainableLLM, problem: dict, problem_id: int) -> RolloutResult:
             start_ts = time.monotonic()
@@ -688,6 +695,7 @@ class ActorLoopRay(ActorLoop):
         for finished_task in finished_tasks:
             try:
                 rollout_result, llm_url, problem_id, stop_ts, start_ts = ray.get(finished_task)
+                rollout_result.model_version = self.trainer_state.propagated_weight_version
                 task_dt = stop_ts - start_ts
                 self.task_latencies.append(task_dt)
                 outer_ts = time.monotonic()
@@ -738,8 +746,11 @@ class ActorLoopRay(ActorLoop):
             return self.finished_problems.pop(0)
         return []
 
-    def results_ready_to_publish(self) -> int:
-        return len(self.finished_problems) * self.cfg.attempts
+    def problem_queue_size(self) -> int:
+        return len(self.unfinished_tasks)
+
+    def result_queue_size(self) -> int:
+        return len(self.finished_problems)
 
 
 def run_actor_loop(cfg: DictConfig):
