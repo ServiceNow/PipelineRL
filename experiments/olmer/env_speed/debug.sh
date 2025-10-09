@@ -1,7 +1,7 @@
 #!/bin/bash
 echo "Run 38 workers"
-DEBUG_FILE=timing_debug_workers38_3.jsonl python -m pipelinerl.launch \
-    output_dir=results/actor_debug38_3 \
+DEBUG_FILE=timing_debug_workers38_4.jsonl python -m pipelinerl.launch \
+    output_dir=results/actor_debug38_4 \
     force_restart=true \
     actor.llm_max_rollouts=256 \
     finetune.seq_parallel=8 \
