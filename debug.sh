@@ -1,12 +1,12 @@
 #!/bin/bash
-echo "Run 40 workers"
-DEBUG_FILE=timing_debug_workers40_1.jsonl python -m pipelinerl.launch \
-    output_dir=results/actor_debug40_1 \
+echo "Run 38 workers"
+DEBUG_FILE=timing_debug_workers38_3.jsonl python -m pipelinerl.launch \
+    output_dir=results/actor_debug38_3 \
     force_restart=true \
     actor.llm_max_rollouts=256 \
     finetune.seq_parallel=8 \
     eval_every_n_versions=0 \
-    actor.rollout_workers=40 \
+    actor.rollout_workers=38 \
     debug.mode=actor \
     world.actor_fraction=8 \
     world.finetune_fraction=0 \

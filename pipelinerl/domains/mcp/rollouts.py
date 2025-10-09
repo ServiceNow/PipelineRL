@@ -13,10 +13,9 @@ from omegaconf import DictConfig, OmegaConf
 from tapeagents.agent import DEFAULT, Agent
 from tapeagents.core import LLMCall, Tape, TrainingText
 from tapeagents.dialog_tape import UserStep
-from tapeagents.llms import LiteLLM
 from tapeagents.llms.trainable import TrainableLLM
 from tapeagents.mcp import MCPEnvironment
-from tapeagents.orchestrator import async_execute_agent, execute_agent, get_agent_and_env_from_config, save_debug_tape
+from tapeagents.orchestrator import async_execute_agent, execute_agent, get_agent_and_env_from_config
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 
 from pipelinerl.async_llm import make_training_text
@@ -42,7 +41,6 @@ def _get_embedded_worker(env_cfg: DictConfig, concurrency: int) -> EmbeddedEnvir
     else:
         _embedded_worker.set_concurrency(concurrency)
     return _embedded_worker
-
 
 def count_tool_calls_by_category(llm_calls: List[LLMCall]) -> Dict[str, int]:
     """
@@ -319,7 +317,6 @@ def generate_mcp_rollout_with_local_env(
         tape = execute_agent(agent, tape, environment, max_loops=cfg.agent_max_loops)
         logger.info("Agent finished")
         tape.metadata.result.update({"total_execution_time": time.perf_counter() - t_exec})
-        # save_debug_tape(tape)
         reward_table = RewardTable(**dict(cfg.rewards))
 
         llm_calls: list[LLMCall] = [

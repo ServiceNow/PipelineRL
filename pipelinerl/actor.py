@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -20,7 +21,6 @@ import uvloop
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 from tapeagents.llms import TrainableLLM
-from tapeagents.orchestrator import save_debug_line
 
 import wandb
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
@@ -45,6 +45,11 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+def save_debug_line(data:dict):
+    data["ts"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    fname = os.environ.get("DEBUG_FILE", "timing_debug.jsonl")
+    with open(fname, "a") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 class SlidingWindowData(BaseModel):
     prompt_tokens_window: list[list[int]] = Field(
@@ -73,9 +78,11 @@ class SlidingWindowAggregator:
             self.data.timestamps.pop(0)
 
     def get_stats(self):
-        if len(self.data.prompt_tokens_window) < self.window_size:
-            logger.warning(f"Not enough data to compute sliding stats, window size: {self.window_size}, data length: {len(self.data.prompt_tokens_window)}")
+        if len(self.data.prompt_tokens_window) < 2:
+            logger.warning("Not enough data to compute sliding stats")
             return None
+        elif len(self.data.prompt_tokens_window) < self.window_size:
+            logger.warning(f"Compute sliding stats over just {len(self.data.prompt_tokens_window)} samples")
 
         # 1. How many samples do we produce per second?
         # 2. How many output tokens do we produce per second?
