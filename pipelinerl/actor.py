@@ -74,6 +74,7 @@ class SlidingWindowAggregator:
 
     def get_stats(self):
         if len(self.data.prompt_tokens_window) < self.window_size:
+            logger.warning(f"Not enough data to compute sliding stats, window size: {self.window_size}, data length: {len(self.data.prompt_tokens_window)}")
             return None
 
         # 1. How many samples do we produce per second?
@@ -592,6 +593,7 @@ class ActorLoop:
                     stats[f"{prefix}{new_suffix}"] = stats[key]
                     break
 
+        logger.info(f"Publish actor stats to wandb: {stats}")
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
@@ -631,6 +633,7 @@ class ActorLoopRay(ActorLoop):
         self.unfinished_tasks = []
         self.llms_by_url = {llm.get_base_url(): llm for llm in self.llms}
         self.llms_utilization = {llm.get_base_url(): 0 for llm in self.llms}
+        self.scheduler_name = f"{'train' if self.is_training else 'test'} ray scheduler"
         self.problem_id = 0
         self.attempts = self.cfg.attempts if self.is_training else 1
         self.unfinished_problems = defaultdict(list) # up to `attempts` rollout results for each problem
@@ -696,6 +699,15 @@ class ActorLoopRay(ActorLoop):
             try:
                 rollout_result, llm_url, problem_id, stop_ts, start_ts = ray.get(finished_task)
                 rollout_result.model_version = self.trainer_state.propagated_weight_version
+                full_group_id = f"{self.scheduler_name}_{problem_id}"
+                rollout_result.group_id = full_group_id
+                rollout_index = len(self.unfinished_problems[problem_id])
+                for step_index, sample in enumerate(rollout_result.training_texts):
+                    # Downstream in the pipeline we'll need these fields in every sample
+                    sample.metadata["model_version"] = rollout_result.model_version
+                    sample.metadata["rollout_index"] = rollout_index
+                    sample.metadata["step_index"] = step_index
+                    sample.group_id = full_group_id
                 task_dt = stop_ts - start_ts
                 self.task_latencies.append(task_dt)
                 outer_ts = time.monotonic()
@@ -714,7 +726,9 @@ class ActorLoopRay(ActorLoop):
             logger.info(f"Problem {problem_id} has {len(self.unfinished_problems[problem_id])} rollout results")
             if len(self.unfinished_problems[problem_id]) == self.cfg.attempts:
                 logger.info(f"Problem {problem_id} group finished")
-                self.finished_problems.append(self.unfinished_problems[problem_id])
+                group = self.unfinished_problems[problem_id]
+                random.shuffle(group)
+                self.finished_problems.append(group)
                 del self.unfinished_problems[problem_id]
                 logger.info(f"{len(self.finished_problems)} finished problems ready to return")
             logger.info(

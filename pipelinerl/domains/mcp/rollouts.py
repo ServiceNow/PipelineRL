@@ -430,8 +430,7 @@ def generate_mcp_rollout_with_local_env(
             training_texts=training_texts,
             metrics=metrics,
             latency=latency,
-            dataset_name=problem["dataset"],
-            llm_url=llm.get_base_url(),
+            dataset_name=problem["dataset"]
         )
     except Exception as e:
         err_msg = f"Error generating rollout: {e}"
