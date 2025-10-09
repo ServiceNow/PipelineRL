@@ -64,8 +64,9 @@ class SlidingWindowData(BaseModel):
 
 
 class SlidingWindowAggregator:
-    def __init__(self, window_size: int):
+    def __init__(self, window_size: int, min_samples: int = 5):
         self.window_size = window_size
+        self.min_samples = min_samples
         self.data = SlidingWindowData()
 
     def update(self, prompt_tokens: list[int], output_tokens: list[int]):
@@ -78,7 +79,7 @@ class SlidingWindowAggregator:
             self.data.timestamps.pop(0)
 
     def get_stats(self):
-        if len(self.data.prompt_tokens_window) < 2:
+        if len(self.data.prompt_tokens_window) < self.min_samples:
             logger.warning("Not enough data to compute sliding stats")
             return None
         elif len(self.data.prompt_tokens_window) < self.window_size:
