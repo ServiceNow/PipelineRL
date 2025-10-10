@@ -14,6 +14,10 @@ test_llm:
   parameters:
     max_tokens: 8192
 
+rewards:
+  correct_answer_not_finished: 0.0
+  buffer_tokens: 2000
+
 actor:
   rollout_policy: pipelinerl.domains.mcp.generate_mcp_rollout_with_local_env
   system_prompt: Please reason step by step, and put your final answer within \boxed{{}}.
@@ -22,7 +26,10 @@ actor:
   problem_queue_size: 256
   task_template: |-
     {task}
-  shared_memory_entry_size: 10000000
+  shared_memory_entry_size: 200000000
+
+preprocess:
+  shared_memory_entry_size: 2000000000
 
 finetune:
   seq_length: 32000
@@ -144,6 +151,7 @@ agent:
       trim_obs_except_last_n: 2
       next_node: code
 
+<<<<<<< HEAD
 model_path: Qwen/Qwen3-8B
 # model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
 
@@ -161,3 +169,7 @@ length_shaping:
   slope: 0.001                     # penalty per token beyond target
   max_penalty: 0.2                 # clamp absolute penalty
   bonus_on_short_correct: 0.05     # bonus if correct and concise
+=======
+# model_path: Qwen/Qwen3-8B
+model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
+>>>>>>> mcp_tir
