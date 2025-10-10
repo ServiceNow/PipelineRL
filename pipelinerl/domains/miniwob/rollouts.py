@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import random
 import time
+import traceback
 
 import aiohttp
 from examples.rl_webagent.steps import WebTape
@@ -55,6 +57,28 @@ def tape_contains_an_error(tape: WebTape) -> bool:
     )
 
 
+async def check_env_server_health(env_job: Job, session: aiohttp.ClientSession) -> dict:
+    """Check environment server health via HTTP API."""
+    try:
+        url = f"http://{env_job.hostname}:{env_job.port}/health"
+        async with session.get(url, timeout=5) as response:
+            if response.status == 200:
+                health_data = await response.json()
+                return {
+                    "healthy": True,
+                    "health_data": health_data,
+                    "last_check": time.time()
+                }
+            else:
+                error_text = await response.text()
+                return {"healthy": False, "error_message": f"HTTP {response.status}: {error_text}", "last_check": time.time()}
+    except Exception as e:
+        exception_type = type(e).__name__
+        exception_message = str(e) if str(e) else "No message available"
+        logger.exception(f"Error checking environment server health: {exception_type}: {exception_message}", stack_info=True)
+        return {"healthy": False, "error_message": f"Exception: {exception_type}: {exception_message}", "last_check": time.time(), "error_stacktrace": traceback.format_exc()}
+
+
 async def generate_miniwob_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -70,53 +94,135 @@ async def generate_miniwob_rollout(
     # get training text from llm calls
 
     start_time = time.time()
+    
+    # Overall timeout for the entire rollout to prevent hanging
+    rollout_timeout = getattr(cfg, 'rollout_timeout', 600)  # 10 minutes default
 
-    # (1) Choose a random environment server
     env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
-    # choose the env job randomly
-    env_job = random.choice(env_jobs)
-    assert env_job.port is not None
-    env_job_url = f"http://{env_job.hostname}:{env_job.port}"
+    env_jobs_url_tried = []
 
+    # Try each environment server with health checks until one of them returns a rollout result
+    for _ in range(len(env_jobs)):
+        # Choose the next environment server to try randomly from the ones that have not been tried yet
+        env_job = random.choice([job for job in env_jobs if f"http://{job.hostname}:{job.port}" not in env_jobs_url_tried])
+        env_job_url = f"http://{env_job.hostname}:{env_job.port}"
+        env_jobs_url_tried.append(env_job_url)
+
+        # Check server health before using
+        health = await check_env_server_health(env_job, session)
+        if not health["healthy"]:
+            logger.warning(f"Environment server {env_job_url} is unhealthy: {health}")
+            logger.warning(f"Get health error stacktrace: {health['error_stacktrace']}")
+            continue
+        # Log health status for monitoring
+        if health["healthy"]:
+            logger.info(f"Using healthy environment server {env_job_url}: {health}")
+
+        try:
+            # Execute the entire rollout with a timeout
+            return await asyncio.wait_for(
+                _execute_rollout_with_timeout(cfg, llm, problem, session, start_time, env_job_url),
+                timeout=rollout_timeout
+            )
+        except asyncio.TimeoutError:
+            health = await check_env_server_health(env_job, session)
+            if stack_trace := health.get("error_stacktrace"):
+                logger.warning(f"Get health error stacktrace: {stack_trace}")
+            logger.warning(f"Rollout timeout error stacktrace: {traceback.format_exc()}")
+            logger.warning(f"Rollout timed out after {rollout_timeout} seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {health}. Trying next server.")
+            continue
+        except Exception as e:
+            health = await check_env_server_health(env_job, session)
+            if stack_trace := health.get("error_stacktrace"):
+                logger.warning(f"Get health error stacktrace: {stack_trace}")
+            logger.warning(f"Rollout failed error stacktrace: {traceback.format_exc()}")
+            logger.warning(f"Rollout failed for task {problem['dataset']}/{problem['task']}/{problem['seed']} on environment {env_job_url}. Health: {health}. Trying next server.")
+            continue
+    # If all servers failed
+    logger.error(f"All environment servers failed for task {problem['dataset']}/{problem['task']}/{problem['seed']}. Returning a failed rollout result.")
+    return _create_failed_rollout_result(problem, start_time, "all environment servers failed")
+
+
+async def _execute_rollout_with_timeout(
+    cfg: DictConfig,
+    llm: TrainableLLM,
+    problem: dict,
+    session: aiohttp.ClientSession,
+    start_time: float,
+    env_job_url: str,
+) -> RolloutResult:
     # (2) Generate environment, TapeAgent, and run them to get a Tape
     no_error = True  # track if there was an error in the tape
     environment = AsyncRemoteEnvironment(server_url=env_job_url)  # type: ignore
     async with environment.acontext(session, wait_for_env=True) as env:
         start_attempts = cfg.start_attempts
         t = time.perf_counter()
-        while True:
+        while start_attempts > 0:
             try:
-                tape_dict, _ = await env.start_task(problem)
+                tape_dict, info = await env.start_task(problem)
+                if info.get("error"):
+                    raise ValueError(info['error'])
                 break
             except Exception as e:
-                logger.warning(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']}")
                 start_attempts -= 1
+                logger.warning(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']}. {start_attempts} attempts remaining. Error: {e}")
                 if start_attempts <= 0:
+                    logger.error(f"Failed to start task after all retry attempts: {e}")
                     no_error = False
                     tape_dict = {}
                     break
                 else:
-                    logger.warning(f"retry after 5 seconds: {e}")
+                    logger.warning("Retry start task after 5 seconds.")
                     await asyncio.sleep(5)
         logger.info(
-            f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds"
+            f"Task {problem['dataset']}/{problem['task']}/{problem['seed']} started in {time.perf_counter() - t:.2f} seconds. Worker ID: {env.worker_id}. Tape dict: {tape_dict}"
         )
         tape: WebTape = WebTape(**tape_dict)  # convert http response dict to WebTape object
         t = time.perf_counter()
         if no_error:  # only run the agent if the task started successfully
-            logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
-            try:
-                actions = await env.a_actions()
-                tools_description = await env.a_tools_description()
-                logger.debug(f"Available tools: {tools_description}")
-                agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
-                agent.llms = {DEFAULT: llm}
-                tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
-            except Exception as e:
-                logger.error(f"Error occurred while running agent: {e}")
-                no_error = False
+            logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}")
+            agent_attempts = cfg.agent_attempts
+            while agent_attempts > 0:
+                # check if the worker is alive.
+                try:
+                    # this will either raise RuntimeError if worker is not alive anymore, or return a dictionary with the worker status
+                    worker_status = await env.check_worker_alive()
+                    if worker_status.get("status") == "starting":
+                        logger.warning(f"Worker {env.worker_id} for task {problem['dataset']}/{problem['task']}/{problem['seed']} and tape ID {tape.metadata.id} is starting, waiting 5 seconds for it to be fully started.")
+                        await asyncio.sleep(5)
+                        continue
+                except Exception as e:
+                    # if worker is dead, no need to retry
+                    logger.exception(f"Worker {env.worker_id} for task {problem['dataset']}/{problem['task']}/{problem['seed']} and tape ID {tape.metadata.id} is dead. Error: {e}", stack_info=True)
+                    no_error = False
+                    break
+                # if worker is alive, run the agent
+                try:
+                    actions = await env.a_actions()
+                    tools_description = await env.a_tools_description()
+                    agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
+                    agent.llms = {DEFAULT: llm}
+                    tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
+                    # Check if the tape has an error from the orchestrator (e.g., SocketTimeoutError, RuntimeError: Worker is not alive, etc.)
+                    if tape.metadata.error:
+                        logger.error(f"Agent execution for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id} returned a tape with error: {tape.metadata.error}")
+                        raise ValueError(tape.metadata.error)
+                    else:
+                        # Success - break out of retry loop
+                        logger.info(f"Agent execution for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id} finished successfully")
+                        break
+                except Exception as e:
+                    agent_attempts -= 1
+                    logger.warning(f"Error occurred while running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}. {agent_attempts} attempts remaining. Error: {e}")
+                    if agent_attempts <= 0:
+                        logger.error(f"Agent execution failed after all retry attempts for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}: {e}")
+                        no_error = False
+                        break
+                    else:
+                        logger.warning(f"Retry agent execution after 5 seconds for task {problem['dataset']}/{problem['task']}/{problem['seed']} with worker ID: {env.worker_id} and tape ID {tape.metadata.id}.")
+                        await asyncio.sleep(5)
             logger.info(
-                f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds"
+                f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']} in {time.perf_counter() - t:.2f} seconds with worker ID: {env.worker_id} and tape ID {tape.metadata.id}"
             )
         tape.metadata.result.update({"total_execution_time": time.perf_counter() - t})
 
@@ -142,12 +248,15 @@ async def generate_miniwob_rollout(
     # get the number of PageObservation steps in the tape
     n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
 
-    #reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
-    # massimo's setup:
-    reward = float(raw_reward>0)
-    if reward == 0.0:
-        reward = -1.0
-    reward *= 0.98 ** n_page_observations
+    if cfg.reward_computation == "nico":
+        reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
+    elif cfg.reward_computation == "massimo":
+        reward = float(raw_reward>0)
+        if reward == 0.0:
+            reward = -1.0
+        reward *= 0.98 ** n_page_observations
+    else:
+        raise ValueError(f"Invalid reward configuration: {cfg.reward_computation}")
 
     # (3) Get LLM calls from Tape
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
@@ -197,4 +306,36 @@ async def generate_miniwob_rollout(
         dataset_name=problem["dataset"],
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
+    )
+
+
+def _create_failed_rollout_result(problem: dict, start_time: float, error_type: str) -> RolloutResult:
+    """Create a failed rollout result for timeout or other errors."""
+    latency = time.time() - start_time
+    
+    # Create empty training texts and metrics for failed rollout
+    metrics = MiniwobMetrics(
+        reward=-1.0,
+        success=False,
+        no_error=False,
+        no_answer=True,
+        overflow=False,
+        n_llm_calls=0,
+        n_step_errors=0,
+        n_page_observations=0,
+        n_steps=0,
+        total_execution_time=latency,
+        agent_execution_time=-1.0,
+        environment_execution_time=-1.0,
+        env_step_time=-1.0,
+        agent_step_time=-1.0,
+    )
+    
+    return RolloutResult(
+        training_texts=[],
+        metrics=metrics,
+        latency=latency,
+        dataset_name=problem["dataset"],
+        prompt_tokens=[],
+        output_tokens=[],
     )

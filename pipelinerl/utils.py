@@ -238,6 +238,9 @@ def calculate_stats(stats: List | Dict[Any, Any]) -> Dict[str, float]:
     if not isinstance(stats, list):
         raise TypeError(f"Expected stats to be a list, got {type(stats)}")
 
+    if len(stats) == 0:
+        return {}
+
     aggregated_stats = {
         "max": float(max(stats)),
         "min": float(min(stats)),
