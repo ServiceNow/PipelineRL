@@ -154,6 +154,11 @@ def preprocess_dataset(
         entry = dict(data[i])
         for k, v in preprocess(data[i]).items():
             entry[k] = v
+        metadata = entry.get("metadata")
+        if isinstance(metadata, dict):
+            entry["finish_reason"] = metadata.get("finish_reason")
+        else:
+            entry["finish_reason"] = None
         dataset.append(entry)        
     for entry in dataset:
         entry["model_version"] = entry["metadata"]["model_version"]
@@ -666,4 +671,3 @@ def run_preprocessing_loop(
                     if worker.is_alive():
                         worker.terminate()
                         worker.join(timeout=1.0)
-
