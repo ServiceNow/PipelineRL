@@ -149,5 +149,5 @@ agent:
       trim_obs_except_last_n: 2
       next_node: code
 
-# model_path: Qwen/Qwen3-8B
-model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
+model_path: Qwen/Qwen3-8B
+# model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
