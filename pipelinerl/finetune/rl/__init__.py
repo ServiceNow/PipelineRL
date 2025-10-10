@@ -296,15 +296,29 @@ def rl_step(
             )
             group_ratio_new_old = torch.exp(lrn_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2)
             group_advantages_t = (adv_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2).detach()
+            # Sum token weights per segment so GSPO respects normalization/overflow settings.
+            zero_weights = torch.zeros_like(tokens_weights)
+            weight_sum, _, _ = per_segment_sums(
+                batch.segment_ids,
+                masks_shifted,
+                tokens_weights,
+                zero_weights,
+                seq_parallel_group=seq_parallel_group,
+            )
+            valid_mask = (tok_count > 0) & (weight_sum > 0)
+            valid_mask_3d = valid_mask.unsqueeze(1).unsqueeze(2)
             surr1 = group_ratio_new_old * group_advantages_t
             clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
-            clamp_log_ratio_new_old_indicators = clamped_group_ratio != group_ratio_new_old
+            clamp_log_ratio_new_old_indicators = (clamped_group_ratio != group_ratio_new_old) & valid_mask_3d
             surr2 = clamped_group_ratio * group_advantages_t
+            sequence_weights = weight_sum.unsqueeze(1).unsqueeze(2)
             # If we have a sentinel or no segments, return a zero loss but keep graph
             if batch.sentinel or surr1.numel() == 0:
                 policy_loss_total = new_logprobs[..., :1].sum() * 0.0
             else:
-                policy_loss_total = -torch.min(surr1, surr2).sum()
+                mask_float = valid_mask_3d.to(dtype=surr1.dtype)
+                min_terms = torch.min(surr1, surr2) * mask_float * sequence_weights
+                policy_loss_total = -min_terms.sum()
             expanded_indicators = torch.zeros_like(masks_shifted, dtype=torch.float)
             # Expand per-sequence indicators to token-level across segment ranges
             # Flatten to 1-D so single-sequence cases don't produce 0-d tensors
@@ -490,10 +504,20 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     assert len(df) == len(df_init)
 
     # Step 4: make token-level overflow and mean group length information
-    df["overflow"] = df.apply(
-        lambda row: [0.0] * len(row["overflow"]) if eos_token_id in row["input_ids"] else [1.0] * len(row["overflow"]),
-        axis=1,
-    )
+    def _overflow_from_finish_reason(row):
+        length = len(row["overflow"])
+        finish_reason = row.get("finish_reason")
+        if isinstance(finish_reason, str):
+            finish_reason = finish_reason.strip().lower()
+            if finish_reason == "length":
+                return [1.0] * length
+            if finish_reason in {"stop", "content_filter"}:
+                return [0.0] * length
+        if row.get("finished"):
+            return [0.0] * length
+        return [0.0] * length if eos_token_id in row["input_ids"] else [1.0] * length
+
+    df["overflow"] = df.apply(_overflow_from_finish_reason, axis=1)
     df["group_tokens"] = df.apply(lambda row: [row["group_tokens"]] * len(row["input_ids"]), axis=1)
     df["num_labels"] = df.apply(
         lambda row: [sum(1 for label in row["labels"] if label != -100)] * len(row["input_ids"]), axis=1
