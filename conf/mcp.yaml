@@ -152,6 +152,7 @@ agent:
       next_node: code
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 model_path: Qwen/Qwen3-8B
 # model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
 
@@ -169,7 +170,6 @@ length_shaping:
   slope: 0.001                     # penalty per token beyond target
   max_penalty: 0.2                 # clamp absolute penalty
   bonus_on_short_correct: 0.05     # bonus if correct and concise
-=======
-# model_path: Qwen/Qwen3-8B
-model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft
->>>>>>> mcp_tir
+
+model_path: Qwen/Qwen3-8B
+# model_path: /mnt/llmd/base_models/ServiceNow-AI/7_9_25_14b_text_reasoning_sft

@@ -18,18 +18,12 @@ from tapeagents.mcp import MCPEnvironment
 from tapeagents.orchestrator import async_execute_agent, execute_agent, get_agent_and_env_from_config
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 
-<<<<<<< HEAD
 from pipelinerl.async_llm import make_training_text
-from pipelinerl.domains.math import RewardTable, get_reward, verify_answer, verify_answer_rpc
 from pipelinerl.domains.mcp.env_server import EmbeddedEnvironmentWorker
 from pipelinerl.domains.mcp.steps import MathAnswer
-from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.world import Job
-=======
-from pipelinerl.domains.mcp.env_server import EmbeddedEnvironmentWorker
 from pipelinerl.domains.math import RewardTable, get_reward, verify_answer, verify_answer_rpc, length_penalty
 from pipelinerl.rollouts import RolloutResult, BaseMetrics
->>>>>>> mcp_tir
 
 logger = logging.getLogger(__name__)
 
