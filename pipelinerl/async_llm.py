@@ -9,11 +9,15 @@ from tapeagents.core import LLMCall, LLMOutput, Prompt, TokenLogprob
 from tapeagents.llms.trainable import TrainableLLM
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-from pipelinerl.finetune.data import MASKED_TOKEN_ID
-from pipelinerl.rollouts import TrainingText
 from pipelinerl.processor_factory import get_processor
+from pipelinerl.rollouts import TrainingText
 
 logger = logging.getLogger(__name__)
+
+# -100 is the default "ignore_index" in nn.CrossEntropyLoss
+# Defined here to avoid importing dependencies from finetune.data
+# Do not replace. Import from finetune module breaks ray parallelization!
+MASKED_TOKEN_ID = -100
 
 
 def _to_plain(obj):
