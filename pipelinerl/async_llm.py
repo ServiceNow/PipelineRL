@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 from tapeagents.core import LLMCall, LLMOutput, Prompt, TokenLogprob
 from tapeagents.llms.trainable import TrainableLLM
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from pipelinerl.rollouts import TrainingText
@@ -15,9 +16,19 @@ from pipelinerl.processor_factory import get_processor
 logger = logging.getLogger(__name__)
 
 
+def _to_plain(obj):
+    """ConvertHydra containers to plain Python types for JSON."""
+    if isinstance(obj, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(obj, resolve=True)
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(v) for v in obj]
+    return obj
+
+
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     """Extract PIL Images from multimodal messages."""
-
     images = []
     for message in messages:
         if isinstance(message.get("content"), list):
@@ -56,6 +67,8 @@ async def llm_async_generate(
         "messages": prompt.messages,
         "stream": llm.stream,
     }
+    if getattr(prompt, "tools", None):
+        data["tools"] = prompt.tools
     if llm.collect_logprobs:
         data.update(
             {
@@ -67,9 +80,15 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
+    llm_params = _to_plain(getattr(llm, "parameters", {}))
+    if not isinstance(llm_params, dict):
+        llm_params = {"parameters": llm_params}
+    payload = _to_plain(data)
+    payload.update(llm_params)
+
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
-        json=data | llm.parameters,
+        json=payload,
         headers=headers,
         ssl=False,
     ) as response:
@@ -102,6 +121,12 @@ async def llm_async_generate(
                     except Exception as e:
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
+        try:
+            finish_reason = data["choices"][0].get("finish_reason")
+            stop_reason = data["choices"][0].get("stop_reason")
+        except Exception:
+            finish_reason = None
+            stop_reason = None
     except Exception as e:
         logger.exception(f"Failed to parse llm response: {data}")
         raise e
@@ -112,6 +137,11 @@ async def llm_async_generate(
     llm_call.output_length_tokens = data["usage"]["completion_tokens"]
     assert llm_call is not None, "llm_call is None"
     llm_call.logprobs = parsed_logprobs
+    # Store finish reason details for metrics
+    if finish_reason is not None:
+        llm_call.llm_info["finish_reason"] = finish_reason
+    if stop_reason is not None:
+        llm_call.llm_info["stop_reason"] = stop_reason
     return llm_call
 
 
@@ -206,7 +236,17 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
     logprobs = [lp.logprob for lp in llm_call.logprobs]
-    finished = llm_call.output.content.endswith(tokenizer.eos_token)
+    # Prefer backend-provided finish reason
+    finish_reason = None
+    try:
+        finish_reason = llm_call.llm_info.get("finish_reason")
+    except Exception:
+        finish_reason = None
+
+    if finish_reason is not None:
+        finished = finish_reason == "stop"
+    else:
+        finished = llm_call.output.content.endswith(tokenizer.eos_token)
     prompt_tokens = llm_call.prompt_length_tokens
     output_tokens = llm_call.output_length_tokens
 
@@ -220,4 +260,5 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
         visual_features=visual_features,
+        metadata={"finish_reason": finish_reason} if finish_reason is not None else {},
     )
