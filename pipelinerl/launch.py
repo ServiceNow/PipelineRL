@@ -26,6 +26,8 @@ os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
+VISIBLE_GPUS = os.getenv("CUDA_VISIBLE_DEVICES")
+
 def _popen(
     cmd: list[str],
     env: dict | None = None,
@@ -100,7 +102,11 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
         if v not in [None, ""]:
             cmd.append(str(v))
 
-    gpu_str = ",".join([str(gpu) for gpu in gpus])
+    visible_gpus = VISIBLE_GPUS.split(',')
+    if len(visible_gpus) == 0: 
+        gpu_str = ",".join([str(gpu) for gpu in gpus])
+    else:
+        gpu_str = ",".join([str(visible_gpus[gpu]) for gpu in gpus])
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
@@ -160,7 +166,8 @@ def run_actor_llm(
     if cfg.debug.mode:
         cmd.append("--disable-weight-updates")
 
-    gpu_str = ",".join([str(gpu) for gpu in gpus])
+    visible_gpus = VISIBLE_GPUS.split(',')
+    gpu_str = ",".join([str(visible_gpus[gpu]) for gpu in gpus])
     logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
     save_command(log_dir, cmd)
     log_file_path = os.path.join(log_dir, "stdout.log")
@@ -290,10 +297,14 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         "c10d",
     ]
     if gpus:
-        gpus_str = str(",".join([str(gpu) for gpu in gpus])) if len(gpus) < world_map.node_size else "all"
+        visible_gpus = VISIBLE_GPUS.split(',')
+        if len(visible_gpus) == 0: 
+            gpu_str = ",".join([str(gpu) for gpu in gpus])
+        else:
+            gpu_str = ",".join([str(visible_gpus[gpu]) for gpu in gpus])
         cmd += [
             "--gpu-ids",
-            gpus_str,
+            gpu_str,
         ]
     cmd += [
         "--num_processes",
