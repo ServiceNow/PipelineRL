@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import random
 import time
@@ -12,7 +11,7 @@ import aiohttp
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from tapeagents.agent import DEFAULT, Agent
-from tapeagents.core import LLMCall, Tape, TrainingText
+from tapeagents.core import LLMCall, Tape
 from tapeagents.dialog_tape import UserStep
 from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
@@ -73,178 +72,8 @@ class Metrics(BaseMetrics):
     environment_execution_time: float = -1.0
     overflow: bool = False
 
-async def generate_mcp_rollout(
-    cfg: DictConfig,
-    llm: TrainableLLM,
-    problem: dict,
-    session: aiohttp.ClientSession,
-) -> RolloutResult:
-    start = time.perf_counter()
 
-    chosen_url: str | None = None
-    env_host: str | None = None
-    env_port: int | None = None
-
-    if cfg.world.environment_mode == "remote":
-        env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
-        if not env_jobs:
-            raise RuntimeError("No environment servers available")
-
-        env_urls_all = [f"http://{job.hostname}:{job.port}" for job in env_jobs if job.port is not None]
-        if not env_urls_all:
-            raise RuntimeError("Environment server definitions missing ports")
-
-        while True:
-            env_urls = env_urls_all[:]
-            random.shuffle(env_urls)
-            chosen_url = None
-            for env_url in env_urls:
-                jitter = random.randint(3, 12)
-                try:
-                    environment = AsyncRemoteEnvironment(
-                        server_url=env_url, start_timeout_sec=600, start_repeat_delay=jitter)
-                    context_manager = environment.acontext(session, wait_for_env=True)
-                    env = await context_manager.__aenter__()
-                    try:
-                        await env.start_task(problem)
-                        chosen_url = env_url
-                        actions = await env.a_actions()
-                        tools_description = await env.a_tools_description()
-                        logger.debug(f"Available tools: {tools_description}")
-                        agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
-                        agent.llms = {DEFAULT: llm}
-
-                        tape = Tape(steps=[
-                            UserStep(content=f"{problem['task']}. You have access to the following tools: {tools_description}")
-                        ])
-                        t_exec = time.perf_counter()
-                        while True:
-                            try:
-                                tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
-                                tape.metadata.result.update({"total_execution_time": time.perf_counter() - t_exec})
-                                break
-                            except Exception:
-                                await asyncio.sleep(5)
-                        break  # success
-                    finally:
-                        await context_manager.__aexit__(None, None, None)
-                except Exception as e:
-                    logger.warning(f"Env start failed at {env_url}: {e}")
-                    continue
-            if chosen_url is not None:
-                break  # success
-            await asyncio.sleep(1.0)
-
-        parsed = urlparse(chosen_url)
-        env_host, env_port = parsed.hostname, parsed.port
-    else:
-        concurrency = max(1, int(getattr(cfg.world, "env_replicas_per_actor", 1)))
-        env_worker = _get_embedded_worker(cfg.environment, concurrency)
-        async with env_worker.alifecycle() as environment:
-            start_result = environment.start_task(problem)
-            tape_metadata = start_result if isinstance(start_result, dict) else {}
-
-            actions = environment.actions()
-            tools_description = environment.tools_description()
-            logger.debug(f"Embedded tools: {tools_description}")
-            agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
-            agent.llms = {DEFAULT: llm}
-            tape = Tape(
-                steps=[
-                    UserStep(
-                        content=f"{problem['task']}. You have access to the following tools: {tools_description}"
-                    )
-                ]
-            )
-            if tape_metadata:
-                tape.metadata.other.update(tape_metadata)
-
-            t_exec = time.perf_counter()
-            tape = await async_execute_agent(agent, tape, environment, session, max_loops=cfg.agent_max_loops)
-            tape.metadata.result.update({"total_execution_time": time.perf_counter() - t_exec})
-        env_host = env_port = None
-
-    reward_table = RewardTable(**dict(cfg.rewards))
-
-    llm_calls: list[LLMCall] = [
-        LLMCall(**step.metadata.other["llm_call"])
-        if isinstance(step.metadata.other["llm_call"], dict)
-        else step.metadata.other["llm_call"]
-        for step in tape.steps if step.metadata.other.get("llm_call") is not None
-    ]
-    assert len(llm_calls) > 0, "No LLM calls found"
-    tool_call_counts = count_tool_calls_by_category(llm_calls)
-    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
-    n_llm_calls = len(llm_calls)
-    if env_host and env_port:
-        answer_status = await verify_answer_rpc(
-            session=session,
-            host=env_host,
-            port=env_port,
-            prediction=llm_calls[-1].output.content,  # type: ignore
-            gold=problem["answer"],
-            strict=True,
-        )
-    else:
-        answer_status = verify_answer(
-            prediction=llm_calls[-1].output.content,  # type: ignore
-            gold=problem["answer"],
-            strict=True,
-        )
-    # Tape should finish with an answer
-    tape_finished = True if isinstance(tape.steps[-1], MathAnswer) else False
-    base_reward = get_reward(answer_status, tape_finished, reward_table)
-
-    reward = base_reward
-
-    discount_factor = float(getattr(cfg.actor, "discount_factor", 1.0))
-    if discount_factor != 1.0:
-        total_generated_tokens = sum(getattr(call, "output_length_tokens", 0) for call in llm_calls)
-        reward *= discount_factor ** total_generated_tokens
-
-    buffer_tokens = getattr(reward_table, "buffer_tokens", 0)
-    if buffer_tokens:
-        max_tokens = int(llm.parameters.get("max_tokens", 0))
-        total_output_tokens = sum(getattr(text, "output_tokens", 0) for text in training_texts)
-        if max_tokens > 0:
-            reward += length_penalty(max_tokens, total_output_tokens, buffer_tokens)
-
-    # Assign identical reward to all steps in the rollout (pipeline expects uniform rollout_reward)
-    for text in training_texts:
-        text.reward = reward
-        text.finished = tape_finished
-
-    latency = time.perf_counter() - start
-
-    agent_time = tape.metadata.result.get("agent_execution_time", -1.0)
-    env_time = tape.metadata.result.get("environment_execution_time", -1.0)
-    total_time = tape.metadata.result.get("total_execution_time", -1.0)
-
-
-    metrics = Metrics(
-        reward=reward,
-        success=answer_status == "correct",
-        no_error=answer_status != "unparsable",
-        no_answer=answer_status == "no_answer",
-        num_steps=len(tape.steps),
-        num_python_calls=tool_call_counts.get("run_python_code", 0),
-        n_llm_calls=n_llm_calls,
-        total_execution_time=total_time,
-        agent_execution_time=agent_time,
-        environment_execution_time=env_time,
-        overflow=not tape_finished,
-    )
-
-    return RolloutResult(
-        training_texts=training_texts,
-        metrics=metrics,
-        latency=latency,
-        dataset_name=problem["dataset"],
-    )
-
-
-
-def generate_mcp_rollout_with_local_env(
+def generate_mcp_rollout(
     cfg: DictConfig | dict,
     llm: TrainableLLM,
     problem: dict,
@@ -301,24 +130,6 @@ def generate_mcp_rollout_with_local_env(
 
         # Local reward shaping (configurable in conf/mcp.yaml)
         total_shaping = 0.0
-        shaping_cfg = getattr(cfg, "python_tool_shaping", None)
-        if shaping_cfg is not None:
-            num_python_calls = tool_call_counts.get("run_python_code", 0)
-            bonus_on_correct_with_python = float(getattr(shaping_cfg, "bonus_on_correct_with_python", 0.0))
-            penalty_on_incorrect_without_python = float(getattr(shaping_cfg, "penalty_on_incorrect_without_python", 0.0))
-            max_abs = float(getattr(shaping_cfg, "max_abs", 0.2))
-
-            # Episode-level bonuses/penalties
-            if answer_status == "correct" and num_python_calls >= 1:
-                total_shaping += bonus_on_correct_with_python
-            if answer_status in ("wrong", "unparsable") and num_python_calls == 0:
-                total_shaping -= penalty_on_incorrect_without_python
-
-            # Clamp total shaping
-            if total_shaping > max_abs:
-                total_shaping = max_abs
-            if total_shaping < -max_abs:
-                total_shaping = -max_abs
 
         # Length shaping: discourage very long completions; award concise correct ones
         length_cfg = getattr(cfg, "length_shaping", None)
@@ -359,7 +170,6 @@ def generate_mcp_rollout_with_local_env(
 
         # Assign identical reward to all steps in the rollout (pipeline expects uniform rollout_reward)
         for text in training_texts:
-            # debug_save_training_text(text)
             text.reward = reward
             text.finished = tape_finished
 
@@ -401,7 +211,3 @@ def generate_mcp_rollout_with_local_env(
             environment.close()
         except Exception as e:
             logger.error(f"Error closing environment: {e}")
-
-def debug_save_training_text(text: TrainingText):
-    with open("debug_training_texts.jsonl", "a") as f:
-        f.write(json.dumps({"text": text.text, "n_predicted": text.n_predicted}, ensure_ascii=False) + "\n")

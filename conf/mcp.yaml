@@ -19,7 +19,7 @@ rewards:
   buffer_tokens: 2000
 
 actor:
-  rollout_policy: pipelinerl.domains.mcp.generate_mcp_rollout_with_local_env
+  rollout_policy: pipelinerl.domains.mcp.generate_mcp_rollout
   system_prompt: Please reason step by step, and put your final answer within \boxed{{}}.
   rollout_workers: 64
   llm_max_rollouts: 256
