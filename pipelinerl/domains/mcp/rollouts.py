@@ -4,6 +4,7 @@ import logging
 import random
 import time
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List
 from urllib.parse import urlparse
 
@@ -13,6 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 from tapeagents.agent import DEFAULT, Agent
 from tapeagents.core import LLMCall, Tape, TrainingText
 from tapeagents.dialog_tape import UserStep
+from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
 from tapeagents.mcp import MCPEnvironment
 from tapeagents.orchestrator import async_execute_agent, execute_agent, get_agent_and_env_from_config
@@ -250,6 +252,8 @@ def generate_mcp_rollout_with_local_env(
     start = time.perf_counter()
     if isinstance(cfg, dict):
         cfg = OmegaConf.create(cfg)
+    tapes_dir = Path(cfg.output_dir) / "actor" / "tapes"
+    tapes_dir.mkdir(parents=True, exist_ok=True)
     agent, _env = get_agent_and_env_from_config(cfg)
     environment: MCPEnvironment = _env
     logger.info(f"Agent and environment loaded, using llm {llm.model_name} at {llm.get_base_url()}")
@@ -364,6 +368,9 @@ def generate_mcp_rollout_with_local_env(
         agent_time = tape.metadata.result.get("agent_execution_time", -1.0)
         env_time = tape.metadata.result.get("environment_execution_time", -1.0)
         total_time = tape.metadata.result.get("total_execution_time", -1.0)
+
+        tape_name = problem.get("_pipeline_rl_id", tape.metadata.id)
+        save_json_tape(tape, tapes_dir.as_posix(), tape_name)
 
         metrics = Metrics(
             reward=reward,

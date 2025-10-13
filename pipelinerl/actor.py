@@ -662,8 +662,9 @@ class ActorLoopRay(ActorLoop):
 
         assert self.trainer_state.propagated_weight_version is not None
         rollout_policy: Callable[[DictConfig, TrainableLLM, dict], RolloutResult] = hydra.utils.get_method(self.cfg.actor.rollout_policy)
-        def rollout_wrapper(cfg: DictConfig, llm: TrainableLLM, problem: dict, problem_id: int) -> RolloutResult:
+        def rollout_wrapper(cfg: DictConfig, llm: TrainableLLM, problem: dict, problem_id: int, attempt_number: int) -> RolloutResult:
             start_ts = time.monotonic()
+            problem["_pipeline_rl_id"] = f"problem_{problem_id}_attempt_{attempt_number}"
             rollout_result: RolloutResult = rollout_policy(cfg, llm, problem)
             ts = time.monotonic()
             logger.info(f"Problem {problem_id} finished in {ts - start_ts:.2f} seconds")
@@ -684,7 +685,7 @@ class ActorLoopRay(ActorLoop):
             llm_url, task_count = min(self.llms_utilization.items(), key=lambda x: x[1])
             logger.info(f"Submitting problem {self.problem_id} attempt {attempt_number}/{self.attempts} to the least busy LLM {llm_url} with {task_count} tasks")
             llm = self.llms_by_url[llm_url]
-            task_ref = self.ray_remote.remote(self.cfg_dict, llm, problem, self.problem_id)
+            task_ref = self.ray_remote.remote(self.cfg_dict, llm, problem, self.problem_id, attempt_number)
             self.llms_utilization[llm_url] += 1
             self.unfinished_tasks.append(task_ref)
         self.problem_id += 1
