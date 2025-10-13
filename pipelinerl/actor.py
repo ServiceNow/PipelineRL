@@ -45,12 +45,6 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-def save_debug_line(data:dict):
-    data["ts"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    fname = os.environ.get("DEBUG_FILE", "timing_debug.jsonl")
-    with open(fname, "a") as f:
-        f.write(json.dumps(data, ensure_ascii=False) + "\n")
-
 class SlidingWindowData(BaseModel):
     prompt_tokens_window: list[list[int]] = Field(
         default_factory=list,
@@ -208,13 +202,11 @@ async def schedule_rollouts(
     connector = aiohttp.TCPConnector(limit=50000, limit_per_host=50000, keepalive_timeout=1.0)
     timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
     old_finished_rollouts = 0
-    start_time = time.time()
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         while True:
             if time.time() - last_logged > 10.0 and sum(active_rollouts):
                 if finished_rollouts > old_finished_rollouts:
                     old_finished_rollouts = finished_rollouts
-                    save_debug_line({"rollouts_finished": finished_rollouts, "tokens_produced": token_count, "dt": time.time() - start_time, "token_speed": token_count / (time.time() - start_time)})
                 logger.info(
                     f"{scheduler_name}: "
                     f"rollouts in progress: {sum(active_rollouts)}, "
@@ -748,19 +740,10 @@ class ActorLoopRay(ActorLoop):
                 f"total tokens: {self.token_count}, "
                 f"gen speed: {self.token_count / dt:.2f} tokens/sec, "
                 f"task latency: {np.mean(self.task_latencies[-10:]):.2f} sec, "
-                f"ray delay: {np.mean(self.ray_result_latencies[-10:]):.4f} sec"
+                f"ray delay: {np.mean(self.ray_result_latencies[-10:]):.4f} sec,"
+                f"time elapsed: {dt:.2f} sec,\n"
+                f"LLMs utilization: {self.llms_utilization}"
             )
-            save_debug_line({
-                "rollouts_finished": self.finished_rollouts_count,
-                "rollouts_in_progress": len(self.unfinished_tasks),
-                "problems_in_progress": len(self.unfinished_problems),
-                "tokens_produced": self.token_count,
-                "dt": dt,
-                "token_speed": self.token_count / dt,
-                "ray_latency": np.mean(self.ray_result_latencies[-10:]),
-                "task_latency": np.mean(self.task_latencies[-10:]),
-            })
-            logger.info(f"LLMs utilization: {self.llms_utilization}")
         
     def get_new_results(self) -> list[list[RolloutResult]]:
         self.receive_finished_tasks()
