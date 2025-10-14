@@ -15,6 +15,8 @@ save_tapes: False
 
 output_dir: results/miniwob/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: meta-llama/Llama-3.1-8B-Instruct
+use_ray: true
+attempts: 8
 
 finetune:
   seq_length: 16384  # input + output tokens
@@ -37,6 +39,9 @@ vllm_config:
 
 actor:
   rollout_policy: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
+  async_batch_size: 1
+  llm_max_rollouts: 256
+  problem_queue_size: 256
   shared_memory_entry_size: 100000000
 
 preprocess:
@@ -123,12 +128,7 @@ agent:
 # ENVIRONMENT CONFIGURATION
 start_attempts: 3  # number of attempts to start each task
 environment:
-  _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
-  miniwob_url: ???
-  n_envs: 32
-  host: "0.0.0.0"
-  env_call_timeout: 600  # timeout for each environment call (e.g. start_task, act, etc.)
-  web_env_target: examples.rl_webagent.environment.WebEnvironment
+  _target_: examples.rl_webagent.environment.WebEnvironment
   exp_path: ${output_dir}/env_server
   headless: true
   observation_format: html
