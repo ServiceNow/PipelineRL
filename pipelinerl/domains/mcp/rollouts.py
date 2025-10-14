@@ -18,14 +18,11 @@ from tapeagents.orchestrator import async_execute_agent, execute_agent, get_agen
 
 from pipelinerl.async_llm import make_training_text
 from pipelinerl.domains.math import RewardTable, get_reward, verify_answer
-from pipelinerl.domains.mcp.env_server import EmbeddedEnvironmentWorker
 from pipelinerl.domains.mcp.steps import MathAnswer
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 
 logger = logging.getLogger(__name__)
 
-
-_embedded_worker: EmbeddedEnvironmentWorker | None = None
 
 class FailedRollout(Exception):
     pass
