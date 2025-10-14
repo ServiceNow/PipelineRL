@@ -307,6 +307,7 @@ class ActorLoop:
         self.smm: SharedMemoryManager | None = None
         self.problem_queue: SharedMemoryQueue | None = None
         self.result_queue: SharedMemoryQueue | None = None
+        self.rollout_errors = 0
         logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
 
     def start_backend(self):
@@ -529,6 +530,7 @@ class ActorLoop:
                             "trainer_model_version": trainer_version_to_publish,
                             "time_since_start": time.time() - loop_start_time,
                             "groups_in_progress": in_progress,
+                            "rollout_errors": self.rollout_errors,
                         }
                         trainer_version_to_publish = None
                     else:
@@ -742,6 +744,7 @@ class ActorLoopRay(ActorLoop):
                 rollout_results, llm_url, problem_id, task_latencies, stop_ts = ray.get(finished_task)
             except Exception as e:
                 logger.error(f"Error getting finished ray task: {e}")
+                self.rollout_errors += 1
                 continue
             self.ray_result_latencies.append(time.monotonic() - stop_ts)
             for rollout_result in rollout_results:
