@@ -630,7 +630,7 @@ class ActorLoopRay(ActorLoop):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert self.cfg.attempts % self.cfg.actor.async_batch_size == 0, "attempts must be divisible by actor.async_batch_size"
+        assert self.cfg.attempts % self.cfg.actor.async_batch_size == 0, f"attempts {self.cfg.attempts} must be divisible by actor.async_batch_size {self.cfg.actor.async_batch_size}"
         self.cfg_dict = OmegaConf.to_container(self.cfg, resolve=True)
         self.unfinished_tasks = []
         self.llms_by_url = {llm.get_base_url(): llm for llm in self.llms}
@@ -916,9 +916,7 @@ def run_actor_loop(cfg: DictConfig):
         ):
             logger.info("Create test loop")
             test_loop.start_backend()
-            test_loop_run = test_loop.run(
-                dataset=test_dataset,
-            )
+            test_loop_run = test_loop.run(dataset=test_dataset)
             train_loop.is_scheduling_paused = True
             current_eval = next_regular_eval
 
