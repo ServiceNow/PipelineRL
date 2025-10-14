@@ -656,13 +656,16 @@ class ActorLoopRay(ActorLoop):
 
         assert self.trainer_state.propagated_weight_version is not None
         rollout_policy: Callable[[DictConfig, TrainableLLM, dict], RolloutResult] = hydra.utils.get_method(self.cfg.actor.rollout_policy)
-        def rollout_wrapper(cfg_dict: dict, llm: TrainableLLM, problem: dict, problem_id: int, attempt_number: int) -> RolloutResult:
+        def rollout_wrapper(cfg_dict: dict, llm: TrainableLLM, problems: list[dict], problem_id: int) -> RolloutResult:
+            assert len(problems) == 1, "Sync mode should only be used with 1 problem at a time"
+            problem = problems[0]
             cfg = OmegaConf.create(cfg_dict)
             start_ts = time.monotonic()
+            logger.info(f"Running sync rollout for problem {problem['_task_id']}")
             rollout_result: RolloutResult = rollout_policy(cfg, llm, problem)
-            ts = time.monotonic()
-            logger.info(f"Problem {problem_id}_{attempt_number} finished in {ts - start_ts:.2f} seconds")
-            return rollout_result, llm.get_base_url(), problem_id, ts, start_ts
+            stop_ts = time.monotonic()
+            logger.info(f"Problem {problem['_task_id']} finished in {stop_ts - start_ts:.2f} seconds")
+            return [rollout_result], llm.get_base_url(), problem_id, [stop_ts - start_ts], stop_ts
 
         async def run_multiple_rollouts(cfg: DictConfig, llm: TrainableLLM, problems: list[dict], session: aiohttp.ClientSession) -> RolloutResult:
             # Run all rollouts in parallel using asyncio.gather
@@ -694,7 +697,12 @@ class ActorLoopRay(ActorLoop):
             stop_ts = time.monotonic()
             return results, llm.get_base_url(), problem_id, task_latencies, stop_ts
 
-        self.ray_remote = ray.remote(rollout_async_batch_wrapper)
+        if self.cfg.actor.async_batch_size > 1:
+            logger.info("Using async mode")
+            self.ray_remote = ray.remote(rollout_async_batch_wrapper)
+        else:
+            logger.info("Using sync mode")
+            self.ray_remote = ray.remote(rollout_wrapper)
         self.start_time = time.time()
 
     def have_capacity(self) -> bool:
