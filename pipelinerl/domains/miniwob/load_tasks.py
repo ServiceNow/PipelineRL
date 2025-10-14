@@ -207,6 +207,11 @@ def load_tasks(dataset_names: list[str], train_split: float = 0.6, seeds: list[i
                 {"dataset": task, "task": task, "seed": seed}
                 for task in MASSIMO_TRAIN_SPLIT for seed in range(3,10)  # seeds 0-2 are used for held out goals in Mass setup
             ])
+        elif name == "massimo_train_heldout_goals":
+            tasks.extend([
+                {"dataset": task, "task": task, "seed": seed}
+                for task in MASSIMO_TRAIN_SPLIT for seed in range(3)  # seeds 0-2 are used for held out goals in Mass setup
+            ])
         elif name == "massimo_test":
             tasks.extend([
                 {"dataset": task, "task": task, "seed": seed}
