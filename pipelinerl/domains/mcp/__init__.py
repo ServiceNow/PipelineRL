@@ -1,2 +1,2 @@
 from .env_server import EmbeddedEnvironmentWorker, EmbeddedMCPEnvironment, MCPEnvironmentServer
-from .rollouts import generate_mcp_rollout
+from .rollouts import generate_mcp_rollout, generate_mcp_rollout_async, generate_mcp_rollouts_shared_env

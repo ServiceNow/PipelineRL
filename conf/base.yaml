@@ -19,6 +19,8 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  async_batch_size: 4
+
 environment: null
 preprocess:
   input: actor

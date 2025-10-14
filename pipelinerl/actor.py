@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import math
 import multiprocessing as mp
@@ -629,6 +628,7 @@ class ActorLoopRay(ActorLoop):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        assert self.cfg.attempts % self.cfg.actor.async_batch_size == 0, "attempts must be divisible by actor.async_batch_size"
         self.cfg_dict = OmegaConf.to_container(self.cfg, resolve=True)
         self.unfinished_tasks = []
         self.llms_by_url = {llm.get_base_url(): llm for llm in self.llms}
@@ -654,14 +654,45 @@ class ActorLoopRay(ActorLoop):
 
         assert self.trainer_state.propagated_weight_version is not None
         rollout_policy: Callable[[DictConfig, TrainableLLM, dict], RolloutResult] = hydra.utils.get_method(self.cfg.actor.rollout_policy)
-        def rollout_wrapper(cfg: DictConfig, llm: TrainableLLM, problem: dict, problem_id: int, attempt_number: int) -> RolloutResult:
+        def rollout_wrapper(cfg_dict: dict, llm: TrainableLLM, problem: dict, problem_id: int, attempt_number: int) -> RolloutResult:
+            cfg = OmegaConf.create(cfg_dict)
             start_ts = time.monotonic()
-            problem["_pipeline_rl_id"] = f"problem_{problem_id}_attempt_{attempt_number}"
             rollout_result: RolloutResult = rollout_policy(cfg, llm, problem)
             ts = time.monotonic()
-            logger.info(f"Problem {problem_id} finished in {ts - start_ts:.2f} seconds")
+            logger.info(f"Problem {problem_id}_{attempt_number} finished in {ts - start_ts:.2f} seconds")
             return rollout_result, llm.get_base_url(), problem_id, ts, start_ts
-        self.ray_remote = ray.remote(rollout_wrapper)
+
+        async def run_multiple_rollouts(cfg: DictConfig, llm: TrainableLLM, problems: list[dict], session: aiohttp.ClientSession) -> RolloutResult:
+            # Run all rollouts in parallel using asyncio.gather
+            async def run_rollout(problem):
+                logger.info(f"Running async rollout loop for problem {problem['_task_id']}")
+                start_ts = time.monotonic()
+                rollout_result = await rollout_policy(cfg, llm, problem, session)
+                stop_ts = time.monotonic()
+                latency = stop_ts - start_ts
+                return rollout_result, latency
+
+            tasks = [run_rollout(problem) for problem in problems]
+            results_with_latencies = await asyncio.gather(*tasks)
+            rollout_results = [res for res, _ in results_with_latencies]
+            task_latencies = [latency for _, latency in results_with_latencies]
+            return rollout_results, task_latencies
+
+        async def run_rollouts_with_session(cfg: DictConfig, llm: TrainableLLM, problems: list[dict]) -> RolloutResult:
+            connector = aiohttp.TCPConnector(limit=cfg.actor.async_batch_size, limit_per_host=cfg.actor.async_batch_size, keepalive_timeout=1.0)
+            timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                rollout_results, task_latencies = await run_multiple_rollouts(cfg, llm, problems, session)
+            return rollout_results, task_latencies
+
+        def rollout_async_batch_wrapper(cfg_dict: dict, llm: TrainableLLM, problems: list[dict], problem_id: int) -> RolloutResult:
+            cfg = OmegaConf.create(cfg_dict)
+            logger.info(f"Running async rollouts for {len(problems)} problems")
+            results, task_latencies = asyncio.run(run_rollouts_with_session(cfg, llm, problems))
+            stop_ts = time.monotonic()
+            return results, llm.get_base_url(), problem_id, task_latencies, stop_ts
+
+        self.ray_remote = ray.remote(rollout_async_batch_wrapper)
         self.start_time = time.time()
 
     def have_capacity(self) -> bool:
@@ -673,12 +704,22 @@ class ActorLoopRay(ActorLoop):
         return have_capacity
 
     def submit_problem(self, problem: dict):
-        for attempt_number in range(self.attempts):
+        # Make a list of cfg.attempts identical problems (deepcopies can be used if necessary)
+        problems = []
+        for n in range(self.attempts):
+            p = problem.copy()
+            p["_task_id"] = f"problem_{self.problem_id}_attempt_{n}"
+            problems.append(p)
+        # Split problems into batches of up to cfg.async_batch_size
+        batches = [problems[i:i + self.cfg.actor.async_batch_size] for i in range(0, len(problems), self.cfg.actor.async_batch_size)]
+        for batch_idx, problem_batch in enumerate(batches):
             llm_url, task_count = min(self.llms_utilization.items(), key=lambda x: x[1])
-            logger.info(f"Submitting problem {self.problem_id} attempt {attempt_number}/{self.attempts} to the least busy LLM {llm_url} with {task_count} tasks")
+            logger.info(
+                f"Submitting problem {self.problem_id} batch {batch_idx + 1}/{len(batches)} to the least busy LLM {llm_url} with {task_count} tasks"
+            )
             llm = self.llms_by_url[llm_url]
-            task_ref = self.ray_remote.remote(self.cfg_dict, llm, problem, self.problem_id, attempt_number)
-            self.llms_utilization[llm_url] += 1
+            task_ref = self.ray_remote.remote(self.cfg_dict, llm, problem_batch, self.problem_id)
+            self.llms_utilization[llm_url] += len(problem_batch)
             self.unfinished_tasks.append(task_ref)
         self.problem_id += 1
 
@@ -698,7 +739,12 @@ class ActorLoopRay(ActorLoop):
         dt = time.time() - self.start_time
         for finished_task in finished_tasks:
             try:
-                rollout_result, llm_url, problem_id, stop_ts, start_ts = ray.get(finished_task)
+                rollout_results, llm_url, problem_id, task_latencies, stop_ts = ray.get(finished_task)
+            except Exception as e:
+                logger.error(f"Error getting finished ray task: {e}")
+                continue
+            self.ray_result_latencies.append(time.monotonic() - stop_ts)
+            for rollout_result in rollout_results:
                 rollout_result.model_version = self.trainer_state.propagated_weight_version
                 full_group_id = f"{self.scheduler_name}_{problem_id}"
                 rollout_result.group_id = full_group_id
@@ -709,21 +755,14 @@ class ActorLoopRay(ActorLoop):
                     sample.metadata["rollout_index"] = rollout_index
                     sample.metadata["step_index"] = step_index
                     sample.group_id = full_group_id
-                task_dt = stop_ts - start_ts
-                self.task_latencies.append(task_dt)
-                outer_ts = time.monotonic()
-                ray_result_latency = outer_ts - stop_ts
-                self.ray_result_latencies.append(ray_result_latency)
-            except Exception as e:
-                logger.error(f"Error getting finished ray task: {e}")
-                continue
-            if self.llms_utilization[llm_url] > 0:
-                self.llms_utilization[llm_url] -= 1
-            else:
-                logger.warning(f"LLM {llm_url} utilization is 0, but got a result")
-            self.token_count += get_number_of_tokens_in_result(rollout_result)
-            self.finished_rollouts_count += 1
-            self.unfinished_problems[problem_id].append(rollout_result)
+                self.task_latencies += task_latencies
+                if self.llms_utilization[llm_url] > 0:
+                    self.llms_utilization[llm_url] -= 1
+                else:
+                    logger.warning(f"LLM {llm_url} utilization is 0, but got a result")
+                self.token_count += get_number_of_tokens_in_result(rollout_result)
+                self.finished_rollouts_count += 1
+                self.unfinished_problems[problem_id].append(rollout_result)
             logger.info(f"Problem {problem_id} has {len(self.unfinished_problems[problem_id])} rollout results")
             if len(self.unfinished_problems[problem_id]) == self.cfg.attempts:
                 logger.info(f"Problem {problem_id} group finished")
@@ -744,7 +783,7 @@ class ActorLoopRay(ActorLoop):
                 f"time elapsed: {dt:.2f} sec,\n"
                 f"LLMs utilization: {self.llms_utilization}"
             )
-        
+
     def get_new_results(self) -> list[list[RolloutResult]]:
         self.receive_finished_tasks()
         if len(self.finished_problems) > 0:
