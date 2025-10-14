@@ -19,9 +19,6 @@ from pipelinerl.world import Job, WorldMap
 
 logger = logging.getLogger(__name__)
 
-# TODO: rm debug code
-import tapeagents
-
 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -576,7 +573,6 @@ def main(cfg: DictConfig):
 
     processes = []
 
-    logger.info(f"TapeAgents loaded from: {tapeagents.__file__}")
     lead_launcher_stream = SingleStreamSpec(exp_path=exp_dir, topic="launcher_0")
     init_msg = {"exp_init": "true"}
     if world_map.my_rank == 0:
