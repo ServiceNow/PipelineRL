@@ -5,9 +5,9 @@ defaults:
   - _self_
 
 world:
-  actor_fraction: 3
+  actor_fraction: 2
   preprocessor_fraction: 0
-  finetune_fraction: 5
+  finetune_fraction: 6
 
 # debug:
 #   mode: actor
@@ -20,7 +20,11 @@ attempts: 8
 
 finetune:
   seq_length: 16384  # input + output tokens
-  max_train_steps: 1000
+  max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
+  train_batch_size: 1
+  gradient_accumulation_passes: 1024
+
+eval_every_n_versions: 10240  # 1024 effective bs * 10 "optim steps"
 
 llm:
   parameters:
@@ -45,10 +49,25 @@ actor:
   shared_memory_entry_size: 100000000
 
 preprocess:
-  shared_memory_entry_size: 1000000000
+  n_workers: 32  # Increase from 8
+  chunk_n_groups: 8  # Increase from 2 for better throughput
+  # queue for loaded raw groups
+  raw_queue_size: 32      # Increase from 8
+  # queue for processed chunks of multiple groups
+  input_queue_size: 64    # Increase from 32
+  # queue for ready chunks for multiple groups
+  output_queue_size: 64   # Increase from 32
+  # ring buffer to replace old samples with new ones when training is slow
+  ring_buffer_size: 1024  # Increase from 128
+  # "virtual" sample queue per lead trainer
+  max_ready_samples_per_lead: 256  # Increase from 64
+  shared_memory_entry_size: 1000000000  # Increase from 100M
 
 # AGENT CONFIGURATION
 agent_max_loops: 10  # max number of agent - environment interactions for each task
+agent_attempts: 3  # number of attempts to run the agent (retry on errors)
+rollout_timeout: 600  # overall timeout for entire rollout in seconds (10 minutes)
+reward_computation: nico
 agent:
   _target_: tapeagents.agent.Agent
   name : web_agent
@@ -66,8 +85,9 @@ agent:
       {allowed_steps}
       Do not reproduce schema when producing the steps, use it as a reference.
     json_format: |
-      Important! Respond with parsable JSON, do not include any text or code.
-      Do not output anything besides one JSON object.
+      Important! Respond with very simple parsable JSON!
+      Do not use any special characters or code. Do not use new lines, tabs, or any other formatting inside the JSON.
+      Do not output anything besides one simple JSON object.
   nodes:
     - _target_: examples.rl_webagent.agent.WebNode
       name: set_goal
@@ -94,7 +114,7 @@ agent:
         - check if you are stuck with repeating the same action over and over again, if so, try something else and change the action.
         - check if you think the task is done, if not give a detailed list of actions to do next to accomplish the task.
         - finally, if the task is not done, describe the immediate next action to be performed and its expected effect on the page.
-        Produce only one reasoning_thought step!
+        Produce only one reasoning_thought step! Be brief and to the point. You can skip some details if they are not relevant for this step.
         ${agent.templates.json_format}
       steps_prompt: ${agent.templates.allowed_steps}
       steps:
@@ -129,7 +149,7 @@ agent:
 start_attempts: 3  # number of attempts to start each task
 environment:
   _target_: examples.rl_webagent.environment.WebEnvironment
-  exp_path: ${output_dir}/env_server
+  exp_path: null
   headless: true
   observation_format: html
 

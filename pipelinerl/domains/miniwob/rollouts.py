@@ -97,7 +97,10 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
 
         # save the tape as we go
         if cfg.save_tapes:
-            save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape.metadata.id)
+            try:
+                save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape.metadata.id)
+            except Exception as e:
+                logger.error(f"Error saving tape: {e}")
 
         # (3) Compute rewards
         obs_steps = [step for step in tape if isinstance(step, Observation)]
@@ -116,12 +119,32 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
         # get the number of PageObservation steps in the tape
         n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
 
-        # reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
-        # massimo's setup:
-        reward = float(raw_reward > 0)
-        if reward == 0.0:
-            reward = -1.0
-        reward *= 0.98**n_page_observations
+        if obs_steps:
+            last_obs = obs_steps[-1]
+            # in Miniwob, the observation "reward" is defined as RAW_REWARD_GLOBAL > 0
+            # see here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/src/browsergym/miniwob/base.py#L188
+            # Let's take directly the RAW_REWARD_GLOBAL from the metadata
+            # raw_reward = last_obs.metadata.other.get("reward", 0.0)
+            raw_reward = last_obs.metadata.other.get("info", {}).get("task_info", {}).get("REWARD_GLOBAL", -1.0)
+        else:
+            raw_reward = -1.0
+
+        no_error = not tape_contains_an_error(tape)
+        # get the number of LLMOutputParsingFailureAction in the tape
+        n_step_errors = len([step for step in tape.steps if isinstance(step, LLMOutputParsingFailureAction)])
+        # get the number of PageObservation steps in the tape
+        n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
+
+        if cfg.reward_computation == "nico":
+            reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
+        elif cfg.reward_computation == "massimo":
+            reward = float(raw_reward>0)
+            if reward == 0.0:
+                reward = -1.0
+            reward *= 0.98 ** n_page_observations
+        else:
+            raise ValueError(f"Invalid reward configuration: {cfg.reward_computation}")
+
 
         # (3) Get LLM calls from Tape
         llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
@@ -152,7 +175,7 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
         metrics = MiniwobMetrics(
             reward=reward,
             success=reward > 0.5,
-            no_error=not tape_contains_an_error(tape),
+            no_error=no_error,
             no_answer=reward < 0,
             overflow=not all_finished,
             n_llm_calls=n_llm_calls,
