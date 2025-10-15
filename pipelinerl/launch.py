@@ -554,7 +554,8 @@ def main(cfg: DictConfig):
     group = str(exp_dir)
     root = cfg.wandb.wandb_workspace_root
     if root:
-        if not group.startswith(root + "/"):
+        check_root = (root + "/") if not root.endswith("/") else root
+        if not group.startswith(check_root):
             raise ValueError(f"run_dir {exp_dir} does not start with root {root}")
         cfg.wandb.wandb_group = group[len(root) + 1 :]
     if world_map.total_finetune_gpus:
