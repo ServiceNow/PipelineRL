@@ -9,9 +9,7 @@ world:
   preprocessor_fraction: 0
   finetune_fraction: 6
 
-# debug:
-#   mode: actor
-save_tapes: False
+save_tapes: true
 
 output_dir: results/miniwob/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: meta-llama/Llama-3.1-8B-Instruct
@@ -43,9 +41,10 @@ vllm_config:
 
 actor:
   rollout_policy: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
-  async_batch_size: 1
   llm_max_rollouts: 256
   problem_queue_size: 256
+  async_batch_size: 1
+  rollout_workers: 32
   shared_memory_entry_size: 100000000
 
 preprocess:
