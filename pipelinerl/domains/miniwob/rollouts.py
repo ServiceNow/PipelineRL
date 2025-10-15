@@ -98,9 +98,10 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
         # save the tape as we go
         if cfg.save_tapes:
             try:
-                save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape.metadata.id)
+                tape_name = problem.get("_task_id", tape.metadata.id)
+                save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape_name)
             except Exception as e:
-                logger.error(f"Error saving tape: {e}")
+                logger.error(f"Error saving tape {tape_name}: {e}")
 
         # (3) Compute rewards
         obs_steps = [step for step in tape if isinstance(step, Observation)]
