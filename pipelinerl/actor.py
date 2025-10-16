@@ -14,7 +14,7 @@ from pathlib import Path
 import aiohttp
 import hydra
 import uvloop
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 from tapeagents.llms import TrainableLLM
 from typing import Dict, List
@@ -260,6 +260,80 @@ def random_iter(problems: list):
         yield random.sample(problems, 1)[0]
 
 
+def curriculum_iter(
+    problems: list,
+    trainer_state: TrainerState,
+    curriculum_cfg: DictConfig,
+    logger: logging.Logger | None = None,
+):
+    curriculum_obj = OmegaConf.to_container(curriculum_cfg, resolve=True) if isinstance(curriculum_cfg, DictConfig) else curriculum_cfg
+    base_names = set(curriculum_obj.get("base_datasets", []))
+    hard_names = set(curriculum_obj.get("hard_datasets", []))
+    if hard_names and not base_names:
+        base_names = {problem.get("dataset") for problem in problems if problem.get("dataset") not in hard_names}
+
+    base_pool = [
+        problem
+        for problem in problems
+        if (problem.get("dataset") in base_names) or (not base_names and problem.get("dataset") not in hard_names)
+    ]
+    hard_pool = [problem for problem in problems if problem.get("dataset") in hard_names]
+
+    if not hard_pool:
+        if logger:
+            logger.warning(
+                "Curriculum enabled but no problems matched hard_datasets list; falling back to base sampling"
+            )
+        yield from random_iter(problems)
+        return
+
+    if not base_pool:
+        if logger:
+            logger.warning("Curriculum enabled but base pool is empty; sampling exclusively from hard dataset")
+        base_pool = hard_pool
+
+    schedule_cfg = curriculum_obj.get("schedule", [])
+    if not schedule_cfg:
+        schedule = [(0, 0.0)]
+    else:
+        if not isinstance(schedule_cfg, list):
+            schedule_cfg = [schedule_cfg]
+        schedule = []
+        for entry in schedule_cfg:
+            step = int(entry.get("step", 0))
+            hard_weight = float(entry.get("hard_weight", 0.0))
+            hard_weight = max(0.0, min(1.0, hard_weight))
+            schedule.append((step, hard_weight))
+        schedule.sort(key=lambda item: item[0])
+
+    current_stage = -1
+
+    while True:
+        samples_processed = trainer_state.samples_processed or 0
+        hard_weight = schedule[0][1]
+        stage_index = 0
+        for idx, (step, weight) in enumerate(schedule):
+            if samples_processed >= step:
+                hard_weight = weight
+                stage_index = idx
+            else:
+                break
+
+        if logger and stage_index != current_stage:
+            logger.info(
+                "Curriculum stage %d active (samples_processed=%d, hard_weight=%.3f)",
+                stage_index,
+                samples_processed,
+                hard_weight,
+            )
+            current_stage = stage_index
+
+        if hard_pool and random.random() < hard_weight:
+            yield random.choice(hard_pool)
+        else:
+            yield random.choice(base_pool)
+
+
 def sequential_iter(problems: list):
     for problem in problems:
         yield problem
@@ -384,7 +458,19 @@ class ActorLoop:
         # for train sample, sample random batches infinitely
         # for test samples, loop through the dataset once
         if self.is_training:
-            problem_iter = random_iter(dataset)
+            curriculum_cfg = getattr(self.cfg.actor, "curriculum", None)
+            use_curriculum = bool(
+                curriculum_cfg and getattr(curriculum_cfg, "enabled", False) and dataset
+            )
+            if use_curriculum:
+                problem_iter = curriculum_iter(
+                    dataset,
+                    trainer_state=self.trainer_state,
+                    curriculum_cfg=curriculum_cfg,
+                    logger=logger,
+                )
+            else:
+                problem_iter = random_iter(dataset)
         else:
             problem_iter = sequential_iter(dataset)
         assert self.trainer_state.propagated_weight_version is not None
