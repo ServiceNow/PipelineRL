@@ -429,41 +429,66 @@ def curriculum_iter(
     while True:
         samples_processed = trainer_state.samples_processed or 0
         desired_stage_index = 0
-        hard_weight = schedule[0]["hard_weight"]
 
         for idx, stage_cfg in enumerate(schedule):
             step = stage_cfg["step"]
             if samples_processed >= step:
                 desired_stage_index = idx
-                hard_weight = stage_cfg["hard_weight"]
             else:
                 break
 
-        stage_index = desired_stage_index
-        blocker_messages: list[str] = []
-        while stage_index >= 0:
-            ready, blockers = stage_ready(schedule[stage_index])
+        current_stage = int(stage_state.get("index", 0))
+        if current_stage < 0:
+            current_stage = 0
+        if current_stage >= len(schedule):
+            current_stage = len(schedule) - 1
+
+        stage_index = min(current_stage, desired_stage_index)
+        promotion_blockers: list[str] = []
+
+        # Walk backwards until the current stage is ready (or we reach stage 0)
+        while stage_index > 0:
+            ready, _ = stage_ready(schedule[stage_index])
             if ready:
-                blocker_messages = []
                 break
-            blocker_messages = blockers
             stage_index -= 1
 
-        if stage_index < 0:
-            stage_index = 0
-            hard_weight = schedule[0]["hard_weight"]
-        else:
-            hard_weight = schedule[stage_index]["hard_weight"]
+        ready, current_blockers = stage_ready(schedule[stage_index])
+        if not ready and stage_index > 0:
+            # If even after walking back we are not ready, fall back further until 0
+            while stage_index > 0 and not ready:
+                stage_index -= 1
+                ready, current_blockers = stage_ready(schedule[stage_index])
 
-        if logger and desired_stage_index != stage_index and blocker_messages:
-            block_signature = (desired_stage_index, tuple(blocker_messages))
+        # Attempt to promote by at most one stage towards the desired stage
+        if stage_index < desired_stage_index:
+            next_index = stage_index + 1
+            next_ready, blockers = stage_ready(schedule[next_index])
+            if next_ready:
+                stage_index = next_index
+                current_blockers = []
+            else:
+                promotion_blockers = blockers
+
+        hard_weight = schedule[stage_index]["hard_weight"]
+
+        blockers_for_log: list[str] = []
+        block_stage: int | None = None
+        if stage_index < desired_stage_index:
+            blockers_for_log = promotion_blockers or current_blockers
+            block_stage = stage_index + 1
+
+        if logger and block_stage is not None and blockers_for_log:
+            block_signature = (block_stage, tuple(blockers_for_log))
             if block_signature != last_block_log:
                 logger.info(
                     "Curriculum stage %d gated by: %s",
-                    desired_stage_index,
-                    "; ".join(blocker_messages),
+                    block_stage,
+                    "; ".join(blockers_for_log),
                 )
                 last_block_log = block_signature
+        elif stage_index >= desired_stage_index:
+            last_block_log = None
 
         if logger and stage_index != current_stage:
             logger.info(
