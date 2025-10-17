@@ -109,6 +109,27 @@ def ensure_boxed_answer(text: str) -> tuple[str, bool]:
     if adjusted == cleaned:
         adjusted = f"{cleaned}\n{candidate_boxed}" if cleaned else candidate_boxed
     return adjusted, adjusted != cleaned
+def get_reward(answer_status: str, finished: bool, reward_table: RewardTable) -> float:
+    match (answer_status, finished):
+        case ("wrong", False):
+            return reward_table.wrong_answer_not_finished
+        case ("wrong", True):
+            return reward_table.wrong_answer_finished
+        case ("no_answer", False):
+            return reward_table.no_answer_not_finished
+        case ("no_answer", True):
+            return reward_table.no_answer_finished
+        case ("unparsable", False):
+            return reward_table.unparsable_not_finished
+        case ("unparsable", True):
+            return reward_table.unparsable_finished
+        case ("correct", False):
+            return reward_table.correct_answer_not_finished
+        case ("correct", True):
+            return reward_table.correct_answer_finished
+        case _:
+            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{finished}")
+
 
 def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
     """
@@ -144,7 +165,7 @@ async def generate_math_rollout(
         if changed:
             llm_call.output.content = sanitized
             auto_boxed = True
-    rewards = RewardTable(**dict(cfg.rewards))
+    reward_table = RewardTable(**dict(cfg.rewards))
     discount_factor = cfg.actor.discount_factor
 
     # math_verify is a fast environment, no support for environment replicas for now
@@ -166,30 +187,11 @@ async def generate_math_rollout(
 
     trace = make_training_text(llm, llm_call)
     # Determine reward based on answer status and finished state
-    match (answer_status, trace.finished):
-        case ("wrong", False):
-            reward = rewards.wrong_answer_not_finished
-        case ("wrong", True):
-            reward = rewards.wrong_answer_finished
-        case ("no_answer", False):
-            reward = rewards.no_answer_not_finished
-        case ("no_answer", True):
-            reward = rewards.no_answer_finished
-        case ("unparsable", False):
-            reward = rewards.unparsable_not_finished
-        case ("unparsable", True):
-            reward = rewards.unparsable_finished
-        case ("correct", False):
-            reward = rewards.correct_answer_not_finished
-        case ("correct", True):
-            reward = rewards.correct_answer_finished
-        case _:
-            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{trace.finished}")
-
+    reward = get_reward(answer_status, trace.finished, reward_table)
     # Apply discount factor based on output length
     reward *= discount_factor**llm_call.output_length_tokens
     overlong_penalty = 0
-    if rewards.buffer_tokens > 0:
+    if reward_table.buffer_tokens > 0:
         overlong_penalty = length_penalty(llm.parameters['max_tokens'], llm_call.output_length_tokens, rewards.buffer_tokens)
     reward += overlong_penalty
     trace.reward = reward

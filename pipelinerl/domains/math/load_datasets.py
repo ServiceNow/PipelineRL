@@ -190,6 +190,26 @@ def _load_aime_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
     return add_ids(samples)
 
 
+def _load_aime_2025_opencompass(upsample_factor: int = 0) -> list[dict]:
+    configs = ["AIME2025-I", "AIME2025-II"]
+    dataset_name = "aime_2025" + ("" if upsample_factor > 0 else "_original")
+
+    samples: list[dict] = []
+    for config_name in configs:
+        ds = load_dataset("opencompass/AIME2025", config_name, split="test")
+        samples.extend([s for s in process_math(ds, dataset_name) if s is not None])
+
+    original_size = len(samples)
+    if upsample_factor > 0:
+        samples *= upsample_factor
+
+    logger.info(
+        f"Loading aime 2025 (OpenCompass) dataset: {len(samples)} samples"
+        + (f" (upsampled from {original_size})" if upsample_factor > 0 else "")
+    )
+    return add_ids(samples)
+
+
 def _load_amc_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
     amc_dataset = load_dataset("AI-MO/aimo-validation-amc", split="train", trust_remote_code=True)
     amc_dataset = amc_dataset.filter(lambda x: str(year) in x["url"])

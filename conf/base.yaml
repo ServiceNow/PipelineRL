@@ -5,6 +5,7 @@ defaults:
   - _self_
 
 seed: 42
+use_ray: false
 
 finetune:
   seed: ${..seed}
@@ -67,8 +68,7 @@ vllm_config:
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
-    max_model_len: 12000
-    #quantization: bf16_last_layer_fp32 
+    max_model_len: 16000
 
 world:
   replicas: 1
@@ -78,10 +78,12 @@ world:
   finetune_fraction: 4
 
   # Number of environment servers per actor VLLM server
-  env_replicas: 1
+  env_replicas_per_actor: 1
 
   actor_group_port: 9000
   environment_start_port: 7777
+# Remote vs embedded environment execution strategy
+  environment_mode: remote
 # this will be autocreated based on the config
 jobs: []
 

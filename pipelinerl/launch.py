@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,8 +19,9 @@ from pipelinerl.world import Job, WorldMap
 
 logger = logging.getLogger(__name__)
 
-# All the launch commands in this file pass the environment to child processes
-os.environ["PYTHONPATH"] = f"/home/toolkit/TapeAgents"
+# TODO: rm debug code
+import tapeagents
+
 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -70,6 +72,13 @@ def validate_config(cfg: DictConfig):
     if cfg.finetune.model_class == "causal-language-modeling-with-value-head":
         if not hasattr(cfg.finetune.rl, "value_loss_coef") or cfg.finetune.rl.value_loss_coef <= 0.0:
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
+
+    if cfg.finetune.seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
+        raise ValueError(
+            f"seq_length {cfg.finetune.seq_length} must be greater than or equal to "
+            f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
+        )
+
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
@@ -150,6 +159,29 @@ def run_actor_llm(
         str(world_map.weight_update_group_size),
     ]
 
+    # Provide deterministic rendezvous port defaults when env vars are absent.
+    # vLLM spins up a torch.distributed TCPStore using VLLM_PORT. On the remote
+    # scheduler we observed replica crashes (store collisions, connection
+    # refused) because every start script inherited the same default port. By
+    # exporting VLLM_PORT_BASE/VLLM_PORT_STRIDE we carve out a rendezvous range
+    # per actor_idx while keeping the public HTTP listener at 8080+local_idx.
+    env = dict(os.environ)
+    if "VLLM_PORT_BASE" not in env:
+        # Each rank gets 1000 ports; 43000 leaves room below.
+        env["VLLM_PORT_BASE"] = str(43000 + 1000 * world_map.my_rank)
+        logger.debug(
+            "Setting default VLLM_PORT_BASE=%s for rank %s",
+            env["VLLM_PORT_BASE"], world_map.my_rank,
+        )
+    if "VLLM_PORT_STRIDE" not in env:
+        env["VLLM_PORT_STRIDE"] = "20"
+
+    env_overrides = {
+        key: str(env[key])
+        for key in ("VLLM_PORT_BASE", "VLLM_PORT_STRIDE")
+        if key in env
+    }
+
     # Add vLLM kwargs as separate arguments
     if cfg.vllm_config.vllm_kwargs:
         for k, v in cfg.vllm_config.vllm_kwargs.items():
@@ -162,13 +194,13 @@ def run_actor_llm(
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
-    save_command(log_dir, cmd)
+    save_command(log_dir, cmd, env_overrides or None)
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         yield _popen(
             cmd,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
+            env={**env, "CUDA_VISIBLE_DEVICES": gpu_str},
             stdout=log_file,
             stderr=err_file,
         )
@@ -365,14 +397,21 @@ def run_redis(cfg: DictConfig):
     yield _popen(cmd, env=dict(os.environ))
 
 
-def save_command(script_dir: Path, cmd):
+def save_command(script_dir: Path, cmd, env: dict | None = None):
     os.makedirs(script_dir, exist_ok=True)
     script_path = script_dir / "start.sh"
     with open(script_path, "w") as f:
         f.write("#!/bin/bash\n")
+        f.write("set -e\n")
+        if env:
+            for key, value in sorted(env.items()):
+                quoted_value = shlex.quote(value)
+                f.write(f"export {key}={quoted_value}\n")
         # Properly quote arguments for the shell script
-        quoted_cmd = [f"'{arg}'" if " " in arg or "$" in arg else arg for arg in cmd]
-        f.write(" ".join(quoted_cmd) + "\n")
+        quoted_cmd = [shlex.quote(arg) for arg in cmd]
+        f.write("exec ")
+        f.write(" ".join(quoted_cmd))
+        f.write("\n")
     os.chmod(script_path, 0o755)
     logger.info(f"Saved start script to {script_path}")
 
@@ -537,6 +576,7 @@ def main(cfg: DictConfig):
 
     processes = []
 
+    logger.info(f"TapeAgents loaded from: {tapeagents.__file__}")
     lead_launcher_stream = SingleStreamSpec(exp_path=exp_dir, topic="launcher_0")
     init_msg = {"exp_init": "true"}
     if world_map.my_rank == 0:
@@ -576,6 +616,8 @@ def main(cfg: DictConfig):
 
     if cfg.debug.mode == "finetune":
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
+    elif cfg.debug.mode == "llm":
+        processes.extend(launch_jobs(cfg, world_map, ["actor_llm"]))
     elif cfg.debug.mode == "actor":
         processes.extend(launch_jobs(cfg, world_map, ["actor", "environment", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
