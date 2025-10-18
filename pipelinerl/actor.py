@@ -52,6 +52,22 @@ def save_debug_line(data:dict):
     with open(fname, "a") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
+def get_number_of_tokens_in_result(result: RolloutResult) -> int:
+    """Aggregate prompt + output tokens for all training texts in a rollout result."""
+    total_tokens = 0
+    for training_text in result.training_texts:
+        prompt_tokens = getattr(training_text, "prompt_tokens", 0) or 0
+        output_tokens = getattr(training_text, "output_tokens", 0) or 0
+        if prompt_tokens or output_tokens:
+            total_tokens += prompt_tokens + output_tokens
+            continue
+        input_ids = getattr(training_text, "input_ids", None)
+        if input_ids:
+            total_tokens += len(input_ids)
+            continue
+        total_tokens += getattr(training_text, "n_predicted", 0) or 0
+    return total_tokens
+
 class SlidingWindowData(BaseModel):
     prompt_tokens_window: list[list[int]] = Field(
         default_factory=list,
@@ -153,12 +169,12 @@ class CurriculumSuccessTracker:
         buffer = self._buffers.get(dataset)
         if buffer is None or not buffer:
             return None
-        if window is None or window <= 0 or window >= len(buffer):
+        if window is None or window <= 0:
             values = list(buffer)
         else:
-            if len(buffer) < window:
-                return None
             values = list(buffer)[-window:]
+            if len(values) < window:
+                return None
         if not values:
             return None
         return sum(values) / len(values)
