@@ -192,7 +192,11 @@ async def generate_math_rollout(
     reward *= discount_factor**llm_call.output_length_tokens
     overlong_penalty = 0
     if reward_table.buffer_tokens > 0:
-        overlong_penalty = length_penalty(llm.parameters['max_tokens'], llm_call.output_length_tokens, rewards.buffer_tokens)
+        overlong_penalty = length_penalty(
+            llm.parameters["max_tokens"],
+            llm_call.output_length_tokens,
+            reward_table.buffer_tokens,
+        )
     reward += overlong_penalty
     trace.reward = reward
 
