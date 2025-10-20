@@ -239,6 +239,7 @@ def collate_packed(
         "labels": torch.empty(1, total_length, dtype=torch.long),
         "attention_mask": torch.ones(1, total_length, dtype=torch.long),  # initialize to 1s
         "position_ids": torch.empty(1, total_length, dtype=torch.long),
+        "segment_ids": torch.empty(1, total_length, dtype=torch.long),
     }
 
     # initialize lists for extra keys
@@ -254,6 +255,9 @@ def collate_packed(
 
         # use arange to fill position_ids
         base_tensors["position_ids"][0, start_idx:end_idx] = torch.arange(seq_len)
+        # set per-token segment ids to this sequence index
+        if seq_len > 0:
+            base_tensors["segment_ids"][0, start_idx:end_idx] = i
 
         # process labels
         example_labels = torch.tensor(example["labels"], dtype=torch.long)

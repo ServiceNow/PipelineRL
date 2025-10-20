@@ -17,6 +17,7 @@ from queue import Empty, Full
 from typing import List
 
 import datasets
+import random
 import transformers
 from litellm import BaseModel, Field
 
@@ -153,6 +154,11 @@ def preprocess_dataset(
         entry = dict(data[i])
         for k, v in preprocess(data[i]).items():
             entry[k] = v
+        metadata = entry.get("metadata")
+        if isinstance(metadata, dict):
+            entry["finish_reason"] = metadata.get("finish_reason")
+        else:
+            entry["finish_reason"] = None
         dataset.append(entry)        
     for entry in dataset:
         entry["model_version"] = entry["metadata"]["model_version"]
@@ -565,6 +571,7 @@ def run_preprocessing_loop(
 
                     batch_done = False
                     start_writing = time.time()
+                    random.shuffle(processed_entries_queue)
                     while (len(processed_entries_queue) > 0 and not batch_done) or (cfg.preprocess.dataset_buffer_size and not batch_done):
                         logger.debug(f"[inner loop] trainer {trainer_id} has {samples_per_trainer[trainer_id]} samples, target is {target_samples_per_lead}")
                         if cfg.finetune.seq_packing:
@@ -679,4 +686,3 @@ def run_preprocessing_loop(
                     if worker.is_alive():
                         worker.terminate()
                         worker.join(timeout=1.0)
-

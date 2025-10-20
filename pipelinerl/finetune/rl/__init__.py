@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
+from pipelinerl.finetune.rl.utils import per_segment_sums
 
 from .utils import (
     sum_sum,
@@ -39,13 +40,14 @@ class RLConfig(BaseModel):
     policy_loss: str = Field(
         default="ppo",
         description="Policy Loss to use for RL",
-        choices=["ppo", "reinforce"],
+        choices=["ppo", "reinforce", "gspo"],
     )
     use_advantages: bool = Field(
         default=True,
         description="Use advantages instead of rewards to compute the loss",
     )
-    epsilon: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
+    epsilon_low: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
+    epsilon_high: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
     batch_size: int = Field(default=0, description="Batch size is required for normalization")
     reward_minus_kl_coef: float = Field(
         default=0.0,
@@ -133,6 +135,7 @@ def rl_step(
     current_step: int,
     max_step: int,
     config: RLConfig,
+    seq_parallel_group=None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Perform a single RL step on the model using the given batch and config.
@@ -270,27 +273,70 @@ def rl_step(
     match config.policy_loss:
         case "ppo":
             surr1 = ratio_new_old * log_p_weights
-            clamped_ratio = torch.clamp(ratio_new_old, 1 - config.epsilon, 1 + config.epsilon)
+            clamped_ratio = torch.clamp(ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = clamped_ratio != ratio_new_old
             surr2 = clamped_ratio * log_p_weights
             policy_loss = torch.min(surr1, surr2)
         case "reinforce":
             surr1 = torch.zeros_like(ratio_new_old)
             surr2 = torch.zeros_like(ratio_new_old)
-            clamp_log_ratio_new_old_indicators = ratio_new_old > 1 + config.epsilon
-            ratio_new_old = torch.clamp(ratio_new_old, 0, 1 + config.epsilon)
+            clamp_log_ratio_new_old_indicators = ratio_new_old > 1 + config.epsilon_high
+            ratio_new_old = torch.clamp(ratio_new_old, 0, 1 + config.epsilon_high)
             policy_loss = new_logprobs * log_p_weights * ratio_new_old.detach()
+        case "gspo":
+            if segments is None:
+                raise ValueError("GSPO loss requires packed sequences with segments")
+            # Aggregate per-sequence means over valid (labeled) tokens only.
+            lrn_sum, adv_sum, tok_count = per_segment_sums(
+                batch.segment_ids,
+                masks_shifted,
+                log_ratio_new_old,
+                advantages,
+                seq_parallel_group=seq_parallel_group,
+            )
+            group_ratio_new_old = torch.exp(lrn_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2)
+            group_advantages_t = (adv_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2).detach()
+            # Sum token weights per segment so GSPO respects normalization/overflow settings.
+            zero_weights = torch.zeros_like(tokens_weights)
+            weight_sum, _, _ = per_segment_sums(
+                batch.segment_ids,
+                masks_shifted,
+                tokens_weights,
+                zero_weights,
+                seq_parallel_group=seq_parallel_group,
+            )
+            valid_mask = (tok_count > 0) & (weight_sum > 0)
+            valid_mask_3d = valid_mask.unsqueeze(1).unsqueeze(2)
+            surr1 = group_ratio_new_old * group_advantages_t
+            clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
+            clamp_log_ratio_new_old_indicators = (clamped_group_ratio != group_ratio_new_old) & valid_mask_3d
+            surr2 = clamped_group_ratio * group_advantages_t
+            sequence_weights = weight_sum.unsqueeze(1).unsqueeze(2)
+            # If we have a sentinel or no segments, return a zero loss but keep graph
+            if batch.sentinel or surr1.numel() == 0:
+                policy_loss_total = new_logprobs[..., :1].sum() * 0.0
+            else:
+                mask_float = valid_mask_3d.to(dtype=surr1.dtype)
+                min_terms = torch.min(surr1, surr2) * mask_float * sequence_weights
+                policy_loss_total = -min_terms.sum()
+            expanded_indicators = torch.zeros_like(masks_shifted, dtype=torch.float)
+            # Expand per-sequence indicators to token-level across segment ranges
+            # Flatten to 1-D so single-sequence cases don't produce 0-d tensors
+            for (start, end), val in zip(segments, clamp_log_ratio_new_old_indicators.flatten()):
+                expanded_indicators[0, start:end] = float(val)
+            clamp_log_ratio_new_old_indicators = expanded_indicators
         case _:
             raise ValueError(f"Unknown algorithm {config.policy_loss}")
 
     # combine loss components
-    loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
-    assert loss.shape == tokens_weights.shape, (
-        f"Loss shape {loss.shape} does not match example weights shape {tokens_weights.shape}"
-    )
-    loss = loss * tokens_weights  # 1 x (BxL) x 1
+    if config.policy_loss != "gspo":
+        loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
+        assert loss.shape == tokens_weights.shape, (
+            f"Loss shape {loss.shape} does not match example weights shape {tokens_weights.shape}"
+        )
+        loss = loss * tokens_weights  # 1 x (BxL) x 1
 
-    policy_loss_total = -sum_sum(loss, masks_shifted, segments)
+        policy_loss_total = -sum_sum(loss, masks_shifted, segments)
     
     if has_value_head:
         # Get the value predictions
@@ -341,9 +387,9 @@ def rl_step(
         "kl_new_old": sum_sum(approx_kl_new_old / num_labels_in_seq, masks_shifted, segments).item(),
         "max_kl": approx_kl[masks_shifted].max().item(),
         "min_kl": approx_kl[masks_shifted].min().item(),
-        "policy_loss": sum_sum(policy_loss / num_labels_in_seq, masks_shifted, segments).item(),
-        "surr1": sum_sum(surr1 / num_labels_in_seq, masks_shifted, segments).item(),
-        "surr2": sum_sum(surr2 / num_labels_in_seq, masks_shifted, segments).item(),
+        #"policy_loss": sum_sum(policy_loss / num_labels_in_seq, masks_shifted, segments).item(),
+        #"surr1": sum_sum(surr1 / num_labels_in_seq, masks_shifted, segments).item(),
+        #"surr2": sum_sum(surr2 / num_labels_in_seq, masks_shifted, segments).item(),
         "ratio_new_old": sum_sum(ratio_new_old / num_labels_in_seq, masks_shifted, segments).item(),
         "ratio_new_old_sum": sum_sum(ratio_new_old, masks_shifted, segments).item(),
         "ratio_new_old_squared_sum": sum_sum(  # useful to estimate the ESS
@@ -357,7 +403,7 @@ def rl_step(
         "clamp_log_ratio_new_old_indicator": sum_sum(
             clamp_log_ratio_new_old_indicators / num_labels_in_seq, masks_shifted, segments
         ).item(),
-        "num_nans": torch.isnan(loss).sum().item(),
+        #"num_nans": torch.isnan(loss).sum().item(),
         "token_weight": sum_sum(tokens_weights / num_labels_in_seq, masks_shifted, segments).item(),
         "max_token_weight": tokens_weights[masks_shifted].max().item(),
         "min_token_weight": tokens_weights[masks_shifted].min().item(),
@@ -458,10 +504,20 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     assert len(df) == len(df_init)
 
     # Step 4: make token-level overflow and mean group length information
-    df["overflow"] = df.apply(
-        lambda row: [0.0] * len(row["overflow"]) if eos_token_id in row["input_ids"] else [1.0] * len(row["overflow"]),
-        axis=1,
-    )
+    def _overflow_from_finish_reason(row):
+        length = len(row["overflow"])
+        finish_reason = row.get("finish_reason")
+        if isinstance(finish_reason, str):
+            finish_reason = finish_reason.strip().lower()
+            if finish_reason == "length":
+                return [1.0] * length
+            if finish_reason in {"stop", "content_filter"}:
+                return [0.0] * length
+        if row.get("finished"):
+            return [0.0] * length
+        return [0.0] * length if eos_token_id in row["input_ids"] else [1.0] * length
+
+    df["overflow"] = df.apply(_overflow_from_finish_reason, axis=1)
     df["group_tokens"] = df.apply(lambda row: [row["group_tokens"]] * len(row["input_ids"]), axis=1)
     df["num_labels"] = df.apply(
         lambda row: [sum(1 for label in row["labels"] if label != -100)] * len(row["input_ids"]), axis=1

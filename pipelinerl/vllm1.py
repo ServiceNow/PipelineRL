@@ -26,6 +26,7 @@ from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # noqa: F401 - registers custom quantization configs
 from pipelinerl.finetune_loop import WeightUpdateRequest
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,13 @@ handler.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+# Ensure quantization module logs are visible, too.
+_qlogger = logging.getLogger("pipelinerl.vllm_quantization")
+_qlogger.setLevel(logging.INFO)
+if not _qlogger.handlers:
+    _qlogger.addHandler(handler)
+_qlogger.propagate = False
 
 
 @runtime_checkable
