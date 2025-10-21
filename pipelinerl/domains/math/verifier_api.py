@@ -1,6 +1,7 @@
 import time
 import requests
 import asyncio
+import re
 from concurrent.futures import ProcessPoolExecutor
 import aiohttp
 import uvicorn
@@ -61,6 +62,18 @@ def timeout(seconds=1):
         signal.signal(signal.SIGALRM, original_handler)
 
 
+DELIMITER_STR = re.compile(r"\[END FINAL RESPONSE\]", flags=re.IGNORECASE)
+
+
+def strip_delimiter_strings(text: str) -> str:
+    if not text:
+        return text
+    stripped = DELIMITER_STR.sub("", text)
+    # Remove lines that became empty after sentinel stripping to avoid parsing noise
+    cleaned_lines = [line for line in stripped.splitlines() if line.strip()]
+    return "\n".join(cleaned_lines)
+
+
 def verify_answer(prediction: str, gold: str, strict: bool = True, max_prediction_length: int = 1000) -> str:
     """
     Checks if a predicted answer matches a gold (correct) answer by making a request to the math_verify package.
@@ -88,12 +101,12 @@ def verify_answer(prediction: str, gold: str, strict: bool = True, max_predictio
 
 
 def verify_math(prediction: str, gold: str, strict: bool = True, max_prediction_length: int = 1000) -> str:
-    import re
-
     try:
         # Input Sanitization / Validation
         if not isinstance(prediction, str) or not isinstance(gold, str):
             raise ValueError("Prediction and gold must be strings")
+
+        prediction = strip_delimiter_strings(prediction)
 
         # Try extracting from \boxed{...} first
         boxed_start = prediction.rfind("\\boxed{")
@@ -109,7 +122,7 @@ def verify_math(prediction: str, gold: str, strict: bool = True, max_prediction_
             # Fallback: look for <answer>...</answer> tags
             answer_match = re.findall(r"<answer>(.*?)</answer>", prediction, re.DOTALL)
             if answer_match:
-                extracted_prediction = answer_match[-1].strip()  # last one if multiple
+                extracted_prediction = strip_delimiter_strings(answer_match[-1].strip())  # last one
             else:
                 raise NoAnswerException()
 
@@ -225,5 +238,3 @@ class MathEnvironment:
                 return JSONResponse(content={"status": "ok"})
 
             uvicorn.run(app, host="0.0.0.0", port=port, timeout_keep_alive=60)
-
-
