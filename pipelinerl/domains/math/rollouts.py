@@ -1,7 +1,9 @@
+import json
+import logging
+import random
 import re
 import time
-import random
-import logging
+from pathlib import Path
 
 import aiohttp
 from omegaconf import DictConfig
@@ -14,6 +16,7 @@ from tapeagents.llms.trainable import TrainableLLM
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from .verifier_api import verify_answer_rpc
 
+logger = logging.getLogger(__name__)
 
 class Metrics(BaseMetrics):
     penalty: float
@@ -139,6 +142,30 @@ def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) ->
         return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
     return 0.
 
+
+def log_answer_status(cfg: DictConfig, problem: dict, answer_status: str, reward: float, latency: float) -> None:
+    """
+    Metric logging for answer status - correct, wrong, no_answer, unparsable
+    """
+    try:
+        log_dir = Path(cfg.output_dir) if cfg.output_dir else None
+        if not log_dir:
+            return
+        log_path = log_dir / "answer_status.jsonl"
+        record = {
+            "t": time.time(),
+            "problem_id": problem.get("id"),
+            "dataset": problem.get("dataset"),
+            "answer_status": answer_status,
+            "reward": reward,
+            "latency": latency,
+        }
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record))
+            handle.write("\n")
+    except Exception:
+        logger.debug("Failed to append answer status log", exc_info=True)
+
 async def generate_math_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -199,6 +226,7 @@ async def generate_math_rollout(
         )
     reward += overlong_penalty
     trace.reward = reward
+    log_answer_status(cfg, problem, answer_status, reward, latency)
 
     # Prefer backend-provided finish reason if available; normalize for comparisons
     if isinstance(trace.metadata, dict):
@@ -249,6 +277,7 @@ async def generate_math_rollout(
     return RolloutResult(
         training_texts=[trace],
         metrics=metrics,
-        latency=latency, 
+        latency=latency,
         dataset_name=problem.get("dataset"),
+        answer_status=answer_status,
     )
