@@ -7,11 +7,11 @@ import os
 import queue
 import random
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from queue import Empty
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import aiohttp
 import hydra
@@ -21,8 +21,6 @@ import uvloop
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 from tapeagents.llms import TrainableLLM
-from typing import Dict, List, Optional
-
 import wandb
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
@@ -132,58 +130,6 @@ class SlidingWindowAggregator:
 
 
 
-class CurriculumSuccessTracker:
-    def __init__(self) -> None:
-        self._buffers: dict[str, deque[int]] = {}
-        self._max_windows: dict[str, int] = {}
-        self._total_counts: defaultdict[str, int] = defaultdict(int)
-
-    def ensure_window(self, dataset: str, window: int) -> None:
-        if window <= 0:
-            window = 1
-        current = self._max_windows.get(dataset, 0)
-        if window <= current:
-            return
-        existing = self._buffers.get(dataset, deque(maxlen=window))
-        if existing.maxlen != window:
-            new_buffer = deque(existing, maxlen=window)
-        else:
-            new_buffer = existing
-        self._buffers[dataset] = new_buffer
-        self._max_windows[dataset] = window
-
-    def update(self, dataset: str, success_values: list[int | bool]) -> None:
-        if not success_values:
-            return
-        buffer = self._buffers.get(dataset)
-        if buffer is None:
-            maxlen = self._max_windows.get(dataset, max(1, len(success_values)))
-            buffer = deque(maxlen=maxlen)
-            self._buffers[dataset] = buffer
-            self._max_windows[dataset] = maxlen
-        for value in success_values:
-            buffer.append(1 if bool(value) else 0)
-            self._total_counts[dataset] += 1
-
-    def success_mean(self, dataset: str, window: Optional[int] = None) -> Optional[float]:
-        buffer = self._buffers.get(dataset)
-        if buffer is None or not buffer:
-            return None
-        if window is None or window <= 0:
-            values = list(buffer)
-        else:
-            values = list(buffer)[-window:]
-            if len(values) < window:
-                return None
-        if not values:
-            return None
-        return sum(values) / len(values)
-
-    def total_samples(self, dataset: str) -> int:
-        return self._total_counts.get(dataset, 0)
-
-
-
 def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
 
@@ -191,28 +137,14 @@ def make_stats_dict() -> dict:
 def parse_curriculum_schedule(curriculum_cfg) -> list[dict]:
     raw_schedule = curriculum_cfg.get("schedule", [])
     if not raw_schedule:
-        return [{"step": 0, "hard_weight": 0.0, "thresholds": []}]
+        return [{"step": 0, "medium_weight": 0.0, "hard_weight": 0.0}]
     if not isinstance(raw_schedule, list):
         raw_schedule = [raw_schedule]
-    default_cooldown = curriculum_cfg.get("default_promotion_cooldown_samples", 8000)
-    try:
-        default_cooldown = int(default_cooldown)
-    except (TypeError, ValueError):
-        default_cooldown = 8000
-    if default_cooldown < 0:
-        default_cooldown = 0
-
-    default_hysteresis = curriculum_cfg.get("default_threshold_hysteresis", 0.02)
-    try:
-        default_hysteresis = float(default_hysteresis)
-    except (TypeError, ValueError):
-        default_hysteresis = 0.02
-    if default_hysteresis < 0.0:
-        default_hysteresis = 0.0
-
     parsed_schedule: list[dict] = []
     for entry in raw_schedule:
         step = int(entry.get("step", 0))
+        if step < 0:
+            step = 0
         hard_weight = float(entry.get("hard_weight", 0.0))
         hard_weight = max(0.0, min(1.0, hard_weight))
         medium_weight_value = entry.get("medium_weight", 0.0)
@@ -222,68 +154,104 @@ def parse_curriculum_schedule(curriculum_cfg) -> list[dict]:
             medium_weight = 0.0
         medium_weight = max(0.0, min(1.0, medium_weight))
         weight_sum = medium_weight + hard_weight
-        max_non_base = 0.85
-        if weight_sum > max_non_base and weight_sum > 0:
-            scale = max_non_base / weight_sum
+        if weight_sum > 1.0 and weight_sum > 0.0:
+            scale = 1.0 / weight_sum
             medium_weight *= scale
             hard_weight *= scale
-        demotion_patience_value = entry.get("demotion_patience", 1)
-        try:
-            demotion_patience = int(demotion_patience_value)
-        except (TypeError, ValueError):
-            demotion_patience = 1
-        if demotion_patience < 1:
-            demotion_patience = 1
-        cooldown_value = entry.get(
-            "promotion_cooldown_samples", entry.get("cooldown_samples", default_cooldown)
-        )
-        try:
-            promotion_cooldown_samples = int(cooldown_value)
-        except (TypeError, ValueError):
-            promotion_cooldown_samples = default_cooldown
-        if promotion_cooldown_samples < 0:
-            promotion_cooldown_samples = 0
-        hysteresis_value = entry.get("threshold_hysteresis", default_hysteresis)
-        try:
-            threshold_hysteresis = float(hysteresis_value)
-        except (TypeError, ValueError):
-            threshold_hysteresis = default_hysteresis
-        threshold_hysteresis = max(0.0, threshold_hysteresis)
-        thresholds_cfg = entry.get("success_thresholds", []) or []
-        if not isinstance(thresholds_cfg, list):
-            thresholds_cfg = [thresholds_cfg]
-        thresholds: list[dict] = []
-        for threshold_entry in thresholds_cfg:
-            dataset = threshold_entry.get("dataset")
-            if not dataset:
+        ready_success_cfg = entry.get("ready_success") or []
+        if not isinstance(ready_success_cfg, list):
+            ready_success_cfg = [ready_success_cfg]
+        ready_success: list[dict] = []
+        for cond in ready_success_cfg:
+            if not isinstance(cond, dict):
                 continue
-            threshold_value = float(threshold_entry.get("threshold", 1.0))
-            window = int(threshold_entry.get("window", threshold_entry.get("window_size", 0) or 1))
-            if window <= 0:
-                window = 1
-            min_samples_value = threshold_entry.get("min_samples")
-            min_samples = int(min_samples_value) if min_samples_value is not None else None
-            thresholds.append(
+            dataset = cond.get("dataset")
+            metric = cond.get("metric", "success_mean")
+            try:
+                threshold = float(cond.get("threshold", 1.0))
+            except (TypeError, ValueError):
+                threshold = 1.0
+            ready_success.append(
                 {
                     "dataset": dataset,
-                    "threshold": threshold_value,
-                    "window": window,
-                    "min_samples": min_samples,
+                    "metric": metric,
+                    "threshold": threshold,
                 }
             )
+        patience_value = entry.get("ready_patience", 1)
+        try:
+            ready_patience = max(1, int(patience_value))
+        except (TypeError, ValueError):
+            ready_patience = 1
         parsed_schedule.append(
             {
                 "step": step,
-                "hard_weight": hard_weight,
                 "medium_weight": medium_weight,
-                "thresholds": thresholds,
-                "demotion_patience": demotion_patience,
-                "promotion_cooldown_samples": promotion_cooldown_samples,
-                "threshold_hysteresis": threshold_hysteresis,
+                "hard_weight": hard_weight,
+                "ready_success": ready_success,
+                "ready_patience": ready_patience,
             }
         )
     parsed_schedule.sort(key=lambda item: item["step"])
     return parsed_schedule
+
+
+def advance_curriculum_stage(
+    schedule: list[dict],
+    stage_state: dict,
+    samples_processed: int,
+    stats: dict,
+    logger: logging.Logger | None = None,
+) -> None:
+    if not schedule or stage_state is None:
+        return
+    current_idx = int(stage_state.get("index", 0))
+    ready_counts = stage_state.setdefault("ready_counts", {})
+    advanced = False
+
+    while current_idx + 1 < len(schedule):
+        next_idx = current_idx + 1
+        stage_cfg = schedule[next_idx]
+        min_step = stage_cfg.get("step", 0)
+        if samples_processed < min_step:
+            break
+
+        ready_conditions: list[dict] = stage_cfg.get("ready_success") or []
+        patience = max(1, int(stage_cfg.get("ready_patience", 1)))
+
+        if ready_conditions:
+            all_pass = True
+            for cond in ready_conditions:
+                dataset = cond.get("dataset")
+                metric = cond.get("metric", "success_mean")
+                threshold = float(cond.get("threshold", 1.0))
+                if dataset:
+                    metric_key = f"{dataset}/{metric}"
+                else:
+                    metric_key = metric
+                value = stats.get(metric_key)
+                if value is None or value < threshold:
+                    all_pass = False
+                    break
+            if all_pass:
+                ready_counts[next_idx] = ready_counts.get(next_idx, 0) + 1
+            else:
+                ready_counts[next_idx] = 0
+                break
+            if ready_counts[next_idx] < patience:
+                break
+        current_idx = next_idx
+        stage_state["index"] = current_idx
+        ready_counts.pop(next_idx, None)
+        advanced = True
+        if logger:
+            logger.info(
+                "Curriculum stage %d activated (samples_processed=%d)",
+                current_idx,
+                samples_processed,
+            )
+    if not advanced:
+        stage_state["index"] = current_idx
 
 
 async def schedule_rollouts(
@@ -329,9 +297,9 @@ async def schedule_rollouts(
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
-            logger.info(f"Starting rollout policy for problem {problem['id']}")
+            logger.debug(f"Starting rollout policy for problem {problem['id']}")
             rollout_result: RolloutResult = await rollout_policy(cfg, llm, problem, session)
-            logger.info(f"Finished rollout policy for problem {problem['id']}")
+            logger.debug(f"Finished rollout policy for problem {problem['id']}")
             rollout_result.model_version = model_version
             token_count += get_number_of_tokens_in_result(rollout_result)
             # Make a group id that will be different from groups made by another rollout maker
@@ -378,7 +346,7 @@ async def schedule_rollouts(
                 if finished_rollouts > old_finished_rollouts:
                     old_finished_rollouts = finished_rollouts
                     save_debug_line({"rollouts_finished": finished_rollouts, "tokens_produced": token_count, "dt": time.time() - start_time, "token_speed": token_count / (time.time() - start_time)})
-                logger.info(
+                logger.debug(
                     f"{scheduler_name}: "
                     f"rollouts in progress: {sum(active_rollouts)}, "
                     f"groups in progress: {len(group_rollouts)}, "
@@ -454,9 +422,8 @@ def curriculum_iter(
     trainer_state: TrainerState,
     curriculum_cfg: DictConfig,
     logger: logging.Logger | None = None,
-    success_tracker: CurriculumSuccessTracker | None = None,
-    stage_state: Optional[dict] = None,
     parsed_schedule: Optional[list[dict]] = None,
+    stage_state: Optional[dict] = None,
 ):
     curriculum_obj = (
         OmegaConf.to_container(curriculum_cfg, resolve=True)
@@ -486,304 +453,72 @@ def curriculum_iter(
     medium_pool = [problem for problem in problems if problem.get("dataset") in medium_names]
     hard_pool = [problem for problem in problems if problem.get("dataset") in hard_names]
 
-    if not hard_pool:
-        if logger:
-            logger.warning(
-                "Curriculum enabled but no problems matched hard_datasets list; falling back to base sampling"
-            )
-        yield from random_iter(problems)
-        return
-
-    if medium_names and not medium_pool and logger:
-        logger.warning(
-            "Curriculum medium_datasets specified but no problems matched; medium weighting will be ignored"
-        )
+    if not base_pool and medium_pool:
+        base_pool = list(medium_pool)
+        medium_pool = []
 
     if not base_pool:
         if logger:
-            logger.warning("Curriculum enabled but base pool is empty; falling back to medium or hard datasets")
-        if medium_pool:
-            base_pool = list(medium_pool)
-            medium_pool = []
-        else:
-            base_pool = hard_pool
+            logger.warning("Curriculum enabled but no matching datasets were found; falling back to random sampling")
+        yield from random_iter(problems)
+        return
 
     schedule = parsed_schedule or parse_curriculum_schedule(curriculum_obj)
-    if success_tracker:
-        for stage in schedule:
-            for threshold in stage["thresholds"]:
-                success_tracker.ensure_window(threshold["dataset"], threshold["window"])
+    if not schedule:
+        schedule = [{"step": 0, "medium_weight": 0.0, "hard_weight": 0.0}]
 
-    def stage_ready(stage_cfg: dict, relaxation: float = 0.0) -> tuple[bool, list[str], bool, list[dict]]:
-        if not stage_cfg["thresholds"] or success_tracker is None:
-            return True, [], False, []
-        blockers: list[str] = []
-        threshold_blocked = False
-        stats: list[dict] = []
-        for threshold in stage_cfg["thresholds"]:
-            dataset = threshold["dataset"]
-            threshold_value = threshold["threshold"]
-            window = threshold["window"]
-            min_samples = threshold.get("min_samples")
-            total_samples = success_tracker.total_samples(dataset)
-            if min_samples is not None:
-                if total_samples < min_samples:
-                    blockers.append(
-                        f"{dataset}: waiting for {min_samples} samples (have {total_samples})"
-                    )
-                    stats.append(
-                        {
-                            "dataset": dataset,
-                            "success_mean": None,
-                            "threshold": threshold_value,
-                            "relaxation": relaxation,
-                            "window": window,
-                            "min_samples": min_samples,
-                            "total_samples": total_samples,
-                            "status": "min_samples",
-                        }
-                    )
-                    continue
-            success_mean_value = success_tracker.success_mean(dataset, window)
-            if success_mean_value is None:
-                blockers.append(f"{dataset}: insufficient window data (need {window})")
-                stats.append(
-                    {
-                        "dataset": dataset,
-                        "success_mean": None,
-                        "threshold": threshold_value,
-                        "relaxation": relaxation,
-                        "window": window,
-                        "min_samples": min_samples,
-                        "total_samples": total_samples,
-                        "status": "insufficient_window",
-                    }
-                )
-                continue
-            adjusted_threshold = threshold_value - relaxation
-            if success_mean_value < adjusted_threshold:
-                threshold_blocked = True
-                blockers.append(
-                    f"{dataset}: success_mean {success_mean_value:.3f} < {adjusted_threshold:.3f} (threshold={threshold_value:.3f}, relaxation={relaxation:.3f}, window={window})"
-                )
-                stats.append(
-                    {
-                        "dataset": dataset,
-                        "success_mean": success_mean_value,
-                        "threshold": threshold_value,
-                        "relaxation": relaxation,
-                        "window": window,
-                        "min_samples": min_samples,
-                        "total_samples": total_samples,
-                        "status": "threshold",
-                    }
-                )
-                continue
-            stats.append(
-                {
-                    "dataset": dataset,
-                    "success_mean": success_mean_value,
-                    "threshold": threshold_value,
-                    "relaxation": relaxation,
-                    "window": window,
-                    "min_samples": min_samples,
-                    "total_samples": total_samples,
-                    "status": "ok",
-                }
-            )
-        return (len(blockers) == 0), blockers, threshold_blocked, stats
-
-    current_stage = -1
-    last_block_log: tuple[int, tuple[str, ...]] | None = None
-    if stage_state is None:
-        stage_state = {"index": 0}
-    stage_state.setdefault("consecutive_failures", {})
-    stage_state.setdefault("last_promotion_samples", -math.inf)
+    current_stage_index = stage_state.get("index", 0) if stage_state is not None else 0
+    last_logged_stage: Optional[int] = None
 
     while True:
         samples_processed = trainer_state.samples_processed or 0
-        desired_stage_index = 0
+        max_stage_allowed = current_stage_index
+        while (
+            max_stage_allowed + 1 < len(schedule)
+            and samples_processed >= schedule[max_stage_allowed + 1]["step"]
+        ):
+            max_stage_allowed += 1
 
-        for idx, stage_cfg in enumerate(schedule):
-            step = stage_cfg["step"]
-            if samples_processed >= step:
-                desired_stage_index = idx
-            else:
-                break
-
-        current_stage = int(stage_state.get("index", 0))
-        if current_stage < 0:
-            current_stage = 0
-        if current_stage >= len(schedule):
-            current_stage = len(schedule) - 1
-        prev_stage = current_stage
-
-        stage_index = min(current_stage, desired_stage_index)
-        promotion_blockers: list[str] = []
-        promotion_stats_for_log: list[dict] = []
-
-        # Walk backwards until the current stage is ready (or we reach stage 0)
-        while stage_index > 0:
-            ready, _, _, _ = stage_ready(schedule[stage_index], relaxation=0.0)
-            if ready:
-                break
-            stage_index -= 1
-
-        ready, current_blockers, _, current_stats = stage_ready(
-            schedule[stage_index], relaxation=0.0
-        )
-        if not ready and stage_index > 0:
-            # If even after walking back we are not ready, fall back further until 0
-            while stage_index > 0 and not ready:
-                stage_index -= 1
-                ready, current_blockers, _, current_stats = stage_ready(
-                    schedule[stage_index], relaxation=0.0
-                )
-
-        # Attempt to promote by at most one stage towards the desired stage
-        if stage_index < desired_stage_index:
-            next_index = stage_index + 1
-            next_ready, blockers, _, next_stats = stage_ready(
-                schedule[next_index], relaxation=0.0
-            )
-            if next_ready:
-                stage_index = next_index
-                current_blockers = []
-                current_stats = next_stats
-            else:
-                promotion_blockers = blockers
-                promotion_stats_for_log = next_stats
-        promotion_block_stage: int | None = None
-        promotion_blockers_for_log: list[str] = []
-        if stage_index < desired_stage_index:
-            promotion_block_stage = stage_index + 1
-            promotion_blockers_for_log = promotion_blockers or current_blockers
-            if promotion_blockers_for_log:
-                if not promotion_stats_for_log:
-                    promotion_stats_for_log = current_stats
-            else:
-                promotion_block_stage = None
-
-        candidate_stage_index = stage_index
-        if candidate_stage_index > prev_stage + 1:
-            candidate_stage_index = prev_stage + 1
-
-        cooldown_blockers: list[str] = []
-        cooldown_stats: list[dict] = []
-        last_promotion_samples = stage_state.get("last_promotion_samples", -math.inf)
-        if candidate_stage_index > prev_stage:
-            cooldown_required = schedule[candidate_stage_index].get(
-                "promotion_cooldown_samples", 0
-            )
-            samples_since_promotion = samples_processed - last_promotion_samples
-            if samples_since_promotion < cooldown_required:
-                cooldown_blockers = [
-                    (
-                        f"promotion cooldown active: {samples_since_promotion} / "
-                        f"{cooldown_required} samples since last promotion"
-                    )
-                ]
-                cooldown_stats = current_stats
-                candidate_stage_index = prev_stage
-            else:
-                stage_state["last_promotion_samples"] = samples_processed
-
-        stage_index = candidate_stage_index
-
-        blockers_for_log: list[str] = []
-        block_stage: int | None = None
-        failure_counts: dict[int, int] = stage_state.setdefault("consecutive_failures", {})
-        demotion_stats_for_log: list[dict] = []
-        demotion_cancelled = False
-        if prev_stage > stage_index:
-            _, prev_blockers, prev_threshold_blocked, prev_stats = stage_ready(
-                schedule[prev_stage],
-                relaxation=schedule[prev_stage].get("threshold_hysteresis", 0.0),
-            )
-            patience = schedule[prev_stage].get("demotion_patience", 1)
-            if prev_threshold_blocked and patience > 1:
-                failures = failure_counts.get(prev_stage, 0) + 1
-                if failures < patience:
-                    failure_counts[prev_stage] = failures
-                    stage_index = prev_stage
-                    demotion_cancelled = True
-                    block_stage = prev_stage
-                    blockers_for_log = prev_blockers
-                    promotion_stats_for_log = prev_stats
-                    demotion_stats_for_log = prev_stats
-                else:
-                    failure_counts[prev_stage] = 0
-            else:
-                failure_counts[prev_stage] = 0
+        if stage_state is not None:
+            desired_index = int(stage_state.get("index", 0))
+            current_stage_index = max(0, min(desired_index, max_stage_allowed))
         else:
-            failure_counts.setdefault(prev_stage, 0)
-            failure_counts[prev_stage] = 0
+            current_stage_index = max_stage_allowed
 
-        if not demotion_cancelled:
-            failure_counts.setdefault(stage_index, 0)
-            if stage_index != prev_stage:
-                failure_counts[stage_index] = 0
-
-        hard_weight = schedule[stage_index]["hard_weight"]
-        medium_weight = schedule[stage_index].get("medium_weight", 0.0)
+        stage_cfg = schedule[current_stage_index]
+        medium_weight = stage_cfg.get("medium_weight", 0.0)
+        hard_weight = stage_cfg.get("hard_weight", 0.0)
         if not medium_pool:
             medium_weight = 0.0
+        if not hard_pool:
+            hard_weight = 0.0
+        base_weight = max(0.0, 1.0 - medium_weight - hard_weight)
+        weight_sum = base_weight + medium_weight + hard_weight
+        if weight_sum == 0.0:
+            base_weight = 1.0
+            medium_weight = 0.0
+            hard_weight = 0.0
 
-        stats_for_log: list[dict] = []
-        if block_stage is None and promotion_block_stage is not None:
-            block_stage = promotion_block_stage
-            blockers_for_log = promotion_blockers_for_log
-            stats_for_log = promotion_stats_for_log
-        if block_stage is None and cooldown_blockers:
-            block_stage = prev_stage + 1 if prev_stage + 1 < len(schedule) else prev_stage
-            blockers_for_log = cooldown_blockers
-            stats_for_log = cooldown_stats
-        if not stats_for_log and demotion_stats_for_log:
-            stats_for_log = demotion_stats_for_log
-
-        if logger and block_stage is not None and blockers_for_log:
-            block_signature = (block_stage, tuple(blockers_for_log))
-            if block_signature != last_block_log:
-                stats_desc = ""
-                if stats_for_log:
-                    formatted = []
-                    for stat in stats_for_log:
-                        mean_val = stat.get("success_mean")
-                        mean_str = f"{mean_val:.3f}" if mean_val is not None else "n/a"
-                        formatted.append(
-                            f"{stat.get('dataset')}: mean={mean_str}, thr={stat.get('threshold', 0.0):.3f}, "
-                            f"rel={stat.get('relaxation', 0.0):.3f}, window={stat.get('window')}, "
-                            f"samples={stat.get('total_samples')}, status={stat.get('status', 'n/a')}"
-                        )
-                    stats_desc = " | stats: " + "; ".join(formatted)
-                logger.info(
-                    "Curriculum stage %d gated by: %s%s",
-                    block_stage,
-                    "; ".join(blockers_for_log),
-                    stats_desc,
-                )
-                last_block_log = block_signature
-        elif stage_index >= desired_stage_index:
-            last_block_log = None
-
-        if logger and stage_index != current_stage:
-            base_weight = max(0.0, 1.0 - hard_weight - medium_weight)
+        if logger and last_logged_stage != current_stage_index:
             logger.info(
                 "Curriculum stage %d active (samples_processed=%d, base=%.3f, medium=%.3f, hard=%.3f)",
-                stage_index,
+                current_stage_index,
                 samples_processed,
                 base_weight,
                 medium_weight,
                 hard_weight,
             )
-            current_stage = stage_index
+            last_logged_stage = current_stage_index
 
-        stage_state["index"] = stage_index
+        if stage_state is not None:
+            stage_state["index"] = current_stage_index
 
         choice = random.random()
-        if hard_pool and choice < hard_weight:
+        hard_cutoff = hard_weight
+        medium_cutoff = hard_cutoff + medium_weight
+        if hard_pool and choice < hard_cutoff:
             yield random.choice(hard_pool)
-        elif medium_pool and choice < hard_weight + medium_weight:
+        elif medium_pool and choice < medium_cutoff:
             yield random.choice(medium_pool)
         else:
             yield random.choice(base_pool)
@@ -818,7 +553,7 @@ class ActorLoop:
         self.is_training = is_training
         self.is_scheduling_paused = False
         self.debug_mode = bool(cfg.debug.mode)
-        self.curriculum_tracker: CurriculumSuccessTracker | None = None
+        self.curriculum_schedule: list[dict] | None = None
         self.curriculum_stage_state: dict | None = None
 
         self.smm: SharedMemoryManager | None = None
@@ -867,6 +602,7 @@ class ActorLoop:
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
+        self.answer_status_counts = Counter()
 
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
@@ -893,14 +629,14 @@ class ActorLoop:
             for k, v in all_metrics.items():
                 if isinstance(v, list):
                     self.stats[k][dataset_name][group_id] += v
-                    if k == "success" and self.curriculum_tracker:
-                        self.curriculum_tracker.update(dataset_name, v)
                 elif isinstance(v, float) | isinstance(v, bool) | isinstance(v, int):
                     self.stats[k][dataset_name][group_id].append(v)
-                    if k == "success" and self.curriculum_tracker:
-                        self.curriculum_tracker.update(dataset_name, [v])
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
+
+            status = getattr(result, "answer_status", None)
+            if status in {"correct", "wrong", "unparsable", "no_answer"}:
+                self.answer_status_counts[status] += 1
 
         if self.sliding_aggregator:
             prompt_length_tokens = [
@@ -949,27 +685,23 @@ class ActorLoop:
                     else curriculum_cfg
                 )
                 parsed_schedule = parse_curriculum_schedule(curriculum_obj)
-                self.curriculum_tracker = CurriculumSuccessTracker()
-                for stage in parsed_schedule:
-                    for threshold in stage["thresholds"]:
-                        self.curriculum_tracker.ensure_window(threshold["dataset"], threshold["window"])
+                self.curriculum_schedule = parsed_schedule
                 self.curriculum_stage_state = {"index": 0}
                 problem_iter = curriculum_iter(
                     dataset,
                     trainer_state=self.trainer_state,
                     curriculum_cfg=curriculum_cfg,
                     logger=logger,
-                    success_tracker=self.curriculum_tracker,
-                    stage_state=self.curriculum_stage_state,
                     parsed_schedule=parsed_schedule,
+                    stage_state=self.curriculum_stage_state,
                 )
             else:
                 problem_iter = random_iter(dataset)
-                self.curriculum_tracker = None
+                self.curriculum_schedule = None
                 self.curriculum_stage_state = None
         else:
             problem_iter = sequential_iter(dataset)
-            self.curriculum_tracker = None
+            self.curriculum_schedule = None
             self.curriculum_stage_state = None
         assert self.trainer_state.propagated_weight_version is not None
 
@@ -1136,8 +868,21 @@ class ActorLoop:
         stats |= loop_stats
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
-        if self.curriculum_stage_state is not None:
+        if self.curriculum_schedule and self.curriculum_stage_state is not None:
+            advance_curriculum_stage(
+                self.curriculum_schedule,
+                self.curriculum_stage_state,
+                self.trainer_state.samples_processed or 0,
+                stats,
+                logger,
+            )
             stats["curriculum_stage_active"] = self.curriculum_stage_state.get("index", 0)
+
+        total_status = sum(self.answer_status_counts.values())
+        if total_status:
+            for status, count in self.answer_status_counts.items():
+                stats[f"{split_name}answer_status_{status}_count"] = count
+                stats[f"{split_name}answer_status_{status}_ratio"] = count / total_status
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
