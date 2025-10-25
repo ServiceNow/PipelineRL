@@ -1,6 +1,7 @@
 import base64
 import io
 import logging
+import json
 
 import aiohttp
 import numpy as np
@@ -13,6 +14,18 @@ from pipelinerl.rollouts import TrainingText
 from pipelinerl.processor_factory import get_processor
 
 logger = logging.getLogger(__name__)
+
+from omegaconf import ListConfig, DictConfig
+
+def omegaconf_to_native(obj):
+    if isinstance(obj, ListConfig):
+        return list(obj)
+    elif isinstance(obj, DictConfig):
+        return dict(obj)
+    return obj
+
+def convert_dict(d):
+    return {k: omegaconf_to_native(v) for k, v in d.items()}
 
 
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
@@ -64,12 +77,10 @@ async def llm_async_generate(
                 "skip_special_tokens": False,
             }
         )
-
-    logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
-
+    
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
-        json=data | llm.parameters,
+        json=convert_dict(data | llm.parameters),
         headers=headers,
         ssl=False,
     ) as response:
