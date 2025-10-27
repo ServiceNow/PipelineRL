@@ -519,6 +519,7 @@ class ActorLoop:
                 self.update_stats(rollout_results=rollout_results)
 
                 finished_groups += 1
+                logger.info(f"Finished {'train' if self.is_training else 'test'} groups {finished_groups} out of {expected_rollouts}")
                 time_to_publish_train_stats = (
                     self.is_training and trainer_version_to_publish is not None
                 ) or self.debug_mode
@@ -587,7 +588,6 @@ class ActorLoop:
                     stats[f"{prefix}{new_suffix}"] = stats[key]
                     break
 
-        logger.info(f"Publish actor stats to wandb: {stats}")
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
@@ -620,8 +620,6 @@ class ActorLoopRay(ActorLoop):
     Loop that runs the ray tasks for n_jobs to perform rollouts in parallel
     """
 
-    ray_ready: bool = False
-
     def __init__(self, cfg: DictConfig, *args, **kwargs):
         assert cfg.attempts % cfg.actor.async_batch_size == 0, (
             f"attempts {cfg.attempts} must be divisible by actor.async_batch_size {cfg.actor.async_batch_size}"
@@ -643,19 +641,16 @@ class ActorLoopRay(ActorLoop):
         self.log_dir = Path(self.cfg.output_dir) / "actor" / "ray"
 
     def start_backend(self):
-        if not self.ray_ready:
-            logger.info(f"Initializing Ray with {self.cfg.actor.rollout_workers} workers..")
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            ray_context = ray.init(
-                num_cpus=self.cfg.actor.rollout_workers,
-                dashboard_host="0.0.0.0",
-                include_dashboard=True,
-                log_to_driver=True,
-            )
-            logger.info(f"Ray initialized, dashboard at {ray_context.dashboard_url}")
-            self.ray_ready = True
-        else:
-            logger.info("Ray already initialized")
+        logger.info(f"Initializing Ray with {self.cfg.actor.rollout_workers} workers..")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        ray_context = ray.init(
+            num_cpus=self.cfg.actor.rollout_workers,
+            dashboard_host="0.0.0.0",
+            include_dashboard=True,
+            log_to_driver=True,
+            ignore_reinit_error=True,
+        )
+        logger.info(f"Ray initialized, dashboard at {ray_context.dashboard_url}")
 
         assert self.trainer_state.propagated_weight_version is not None
         rollout_policy: Callable[[DictConfig, TrainableLLM, dict], RolloutResult] = hydra.utils.get_method(
