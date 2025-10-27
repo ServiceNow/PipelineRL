@@ -440,6 +440,7 @@ def run_finetuning_loop(
         logger.info("Load the first version of the model into inference LLMs")
         weight_update_manager.send_weight_update(training_metrics.samples)
     else:
+        logger.info("send_weight_updates disabled, weight_update_manager is None")
         weight_update_manager = None
 
     batch_queue = Queue(maxsize=1)

@@ -202,7 +202,7 @@ def run_dataset_loader(
                     # This is a blocking call, but in most cases there will be space
                     raw_chunk_queue.put(buffer)
             except Exception as e:
-                logger.error(f"Error in dataset loader: {e}")
+                logger.exception(f"Error in dataset loader: {e}")
                 raw_chunk_queue.put(e)
                 break
 
@@ -389,8 +389,8 @@ def run_preprocessing_loop(
     
     # Initialize TrainerState
     trainer_state = TrainerState(exp_root_dir)
-    if cfg.debug.mode == "preprocessor":
-        logger.info("Debug mode: preprocessor")
+    if cfg.debug.mode == "preprocessor" or cfg.debug.mode == "actor+preprocessor":
+        logger.info(f"Debug mode: {cfg.debug.mode}")
         trainer_state.debug_mode_init()
     elif cfg.debug.mode == "finetune+preprocessor":
         logger.info("Debug mode: finetune+preprocessor")
@@ -537,7 +537,7 @@ def run_preprocessing_loop(
                             else:
                                 processed_entries_queue_popped_data += 1
                                 if processed_entries_queue_popped_data % 100 == 0 and last_time_notice != processed_entries_queue_popped_data // 100:
-                                    logger.warning(f"Popped {processed_entries_queue_popped_data} old entries from processed entries queue")
+                                    logger.warning(f"Popped {processed_entries_queue_popped_data} old entries from processed entries queue of max size {processed_entries_queue.maxlen}")
                                     last_time_notice = processed_entries_queue_popped_data // 100
                         entry = buffer.popleft()
                         processed_entries_queue.append(entry) # drop from the left if full
