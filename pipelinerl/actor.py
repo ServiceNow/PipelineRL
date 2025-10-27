@@ -547,7 +547,7 @@ class ActorLoop:
                         loop_stats=loop_stats,
                     )
 
-                if finished_groups == expected_rollouts:
+                if expected_rollouts >= 0 and finished_groups + self.rollout_errors >= expected_rollouts:
                     logger.info(f"Finished {expected_rollouts} rollouts, stopping actor loop")
                     self.stop_tasks()
                     break
@@ -799,7 +799,8 @@ class ActorLoopRay(ActorLoop):
                 self.finished_rollouts_count += 1
                 self.unfinished_problems[problem_id].append(rollout_result)
             logger.info(f"Problem {problem_id} has {len(self.unfinished_problems[problem_id])} rollout results")
-            if len(self.unfinished_problems[problem_id]) == self.cfg.attempts:
+            attempts = self.cfg.attempts if self.is_training else 1
+            if len(self.unfinished_problems[problem_id]) == attempts:
                 logger.info(f"Problem {problem_id} group finished")
                 group = self.unfinished_problems[problem_id]
                 random.shuffle(group)
