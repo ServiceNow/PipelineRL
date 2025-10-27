@@ -603,6 +603,7 @@ class ActorLoop:
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
         self.answer_status_counts = Counter()
+        self.dataset_sample_counts = Counter()
 
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
@@ -637,6 +638,8 @@ class ActorLoop:
             status = getattr(result, "answer_status", None)
             if status in {"correct", "wrong", "unparsable", "no_answer"}:
                 self.answer_status_counts[status] += 1
+            if dataset_name:
+                self.dataset_sample_counts[str(dataset_name)] += 1
 
         if self.sliding_aggregator:
             prompt_length_tokens = [
@@ -883,6 +886,12 @@ class ActorLoop:
             for status, count in self.answer_status_counts.items():
                 stats[f"{split_name}answer_status_{status}_count"] = count
                 stats[f"{split_name}answer_status_{status}_ratio"] = count / total_status
+        total_rollouts = sum(self.dataset_sample_counts.values())
+        if total_rollouts:
+            stats["dataset_rollouts_total"] = total_rollouts
+            for dataset, count in self.dataset_sample_counts.items():
+                stats[f"{dataset}/rollout_count"] = count
+                stats[f"{dataset}/rollout_ratio"] = count / total_rollouts
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
