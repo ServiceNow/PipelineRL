@@ -1,6 +1,7 @@
 import base64
 import io
 import logging
+import json
 
 import aiohttp
 import numpy as np
@@ -13,6 +14,18 @@ from pipelinerl.rollouts import TrainingText
 from pipelinerl.processor_factory import get_processor
 
 logger = logging.getLogger(__name__)
+
+from omegaconf import ListConfig, DictConfig
+
+def omegaconf_to_native(obj):
+    if isinstance(obj, ListConfig):
+        return list(obj)
+    elif isinstance(obj, DictConfig):
+        return dict(obj)
+    return obj
+
+def convert_dict(d):
+    return {k: omegaconf_to_native(v) for k, v in d.items()}
 
 
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
@@ -65,11 +78,20 @@ async def llm_async_generate(
             }
         )
 
-    logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
+    # logger.info(f"Came here=====")
+    # logger.info(f"LLM call data: {data | llm.parameters}")
+    # logger.info(f"POST request to {llm.base_url}/v1/chat/completions")
+    # logger.info('================================')
+    # for k,v in (data | llm.parameters).items():
+    #     logger.info(f"Key: {k}, Value: {v}")
+    #     logger.info(f"{type(k)}: {type(v)}")
+    # logger.info('================================')
 
+    # logger.info(f"Attempting JSON conversion: {json.dumps(convert_dict(data | llm.parameters))}")
+    
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
-        json=data | llm.parameters,
+        json=convert_dict(data | llm.parameters),
         headers=headers,
         ssl=False,
     ) as response:

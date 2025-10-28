@@ -149,6 +149,7 @@ async def schedule_rollouts(
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
+            # breakpoint()
             rollout_result = await rollout_policy(cfg, llm, problem, session)
             rollout_result.model_version = model_version
             # Make a group id that will be different from groups made by another rollout maker

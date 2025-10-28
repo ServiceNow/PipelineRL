@@ -1,0 +1,40 @@
+defaults:
+    - base
+    - _self_
+
+wandb:
+  use_wandb: True
+  # W&B id; if given, will resume this run
+  wandb_id: null
+  wandb_name: null
+  # W&B entity name
+  wandb_entity_name: null
+  # W&B project name
+  wandb_project_name: shiva_apriel
+  # W&B resume policy
+  wandb_resume: always
+  # Whether to use only the basename or the full path as the run name
+  wandb_use_basename: True
+  wandb_workspace_root: /mnt/core_llm_large/shiva/PipelineRL/results/exps
+  # set the group in your config
+  wandb_group: null
+  wandb_dir: null
+  tags: []
+  
+actor:
+  rollout_policy: pipelinerl.domains.coding.rollouts.generate_coding_rollout
+  system_prompt: Please solve the given coding problem in python.
+  task_template: |-
+    {task}
+
+rewards:
+  correct: 1.0
+  incorrect: 0
+
+environment:
+  _target_: pipelinerl.domains.coding.verifier_api.CodeEnvironment
+dataset_loader: pipelinerl.domains.coding.load_dataset.load_datasets
+train_dataset_names:
+- default
+test_dataset_names:
+  - load_datasets

@@ -1,0 +1,16 @@
+defaults:
+    - base
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.coding.rollouts.generate_coding_rollout
+  system_prompt: Please solve the given coding problem in python.
+  task_template: |-
+    {task}
+environment:
+  _target_: pipelinerl.domains.coding.verifier_api.CodeEnvironment
+dataset_loader: pipelinerl.domains.coding.load_dataset.load_datasets
+train_dataset_names:
+- dummy
+test_dataset_names:
+  - dummy

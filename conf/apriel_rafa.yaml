@@ -1,0 +1,153 @@
+# changed parameters marked below
+defaults:
+  - math
+  - override finetune: base
+  - override rewards: success_and_format
+  - override streams: redis
+  - _self_
+
+wandb:
+  use_wandb: True
+  # W&B id; if given, will resume this run
+  wandb_id: null
+  wandb_name: null
+  # W&B entity name
+  wandb_entity_name: null
+  # W&B project name
+  wandb_project_name: shiva_apriel
+  # W&B resume policy
+  wandb_resume: always
+  # Whether to use only the basename or the full path as the run name
+  wandb_use_basename: True
+  wandb_workspace_root: /mnt/core_llm_large/shiva/PipelineRL/results/exps
+  # set the group in your config
+  wandb_group: null
+  wandb_dir: null
+  tags: []
+
+vllm_config:
+  use_v1: true
+  vllm_kwargs:
+    max_model_len: 16384
+
+finetune:
+  learning_rate: 5e-7
+  max_train_steps: 1024 # Effective outer loop accumulation. 
+  save_checkpoint_steps: 9999999
+  seq_length: 16384 # Should be same as vllm_config.vllm_kwargs.max_model_len
+  gradient_clipping_threshold: 0.1
+  seq_parallel: 4 # Controls the sequence parallelism degree, can be set to 8 in prod run. 
+  save_final_training_state: false
+  gradient_accumulation_passes: 1024 # Effective inner loop accumulation. 
+  rl:
+    policy_loss: grpo
+    overlong_filtering: true
+
+rewards:
+  correct_answer_not_finished: 0.0
+  buffer_tokens: 0
+
+actor:
+  sampling:
+    method: random
+    log_each_n_secs: 0
+  llm_max_rollouts: 256 # ~ Batch size of the LLM during rollouts. To be optimized based on how fast the finetune consumes them.
+  rollout_workers: 2 # The CPU workers sending rollout requests to the LLM processes. HAS TO BE 1 gpu per actor!! 
+  log_each_n_secs: 10
+  rollout_policy: pipelinerl.domains.math.generate_math_rollout
+  discount_factor: 1
+  system_prompt: ""
+  task_prompt: "Please reason step by step, and put your final answer within \boxed{}."
+  throughput_window_size: 50
+  shared_memory_entry_size: 100000000
+  ensure_boxed_answers: true
+environment:
+  _target_: pipelinerl.domains.math.MathEnvironment
+
+train_dataset_names:
+- open_reasoner_zero_57k
+- open_reasoner_zero_extended_72k 
+
+test_dataset_names:
+  - aime_2024
+
+# Might need to add GPUs here for KL
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 8
+  queue_size: 8
+  chunk_n_groups: 8
+  submit_delay: 0.
+  pop_old_data: ${..pop_old_data} 
+  buffer_size: 0
+  shared_memory_entry_size: 100000000
+
+llm:
+  parameters:
+    # changed
+    max_tokens: 12000
+    # changed
+    temperature: 1.0
+    stop:
+      - </s>
+      - '[END FINAL RESPONSE]'
+      - <|end|>
+      - <|assistant|>
+      - <|user|>
+    stop_token_ids: []
+
+test_llm:
+  parameters: 
+    max_tokens: 12000
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 50
+    stop:
+      - </s>
+      - '[END FINAL RESPONSE]'
+      - <|end|>
+      - <|assistant|>
+      - <|user|>
+    stop_token_ids: []
+
+# Say I have 10 nodes, with 8 gpus each = 80 gpus
+world:
+  replicas: 1
+  
+  # The following are per-node
+  actor_fraction: 4
+  preprocessor_fraction: 0
+  finetune_fraction: 4
+
+  env_replicas: 2 # Rafa will get back.
+
+  actor_group_port: 9000
+  environment_start_port: 7777  
+# this will be autocreated based on the config
+jobs: []
+
+eval_every_n_versions: 0
+model_path: /mnt/core_llm_large/aman/merge_model/rc2-4-merge-rc2-3---lc3-111325/
+accelerate_config: null
+use_deepspeed: true
+deepspeed_config: deepspeed_stage3_bf16
+use_fsdp: false
+fsdp:
+  param_dtype: fp32
+  reduce_dtype: fp32
+  buffer_dtype: fp32
+
+output_dir: ???
+force_restart: true
+pop_old_data: true
+max_lag: null
+
+me:
+  job_idx: null
+
+debug:
+  mode: ""
+  streams_from: null
+  place_inference_workers: true
+ 

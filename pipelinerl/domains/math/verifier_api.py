@@ -201,6 +201,7 @@ class MathEnvironment:
             async def verify(request: dict):
                 prediction = request["prediction"]
                 gold = request["gold"]
+                # TODO: Call http://10.235.0.1/verify_math to check for correctness
                 strict = request["strict"]
                 max_prediction_length = request["max_prediction_length"]
 
