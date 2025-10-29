@@ -68,10 +68,10 @@ environment:
   _target_: pipelinerl.domains.coding.verifier_api.CodeEnvironment
 
 train_dataset_names:
-- dummy
+- mixed-training-text-datasets
 
 test_dataset_names:
-  - dummy
+  - mixed-training-text-datasets
 
 preprocess:
   input: actor

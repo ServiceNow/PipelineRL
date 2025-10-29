@@ -11,6 +11,6 @@ environment:
   _target_: pipelinerl.domains.coding.verifier_api.CodeEnvironment
 dataset_loader: pipelinerl.domains.coding.load_dataset.load_datasets
 train_dataset_names:
-- dummy
+- mixed-training-text-datasets
 test_dataset_names:
-  - dummy
+  - mixed-training-text-datasets
