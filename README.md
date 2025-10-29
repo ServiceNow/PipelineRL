@@ -158,7 +158,7 @@ test_dataset_names:
 You can now launch the training with the following command:
 
 ```bash
-python -m pipelinerl.launch config_name=guessing output_dir=results/guessing
+python -m pipelinerl.launch --config-name=guessing output_dir=results/guessing
 ```
 
 Once the LLMs are served, the actor will be evaluated on the test dataset before collecting training rollouts.
