@@ -1,0 +1,90 @@
+defaults:
+  - base
+  - override streams: redis
+  - override finetune: ppo
+  - _self_
+
+world:
+  actor_fraction: 2
+  preprocessor_fraction: 0
+  finetune_fraction: 4
+
+save_tapes: true
+
+output_dir: results/workarena/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: meta-llama/Llama-3.1-8B-Instruct
+use_ray: true
+
+finetune:
+  seq_length: 16384  # input + output tokens
+  max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
+  train_batch_size: 1
+  gradient_accumulation_passes: 1024
+
+eval_every_n_versions: 10240  # 1024 effective bs * 10 "optim steps"
+
+llm:
+  use_cache: false
+  parameters:
+    max_tokens: 4096  # output tokens
+    temperature: 1.0
+test_llm:
+  parameters:
+    max_tokens: ${...llm.parameters.max_tokens}
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 50
+
+vllm_config:
+  use_v1: false
+  vllm_kwargs:
+    max-num-seqs: 256
+    max-num-batched-tokens: 32000
+    max_model_len: 16384
+    gpu-memory-utilization: 0.9
+
+actor:
+  rollout_policy: pipelinerl.domains.workarena.rollouts.generate_workarena_rollout
+  llm_max_rollouts: 256
+  problem_queue_size: 32
+  async_batch_size: 1
+  rollout_workers: 32
+  shared_memory_entry_size: 100000000
+
+preprocess:
+  n_workers: 32  # Increase from 8
+  chunk_n_groups: 8  # Increase from 2 for better throughput
+  # queue for loaded raw groups
+  raw_queue_size: 32      # Increase from 8
+  # queue for processed chunks of multiple groups
+  input_queue_size: 64    # Increase from 32
+  # queue for ready chunks for multiple groups
+  output_queue_size: 64   # Increase from 32
+  # ring buffer to replace old samples with new ones when training is slow
+  ring_buffer_size: 1024  # Increase from 128
+  # "virtual" sample queue per lead trainer
+  max_ready_samples_per_lead: 256  # Increase from 64
+  shared_memory_entry_size: 1000000000  # Increase from 100M
+
+# AGENT CONFIGURATION
+agent_max_loops: 30  # max number of agent - environment interactions for each task
+agent_attempts: 3  # number of attempts to run the agent (retry on errors)
+rollout_timeout: 600  # overall timeout for entire rollout in seconds (10 minutes)
+agent:
+  _target_: examples.workarena.agent.WorkArenaAgent
+
+# ENVIRONMENT CONFIGURATION
+start_attempts: 3  # number of attempts to start each task
+environment:
+  _target_: examples.workarena.environment.WorkArenaEnvironment
+  exp_path: null
+  headless: true
+
+# DATASET CONFIGURATION
+dataset_loader: pipelinerl.domains.workarena.load_tasks.load_tasks
+dataset_loader_params:
+  seeds: [0, 42, 1337, 900, 103]
+train_dataset_names:
+  - all
+test_dataset_names:
+  - atomic
