@@ -20,6 +20,7 @@ actor:
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
   async_batch_size: 4
+  collect_logprobs: true
 
 environment: null
 preprocess:

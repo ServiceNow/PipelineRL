@@ -50,6 +50,7 @@ actor:
   async_batch_size: 1
   rollout_workers: 32
   shared_memory_entry_size: 100000000
+  collect_logprobs: false
 
 preprocess:
   n_workers: 32  # Increase from 8

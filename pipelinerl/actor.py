@@ -451,6 +451,7 @@ class ActorLoop:
             can_submit_before_update = math.inf
 
         logger.info(f"Start {'train' if self.is_training else 'test'} actor loop")
+        rollouts_last_minute = []
         with (
             write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
@@ -481,8 +482,7 @@ class ActorLoop:
                                     assert False, "Problem queue was not full just a moment ago, but now it is full"
                             except StopIteration:
                                 break
-                        else:
-                            break
+                        break
 
                 # Second, try return a result
                 try:
@@ -506,6 +506,7 @@ class ActorLoop:
                 samples_in_queue = self.results_ready_to_publish()
                 all_text_dumps = []
                 for r in rollout_results:
+                    rollouts_last_minute.append(time.perf_counter())
                     for text in r.training_texts:
                         all_text_dumps.append(text.model_dump())
                 data_stream_writer.write(all_text_dumps)
@@ -524,6 +525,10 @@ class ActorLoop:
                     self.is_training and trainer_version_to_publish is not None
                 ) or self.debug_mode
                 time_to_publish_test_stats = finished_groups == expected_rollouts
+                time_to_publish_train_stats = True # TODO: remove this
+
+                # leave only the rollouts that are in the last minute
+                rollouts_last_minute = [t for t in rollouts_last_minute if t > time.perf_counter() - 60]
 
                 # Publish stats at every new model version or if all tapes are finished
                 if time_to_publish_train_stats or time_to_publish_test_stats:
@@ -537,6 +542,7 @@ class ActorLoop:
                             "time_since_start": time.time() - loop_start_time,
                             "groups_in_progress": in_progress,
                             "rollout_errors": self.rollout_errors,
+                            "rollouts_per_min": len(rollouts_last_minute),
                         }
                         trainer_version_to_publish = None
                     else:
@@ -720,7 +726,7 @@ class ActorLoopRay(ActorLoop):
             self.ray_remote = ray.remote(rollout_async_batch_wrapper)
         else:
             logger.info("Using sync mode")
-            self.ray_remote = ray.remote(rollout_wrapper)
+            self.ray_remote = ray.remote(num_cpus=0)(rollout_wrapper)
         self.start_time = time.time()
 
     def have_capacity(self) -> bool:
@@ -730,8 +736,6 @@ class ActorLoopRay(ActorLoop):
             for llm_url in self.llms_utilization
         )
         have_capacity = have_capacity and have_llm_capacity
-        if not have_capacity:
-            time.sleep(0.1)  # sleep for a while to avoid quick loops when no capacity
         return have_capacity
 
     def submit_problem(self, problem: dict):
@@ -753,6 +757,7 @@ class ActorLoopRay(ActorLoop):
             )
             llm = self.llms_by_url[llm_url]
             task_ref = self.ray_remote.remote(self.cfg_dict, llm, problem_batch, self.problem_id)
+            time.sleep(1.0) # TODO: remove this
             self.llms_utilization[llm_url] += len(problem_batch)
             self.unfinished_tasks.append(task_ref)
         self.problem_id += 1
@@ -886,7 +891,7 @@ def run_actor_loop(cfg: DictConfig):
             context_size=_context_size,
             parameters=cfg.llm.parameters,
             use_cache=False,
-            collect_logprobs=True,
+            collect_logprobs=cfg.actor.collect_logprobs,
             observe_llm_calls=False,
         )
         for url in llm_urls
@@ -899,7 +904,7 @@ def run_actor_loop(cfg: DictConfig):
             context_size=_context_size,
             parameters=cfg.test_llm.parameters,
             use_cache=False,
-            collect_logprobs=True,
+            collect_logprobs=cfg.actor.collect_logprobs,
             observe_llm_calls=False,
         )
         for url in llm_urls
