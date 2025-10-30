@@ -106,6 +106,7 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         ex_t = time.perf_counter()
         tape = execute_agent(agent, tape, environment, max_loops=cfg.agent_max_loops)
         execution_time = time.perf_counter() - ex_t
+        success, result = environment.validate_task(tape)
     finally:
         close_t = time.perf_counter()
         environment.close()
@@ -132,7 +133,6 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         except Exception as e:
             logger.error(f"Error saving tape {tape_name}: {e}")
 
-    success, result = environment.validate_task(tape)
     reward = compute_reward(tape, success, result)
 
     # (3) Get LLM calls from Tape
