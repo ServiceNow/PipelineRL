@@ -525,7 +525,6 @@ class ActorLoop:
                     self.is_training and trainer_version_to_publish is not None
                 ) or self.debug_mode
                 time_to_publish_test_stats = finished_groups == expected_rollouts
-                time_to_publish_train_stats = True # TODO: remove this
 
                 # leave only the rollouts that are in the last minute
                 rollouts_last_minute = [t for t in rollouts_last_minute if t > time.perf_counter() - 60]
