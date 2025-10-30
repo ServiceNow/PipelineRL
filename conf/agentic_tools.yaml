@@ -1,0 +1,16 @@
+defaults:
+    - base
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.agentic_fn_calling.rollouts.generate_agentic_fn_calling_rollout
+  system_prompt: You are a helpful assistant.
+  task_template: |-
+    {task}
+environment:
+  _target_: pipelinerl.domains.agentic_fn_calling.verifier_api.AgenticToolsEnvironment
+dataset_loader: pipelinerl.domains.agentic_fn_calling.load_datasets.load_datasets
+train_dataset_names:
+  - agentic_fn_calling
+test_dataset_names:
+  - agentic_fn_calling
