@@ -45,8 +45,8 @@ finetune:
 
 rewards:
   correct: 1.0
-  incorrect: 0.0
-  partially_correct: -1.0
+  incorrect: -1.0
+  partially_correct: 0.0
 
 actor:
   sampling:

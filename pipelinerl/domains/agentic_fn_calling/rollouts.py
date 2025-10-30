@@ -64,11 +64,11 @@ async def generate_agentic_fn_calling_rollout(
     time_start = time.time()
     llm_call = await llm_async_generate(llm, prompt, session)
     latency = time.time() - time_start
-    logger.info(f"Shiva-LLM generation: {llm_call.output.content}")
+    # logger.info(f"Shiva-LLM generation: {llm_call.output.content}")
     logger.info(f"Shiva-LLM generation took {latency} seconds")
 
     postprocessed_generation = postprocess_generation(llm_call.output.content)
-    logger.info(f"Shiva-LLM post processed output: {postprocessed_generation}")
+    # logger.info(f"Shiva-LLM post processed output: {postprocessed_generation}")
 
     assert llm_call.output.content is not None
     rewards = RewardTable(**dict(cfg.rewards))
