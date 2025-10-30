@@ -5,6 +5,7 @@ import time
 from examples.rl_webagent.steps import WebTape
 from examples.workarena.agent import WorkArenaAgent
 from examples.workarena.environment import WorkArenaEnvironment
+from hydra.utils import instantiate
 from omegaconf import DictConfig
 from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
 from tapeagents.io import save_json_tape
@@ -12,6 +13,7 @@ from tapeagents.llms.trainable import TrainableLLM
 from tapeagents.orchestrator import execute_agent
 
 from pipelinerl.async_llm import make_training_text
+from pipelinerl.domains.workarena.load_tasks import get_task_by_id
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,6 @@ class WorkarenaMetrics(BaseMetrics):
     env_call_time: float
     total_llm_call_time: float
     total_env_call_time: float
-
 
 
 def tape_contains_an_error(tape: WebTape) -> bool:
@@ -74,23 +75,26 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
 
     start_time = time.perf_counter()
 
-    environment = WorkArenaEnvironment(**cfg.env)
+    environment: WorkArenaEnvironment = instantiate(cfg.environment)
     environment.initialize()
     agent = WorkArenaAgent.create(llm)
     logger.info(f"Agent and environment loaded, using llm {llm.model_name} at {llm.get_base_url()}")
     env_agent_creation_time = time.perf_counter() - start_time
     try:
+        task_entrypoint = get_task_by_id(problem["task"])
         start_attempts = cfg.start_attempts
         t = time.perf_counter()
         while True:
             try:
-                tape, _ = environment.start_task(problem)
+                tape, _ = environment.start_task(task_entrypoint)
                 break
             except Exception as e:
                 logger.exception(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']}: {e}")
                 start_attempts -= 1
                 if start_attempts <= 0:
-                    raise Exception(f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']} after {cfg.start_attempts} attempts")
+                    raise Exception(
+                        f"Failed to start task {problem['dataset']}/{problem['task']}/{problem['seed']} after {cfg.start_attempts} attempts"
+                    )
                 else:
                     logger.warning("retry after 1 seconds")
                     time.sleep(1)
@@ -100,7 +104,7 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         )
         logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
         ex_t = time.perf_counter()
-        tape = execute_agent(agent, tape, env, max_loops=cfg.agent_max_loops)
+        tape = execute_agent(agent, tape, environment, max_loops=cfg.agent_max_loops)
         execution_time = time.perf_counter() - ex_t
     finally:
         close_t = time.perf_counter()
@@ -110,7 +114,15 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         f"Agent finished task {problem['dataset']}/{problem['task']}/{problem['seed']}, times: start {env_start_time:.2f} sec, exec {execution_time:.2f} sec, close {env_close_time:.2f} sec, produced tape with {len(tape.steps)} steps"
     )
     total_execution_time = time.perf_counter() - t
-    tape.metadata.result.update({"total_execution_time": total_execution_time, "env_start_time": env_start_time, "env_agent_creation_time": env_agent_creation_time, "execution_time": execution_time, "env_close_time": env_close_time})
+    tape.metadata.result.update(
+        {
+            "total_execution_time": total_execution_time,
+            "env_start_time": env_start_time,
+            "env_agent_creation_time": env_agent_creation_time,
+            "execution_time": execution_time,
+            "env_close_time": env_close_time,
+        }
+    )
 
     # save the tape as we go
     if cfg.save_tapes:
@@ -123,7 +135,6 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     success, result = environment.validate_task(tape)
     reward = compute_reward(tape, success, result)
 
-
     # (3) Get LLM calls from Tape
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
     n_llm_calls = len(llm_calls)
@@ -133,8 +144,14 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         else step.metadata.other["llm_call"]
         for step in llm_calls
     ]
-    llm_call_times = [step.metadata.other.get("llm_call_time") for step in tape.steps if"llm_call_time" in step.metadata.other]
-    env_call_times = [step.metadata.other.get("action_execution_time") for step in tape.steps if"action_execution_time" in step.metadata.other]
+    llm_call_times = [
+        step.metadata.other.get("llm_call_time") for step in tape.steps if "llm_call_time" in step.metadata.other
+    ]
+    env_call_times = [
+        step.metadata.other.get("action_execution_time")
+        for step in tape.steps
+        if "action_execution_time" in step.metadata.other
+    ]
     total_llm_call_time = sum(llm_call_times)
     total_env_call_time = sum(env_call_times)
     llm_call_time = total_llm_call_time / len(llm_call_times) if len(llm_call_times) > 0 else -1.0

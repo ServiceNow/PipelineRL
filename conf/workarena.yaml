@@ -46,7 +46,7 @@ vllm_config:
 actor:
   rollout_policy: pipelinerl.domains.workarena.rollouts.generate_workarena_rollout
   llm_max_rollouts: 256
-  problem_queue_size: 32
+  problem_queue_size: 2
   async_batch_size: 1
   rollout_workers: 32
   shared_memory_entry_size: 100000000
@@ -76,8 +76,8 @@ agent:
 # ENVIRONMENT CONFIGURATION
 start_attempts: 3  # number of attempts to start each task
 environment:
-  _target_: examples.workarena.environment.WorkArenaEnvironment
-  exp_path: null
+  _target_: pipelinerl.domains.workarena.environment.WorkArenaEnvironment
+  exp_path: ${output_dir}/browser
   headless: true
 
 # DATASET CONFIGURATION
@@ -85,6 +85,6 @@ dataset_loader: pipelinerl.domains.workarena.load_tasks.load_tasks
 dataset_loader_params:
   seeds: [0, 42, 1337, 900, 103]
 train_dataset_names:
-  - all
+  - l1
 test_dataset_names:
-  - atomic
+  - l1
