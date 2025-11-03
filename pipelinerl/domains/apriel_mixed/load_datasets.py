@@ -62,6 +62,7 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
             trust_remote_code=True,
             token=os.environ.get("HF_TOKEN"))
 
+        dataset = dataset.filter(lambda sample: sample['ability'] != 'code')
         logger.info(f"Shiva-Loaded dataset of size {len(dataset)}")
         dataset = dataset.shuffle(seed=seed) if seed is not None else dataset
 
