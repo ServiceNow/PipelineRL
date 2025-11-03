@@ -1,0 +1,16 @@
+defaults:
+    - base
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.apriel_mixed.rollouts.generate_apriel_rollout
+  system_prompt: You are a helpful assistant.
+  task_template: |-
+    {task}
+environment:
+  _target_: pipelinerl.domains.apriel_mixed.verifier_api.AprielToolsEnvironment
+dataset_loader: pipelinerl.domains.apriel_mixed.load_datasets.load_datasets
+train_dataset_names:
+  - apriel_mixed
+test_dataset_names:
+  - apriel_mixed
