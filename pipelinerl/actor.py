@@ -7,11 +7,11 @@ import os
 import queue
 import random
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from queue import Empty
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import aiohttp
 import hydra
@@ -21,7 +21,6 @@ import uvloop
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 from tapeagents.llms import TrainableLLM
-
 import wandb
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
@@ -50,6 +49,22 @@ def save_debug_line(data:dict):
     fname = os.environ.get("DEBUG_FILE", "timing_debug.jsonl")
     with open(fname, "a") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+def get_number_of_tokens_in_result(result: RolloutResult) -> int:
+    """Aggregate prompt + output tokens for all training texts in a rollout result."""
+    total_tokens = 0
+    for training_text in result.training_texts:
+        prompt_tokens = getattr(training_text, "prompt_tokens", 0) or 0
+        output_tokens = getattr(training_text, "output_tokens", 0) or 0
+        if prompt_tokens or output_tokens:
+            total_tokens += prompt_tokens + output_tokens
+            continue
+        input_ids = getattr(training_text, "input_ids", None)
+        if input_ids:
+            total_tokens += len(input_ids)
+            continue
+        total_tokens += getattr(training_text, "n_predicted", 0) or 0
+    return total_tokens
 
 class SlidingWindowData(BaseModel):
     prompt_tokens_window: list[list[int]] = Field(
@@ -119,8 +134,124 @@ def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
 
 
-def get_number_of_tokens_in_result(result: RolloutResult) -> int:
-    return sum(training_text.prompt_tokens + training_text.output_tokens for training_text in result.training_texts)
+def parse_curriculum_schedule(curriculum_cfg) -> list[dict]:
+    raw_schedule = curriculum_cfg.get("schedule", [])
+    if not raw_schedule:
+        return [{"step": 0, "medium_weight": 0.0, "hard_weight": 0.0}]
+    if not isinstance(raw_schedule, list):
+        raw_schedule = [raw_schedule]
+    parsed_schedule: list[dict] = []
+    for entry in raw_schedule:
+        step = int(entry.get("step", 0))
+        if step < 0:
+            step = 0
+        hard_weight = float(entry.get("hard_weight", 0.0))
+        hard_weight = max(0.0, min(1.0, hard_weight))
+        medium_weight_value = entry.get("medium_weight", 0.0)
+        try:
+            medium_weight = float(medium_weight_value)
+        except (TypeError, ValueError):
+            medium_weight = 0.0
+        medium_weight = max(0.0, min(1.0, medium_weight))
+        weight_sum = medium_weight + hard_weight
+        if weight_sum > 1.0 and weight_sum > 0.0:
+            scale = 1.0 / weight_sum
+            medium_weight *= scale
+            hard_weight *= scale
+        ready_success_cfg = entry.get("ready_success") or []
+        if not isinstance(ready_success_cfg, list):
+            ready_success_cfg = [ready_success_cfg]
+        ready_success: list[dict] = []
+        for cond in ready_success_cfg:
+            if not isinstance(cond, dict):
+                continue
+            dataset = cond.get("dataset")
+            metric = cond.get("metric", "success_mean")
+            try:
+                threshold = float(cond.get("threshold", 1.0))
+            except (TypeError, ValueError):
+                threshold = 1.0
+            ready_success.append(
+                {
+                    "dataset": dataset,
+                    "metric": metric,
+                    "threshold": threshold,
+                }
+            )
+        patience_value = entry.get("ready_patience", 1)
+        try:
+            ready_patience = max(1, int(patience_value))
+        except (TypeError, ValueError):
+            ready_patience = 1
+        parsed_schedule.append(
+            {
+                "step": step,
+                "medium_weight": medium_weight,
+                "hard_weight": hard_weight,
+                "ready_success": ready_success,
+                "ready_patience": ready_patience,
+            }
+        )
+    parsed_schedule.sort(key=lambda item: item["step"])
+    return parsed_schedule
+
+
+def advance_curriculum_stage(
+    schedule: list[dict],
+    stage_state: dict,
+    samples_processed: int,
+    stats: dict,
+    logger: logging.Logger | None = None,
+) -> None:
+    if not schedule or stage_state is None:
+        return
+    current_idx = int(stage_state.get("index", 0))
+    ready_counts = stage_state.setdefault("ready_counts", {})
+    advanced = False
+
+    while current_idx + 1 < len(schedule):
+        next_idx = current_idx + 1
+        stage_cfg = schedule[next_idx]
+        min_step = stage_cfg.get("step", 0)
+        if samples_processed < min_step:
+            break
+
+        ready_conditions: list[dict] = stage_cfg.get("ready_success") or []
+        patience = max(1, int(stage_cfg.get("ready_patience", 1)))
+
+        if ready_conditions:
+            all_pass = True
+            for cond in ready_conditions:
+                dataset = cond.get("dataset")
+                metric = cond.get("metric", "success_mean")
+                threshold = float(cond.get("threshold", 1.0))
+                if dataset:
+                    metric_key = f"{dataset}/{metric}"
+                else:
+                    metric_key = metric
+                value = stats.get(metric_key)
+                if value is None or value < threshold:
+                    all_pass = False
+                    break
+            if all_pass:
+                ready_counts[next_idx] = ready_counts.get(next_idx, 0) + 1
+            else:
+                ready_counts[next_idx] = 0
+                break
+            if ready_counts[next_idx] < patience:
+                break
+        current_idx = next_idx
+        stage_state["index"] = current_idx
+        ready_counts.pop(next_idx, None)
+        advanced = True
+        if logger:
+            logger.info(
+                "Curriculum stage %d activated (samples_processed=%d)",
+                current_idx,
+                samples_processed,
+            )
+    if not advanced:
+        stage_state["index"] = current_idx
 
 
 async def schedule_rollouts(
@@ -166,9 +297,9 @@ async def schedule_rollouts(
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
-            logger.info(f"Starting rollout policy for problem {problem['id']}")
+            logger.debug(f"Starting rollout policy for problem {problem['id']}")
             rollout_result: RolloutResult = await rollout_policy(cfg, llm, problem, session)
-            logger.info(f"Finished rollout policy for problem {problem['id']}")
+            logger.debug(f"Finished rollout policy for problem {problem['id']}")
             rollout_result.model_version = model_version
             token_count += get_number_of_tokens_in_result(rollout_result)
             # Make a group id that will be different from groups made by another rollout maker
@@ -215,7 +346,7 @@ async def schedule_rollouts(
                 if finished_rollouts > old_finished_rollouts:
                     old_finished_rollouts = finished_rollouts
                     save_debug_line({"rollouts_finished": finished_rollouts, "tokens_produced": token_count, "dt": time.time() - start_time, "token_speed": token_count / (time.time() - start_time)})
-                logger.info(
+                logger.debug(
                     f"{scheduler_name}: "
                     f"rollouts in progress: {sum(active_rollouts)}, "
                     f"groups in progress: {len(group_rollouts)}, "
@@ -286,6 +417,113 @@ def random_iter(problems: list):
         yield random.sample(problems, 1)[0]
 
 
+def curriculum_iter(
+    problems: list,
+    trainer_state: TrainerState,
+    curriculum_cfg: DictConfig,
+    logger: logging.Logger | None = None,
+    parsed_schedule: Optional[list[dict]] = None,
+    stage_state: Optional[dict] = None,
+):
+    curriculum_obj = (
+        OmegaConf.to_container(curriculum_cfg, resolve=True)
+        if isinstance(curriculum_cfg, DictConfig)
+        else curriculum_cfg
+    )
+    base_names = set(curriculum_obj.get("base_datasets", []))
+    medium_names = set(curriculum_obj.get("medium_datasets", []))
+    hard_names = set(curriculum_obj.get("hard_datasets", []))
+    if hard_names and not base_names:
+        base_names = {
+            problem.get("dataset")
+            for problem in problems
+            if problem.get("dataset") not in hard_names and problem.get("dataset") not in medium_names
+        }
+
+    base_pool = [
+        problem
+        for problem in problems
+        if (problem.get("dataset") in base_names)
+        or (
+            not base_names
+            and problem.get("dataset") not in hard_names
+            and (not medium_names or problem.get("dataset") not in medium_names)
+        )
+    ]
+    medium_pool = [problem for problem in problems if problem.get("dataset") in medium_names]
+    hard_pool = [problem for problem in problems if problem.get("dataset") in hard_names]
+
+    if not base_pool and medium_pool:
+        base_pool = list(medium_pool)
+        medium_pool = []
+
+    if not base_pool:
+        if logger:
+            logger.warning("Curriculum enabled but no matching datasets were found; falling back to random sampling")
+        yield from random_iter(problems)
+        return
+
+    schedule = parsed_schedule or parse_curriculum_schedule(curriculum_obj)
+    if not schedule:
+        schedule = [{"step": 0, "medium_weight": 0.0, "hard_weight": 0.0}]
+
+    current_stage_index = stage_state.get("index", 0) if stage_state is not None else 0
+    last_logged_stage: Optional[int] = None
+
+    while True:
+        samples_processed = trainer_state.samples_processed or 0
+        max_stage_allowed = current_stage_index
+        while (
+            max_stage_allowed + 1 < len(schedule)
+            and samples_processed >= schedule[max_stage_allowed + 1]["step"]
+        ):
+            max_stage_allowed += 1
+
+        if stage_state is not None:
+            desired_index = int(stage_state.get("index", 0))
+            current_stage_index = max(0, min(desired_index, max_stage_allowed))
+        else:
+            current_stage_index = max_stage_allowed
+
+        stage_cfg = schedule[current_stage_index]
+        medium_weight = stage_cfg.get("medium_weight", 0.0)
+        hard_weight = stage_cfg.get("hard_weight", 0.0)
+        if not medium_pool:
+            medium_weight = 0.0
+        if not hard_pool:
+            hard_weight = 0.0
+        base_weight = max(0.0, 1.0 - medium_weight - hard_weight)
+        weight_sum = base_weight + medium_weight + hard_weight
+        if weight_sum == 0.0:
+            base_weight = 1.0
+            medium_weight = 0.0
+            hard_weight = 0.0
+
+        if logger and last_logged_stage != current_stage_index:
+            logger.info(
+                "Curriculum stage %d active (samples_processed=%d, base=%.3f, medium=%.3f, hard=%.3f)",
+                current_stage_index,
+                samples_processed,
+                base_weight,
+                medium_weight,
+                hard_weight,
+            )
+            last_logged_stage = current_stage_index
+
+        if stage_state is not None:
+            stage_state["index"] = current_stage_index
+
+        choice = random.random()
+        hard_cutoff = hard_weight
+        medium_cutoff = hard_cutoff + medium_weight
+        if hard_pool and choice < hard_cutoff:
+            yield random.choice(hard_pool)
+        elif medium_pool and choice < medium_cutoff:
+            yield random.choice(medium_pool)
+        else:
+            yield random.choice(base_pool)
+
+
 def sequential_iter(problems: list):
     for problem in problems:
         yield problem
@@ -304,14 +542,19 @@ class ActorLoop:
         self.data_stream = data_stream
         self.trainer_state = trainer_state
         self.stats_stream = stats_stream
-        self.sliding_aggregator = SlidingWindowAggregator(window_size=cfg.actor.throughput_window_size)
+        self.sliding_aggregator = None
+        if is_training:
+            self.sliding_aggregator = SlidingWindowAggregator(
+                window_size=cfg.actor.throughput_window_size
+            )
         self.llms = llms
         self.loop_start_time = -1
         self.cfg: DictConfig = cfg
         self.is_training = is_training
         self.is_scheduling_paused = False
         self.debug_mode = bool(cfg.debug.mode)
-        self.cfg: DictConfig = cfg
+        self.curriculum_schedule: list[dict] | None = None
+        self.curriculum_stage_state: dict | None = None
 
         self.smm: SharedMemoryManager | None = None
         self.problem_queue: SharedMemoryQueue | None = None
@@ -359,6 +602,8 @@ class ActorLoop:
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
+        self.answer_status_counts = Counter()
+        self.dataset_sample_counts = Counter()
 
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
@@ -390,13 +635,28 @@ class ActorLoop:
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
 
-        prompt_length_tokens = [training_text.prompt_tokens for result in rollout_results for training_text in result.training_texts]
-        output_length_tokens = [training_text.output_tokens for result in rollout_results for training_text in result.training_texts]
-        self.sliding_aggregator.update(prompt_length_tokens, output_length_tokens)
-        sliding_window_stats = self.sliding_aggregator.get_stats()
-        if sliding_window_stats is not None:
-            for k, v in sliding_window_stats.items():
-                self.sliding_stats[k].append(v)
+            status = getattr(result, "answer_status", None)
+            if status in {"correct", "wrong", "unparsable", "no_answer"}:
+                self.answer_status_counts[status] += 1
+            if dataset_name:
+                self.dataset_sample_counts[str(dataset_name)] += 1
+
+        if self.sliding_aggregator:
+            prompt_length_tokens = [
+                training_text.prompt_tokens
+                for result in rollout_results
+                for training_text in result.training_texts
+            ]
+            output_length_tokens = [
+                training_text.output_tokens
+                for result in rollout_results
+                for training_text in result.training_texts
+            ]
+            self.sliding_aggregator.update(prompt_length_tokens, output_length_tokens)
+            sliding_window_stats = self.sliding_aggregator.get_stats()
+            if sliding_window_stats is not None:
+                for k, v in sliding_window_stats.items():
+                    self.sliding_stats[k].append(v)
 
 
 
@@ -417,9 +677,35 @@ class ActorLoop:
         # for train sample, sample random batches infinitely
         # for test samples, loop through the dataset once
         if self.is_training:
-            problem_iter = random_iter(dataset)
+            curriculum_cfg = getattr(self.cfg.actor, "curriculum", None)
+            use_curriculum = bool(
+                curriculum_cfg and getattr(curriculum_cfg, "enabled", False) and dataset
+            )
+            if use_curriculum:
+                curriculum_obj = (
+                    OmegaConf.to_container(curriculum_cfg, resolve=True)
+                    if isinstance(curriculum_cfg, DictConfig)
+                    else curriculum_cfg
+                )
+                parsed_schedule = parse_curriculum_schedule(curriculum_obj)
+                self.curriculum_schedule = parsed_schedule
+                self.curriculum_stage_state = {"index": 0}
+                problem_iter = curriculum_iter(
+                    dataset,
+                    trainer_state=self.trainer_state,
+                    curriculum_cfg=curriculum_cfg,
+                    logger=logger,
+                    parsed_schedule=parsed_schedule,
+                    stage_state=self.curriculum_stage_state,
+                )
+            else:
+                problem_iter = random_iter(dataset)
+                self.curriculum_schedule = None
+                self.curriculum_stage_state = None
         else:
             problem_iter = sequential_iter(dataset)
+            self.curriculum_schedule = None
+            self.curriculum_stage_state = None
         assert self.trainer_state.propagated_weight_version is not None
 
         last_trainer_version = self.trainer_state.propagated_weight_version
@@ -585,22 +871,27 @@ class ActorLoop:
         stats |= loop_stats
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
+        if self.curriculum_schedule and self.curriculum_stage_state is not None:
+            advance_curriculum_stage(
+                self.curriculum_schedule,
+                self.curriculum_stage_state,
+                self.trainer_state.samples_processed or 0,
+                stats,
+                logger,
+            )
+            stats["curriculum_stage_active"] = self.curriculum_stage_state.get("index", 0)
 
-        rename_suffixes = {
-            "num_python_calls_mean": "python_calls_mean",
-            "used_python_mean": "python_usage_rate",
-            "num_math_answer_calls_mean": "math_answer_calls_mean",
-            "used_math_answer_mean": "math_answer_usage_rate",
-        }
-
-        for key in list(stats.keys()):
-            for old_suffix, new_suffix in rename_suffixes.items():
-                if key.endswith(old_suffix):
-                    prefix = key[: -len(old_suffix)]
-                    stats[f"{prefix}{new_suffix}"] = stats[key]
-                    break
-
-        logger.info(f"Publish actor stats to wandb: {stats}")
+        total_status = sum(self.answer_status_counts.values())
+        if total_status:
+            for status, count in self.answer_status_counts.items():
+                stats[f"{split_name}answer_status_{status}_count"] = count
+                stats[f"{split_name}answer_status_{status}_ratio"] = count / total_status
+        total_rollouts = sum(self.dataset_sample_counts.values())
+        if total_rollouts:
+            stats["dataset_rollouts_total"] = total_rollouts
+            for dataset, count in self.dataset_sample_counts.items():
+                stats[f"{dataset}/rollout_count"] = count
+                stats[f"{dataset}/rollout_ratio"] = count / total_rollouts
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
@@ -869,6 +1160,9 @@ def run_actor_loop(cfg: DictConfig):
     )
     test_loop_run = None
 
+    pause_training_during_eval = bool(
+        getattr(cfg.actor, "pause_training_during_eval", True)
+    )
     last_regular_eval = -1
     current_eval = -1
     while True:
@@ -892,7 +1186,8 @@ def run_actor_loop(cfg: DictConfig):
             test_loop_run = test_loop.run(
                 dataset=test_dataset,
             )
-            train_loop.is_scheduling_paused = True
+            if pause_training_during_eval:
+                train_loop.is_scheduling_paused = True
             current_eval = next_regular_eval
 
         # 2. If there is an active test loop, keep it running
@@ -903,7 +1198,8 @@ def run_actor_loop(cfg: DictConfig):
                 # 2.1 If the test loop is finished, resume scheduling the training loop
                 test_loop_run = None
                 last_regular_eval = current_eval
-                train_loop.is_scheduling_paused = False
+                if pause_training_during_eval:
+                    train_loop.is_scheduling_paused = False
                 logger.info("Test loop finished")
 
         # 3. Keep running the training loop

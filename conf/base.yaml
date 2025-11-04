@@ -15,6 +15,7 @@ actor:
   llm_max_rollouts: 64
   rollout_workers: 1
   discount_factor: 1
+  pause_training_during_eval: true
   problem_queue_size: 64
   result_queue_size: 64
   throughput_window_size: 50
@@ -140,4 +141,3 @@ wandb:
   wandb_dir: null
   # Comma-separated list of keywords to tag the run.
   tags: []
-

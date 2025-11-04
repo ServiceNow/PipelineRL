@@ -64,3 +64,4 @@ class RolloutResult(BaseModel):
     model_version: int | None = None
     dataset_name: str | None = None
     group_id: str | None = None
+    answer_status: str | None = None

@@ -1,7 +1,10 @@
+import asyncio
+import json
+import logging
+import random
 import re
 import time
-import random
-import logging
+from pathlib import Path
 
 import aiohttp
 from omegaconf import DictConfig
@@ -14,6 +17,7 @@ from tapeagents.llms.trainable import TrainableLLM
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from .verifier_api import verify_answer_rpc
 
+logger = logging.getLogger(__name__)
 
 class Metrics(BaseMetrics):
     penalty: float
@@ -139,6 +143,30 @@ def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) ->
         return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
     return 0.
 
+
+def log_answer_status(cfg: DictConfig, problem: dict, answer_status: str, reward: float, latency: float) -> None:
+    """
+    Metric logging for answer status - correct, wrong, no_answer, unparsable
+    """
+    try:
+        log_dir = Path(cfg.output_dir) if cfg.output_dir else None
+        if not log_dir:
+            return
+        log_path = log_dir / "answer_status.jsonl"
+        record = {
+            "t": time.time(),
+            "problem_id": problem.get("id"),
+            "dataset": problem.get("dataset"),
+            "answer_status": answer_status,
+            "reward": reward,
+            "latency": latency,
+        }
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record))
+            handle.write("\n")
+    except Exception:
+        logger.debug("Failed to append answer status log", exc_info=True)
+
 async def generate_math_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -155,7 +183,16 @@ async def generate_math_rollout(
     prompt = Prompt(messages=messages)
 
     time_start = time.time()
-    llm_call = await llm_async_generate(llm, prompt, session)
+    try:
+        llm_call = await llm_async_generate(llm, prompt, session)
+    except (asyncio.TimeoutError, aiohttp.client_exceptions.ServerTimeoutError) as exc:
+        latency = time.time() - time_start
+        logger.warning(
+            "LLM request timed out for problem %s. Skipping sample.",
+            problem.get("id"),
+            exc_info=exc,
+        )
+        return create_timeout_rollout_result(cfg, problem, latency)
     latency = time.time() - time_start
 
     assert llm_call.output.content is not None
@@ -192,9 +229,14 @@ async def generate_math_rollout(
     reward *= discount_factor**llm_call.output_length_tokens
     overlong_penalty = 0
     if reward_table.buffer_tokens > 0:
-        overlong_penalty = length_penalty(llm.parameters['max_tokens'], llm_call.output_length_tokens, rewards.buffer_tokens)
+        overlong_penalty = length_penalty(
+            llm.parameters["max_tokens"],
+            llm_call.output_length_tokens,
+            reward_table.buffer_tokens,
+        )
     reward += overlong_penalty
     trace.reward = reward
+    log_answer_status(cfg, problem, answer_status, reward, latency)
 
     # Prefer backend-provided finish reason if available; normalize for comparisons
     if isinstance(trace.metadata, dict):
@@ -245,6 +287,32 @@ async def generate_math_rollout(
     return RolloutResult(
         training_texts=[trace],
         metrics=metrics,
-        latency=latency, 
+        latency=latency,
         dataset_name=problem.get("dataset"),
+        answer_status=answer_status,
+    )
+
+
+def create_timeout_rollout_result(
+    cfg: DictConfig,
+    problem: dict,
+    latency: float,
+) -> RolloutResult:
+    answer_status = "timeout"
+    metrics = Metrics(
+        reward=0.0,
+        success=False,
+        no_error=False,
+        no_answer=True,
+        penalty=0.0,
+        overflow=False,
+        auto_boxed=False,
+    )
+    log_answer_status(cfg, problem, answer_status, metrics.reward, latency)
+    return RolloutResult(
+        training_texts=[],
+        metrics=metrics,
+        latency=latency,
+        dataset_name=problem.get("dataset"),
+        answer_status=answer_status,
     )
