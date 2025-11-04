@@ -7,7 +7,7 @@ name = "pipelinerl"
 version = "0.1.0"
 description = "A scalable asynchronous reinforcement learning implementation with in-flight weight updates."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 license = { file = "LICENSE" }
 authors = [
     { name = "ServiceNow" },
