@@ -22,6 +22,7 @@ import transformers
 from litellm import BaseModel, Field
 
 from pipelinerl.finetune.logging_ import flatten_dict_config
+from pipelinerl.preprocess_helpers import group_rollout_idx, validate_rollout_group
 from pipelinerl.shared_memory_array import SharedMemoryArray, SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.utils import setup_logging, wait_for_inference_servers, init_wandb
@@ -196,10 +197,27 @@ def run_dataset_loader(
                 buffer = []
                 n_groups = 0
                 for group in reader.read():
+                    if not group:
+                        continue
+                    is_complete, missing, extra = validate_rollout_group(group, check_group_size)
+                    if not is_complete:
+                        group_name = group[0].get("group_id") if group else "<unknown>"
+                        if not missing and not extra:
+                            logger.warning("Skipping group %s without rollout metadata", group_name)
+                        else:
+                            logger.warning(
+                                "Skipping incomplete group %s: missing rollouts %s extra %s",
+                                group_name,
+                                missing,
+                                extra,
+                            )
+                        continue
                     buffer.extend(group)
                     n_groups += 1
                     if n_groups == chunk_n_groups:
                         break
+                if not buffer:
+                    continue
                 if not _check_group_sizes(buffer, check_group_size):
                     raise ValueError("Invalid group sizes in data")
                 try:
