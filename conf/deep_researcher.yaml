@@ -1,0 +1,60 @@
+defaults:
+  - base
+  - _self_
+
+# Actor configuration
+actor:
+  rollout_policy: pipelinerl.domains.deep_researcher.generate_deep_researcher_rollout
+  system_prompt: null  # System prompt is handled by orchestrator
+  task_template: null  # Task template is handled by orchestrator
+  attempts: 4  # GRPO group size
+  max_turns: 10  # Maximum turns per episode
+  discount_factor: 1.0  # No length penalty
+  orchestration_strategy: react  # react | simple_sequential | custom_deep
+
+# Environment configuration
+environment:
+  _target_: pipelinerl.domains.deep_researcher.DeepResearcherEnvironment
+
+# Dataset loader
+dataset_loader: pipelinerl.domains.deep_researcher.load_datasets
+
+# Datasets
+train_dataset_names:
+  - deep_researcher_train
+
+test_dataset_names:
+  - deep_researcher_test
+
+# Rewards
+rewards:
+  correct: 1.0
+  incorrect: 0.0
+  max_turns_exceeded: -0.5
+
+
+model_path: Qwen/Qwen2.5-7B-Instruct
+
+
+llm:
+  parameters:
+    max_tokens: 4096
+    temperature: 0.6
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+    temperature: 0.6
+
+
+finetune:
+  seq_length: 8000
+  gradient_accumulation_passes: 512
+
+
+world:
+  actor_fraction: 2
+  finetune_fraction: 6
+
+
+eval_every_n_versions: 100
