@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import random
@@ -182,7 +183,16 @@ async def generate_math_rollout(
     prompt = Prompt(messages=messages)
 
     time_start = time.time()
-    llm_call = await llm_async_generate(llm, prompt, session)
+    try:
+        llm_call = await llm_async_generate(llm, prompt, session)
+    except (asyncio.TimeoutError, aiohttp.client_exceptions.ServerTimeoutError) as exc:
+        latency = time.time() - time_start
+        logger.warning(
+            "LLM request timed out for problem %s. Skipping sample.",
+            problem.get("id"),
+            exc_info=exc,
+        )
+        return create_timeout_rollout_result(cfg, problem, latency)
     latency = time.time() - time_start
 
     assert llm_call.output.content is not None
@@ -276,6 +286,31 @@ async def generate_math_rollout(
 
     return RolloutResult(
         training_texts=[trace],
+        metrics=metrics,
+        latency=latency,
+        dataset_name=problem.get("dataset"),
+        answer_status=answer_status,
+    )
+
+
+def create_timeout_rollout_result(
+    cfg: DictConfig,
+    problem: dict,
+    latency: float,
+) -> RolloutResult:
+    answer_status = "timeout"
+    metrics = Metrics(
+        reward=0.0,
+        success=False,
+        no_error=False,
+        no_answer=True,
+        penalty=0.0,
+        overflow=False,
+        auto_boxed=False,
+    )
+    log_answer_status(cfg, problem, answer_status, metrics.reward, latency)
+    return RolloutResult(
+        training_texts=[],
         metrics=metrics,
         latency=latency,
         dataset_name=problem.get("dataset"),
