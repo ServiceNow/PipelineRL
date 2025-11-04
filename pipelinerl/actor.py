@@ -1160,6 +1160,9 @@ def run_actor_loop(cfg: DictConfig):
     )
     test_loop_run = None
 
+    pause_training_during_eval = bool(
+        getattr(cfg.actor, "pause_training_during_eval", True)
+    )
     last_regular_eval = -1
     current_eval = -1
     while True:
@@ -1183,7 +1186,8 @@ def run_actor_loop(cfg: DictConfig):
             test_loop_run = test_loop.run(
                 dataset=test_dataset,
             )
-            train_loop.is_scheduling_paused = True
+            if pause_training_during_eval:
+                train_loop.is_scheduling_paused = True
             current_eval = next_regular_eval
 
         # 2. If there is an active test loop, keep it running
@@ -1194,7 +1198,8 @@ def run_actor_loop(cfg: DictConfig):
                 # 2.1 If the test loop is finished, resume scheduling the training loop
                 test_loop_run = None
                 last_regular_eval = current_eval
-                train_loop.is_scheduling_paused = False
+                if pause_training_during_eval:
+                    train_loop.is_scheduling_paused = False
                 logger.info("Test loop finished")
 
         # 3. Keep running the training loop
