@@ -6,14 +6,14 @@ import shutil
 import time
 from pathlib import Path
 import traceback
-from typing import Dict, Mapping, List, Any, Union
+from typing import Dict, Mapping, List, Any
+
 import numpy as np
-from omegaconf import DictConfig
 import psutil
 import requests
 from importlib.metadata import distributions
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from transformers import PreTrainedTokenizer
-from collections import defaultdict
 
 from pipelinerl.world import Job
 from tapeagents.llms import LLMOutput
@@ -24,6 +24,122 @@ from wandb.sdk import wandb_run
 
 logger = logging.getLogger(__name__)
 
+_ENV_METADATA_KEYS = {"key", "mode", "replicas_per_actor"}
+
+
+def _strip_environment_metadata(env_cfg: DictConfig | dict | None):
+    if env_cfg is None:
+        return None
+    if isinstance(env_cfg, DictConfig):
+        data = OmegaConf.to_container(env_cfg, resolve=False)
+    elif isinstance(env_cfg, dict):
+        data = dict(env_cfg)
+    else:
+        return env_cfg
+    for meta_key in _ENV_METADATA_KEYS:
+        data.pop(meta_key, None)
+    return OmegaConf.create(data)
+
+
+def _env_cfg_get(env_cfg, field: str):
+    if isinstance(env_cfg, DictConfig):
+        return env_cfg.get(field, None)
+    if isinstance(env_cfg, dict):
+        return env_cfg.get(field)
+    return None
+
+
+def select_environment_config(cfg: DictConfig, *, key: str | None = None, index: int | None = None):
+    env_cfgs = getattr(cfg, "environments", None)
+    if env_cfgs:
+        if isinstance(env_cfgs, (ListConfig, list)):
+            if key is not None:
+                for env_cfg in env_cfgs:
+                    env_key = _env_cfg_get(env_cfg, "key") or _env_cfg_get(env_cfg, "name")
+                    if env_key is not None and str(env_key) == str(key):
+                        return _strip_environment_metadata(env_cfg)
+            if index is not None and 0 <= index < len(env_cfgs):
+                return _strip_environment_metadata(env_cfgs[index])
+        elif isinstance(env_cfgs, (DictConfig, dict)):
+            if key is not None and key in env_cfgs:
+                return _strip_environment_metadata(env_cfgs[key])
+            if index is not None:
+                for idx, env_key in enumerate(env_cfgs):
+                    if idx == index:
+                        return _strip_environment_metadata(env_cfgs[env_key])
+
+    return getattr(cfg, "environment", None)
+
+
+def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    env_cfgs = getattr(cfg, "environments", None)
+    default_mode = str(getattr(cfg.world, "environment_mode", "remote"))
+    default_replicas = getattr(cfg.world, "env_replicas_per_actor", 1)
+
+    if isinstance(env_cfgs, (ListConfig, list)):
+        iterable = list(env_cfgs)
+        for idx, env_cfg in enumerate(iterable):
+            if env_cfg is None:
+                continue
+            key = _env_cfg_get(env_cfg, "key") or _env_cfg_get(env_cfg, "name")
+            mode = _env_cfg_get(env_cfg, "mode")
+            replicas = _env_cfg_get(env_cfg, "replicas_per_actor")
+            specs.append(
+                {
+                    "key": str(key) if key is not None else f"environment_{idx}",
+                    "mode": str(mode) if mode is not None else default_mode,
+                    "replicas_per_actor": replicas,
+                    "index": idx,
+                }
+            )
+    elif isinstance(env_cfgs, (DictConfig, dict)):
+        items = env_cfgs.items()
+        for idx, (key, env_cfg) in enumerate(items):
+            if env_cfg is None:
+                continue
+            mode = _env_cfg_get(env_cfg, "mode")
+            replicas = _env_cfg_get(env_cfg, "replicas_per_actor")
+            specs.append(
+                {
+                    "key": str(key),
+                    "mode": str(mode) if mode is not None else default_mode,
+                    "replicas_per_actor": replicas,
+                    "index": idx,
+                }
+            )
+    else:
+        single_env = getattr(cfg, "environment", None)
+        if single_env:
+            key = _env_cfg_get(single_env, "key") or _env_cfg_get(single_env, "name")
+            specs.append(
+                {
+                    "key": str(key) if key is not None else "default",
+                    "mode": default_mode,
+                    "replicas_per_actor": default_replicas,
+                    "index": 0,
+                }
+            )
+    return specs
+
+
+def resolve_environment_key(cfg: DictConfig, default: str | None = None) -> str | None:
+    explicit = cfg.get("environment_key", None) if hasattr(cfg, "get") else None
+    if explicit:
+        return str(explicit)
+    specs = collect_environment_specs(cfg)
+    if len(specs) == 1:
+        return specs[0]["key"]
+    return default
+
+
+def get_environment_jobs(cfg: DictConfig, key: str | None = None) -> list[Job]:
+    jobs_cfg = getattr(cfg, "jobs", [])
+    env_jobs = [Job(**job) for job in jobs_cfg if job["kind"] == "environment"]
+    if key is None:
+        return env_jobs
+    filtered = [job for job in env_jobs if getattr(job, "environment_key", None) == key]
+    return filtered or env_jobs
 
 def init_wandb(
     cfg: DictConfig,
@@ -239,6 +355,9 @@ def calculate_stats(stats: List | Dict[Any, Any]) -> Dict[str, float]:
     if not isinstance(stats, list):
         raise TypeError(f"Expected stats to be a list, got {type(stats)}")
 
+    if len(stats) == 0:
+        return {}
+
     aggregated_stats = {
         "max": float(max(stats)),
         "min": float(min(stats)),
@@ -293,19 +412,27 @@ def wait_for_inference_servers(urls: list[str]):
 
 
 def wait_for_environments(cfg: DictConfig):
-    """
-    Wait for the verifier to be ready.
-    """
-    env_jobs = [Job(**job) for job in cfg.jobs if job.kind == "environment"]
+    """Wait for remote environment servers to report healthy."""
+    specs = collect_environment_specs(cfg)
+    if not any(spec.get("mode") == "remote" for spec in specs):
+        return
+
+    env_jobs = get_environment_jobs(cfg)
+    if not env_jobs:
+        return
     for job in env_jobs:
         while True:
             url = f"http://{job.hostname}:{job.port}/health"
-            # use requests
             try:
                 response = requests.get(url)
                 if response.status_code == 200:
+                    logger.info(
+                        "Environment %s ready at %s",
+                        job.environment_key if job.environment_key is not None else job.replica_idx,
+                        url,
+                    )
                     break
-            except:
+            except requests.exceptions.RequestException:
                 logger.info(f"Waiting for environment at {url} to be ready...")
                 time.sleep(5.0)
 
@@ -321,7 +448,7 @@ def better_crashing(entrypoint_name: str):
         # get process if of the current process
         process_id = os.getpid()
         terminate_with_children(process_id)
-        logger.error(f"I should not even be here...")
+        logger.error("I should not even be here...")
         import sys
 
         sys.exit(1)
