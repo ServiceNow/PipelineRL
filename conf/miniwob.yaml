@@ -1,34 +1,32 @@
 defaults:
   - base
+  - override streams: redis
+  - override finetune: ppo
+  - _self_
 
 world:
-  actor_fraction: 4
-  preprocessor_fraction: 1
-  finetune_fraction: 3
+  actor_fraction: 2
+  preprocessor_fraction: 0
+  finetune_fraction: 6
 
 # debug:
 #   mode: actor
 save_tapes: False
 
-output_dir: results/miniwob_debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+output_dir: results/miniwob/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: meta-llama/Llama-3.1-8B-Instruct
 
 finetune:
-  save_checkpoint_steps: 10
-  seq_length: 4096
+  seq_length: 16384  # input + output tokens
+  max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
   train_batch_size: 1
   gradient_accumulation_passes: 1024
-  learning_rate: 1e-6
-  optim: adamw_torch
-  rl:
-    kl_coef: 0.01  # GRPO beta coefficient
-    reward_minus_kl_coef: 0.0  # RLOO beta coefficient
-    use_advantages: true
-    algo: grpo
+
+eval_every_n_versions: 10240  # 1024 effective bs * 10 "optim steps"
 
 llm:
   parameters:
-    max_tokens: 3072
+    max_tokens: 4096  # output tokens
     temperature: 1.0
 test_llm:
   parameters:
@@ -39,24 +37,37 @@ test_llm:
 
 vllm_config:
   vllm_kwargs:
-    enable-auto-tool-choice: ""
-    tool-call-parser: llama3_json # use hermes for qwen
-    chat_template: pipelinerl/miniwob/tool_chat_template_llama3.1_json.jinja  # copy pasted from https://github.com/vllm-project/vllm/blob/main/examples/tool_chat_template_llama3.1_json.jinja
-    enforce-eager: ""  # speed the actor llm startup a bit
+    max_model_len: 16384  # input + output tokens
 
 actor:
-  rollout_policy: pipelinerl.miniwob.rollouts.generate_miniwob_rollout
+  rollout_policy: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
   shared_memory_entry_size: 100000000
+  llm_max_rollouts: 32
 
 preprocess:
-  shared_memory_entry_size: 1000000000
+  n_workers: 32  # Increase from 8
+  chunk_n_groups: 8  # Increase from 2 for better throughput
+  # queue for loaded raw groups
+  raw_queue_size: 32      # Increase from 8
+  # queue for processed chunks of multiple groups
+  input_queue_size: 64    # Increase from 32
+  # queue for ready chunks for multiple groups
+  output_queue_size: 64   # Increase from 32
+  # ring buffer to replace old samples with new ones when training is slow
+  ring_buffer_size: 1024  # Increase from 128
+  # "virtual" sample queue per lead trainer
+  max_ready_samples_per_lead: 256  # Increase from 64
+  shared_memory_entry_size: 1000000000  # Increase from 100M
 
 # AGENT CONFIGURATION
 agent_max_loops: 10  # max number of agent - environment interactions for each task
+agent_attempts: 3  # number of attempts to run the agent (retry on errors)
+rollout_timeout: 600  # overall timeout for entire rollout in seconds (10 minutes)
+reward_computation: nico
 agent:
   _target_: tapeagents.agent.Agent
   name : web_agent
-  max_iterations: 4  # max number of iterations (make_prompt + llm? + generate_steps) for each loop
+  max_iterations: 4  # max number of iterations (make_prompt + llm + generate_steps) for each loop
   store_llm_calls: true
   templates:
     system_prompt: |
@@ -65,50 +76,64 @@ agent:
       Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
       You will be provided with the content of the current page and a task from the user.
       Do not express your emotions or opinions about the user question.
-    allowed_tools: |
-      You have access to the following tools:
-      {tools_description}
-    thought_format: |
-      Important! Respond with the plain text, do not include any JSON or code.
-      Do not output anything besides what I asked in this message.
+    allowed_steps: |
+      You are allowed to produce ONLY steps with the following json schemas:
+      {allowed_steps}
+      Do not reproduce schema when producing the steps, use it as a reference.
+    json_format: |
+      Important! Respond with very simple parsable JSON!
+      Do not use any special characters or code. Do not use new lines, tabs, or any other formatting inside the JSON.
+      Do not output anything besides one simple JSON object.
   nodes:
     - _target_: examples.rl_webagent.agent.WebNode
       name: set_goal
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
-        Produce the thought that describes the intended solution to the task. In the reasoning lines:
+        Produce the reasoning_thought step that describes the intended solution to the task. In the reasoning lines:
         - review the instructions from the user and the content of the page.
         - outline the main task to be accomplished and the steps to be taken to achieve it.
         - produce definiton of done, that will be checked later to verify if the task was completed.
-        ${agent.templates.thought_format}
-      steps_prompt: ${agent.templates.allowed_tools}
+        Produce only one reasoning_thought step!
+        ${agent.templates.json_format}
+      steps_prompt: ${agent.templates.allowed_steps}
+      steps:
+        - tapeagents.steps.ReasoningThought
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
     - _target_: examples.rl_webagent.agent.WebNode
       name: reflect
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
-        Review the current state of the page and previous steps to find the best possible next action to accomplish the task.
-        Produce the reflection_thought to describe the current page state, reflect on your last action, describe what is left to do, and what will be the immediate next action.
-        Produce only one reflection_thought step!
-        ${agent.templates.thought_format}
-      steps_prompt: ${agent.templates.allowed_tools}
+        Produce the reasoning_thought step that describes the current state of the page, the previous actions, and what should be the next best action to accomplish the task. In the reasoning lines:
+        - think about which information could be relevant to the given task, note relevant BIDs and coordinates.
+        - describe the last action taken, what were its expected effects on the page, versus the actual effects you can observe. Are they the same or not? if not, what could have gone wrong?
+        - check if you are stuck with repeating the same action over and over again, if so, try something else and change the action.
+        - check if you think the task is done, if not give a detailed list of actions to do next to accomplish the task.
+        - finally, if the task is not done, describe the immediate next action to be performed and its expected effect on the page.
+        Produce only one reasoning_thought step! Be brief and to the point. You can skip some details if they are not relevant for this step.
+        ${agent.templates.json_format}
+      steps_prompt: ${agent.templates.allowed_steps}
+      steps:
+        - tapeagents.steps.ReasoningThought
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
     - _target_: examples.rl_webagent.agent.WebNode
       name: act
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
-        Produce the single next tool call to be performed with the current page.
-        If you think that the task is solved, call the FinalAnswer.
+        Produce the next action to be performed with the current page.
+        If you think that the task is solved, produce the final_answer_action.
         You can interact with the page elements using their BIDs or coordinates as arguments for actions.
         HINTS:
         - You can use the BIDs of the elements or the mouse position in x, y coordinates to interact with them.
-        - To select value in a dropdown or combobox, ALWAYS use SelectOption tool.
+        - To select value in a dropdown or combobox, ALWAYS use select_action.
         - To click on a checkbox or radio button, ALWAYS use BID (or coordinates) of the corresponding Text and not the BID (or coordinates) of the element itself.
         - Press enter key to submit the search query.
+        - Always produce only one step at a time.
+        - Step kind is always lowercase and underscore separated.
+        ${agent.templates.json_format}
+      steps_prompt: ${agent.templates.allowed_steps}
       use_known_actions: true
-      use_function_calls: true
       steps:
         - examples.rl_webagent.steps.FinalAnswerAction
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
@@ -118,19 +143,22 @@ agent:
 
 # ENVIRONMENT CONFIGURATION
 start_attempts: 3  # number of attempts to start each task
-environment:
-  _target_: pipelinerl.miniwob.environment_server.WebEnvironmentServer
-  miniwob_url: file:///home/toolkit/miniwob-plusplus/miniwob/html/miniwob/
-  n_envs: 64
-  host: "0.0.0.0"
-  max_session_inactivity_secs: 300
-  web_env_target: examples.rl_webagent.environment.WebEnvironment
-  exp_path: ${output_dir}/env_server
-  headless: true
-  observation_format: html
+environments:
+  - key: miniwob
+    mode: remote
+    _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
+    miniwob_url: ???
+    n_envs: 32
+    host: "0.0.0.0"
+    env_call_timeout: 60  # timeout for each environment call (e.g. start_task, act, etc.)
+    web_env_target: examples.rl_webagent.environment.WebEnvironment
+    exp_path: null
+    headless: true
+    observation_format: html
+environment_key: miniwob
 
 # DATASET CONFIGURATION
-dataset_loader: pipelinerl.miniwob.load_tasks.load_tasks
+dataset_loader: pipelinerl.domains.miniwob.load_tasks.load_tasks
 dataset_loader_params:
   train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
   seeds: [0, 42, 1337, 900, 103]
