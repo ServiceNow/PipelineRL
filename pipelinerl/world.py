@@ -2,7 +2,7 @@ import logging
 import os
 from typing import Literal
 from pydantic import BaseModel
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 import torch
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,10 @@ class Job(BaseModel):
     gpus: list[int] = []
     # The URL of the job
     url: str = ""
+    # Domain identifier for environment jobs
+    environment_key: str | None = None
+    # Idx of the environments in the list of environments
+    environment_index: int | None = None
 
 
 class WorldMap:
@@ -71,8 +75,9 @@ class WorldMap:
         if place_inference_jobs:
             self._place_inference_jobs(cfg)
         self._place_pipeline_stages(cfg)
-        if cfg.environment:
-            self._place_environments(cfg)
+        self.environment_specs = self._collect_environment_specs(cfg)
+        if any(spec["mode"] == "remote" for spec in self.environment_specs):
+            self._place_environments(cfg, self.environment_specs)
 
         # Place the finetune workers on the remaining gpus, take all remaining GPUs
         current_finetune_rank = 0
@@ -108,7 +113,7 @@ class WorldMap:
             for job in jobs:
                 self._log_info(f"  {job.kind} {job.replica_idx} on gpus {job.gpus}, local idx {job.local_idx}")
 
-    def add_job(self, node_rank: int, kind: str, replica_idx: int, local_idx: int = 0, port: int | None = None, gpus: list[int] | None = None, cpu_heavy: bool = False, url: str = "") -> Job:
+    def add_job(self, node_rank: int, kind: str, replica_idx: int, local_idx: int = 0, port: int | None = None, gpus: list[int] | None = None, cpu_heavy: bool = False, url: str = "", environment_key: str | None = None, environment_index: int | None = None) -> Job:
         """Add a job to the world map."""
         if gpus is None:
             gpus = []
@@ -121,7 +126,9 @@ class WorldMap:
             hostname=self.address_map[node_rank],
             port=port,
             gpus=gpus,
-            url=url
+            url=url,
+            environment_key=environment_key,
+            environment_index=environment_index,
         )       
         self.job_map[node_rank].append(job)
         self.total_jobs += 1
@@ -187,18 +194,76 @@ class WorldMap:
             self.add_job(kind="actor", replica_idx=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
             self.add_job(kind="preprocessor", replica_idx=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
 
-    def _place_environments(self, cfg):
-        for worker_idx in range(cfg.world.env_replicas):
-            node = self.get_least_busy_node()
-            envs_at_node = len([job for job in self.job_map[node] if job.kind == "environment"])
-            self.add_job(
-                kind="environment",
-                replica_idx=worker_idx,
-                node_rank=node,
-                port=cfg.world.environment_start_port + envs_at_node,
-                gpus=[],
-                cpu_heavy=True,
-            )
+    def _place_environments(self, cfg: DictConfig, environment_specs: list[dict]):
+        # Scale environment servers to be the same as llm servers
+        base_start_port = cfg.world.environment_start_port
+        llms_per_actor = getattr(self, "llms_per_actor", 1) or 1
+        for spec_idx, spec in enumerate(environment_specs):
+            if spec["mode"] != "remote":
+                continue
+            replicas_per_actor = spec.get("replicas_per_actor")
+            if replicas_per_actor is None:
+                replicas_per_actor = getattr(cfg.world, "env_replicas_per_actor", 1)
+            total_env_replicas = cfg.world.replicas * llms_per_actor * replicas_per_actor
+            for replica_offset in range(total_env_replicas):
+                node = self.get_least_busy_node()
+                envs_at_node = len([job for job in self.job_map[node] if job.kind == "environment"])
+                self.add_job(
+                    kind="environment",
+                    replica_idx=replica_offset,
+                    node_rank=node,
+                    port=base_start_port + envs_at_node,
+                    gpus=[],
+                    cpu_heavy=True,
+                    environment_key=spec["key"],
+                    environment_index=spec.get("index", spec_idx),
+                )
+
+    def _collect_environment_specs(self, cfg: DictConfig) -> list[dict]:
+        specs: list[dict] = []
+        env_cfgs = getattr(cfg, "environments", None)
+        if env_cfgs:
+            if isinstance(env_cfgs, ListConfig):
+                for idx, env_cfg in enumerate(env_cfgs):
+                    if env_cfg is None:
+                        continue
+                    key = env_cfg.get("key") or env_cfg.get("name") or f"environment_{idx}"
+                    mode = env_cfg.get("mode") or getattr(env_cfg, "mode", None) or getattr(cfg.world, "environment_mode", "remote")
+                    replicas_per_actor = env_cfg.get("replicas_per_actor", None)
+                    specs.append(
+                        {
+                            "key": str(key),
+                            "mode": str(mode),
+                            "replicas_per_actor": replicas_per_actor,
+                            "index": idx,
+                        }
+                    )
+            elif isinstance(env_cfgs, DictConfig):
+                for idx, (key, env_cfg) in enumerate(env_cfgs.items()):
+                    if env_cfg is None:
+                        continue
+                    mode = env_cfg.get("mode") or getattr(env_cfg, "mode", None) or getattr(cfg.world, "environment_mode", "remote")
+                    replicas_per_actor = env_cfg.get("replicas_per_actor", None)
+                    specs.append(
+                        {
+                            "key": str(key),
+                            "mode": str(mode),
+                            "replicas_per_actor": replicas_per_actor,
+                            "index": idx,
+                        }
+                    )
+        if not specs:
+            single_env = getattr(cfg, "environment", None)
+            if single_env:
+                specs.append(
+                    {
+                        "key": "default",
+                        "mode": getattr(cfg.world, "environment_mode", "remote"),
+                        "replicas_per_actor": getattr(cfg.world, "env_replicas_per_actor", 1),
+                        "index": 0,
+                    }
+                )
+        return specs
 
     def _place_inference_jobs(self, cfg):
         for _ in range(cfg.world.replicas):
