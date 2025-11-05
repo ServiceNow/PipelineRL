@@ -1,0 +1,91 @@
+defaults:
+  - base
+  - _self_
+
+
+model_path: Qwen/Qwen2.5-3B-Instruct
+
+
+actor:
+  rollout_policy: pipelinerl.domains.deep_researcher.generate_deep_researcher_rollout
+  system_prompt: null
+  task_template: null
+  attempts: 4
+  max_turns: 50
+  discount_factor: 1.0
+  orchestration_strategy: react
+  llm_max_rollouts: 64
+  rollout_workers: 4
+
+# Environment
+environment:
+  _target_: pipelinerl.domains.deep_researcher.DeepResearcherEnvironment
+
+# Dataset
+dataset_loader: pipelinerl.domains.deep_researcher.load_datasets
+train_dataset_names:
+  - deep_researcher_train
+test_dataset_names:
+  - deep_researcher_test
+
+# Rewards
+rewards:
+  correct: 1.0
+  incorrect: 0.0
+  max_turns_exceeded: -0.5
+
+# LLM parameters
+llm:
+  parameters:
+    max_tokens: 4096
+    temperature: 0.6
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+    temperature: 0.6
+
+# vLLM configuration
+vllm_config:
+  use_v1: false
+  vllm_kwargs:
+    dtype: bfloat16
+    gpu-memory-utilization: 0.75
+    max-num-seqs: 64
+    max-num-batched-tokens: 16384
+    enable-chunked-prefill: ""
+    tensor-parallel-size: 1
+    pipeline-parallel-size: 1
+    generation-config: vllm
+
+# World configuration (8 GPUs)
+world:
+  replicas: 1
+  actor_fraction: 4
+  preprocessor_fraction: 0
+  finetune_fraction: 4
+  env_replicas: 2
+
+# Training configuration
+finetune:
+  seq_length: 6000
+  gradient_accumulation_passes: 256
+  attempts: 4
+  max_lag: 2048
+  weight_update_interval: 256
+  learning_rate: 2e-6
+  warmup_steps: 100
+  max_grad_norm: 1.0
+
+# Evaluation
+eval_every_n_versions: 100
+
+# DeepSpeed
+use_deepspeed: true
+deepspeed_config: deepspeed_stage3_bf16
+
+
+wandb:
+  use_wandb: true
+  wandb_project_name: deep-researcher
+  wandb_group: qwen2.5-3b-react
