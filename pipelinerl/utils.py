@@ -6,14 +6,13 @@ import shutil
 import time
 from pathlib import Path
 import traceback
-from typing import Dict, Mapping, List, Any, Union
+from typing import Dict, Mapping, List, Any
 import numpy as np
 from omegaconf import DictConfig
 import psutil
 import requests
 from importlib.metadata import distributions
 from transformers import PreTrainedTokenizer
-from collections import defaultdict
 
 from pipelinerl.world import Job
 from tapeagents.llms import LLMOutput
@@ -239,6 +238,9 @@ def calculate_stats(stats: List | Dict[Any, Any]) -> Dict[str, float]:
     if not isinstance(stats, list):
         raise TypeError(f"Expected stats to be a list, got {type(stats)}")
 
+    if len(stats) == 0:
+        return {}
+
     aggregated_stats = {
         "max": float(max(stats)),
         "min": float(min(stats)),
@@ -293,19 +295,19 @@ def wait_for_inference_servers(urls: list[str]):
 
 
 def wait_for_environments(cfg: DictConfig):
-    """
-    Wait for the verifier to be ready.
-    """
+    """Wait for remote environment servers to report healthy."""
+    if cfg.world.environment_mode != "remote":
+        return
+
     env_jobs = [Job(**job) for job in cfg.jobs if job.kind == "environment"]
     for job in env_jobs:
         while True:
             url = f"http://{job.hostname}:{job.port}/health"
-            # use requests
             try:
                 response = requests.get(url)
                 if response.status_code == 200:
                     break
-            except:
+            except requests.exceptions.RequestException:
                 logger.info(f"Waiting for environment at {url} to be ready...")
                 time.sleep(5.0)
 
@@ -321,7 +323,7 @@ def better_crashing(entrypoint_name: str):
         # get process if of the current process
         process_id = os.getpid()
         terminate_with_children(process_id)
-        logger.error(f"I should not even be here...")
+        logger.error("I should not even be here...")
         import sys
 
         sys.exit(1)

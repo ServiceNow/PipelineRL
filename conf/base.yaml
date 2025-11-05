@@ -5,6 +5,7 @@ defaults:
   - _self_
 
 seed: 42
+use_ray: false
 
 finetune:
   seed: ${..seed}
@@ -23,9 +24,9 @@ preprocess:
   input: actor
   output: training_data
   n_workers: 8
-  chunk_n_groups: 2
+  chunk_n_groups: 8
   # queue for loaded raw groups
-  raw_queue_size: 8
+  raw_queue_size: 128
   # queue for processed chunks of multiple groups  
   input_queue_size: 32
   # queue for ready chunks for multiple groups
@@ -47,7 +48,7 @@ llm:
     temperature: 1.0
 test_llm:
   parameters: 
-    max_tokens: 16000
+    max_tokens: 8192
     temperature: 1.0
     top_p: 0.95
     top_k: 50
@@ -67,6 +68,7 @@ vllm_config:
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
+    max_model_len: 16000
 
 world:
   replicas: 1
@@ -75,10 +77,13 @@ world:
   preprocessor_fraction: 0
   finetune_fraction: 4
 
-  env_replicas: 2
+  # Number of environment servers per actor VLLM server
+  env_replicas_per_actor: 1
 
   actor_group_port: 9000
   environment_start_port: 7777
+# Remote vs embedded environment execution strategy
+  environment_mode: remote
 # this will be autocreated based on the config
 jobs: []
 

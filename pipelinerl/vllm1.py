@@ -1,32 +1,32 @@
 import logging
 import signal
+from typing import Any, Protocol, runtime_checkable
+
 import torch
 import uvloop
-from vllm.utils import FlexibleArgumentParser, set_ulimit
+from vllm._version import version
+from vllm.config import ModelConfig
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.launcher import serve_http
+from vllm.entrypoints.openai.api_server import (
+    build_app,
+    create_server_socket,
+    init_app_state,
+    run_server,
+)
 from vllm.entrypoints.openai.cli_args import (
     make_arg_parser,
     validate_parsed_serve_args,
 )
-from vllm.entrypoints.launcher import serve_http
-from vllm.entrypoints.openai.api_server import (
-    run_server,
-    create_server_socket,
-    build_app,
-    init_app_state,
-)
-from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-from vllm._version import version
 from vllm.usage.usage_lib import UsageContext
-from vllm.config import ModelConfig
+from vllm.utils import FlexibleArgumentParser, set_ulimit
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-
-from pipelinerl.finetune_loop import WeightUpdateRequest
-from typing import Any, Protocol, runtime_checkable
 import pipelinerl.torch_utils
+from pipelinerl.finetune_loop import WeightUpdateRequest
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign

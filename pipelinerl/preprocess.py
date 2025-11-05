@@ -160,7 +160,18 @@ def preprocess_dataset(
         entry["step_index"] = entry["metadata"]["step_index"]
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
-    dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    try:
+        dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    except Exception as e:
+        logger.error(f"Error in populate_rl_data: {e}")
+        logger.error(f"Data: {data}")
+        logger.error(f"Dataset: {dataset}")
+        logger.error(f"Tokenizer: {tokenizer}")
+        logger.error(f"Tokenizer eos_token_id: {tokenizer.eos_token_id}")
+        logger.error(f"RL config: {rl_config}")
+        logger.error(f"LLM: {llm}")
+        logger.error(f"Seq length: {seq_length}")
+        raise e
     return dataset
 
 
@@ -573,6 +584,10 @@ def run_preprocessing_loop(
                                     sample_length = len(entry["input_ids"])
 
                                     if current_length + sample_length > cfg.finetune.seq_length:
+                                        if len(current_batch) == 0:
+                                            raise ValueError(
+                                                f"sample_length is {sample_length}, but cfg.finetune.seq_length is {cfg.finetune.seq_length}"
+                                            )
                                         time_to_write = True
                                         break  # Current micro batch is full
                                     
@@ -637,6 +652,7 @@ def run_preprocessing_loop(
                             "preprocessor/queue/output": output_queue.qsize(),
                             "preprocessor/filtered_out_samples": num_filtered_out,
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
+                            "preprocessor/dropped_after_preprocessing": processed_entries_queue_popped_data,
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
