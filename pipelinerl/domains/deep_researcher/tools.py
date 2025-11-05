@@ -2,7 +2,8 @@
 import os
 import logging
 import asyncio
-from typing import Dict, List, Union
+import inspect
+from typing import Dict, List, Union, Callable
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,16 @@ class AsyncJinaSearch:
         query: str,
         session: aiohttp.ClientSession = None
     ) -> str:
+        """
+        Execute a search query asynchronously using Jina Search.
+
+        Args:
+            query: Search query string
+            session: HTTP session (optional, will create if not provided)
+
+        Returns:
+            Formatted search results
+        """
         if not self.api_key:
             return f"Error: JINA_API_KEY not set. Cannot perform search for '{query}'."
         
@@ -96,6 +107,17 @@ class AsyncJinaReader:
         goal: str = "Extract relevant information",
         session: aiohttp.ClientSession = None
     ) -> str:
+        """
+        Read a URL asynchronously.
+
+        Args:
+            url: URL to read
+            goal: Goal/purpose of reading the page
+            session: HTTP session (optional)
+
+        Returns:
+            Extracted content from the page
+        """
         if not self.api_key:
             return f"Error: JINA_API_KEY not set. Cannot read {url}."
         
@@ -175,6 +197,17 @@ class MockWebSearchTool:
         num_results: int = 3,
         session: aiohttp.ClientSession = None
     ) -> str:
+        """
+        Search for information about a topic.
+        
+        Args:
+            query: Search query string
+            num_results: Number of results to return
+            session: HTTP session (optional)
+            
+        Returns:
+            List of search results with titles and snippets
+        """
         await asyncio.sleep(0.1)
         
         query_lower = query.lower()
@@ -219,6 +252,16 @@ class MockWebLookupTool:
         term: str,
         session: aiohttp.ClientSession = None
     ) -> str:
+        """
+        Look up a specific term in recent search results.
+        
+        Args:
+            term: Term to look up
+            session: HTTP session (optional)
+            
+        Returns:
+            Detailed information about the term
+        """
         await asyncio.sleep(0.1)
         
         term_lower = term.lower()
@@ -241,44 +284,71 @@ class ToolRegistry:
         if use_mock is None:
             use_mock = not bool(os.getenv("JINA_API_KEY"))
         
+        self.tools = {}
+        
         if use_mock:
             logger.info("[ToolRegistry] Using MOCK tools (no API key required)")
-            self.search_tool = MockWebSearchTool()
-            self.lookup_tool = MockWebLookupTool(self.search_tool)
-            self.reader_tool = None
+            search_tool = MockWebSearchTool()
+            self.tools["search"] = search_tool.search
         else:
             logger.info("[ToolRegistry] Using REAL Jina API tools")
-            self.search_tool = AsyncJinaSearch()
-            self.reader_tool = AsyncJinaReader()
-            self.lookup_tool = None
+            search_tool = AsyncJinaSearch()
+            reader_tool = AsyncJinaReader()
+            
+            self.tools["search"] = search_tool.search
+            self.tools["read"] = reader_tool.read
         
         self.use_mock = use_mock
     
+    def _extract_description(self, func) -> dict:
+        doc = inspect.getdoc(func)
+        if not doc:
+            return {"summary": "No description available", "args": {}, "returns": ""}
+        
+        lines = doc.strip().split('\n')
+        summary = lines[0] if lines else "No description"
+        
+        args_section = {}
+        returns_section = ""
+        current_section = None
+        
+        for line in lines[1:]:
+            line = line.strip()
+            if line.startswith("Args:"):
+                current_section = "args"
+            elif line.startswith("Returns:"):
+                current_section = "returns"
+            elif current_section == "args" and ":" in line:
+                arg_name, arg_desc = line.split(":", 1)
+                args_section[arg_name.strip()] = arg_desc.strip()
+            elif current_section == "returns" and line:
+                returns_section = line
+        
+        return {
+            "summary": summary,
+            "args": args_section,
+            "returns": returns_section
+        }
+    
     def get_tool_descriptions(self) -> str:
-        if self.use_mock:
-            return """
-Available Tools:
-
-1. Search[query]: Search for information about a topic
-   Returns: List of search results with titles and snippets
-   Example: Search[Paris population]
-
-2. Lookup[term]: Look up a specific term in recent search results
-   Returns: Detailed information about the term
-   Example: Lookup[population]
-"""
-        else:
-            return """
-Available Tools:
-
-1. Search[query]: Search the web for information
-   Returns: Markdown-formatted search results
-   Example: Search[Paris population 2024]
-
-2. Read[url]: Read and extract content from a webpage
-   Returns: Extracted text content from the URL
-   Example: Read[https://example.com/article]
-"""
+        if not self.tools:
+            return "No tools available."
+        
+        desc = "You have access to the following tools:\n\n"
+        for i, (tool_name, func) in enumerate(self.tools.items(), 1):
+            tool_desc = self._extract_description(func)
+            
+            desc += f"{i}. {tool_name}: {tool_desc['summary']}\n"
+            if tool_desc['args']:
+                desc += "   Arguments:\n"
+                for arg, arg_desc in tool_desc['args'].items():
+                    if arg not in ['self', 'session']:
+                        desc += f"   - {arg}: {arg_desc}\n"
+            if tool_desc['returns']:
+                desc += f"   Returns: {tool_desc['returns']}\n"
+            desc += "\n"
+        
+        return desc.strip()
     
     async def execute_tool(
         self,
@@ -287,24 +357,18 @@ Available Tools:
         session: aiohttp.ClientSession
     ) -> str:
         try:
-            if tool_name == "web_search":
-                return await self.search_tool.search(
-                    query=arguments.get("query", ""),
-                    session=session
-                )
-            elif tool_name == "web_lookup" and self.lookup_tool:
-                return await self.lookup_tool.lookup(
-                    term=arguments.get("term", ""),
-                    session=session
-                )
-            elif tool_name == "web_read" and self.reader_tool:
-                return await self.reader_tool.read(
-                    url=arguments.get("url", ""),
-                    goal=arguments.get("goal", "Extract relevant information"),
-                    session=session
-                )
-            else:
+            if tool_name not in self.tools:
                 return f"Error: Unknown tool '{tool_name}' or tool not available in current mode"
+            
+            func = self.tools[tool_name]
+            sig = inspect.signature(func)
+            
+            kwargs = {"session": session}
+            for param_name in sig.parameters:
+                if param_name in arguments and param_name not in ["self", "session"]:
+                    kwargs[param_name] = arguments[param_name]
+            
+            return await func(**kwargs)
         except Exception as e:
             logger.error(f"[ToolRegistry] Tool execution failed: {e}")
             return f"Error executing {tool_name}: {str(e)}"

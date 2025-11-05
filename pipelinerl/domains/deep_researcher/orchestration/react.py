@@ -57,21 +57,11 @@ class ReActOrchestrator(BaseOrchestrator):
                     logger.debug(f"Executing tool: {tool_name} with args: {tool_args}")
                     
                     try:
-                        # Map tool names to our registry
-                        if tool_name.lower() in ["search", "web_search"]:
-                            result = await self.tool_registry.execute_tool(
-                                "web_search",
-                                {"query": tool_args.get("query", "")},
-                                session
-                            )
-                        elif tool_name.lower() in ["read", "web_read"]:
-                            result = await self.tool_registry.execute_tool(
-                                "web_read",
-                                {"url": tool_args.get("url", "")},
-                                session
-                            )
-                        else:
-                            result = f"Error: Unknown tool '{tool_name}'"
+                        result = await self.tool_registry.execute_tool(
+                            tool_name,
+                            tool_args,
+                            session
+                        )
                         
                         return {
                             "role": "tool",
@@ -150,13 +140,11 @@ class ReActOrchestrator(BaseOrchestrator):
         }
     
     def _get_react_system_prompt(self) -> str:
-        return """You are a helpful research assistant. Your goal is to answer questions accurately using available tools.
+        tool_descriptions = self.tool_registry.get_tool_descriptions()
+        
+        return f"""You are a helpful research assistant. Your goal is to answer questions accurately using available tools.
 
-You have access to the following tools:
-- search: Search the web for information. Use when you need to find general information.
-  Arguments: {"query": "your search query"}
-- read: Read and extract content from a webpage. Use when you have a specific URL.
-  Arguments: {"url": "https://example.com"}
+{tool_descriptions}
 
 How to respond:
 1. If you need more information, call one or more tools
