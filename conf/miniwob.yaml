@@ -146,7 +146,7 @@ start_attempts: 3  # number of attempts to start each task
 environments:
   - key: miniwob
     mode: remote
-    _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
+    _target_: pipelinerl.miniwob.environment_server.WebEnvironmentServer
     miniwob_url: ???
     n_envs: 32
     host: "0.0.0.0"
@@ -158,7 +158,7 @@ environments:
 environment_key: miniwob
 
 # DATASET CONFIGURATION
-dataset_loader: pipelinerl.domains.miniwob.load_tasks.load_tasks
+dataset_loader: pipelinerl.miniwob.load_tasks.load_tasks
 dataset_loader_params:
   train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
   seeds: [0, 42, 1337, 900, 103]
