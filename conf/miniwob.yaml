@@ -40,7 +40,7 @@ vllm_config:
     max_model_len: 16384  # input + output tokens
 
 actor:
-  rollout_policy: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
+  rollout_policy: pipelinerl.miniwob.rollouts.generate_miniwob_rollout
   shared_memory_entry_size: 100000000
   llm_max_rollouts: 32
 

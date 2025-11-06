@@ -11,6 +11,9 @@ from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
 
 
+DOMAIN = "counting"
+
+
 async def generate_counting_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -81,6 +84,7 @@ def load_problems(dataset_names: list[str]):
                 if not isinstance(problem, dict) or "letter" not in problem or "word" not in problem or "count" not in problem:
                     raise ValueError(f"Problem {problem} in dataset {name} is invalid.")
                 problem["dataset"] = name
+                problem.setdefault("domain", DOMAIN)
                 problems.append(problem)
     return problems
     

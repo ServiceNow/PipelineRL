@@ -1,0 +1,27 @@
+defaults:
+  - base
+  - domain_rollouts: base
+  - override rewards: success_and_format
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
+  llm_max_rollouts: 2
+  rollout_workers: 1
+  domain_rollouts:
+    math: ${domain_rollouts.math}
+    guessing: ${domain_rollouts.guessing}
+
+dataset_loader: pipelinerl.domains.multidomain.load_problems
+train_dataset_names:
+  - math_debug
+  - guessing_debug
+test_dataset_names:
+  - math_debug
+
+environment: null
+environment_key: null
+
+world:
+  env_replicas_per_actor: 0
+  environment_mode: embedded

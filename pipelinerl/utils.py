@@ -41,7 +41,7 @@ def _strip_environment_metadata(env_cfg: DictConfig | dict | None):
     return OmegaConf.create(data)
 
 
-def _env_cfg_get(env_cfg, field: str):
+def _env_cfg_type(env_cfg, field: str):
     if isinstance(env_cfg, DictConfig):
         return env_cfg.get(field, None)
     if isinstance(env_cfg, dict):
@@ -55,7 +55,7 @@ def select_environment_config(cfg: DictConfig, *, key: str | None = None, index:
         if isinstance(env_cfgs, (ListConfig, list)):
             if key is not None:
                 for env_cfg in env_cfgs:
-                    env_key = _env_cfg_get(env_cfg, "key") or _env_cfg_get(env_cfg, "name")
+                    env_key = _env_cfg_type(env_cfg, "key") or _env_cfg_type(env_cfg, "name")
                     if env_key is not None and str(env_key) == str(key):
                         return _strip_environment_metadata(env_cfg)
             if index is not None and 0 <= index < len(env_cfgs):
@@ -82,9 +82,9 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
         for idx, env_cfg in enumerate(iterable):
             if env_cfg is None:
                 continue
-            key = _env_cfg_get(env_cfg, "key") or _env_cfg_get(env_cfg, "name")
-            mode = _env_cfg_get(env_cfg, "mode")
-            replicas = _env_cfg_get(env_cfg, "replicas_per_actor")
+            key = _env_cfg_type(env_cfg, "key") or _env_cfg_type(env_cfg, "name")
+            mode = _env_cfg_type(env_cfg, "mode")
+            replicas = _env_cfg_type(env_cfg, "replicas_per_actor")
             specs.append(
                 {
                     "key": str(key) if key is not None else f"environment_{idx}",
@@ -98,8 +98,8 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
         for idx, (key, env_cfg) in enumerate(items):
             if env_cfg is None:
                 continue
-            mode = _env_cfg_get(env_cfg, "mode")
-            replicas = _env_cfg_get(env_cfg, "replicas_per_actor")
+            mode = _env_cfg_type(env_cfg, "mode")
+            replicas = _env_cfg_type(env_cfg, "replicas_per_actor")
             specs.append(
                 {
                     "key": str(key),
@@ -111,7 +111,7 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
     else:
         single_env = getattr(cfg, "environment", None)
         if single_env:
-            key = _env_cfg_get(single_env, "key") or _env_cfg_get(single_env, "name")
+            key = _env_cfg_type(single_env, "key") or _env_cfg_type(single_env, "name")
             specs.append(
                 {
                     "key": str(key) if key is not None else "default",
