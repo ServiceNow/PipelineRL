@@ -5,9 +5,11 @@ defaults:
   - _self_
 
 seed: 42
+desired_num_gpus: 64
 
 finetune:
   seed: ${..seed}
+  desired_num_gpus: ${..desired_num_gpus}
 
 actor:
   log_each_n_secs: 0

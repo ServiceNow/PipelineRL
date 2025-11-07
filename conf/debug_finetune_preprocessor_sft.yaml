@@ -1,0 +1,89 @@
+# Debug configuration for finetune+preprocessor+sft mode
+# This configuration runs all three components together for testing
+
+# @package _global_
+defaults:
+  - _self_
+  - streams: local
+  - wandb: default
+
+# Debug mode configuration
+debug:
+  mode: "finetune+preprocessor+sft"
+  streams_from: null
+  place_inference_workers: true
+  use_existing_llms: false
+
+# Experiment configuration
+output_dir: ???
+seed: 42
+force_restart: false
+
+# Model configuration
+model_path: /mnt/llmd/base_models/Qwen2.5-7B
+max_seq_length: 2048
+batch_size: 100
+
+# Dataset configuration
+dataset_loader: pipelinerl.domains.math.load_datasets
+dataset_loader_params: {}
+train_dataset_names:
+  - open_reasoner_zero_57k
+test_dataset_names:
+  - aime_2024
+
+# World configuration
+world:
+  replicas: 1
+  actor_fraction: 1
+  preprocessor_fraction: 1
+  finetune_fraction: 2
+  env_replicas: 0
+  actor_group_port: 9000
+  environment_start_port: 7777
+
+# LLM configuration
+me:
+  llm_urls: "http://localhost:8000"
+
+llm:
+  parameters:
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 50
+
+# Finetune configuration
+finetune:
+  input: "sft_data"  # Use SFT data as input
+  model_class: "causal-language-modeling"
+  train_batch_size: 1
+  gradient_accumulation_passes: 1
+  seq_parallel: 1
+  seq_packing: false
+  rl:
+    kl_coef: 0.0
+    value_loss_coef: 0.0
+
+# Preprocess configuration
+preprocess:
+  input: "actor"
+  output: "sft_data"
+  dataset_buffer_size: 0
+  ring_buffer_size: 1000
+
+# Streams configuration
+streams:
+  backend: local
+  base_path: null
+  port: 6379
+  save: ""
+
+# Wandb configuration
+wandb:
+  use_wandb: true
+  project: "debug-finetune-preprocessor-sft"
+  name: null
+  tags: ["debug", "finetune", "preprocessor", "sft"]
+
+
+
