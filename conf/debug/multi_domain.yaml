@@ -11,13 +11,16 @@ actor:
   domain_rollouts:
     math: ${domain_rollouts.math}
     guessing: ${domain_rollouts.guessing}
+    coding: ${domain_rollouts.coding}
 
 dataset_loader: pipelinerl.domains.multidomain.load_problems
 train_dataset_names:
   - math_debug
   - guessing_debug
+  - coding_debug
 test_dataset_names:
   - math_debug
+  - coding_debug
 
 environment: null
 environment_key: null

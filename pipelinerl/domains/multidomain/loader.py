@@ -3,6 +3,7 @@ from typing import Dict, Iterable, List, Sequence
 
 from pipelinerl.domains.math.load_datasets import load_datasets as load_math_datasets
 from pipelinerl.domains.guessing.guessing import load_problems as load_guessing_problems
+from pipelinerl.domains.coding.dataset import load_problems as load_coding_problems
 
 
 def _load_math(dataset_names: Sequence[str], *, seed=None, **_: dict) -> List[Dict]:
@@ -13,9 +14,14 @@ def _load_guessing(dataset_names: Sequence[str], **_: dict) -> List[Dict]:
     return load_guessing_problems(list(dataset_names))
 
 
+def _load_coding(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_coding_problems(list(dataset_names), **loader_kwargs)
+
+
 DOMAIN_LOADERS = {
     "math": _load_math,
     "guessing": _load_guessing,
+    "coding": _load_coding,
 }
 
 
@@ -33,6 +39,7 @@ def load_datasets(
     dataset_names: Iterable[str] | str | None,
     *,
     seed: int | None = None,
+    per_domain_params: dict[str, dict] | None = None,
     **kwargs,
 ) -> List[Dict]:
     if dataset_names is None:
@@ -47,11 +54,15 @@ def load_datasets(
 
     counters: dict[tuple[str, str], int] = defaultdict(int)
     problems: List[Dict] = []
+    per_domain_params = dict(per_domain_params or {})
     for domain, names in grouped.items():
         loader = DOMAIN_LOADERS.get(domain)
         if loader is None:
             raise ValueError(f"No loader registered for domain '{domain}'")
-        loaded = loader(names, seed=seed, **kwargs)
+        domain_kwargs = dict(kwargs)
+        if domain in per_domain_params:
+            domain_kwargs.update(dict(per_domain_params[domain] or {}))
+        loaded = loader(names, seed=seed, **domain_kwargs)
         for sample in loaded:
             dataset_name = str(sample.get("dataset", names[0] if names else domain))
             sample.setdefault("domain", domain)
