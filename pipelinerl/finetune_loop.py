@@ -635,12 +635,15 @@ def rl_finetuning_worker(
                 model.set_gradient_accumulation_boundary(True)
                 model.step()
                 grad_norm = model.get_global_grad_norm() if hasattr(model, "get_global_grad_norm") else None
-                if isinstance(training_metrics.grad_norm, torch.Tensor):
+                if isinstance(grad_norm, torch.Tensor):
                     grad_norm = grad_norm.item()
                 training_metrics.grad_norm = grad_norm if grad_norm is not None else -1.0
             else:
                 max_grad_norm = args.get("gradient_clipping_threshold", None)
-                training_metrics.grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
+                grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
+                if isinstance(grad_norm, torch.Tensor):
+                    grad_norm = grad_norm.item()
+                training_metrics.grad_norm = grad_norm
                 optimizer.step()
                 optimizer.zero_grad()
         
