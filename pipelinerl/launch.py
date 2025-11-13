@@ -71,6 +71,13 @@ def validate_config(cfg: DictConfig):
         if not hasattr(cfg.finetune.rl, "value_loss_coef") or cfg.finetune.rl.value_loss_coef <= 0.0:
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
 
+    if cfg.finetune.seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
+        raise ValueError(
+            f"seq_length {cfg.finetune.seq_length} must be greater than or equal to "
+            f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
+        )
+
+
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
     kwargs = cfg.vllm_config.vllm_kwargs
