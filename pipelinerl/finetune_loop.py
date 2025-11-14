@@ -454,8 +454,7 @@ def run_finetuning_loop(
         data_stream=data_stream,
         batch_queue=batch_queue,
     )
-    data_loader_thread = threading.Thread(target=data_loader_worker_fn, args=())
-    data_loader_thread.daemon = True
+    data_loader_thread = threading.Thread(target=data_loader_worker_fn, args=(), daemon=True)
 
     get_accelerator().wait_for_everyone()
     model.train()
