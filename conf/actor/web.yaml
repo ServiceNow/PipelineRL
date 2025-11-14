@@ -1,7 +1,7 @@
 log_each_n_secs: 10
 llm_max_rollouts: 128
 rollout_workers: 1
-rollout_policy: pipelinerl.tapeagents_rollouts.generate_rollout
+rollout_policy: pipelinerl.domains.deep_research.tapeagents_rollouts.generate_rollout
 
 environment:
   _target_: tapeagents.mcp.MCPEnvironment
