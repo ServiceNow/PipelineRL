@@ -153,6 +153,7 @@ class WeightUpdateManager:
         self.update_stream = update_stream
         self.actor_update_group = actor_update_group
         self.thread_pool = ThreadPoolExecutor(max_workers=len(llm_urls))
+        self._shutdown = False
 
     def _request_weight_update(self, url: str, message: WeightUpdateRequest):
         response = None
@@ -170,6 +171,11 @@ class WeightUpdateManager:
         for url in self.llm_urls:
             futures.append(self.thread_pool.submit(self._request_weight_update, url, message))
         return futures
+
+    def shutdown(self):
+        if not self._shutdown:
+            self.thread_pool.shutdown(wait=True)
+            self._shutdown = True
 
     def send_weight_update(
         self,
@@ -449,6 +455,7 @@ def run_finetuning_loop(
         batch_queue=batch_queue,
     )
     data_loader_thread = threading.Thread(target=data_loader_worker_fn, args=())
+    data_loader_thread.daemon = True
 
     get_accelerator().wait_for_everyone()
     model.train()
@@ -481,6 +488,8 @@ def run_finetuning_loop(
             seq_parallel_group, 
         )
     finally:
+        if weight_update_manager is not None:
+            weight_update_manager.shutdown()
         if actor_update_group:
             dist.destroy_process_group(actor_update_group)
 
