@@ -20,6 +20,7 @@ from tapeagents.llms import TrainableLLM
 from typing import Dict, List
 
 import wandb
+from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from pipelinerl.shared_memory_array import SharedMemoryQueue
@@ -425,6 +426,12 @@ class ActorLoop:
                 # the user function must do next(...) to run each iteration
                 yield
 
+                final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
+                samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
+                if self.trainer_state.samples_processed is not None and self.trainer_state.samples_processed >= samples_target:
+                    logger.info("Trainer signalled completion; stopping actor loop")
+                    break
+
                 if self.trainer_state.propagated_weight_version > last_trainer_version:
                     if max_lag is not None:
                         assert groups_per_update is not None
@@ -676,4 +683,8 @@ def run_actor_loop(cfg: DictConfig):
                 logger.info("Test loop finished")
 
         # 3. Keep running the training loop
-        _ = next(train_loop_run)
+        try:
+            _ = next(train_loop_run)
+        except StopIteration:
+            logger.info("Train loop finished")
+            break
