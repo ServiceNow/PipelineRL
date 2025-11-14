@@ -1,14 +1,12 @@
-import os
-import json
 import re
 import time
+
 import aiohttp
 from omegaconf import DictConfig
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.rollouts import RolloutResult, BaseMetrics
-from tapeagents.core import Prompt
-from tapeagents.llms.trainable import TrainableLLM
+from pipelinerl.llm import Prompt, TrainableLLM
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
 
 
 async def generate_guessing_rollout(
@@ -24,7 +22,7 @@ async def generate_guessing_rollout(
         },
         {
             "role": "user",
-            "content": f"You must guess a number between 1 and 1024. Output the answer as <answer>number</answer>."
+            "content": "You must guess a number between 1 and 1024. Output the answer as <answer>number</answer>."
                         " After each guess I will tell you if your answer is higher or lower than the target number."
         }
     ]

@@ -1,15 +1,16 @@
 import re
 import time
 from typing import Any, Literal
+
 import aiohttp
 from omegaconf import DictConfig
+from tapeagents.agent import Agent, Node
+from tapeagents.core import AgentStep, Observation, Tape
 
 from pipelinerl.async_llm import make_training_text
+from pipelinerl.llm import LLMStream, Prompt, TrainableLLM
 from pipelinerl.rollouts import RolloutResult
-from tapeagents.core import Prompt, Tape, Observation, AgentStep 
-from tapeagents.llms import LLMStream
-from tapeagents.llms.trainable import TrainableLLM
-from tapeagents.agent import Node, Agent
+
 
 class ProblemStep(Observation):
     kind: Literal["problem"] = "problem"

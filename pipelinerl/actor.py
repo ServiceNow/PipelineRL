@@ -4,25 +4,25 @@ import math
 import multiprocessing as mp
 import os
 import queue
-from queue import Empty
 import random
 import time
 from collections import defaultdict
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
+from queue import Empty
+from typing import Dict, List
 
 import aiohttp
 import hydra
 import uvloop
 from omegaconf import DictConfig
 from pydantic import BaseModel, Field
-from tapeagents.llms import TrainableLLM
-from typing import Dict, List
 
 import wandb
-from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
-from pipelinerl.rollouts import RolloutResult, BaseMetrics
+from pipelinerl.finetune_loop import calculate_train_steps
+from pipelinerl.llm import TrainableLLM
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.shared_memory_array import SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import (
@@ -621,9 +621,7 @@ def run_actor_loop(cfg: DictConfig):
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
             parameters=cfg.llm.parameters,
-            use_cache=False,
             collect_logprobs=True,
-            observe_llm_calls=False,
         )
         for url in llm_urls
     ]
@@ -633,9 +631,7 @@ def run_actor_loop(cfg: DictConfig):
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
             parameters=cfg.test_llm.parameters,
-            use_cache=False,
             collect_logprobs=True,
-            observe_llm_calls=False,
         )
         for url in llm_urls
     ]

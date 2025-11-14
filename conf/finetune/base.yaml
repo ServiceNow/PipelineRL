@@ -87,7 +87,7 @@ weight_update_interval: 1
 pop_old_data: ${..pop_old_data}
 attempts: 8
 eval_callback:
-  _target_: tapeagents.finetune.eval.dummy_eval_callback
+  _target_: pipelinerl.finetune.utils.dummy_eval_callback
   config_name: ""
 rl:
   policy_loss: reinforce
