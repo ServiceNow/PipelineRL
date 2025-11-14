@@ -25,6 +25,7 @@ from pipelinerl.shared_memory_array import SharedMemoryArray, SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.utils import setup_logging, wait_for_inference_servers, init_wandb
 from pipelinerl.world import WorldMap
+from pipelinerl.finetune_loop import calculate_train_steps
 
 datasets.disable_caching()
 from datasets.arrow_dataset import Dataset
@@ -384,7 +385,7 @@ def run_preprocessing_loop(
         pop_old_data=pop_old_data,
     )
     # Start the dataset loader thread using Thread
-    dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn)
+    dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn, daemon=True)
     dataset_loader_thread.start()
     
     # Initialize TrainerState
@@ -400,6 +401,8 @@ def run_preprocessing_loop(
         logger.info("Normal mode, waiting for finetune loop to start")
         trainer_state.start_listening()
         trainer_state.wait_for_model_version()
+    final_train_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
+    samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
     # Load published samples from state file
     llms = [
@@ -485,6 +488,12 @@ def run_preprocessing_loop(
                 writing_took = 0
                 num_filtered_out = 0
                 while True:
+                    if (
+                        trainer_state.samples_processed is not None
+                        and trainer_state.samples_processed >= samples_target
+                    ):
+                        logger.info("Trainer signalled completion; stopping preprocessor loop")
+                        break
                     llm = llms[next_llm_index] if llms else None
                     if not input_queue.full():
                         try:
@@ -663,4 +672,3 @@ def run_preprocessing_loop(
                     if worker.is_alive():
                         worker.terminate()
                         worker.join(timeout=1.0)
-
