@@ -1,0 +1,27 @@
+defaults:
+    - base
+finetune:
+    seq_length: 4000
+    gradient_accumulation_passes: 6
+    max_train_steps: 1
+    train_batch_size: 4
+    attempts: 4
+llm:
+    parameters:
+        max_tokens: 500
+test_llm:
+    parameters:
+        max_tokens: 500
+actor:
+    rollout_policy: pipelinerl.domains.guessing.generate_guessing_rollout
+environment: null
+dataset_loader: pipelinerl.domains.guessing.load_problems
+train_dataset_names:
+    - train
+test_dataset_names:
+    - test
+world:
+    actor_fraction: 2
+    finetune_fraction: 6
+eval_every_n_versions: 0 #20000
+model_path: Qwen/Qwen2.5-0.5B-Instruct
