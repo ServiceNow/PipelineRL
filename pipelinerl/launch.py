@@ -400,7 +400,7 @@ def clean_up(exp_dir, force_restart):
                 pass
 
 
-def _is_inference_process(proc: subprocess.Popen) -> bool:
+def is_inference_process(proc: subprocess.Popen) -> bool:
     args = proc.args
     if isinstance(args, (list, tuple)):
         cmdline = " ".join(str(a) for a in args)
@@ -444,8 +444,8 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
                     sys.exit(1)
                 logger.info(f"Process {proc.args} finished cleanly")
                 alive.remove(proc)
-            if alive and all(_is_inference_process(proc) for proc in alive):
-                logger.info("All pipeline workers finished; stopping %d inference server(s)", len(alive))
+            if alive and all(is_inference_process(proc) for proc in alive):
+                logger.info(f"All pipeline workers finished; stopping {len(alive)} inference server(s)")
                 for proc in list(alive):
                     logger.info(f"Terminating inference server {proc.args}")
                     terminate_with_children(proc.pid)
