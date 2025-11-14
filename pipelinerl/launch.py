@@ -422,14 +422,19 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
 
     try:
         # Wait for all processes to complete
-        # if just one dies, stop all
-        while True:
-            for proc in processes:
-                if (return_code := proc.poll()) is not None:
-                    # print which process terminate and with what code
-                    logger.error(f"Process {proc.args} terminated with code {proc.returncode}")
+        # if just one dies non-zero, stop all
+        alive = list(processes)
+        while alive:
+            for proc in list(alive):
+                return_code = proc.poll()
+                if return_code is None:
+                    continue
+                if return_code != 0:
+                    logger.error(f"Process {proc.args} terminated with code {return_code}")
                     gently_stop_all_processes()
                     sys.exit(1)
+                logger.info(f"Process {proc.args} finished cleanly")
+                alive.remove(proc)
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
             #     and (version := trainer_state.propagated_weight_version is not None)
