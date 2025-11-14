@@ -1,14 +1,14 @@
-import os
 import json
+import os
 import re
 import time
+
 import aiohttp
 from omegaconf import DictConfig
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.rollouts import RolloutResult, BaseMetrics
-from tapeagents.core import Prompt
-from tapeagents.llms.trainable import TrainableLLM
+from pipelinerl.llm import Prompt, TrainableLLM
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
 
 
 async def generate_counting_rollout(
