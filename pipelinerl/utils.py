@@ -31,7 +31,7 @@ def _strip_environment_metadata(env_cfg: DictConfig | dict | None):
     if env_cfg is None:
         return None
     if isinstance(env_cfg, DictConfig):
-        data = OmegaConf.to_container(env_cfg, resolve=False)
+        data = OmegaConf.to_container(env_cfg, resolve=True)
     elif isinstance(env_cfg, dict):
         data = dict(env_cfg)
     else:
