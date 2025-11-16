@@ -6,6 +6,7 @@ from pipelinerl.domains.guessing.guessing import load_problems as load_guessing_
 from pipelinerl.domains.counting.counting import load_problems as load_counting_problems
 from pipelinerl.domains.chartqa.load_datasets import load_problems as load_chartqa_problems
 from pipelinerl.domains.coding.dataset import load_problems as load_coding_problems
+from pipelinerl.domains.symbolic.dataset import load_problems as load_symbolic_problems
 from pipelinerl.miniwob.load_tasks import load_tasks as load_miniwob_tasks
 
 
@@ -33,6 +34,10 @@ def _load_miniwob(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[D
     return load_miniwob_tasks(list(dataset_names), **loader_kwargs)
 
 
+def _load_symbolic(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_symbolic_problems(list(dataset_names), **loader_kwargs)
+
+
 DOMAIN_LOADERS = {
     "math": _load_math,
     "guessing": _load_guessing,
@@ -40,6 +45,7 @@ DOMAIN_LOADERS = {
     "counting": _load_counting,
     "chartqa": _load_chartqa,
     "miniwob": _load_miniwob,
+    "symbolic": _load_symbolic,
 }
 
 
