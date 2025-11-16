@@ -663,4 +663,3 @@ def run_preprocessing_loop(
                     if worker.is_alive():
                         worker.terminate()
                         worker.join(timeout=1.0)
-
