@@ -5,3 +5,4 @@ counting: pipelinerl.domains.counting.generate_counting_rollout
 miniwob: pipelinerl.miniwob.rollouts.generate_miniwob_rollout
 chartqa: pipelinerl.domains.chartqa.generate_chartqa_rollout
 coding: pipelinerl.domains.coding.generate_coding_rollout
+symbolic: pipelinerl.domains.symbolic.rollouts.generate_symbolic_rollout
