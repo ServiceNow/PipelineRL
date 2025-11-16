@@ -14,12 +14,13 @@ from pathlib import Path
 import aiohttp
 import hydra
 import uvloop
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 from tapeagents.llms import TrainableLLM
 from typing import Dict, List
 
 import wandb
+from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.rollouts import RolloutResult, BaseMetrics
 from pipelinerl.shared_memory_array import SharedMemoryQueue
@@ -265,6 +266,8 @@ def sequential_iter(problems: list):
         yield problem
 
 
+
+
 class ActorLoop:
     def __init__(
         self,
@@ -328,6 +331,7 @@ class ActorLoop:
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
+        self.domain_counts = defaultdict(int)
     
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
@@ -347,6 +351,8 @@ class ActorLoop:
             group_id = result.group_id
             self.latency_list.append(result.latency)
             self.model_versions_list.append(result.model_version)
+            domain_key = dataset_name.split("::", 1)[0] if isinstance(dataset_name, str) else str(dataset_name)
+            self.domain_counts[domain_key] += len(result.training_texts)
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
             all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
             for k, v in all_metrics.items():
@@ -383,8 +389,15 @@ class ActorLoop:
         # If training, we expect to sample infinitely
         # for train sample, sample random batches infinitely
         # for test samples, loop through the dataset once
+        domain_sampler = None
         if self.is_training:
             problem_iter = random_iter(dataset)
+            domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
+            if domain_mix_cfg:
+                mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+                if not isinstance(mix_weights, dict):
+                    raise ValueError("actor.domain_mix must be a mapping from domain to weight")
+                domain_sampler = DomainWeightedSampler(dataset, mix_weights)
         else:
             problem_iter = sequential_iter(dataset)
         assert self.trainer_state.propagated_weight_version is not None
@@ -440,7 +453,10 @@ class ActorLoop:
                         if not blocked_by_lag and not self.problem_queue.full():
                             try:
                                 try:
-                                    problem = next(problem_iter)
+                                    if domain_sampler is not None:
+                                        problem = domain_sampler.sample()
+                                    else:
+                                        problem = next(problem_iter)
                                     self.problem_queue.put(problem, block=False)
                                     submitted_groups += 1
                                 except queue.Full:            
@@ -544,6 +560,25 @@ class ActorLoop:
         )
 
         stats |= loop_stats
+
+        total_domain_samples = sum(self.domain_counts.values())
+        if total_domain_samples:
+            for domain, count in sorted(self.domain_counts.items()):
+                stats[f"{split_name}domain_mix_count/{domain}"] = count
+                stats[f"{split_name}domain_mix_actual/{domain}"] = count / total_domain_samples
+
+        domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
+        if domain_mix_cfg:
+            mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+            if isinstance(mix_weights, dict):
+                target_total = sum(float(v) for v in mix_weights.values() if float(v) > 0)
+                if target_total > 0:
+                    for domain, weight in mix_weights.items():
+                        stats[f"{split_name}domain_mix_target/{domain}"] = float(weight) / target_total
+                else:
+                    for domain in mix_weights:
+                        stats[f"{split_name}domain_mix_target/{domain}"] = 0.0
+
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
         if self.cfg.wandb.use_wandb:
