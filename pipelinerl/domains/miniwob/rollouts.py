@@ -9,14 +9,14 @@ import aiohttp
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from tapeagents.agent import DEFAULT, Agent
-from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
+from tapeagents.core import LLMOutputParsingFailureAction, Observation
 from tapeagents.io import save_json_tape
-from tapeagents.llms.trainable import TrainableLLM
 from tapeagents.orchestrator import async_execute_agent
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 from tapeagents.tools.simple_browser import PageObservation
 
 from pipelinerl.async_llm import make_training_text
+from pipelinerl.llm import TrainableLLM, LLMCall
 from pipelinerl.rollouts import RolloutResult
 from pipelinerl.world import Job
 
@@ -141,6 +141,7 @@ async def generate_miniwob_rollout(
         "n_page_observations": n_page_observations,
         "n_steps": len(tape.steps),
     }
+    logger.info(f"Created {len(training_texts)} training texts, reward: {reward}, has error: {not no_error}")
 
     return RolloutResult(
         training_texts=training_texts,
