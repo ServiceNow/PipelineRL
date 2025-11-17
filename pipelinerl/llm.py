@@ -971,6 +971,8 @@ class TrainableLLM(LLM):
         output = LLMOutput(content=content or "")
         if tool_calls:
             output.tool_calls = [litellm.ChatCompletionMessageToolCall(**tc) for tc in tool_calls]
+        if not isinstance(prompt, Prompt):
+            prompt = Prompt(**prompt.model_dump(exclude_none=True)) # recreate the prompt object from the possible tapeagents prompt
         llm_call = self.log_output(
             prompt,
             output,
