@@ -2,9 +2,9 @@ defaults:
   - base
 
 world:
-  actor_fraction: 4
+  actor_fraction: 1
   preprocessor_fraction: 1
-  finetune_fraction: 3
+  finetune_fraction: 4
 
 # debug:
 #   mode: actor
@@ -21,7 +21,7 @@ finetune:
   learning_rate: 1e-6
   optim: adamw_torch
   rl:
-    kl_coef: 0.00  # GRPO beta coefficient
+    kl_coef: 0.01  # GRPO beta coefficient
     reward_minus_kl_coef: 0.0  # RLOO beta coefficient
     use_advantages: true
     algo: grpo
