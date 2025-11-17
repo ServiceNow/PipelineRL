@@ -5,6 +5,7 @@ defaults:
 train_dataset_names:
   - massimo_train
 test_dataset_names:
+  - massimo_train_heldout_goals
   - massimo_test
 
 reward_computation: massimo
