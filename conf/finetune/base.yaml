@@ -36,7 +36,7 @@ learning_rate: 1e-6
 # How much to clip the gradient (no clipping if null)
 gradient_clipping_threshold: 0.3
 # Learning rate scheduler type (indexed by completed_steps).
-lr_scheduler_type: cosine # could be cosine, constant_with_warmup
+lr_scheduler_type: constant # could be cosine, constant_with_warmup
 # Number of warmup (completed) steps in the learning rate schedule.
 num_warmup_steps: 50
 # Number of gradient accumulation steps.

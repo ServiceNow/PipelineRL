@@ -446,6 +446,7 @@ def run_finetuning_loop(
         logger.info("Load the first version of the model into inference LLMs")
         weight_update_manager.send_weight_update(training_metrics.samples)
     else:
+        logger.info("send_weight_updates disabled, weight_update_manager is None")
         weight_update_manager = None
 
     batch_queue = Queue(maxsize=1)
@@ -491,6 +492,7 @@ def run_finetuning_loop(
             weight_update_manager.shutdown()
         if actor_update_group:
             dist.destroy_process_group(actor_update_group)
+        raise RuntimeError("Finetuning loop finished, exiting worker thread")
 
 
 def rl_finetuning_worker(
