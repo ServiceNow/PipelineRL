@@ -4,22 +4,23 @@ import logging
 import os
 import random
 import time
+
 import aiohttp
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-
-from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.rollouts import RolloutResult
-from pipelinerl.world import Job
-from tapeagents.agent import Agent, DEFAULT
-from tapeagents.core import LLMOutputParsingFailureAction, Observation, LLMCall
+from tapeagents.agent import DEFAULT, Agent
+from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
+from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
+from tapeagents.orchestrator import async_execute_agent
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 from tapeagents.tools.simple_browser import PageObservation
-from tapeagents.orchestrator import async_execute_agent
-from tapeagents.io import save_json_tape
-from examples.rl_webagent.steps import WebTape
 
+from pipelinerl.async_llm import make_training_text
+from pipelinerl.rollouts import RolloutResult
+from pipelinerl.world import Job
+
+from .steps import WebTape
 
 logger = logging.getLogger(__name__)
 
