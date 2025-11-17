@@ -16,8 +16,6 @@ actor:
     chartqa: ${domain_rollouts.chartqa}
     miniwob: ${domain_rollouts.miniwob}
     coding: ${domain_rollouts.coding}
-    symbolic: ${domain_rollouts.symbolic}
-  symbolic_max_prediction_length: 900
   coding_rewards:
     compile_error_penalty: -1.0
     runtime_error_penalty: -0.3
@@ -47,15 +45,6 @@ dataset_loader_params:
       max_examples_per_split: 2048
       trust_remote_code: true
       huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
-    symbolic:
-      max_examples_per_split: 2048
-      task_mix:
-        - simplify_poly
-        - differentiate_poly
-        - differentiate_trig
-      degree_range: [1, 4]
-      terms_range: [2, 5]
-      max_derivative_order: 2
 
 environments:
   - key: math
