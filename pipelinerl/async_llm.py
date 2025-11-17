@@ -53,7 +53,6 @@ async def llm_async_generate(
     data = {
         "model": llm.model_name,
         "messages": prompt.messages,
-        "stream": llm.stream,
     }
     if llm.collect_logprobs:
         data.update(

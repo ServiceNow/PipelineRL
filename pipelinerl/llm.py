@@ -97,6 +97,10 @@ class Prompt(BaseModel):
 LLMOutput: TypeAlias = litellm.utils.Message
 """Type alias for the output of the language model."""
 
+class TokenLogprob(BaseModel):
+    logprob: float
+    token_id: int
+
 
 class LLMCall(BaseModel):
     """
@@ -120,12 +124,6 @@ class LLMCall(BaseModel):
     llm_info: dict = {}
     cost: float = 0
     logprobs: list[TokenLogprob] = Field(default_factory=list, exclude=True)
-
-
-class TokenLogprob(BaseModel):
-    logprob: float
-    token_id: int
-
 
 
 class LLMEvent(BaseModel):
@@ -479,7 +477,6 @@ class TrainableLLM(LLM):
         data = {
             "model": self.model_name,
             "messages": prompt.messages,
-            "stream": self.stream,
             "tools": prompt.tools,
         }
         if self.collect_logprobs:
@@ -498,7 +495,6 @@ class TrainableLLM(LLM):
             url=f"{self.base_url}/v1/chat/completions",
             json=data,
             headers=headers,
-            stream=self.stream,
             verify=False,
         )
         time_send_request = time.time() - start_send_request
@@ -508,39 +504,22 @@ class TrainableLLM(LLM):
             logger.error(f"Failed to get completion: {r.text}")
             r.raise_for_status()
         parsed_logprobs = []
-        if self.stream:
-            response_buffer = []
-            for byte_payload in r.iter_lines():
-                if byte_payload == b"\n":
-                    continue
-                payload = byte_payload.decode("utf-8")
-                if payload.startswith("data:"):
-                    if payload == "data: [DONE]":
-                        continue
-                    json_payload = json.loads(payload.lstrip("data:").rstrip("\n"))
-                    response_delta = json_payload["choices"][0]["delta"].get("content", "")
-                    if not response_delta:
-                        continue
-                    response_buffer.append(response_delta)
-                    yield LLMEvent(chunk=response_delta)
-            output = LLMOutput(content="".join(response_buffer))
-        else:
-            data = r.json()
-            try:
-                content = data["choices"][0]["message"]["content"]
-                tool_calls = data["choices"][0]["message"].get("tool_calls", [])
-                if not content and not tool_calls:
-                    logger.warning(f"Empty completion {data}")
+        data = r.json()
+        try:
+            content = data["choices"][0]["message"]["content"]
+            tool_calls = data["choices"][0]["message"].get("tool_calls", [])
+            if not content and not tool_calls:
+                logger.warning(f"Empty completion {data}")
 
-                if self.collect_logprobs:
-                    completion_logprobs = data["choices"][0]["logprobs"]["content"]
-                    parsed_logprobs = self.parse_completion_logprobs(completion_logprobs)
-            except Exception as e:
-                logger.exception(f"Failed to parse llm response: {r}")
-                raise e
-            output = LLMOutput(content=content)
-            if tool_calls:
-                output.tool_calls = [litellm.ChatCompletionMessageToolCall(**tc) for tc in tool_calls]
+            if self.collect_logprobs:
+                completion_logprobs = data["choices"][0]["logprobs"]["content"]
+                parsed_logprobs = self.parse_completion_logprobs(completion_logprobs)
+        except Exception as e:
+            logger.exception(f"Failed to parse llm response: {r}")
+            raise e
+        output = LLMOutput(content=content)
+        if tool_calls:
+            output.tool_calls = [litellm.ChatCompletionMessageToolCall(**tc) for tc in tool_calls]
         llm_call = self.log_output(prompt, output)
         llm_call.logprobs = parsed_logprobs
         yield LLMEvent(output=output, llm_call=llm_call)
