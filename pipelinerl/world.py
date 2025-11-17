@@ -198,19 +198,23 @@ class WorldMap:
         # Scale environment servers to be the same as llm servers
         base_start_port = cfg.world.environment_start_port
         llms_per_actor = getattr(self, "llms_per_actor", 1) or 1
+        global_replica_idx = 0
         for spec_idx, spec in enumerate(environment_specs):
             if spec["mode"] != "remote":
                 continue
             replicas_per_actor = spec.get("replicas_per_actor")
             if replicas_per_actor is None:
-                replicas_per_actor = getattr(cfg.world, "env_replicas_per_actor", 1)
-            total_env_replicas = cfg.world.replicas * llms_per_actor * replicas_per_actor
+                replicas_per_actor = getattr(cfg.world, "env_replicas_per_actor", None)
+            if replicas_per_actor is not None:
+                total_env_replicas = cfg.world.replicas * llms_per_actor * replicas_per_actor
+            else:
+                total_env_replicas = getattr(cfg.world, "env_replicas", cfg.world.replicas * llms_per_actor)
             for replica_offset in range(total_env_replicas):
                 node = self.get_least_busy_node()
                 envs_at_node = len([job for job in self.job_map[node] if job.kind == "environment"])
                 self.add_job(
                     kind="environment",
-                    replica_idx=replica_offset,
+                    replica_idx=global_replica_idx,
                     node_rank=node,
                     port=base_start_port + envs_at_node,
                     gpus=[],
@@ -218,6 +222,7 @@ class WorldMap:
                     environment_key=spec["key"],
                     environment_index=spec.get("index", spec_idx),
                 )
+                global_replica_idx += 1
 
     def _collect_environment_specs(self, cfg: DictConfig) -> list[dict]:
         specs: list[dict] = []
