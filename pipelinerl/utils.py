@@ -71,6 +71,55 @@ def select_environment_config(cfg: DictConfig, *, key: str | None = None, index:
     return getattr(cfg, "environment", None)
 
 
+def _domain_mix_weights(cfg: DictConfig) -> dict[str, float]:
+    domain_mix_cfg = getattr(getattr(cfg, "actor", None), "domain_mix", None)
+    if not domain_mix_cfg:
+        return {}
+    try:
+        mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+    except Exception:
+        return {}
+    if not isinstance(mix_weights, dict):
+        return {}
+    weights: dict[str, float] = {}
+    for key, value in mix_weights.items():
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            weights[str(key)] = weight
+    return weights
+
+
+def _apply_domain_mix_replicas(cfg: DictConfig, specs: list[dict[str, Any]], default_replicas: Any) -> None:
+    weights = _domain_mix_weights(cfg)
+    if not weights:
+        return
+    try:
+        default_value = float(default_replicas)
+    except (TypeError, ValueError):
+        return
+    if default_value <= 0:
+        return
+    weighted_specs = [spec for spec in specs if spec.get("mode") == "remote" and spec.get("key") in weights]
+    if not weighted_specs:
+        return
+    total_weight = sum(weights[spec["key"]] for spec in weighted_specs)
+    if total_weight <= 0:
+        return
+    average_weight = total_weight / len(weighted_specs)
+    if average_weight <= 0:
+        return
+    for spec in weighted_specs:
+        key = spec["key"]
+        scaled = default_value * (weights[key] / average_weight)
+        replicas = max(1, int(round(scaled)))
+        current = spec.get("replicas_per_actor")
+        if current is None or current == default_replicas:
+            spec["replicas_per_actor"] = replicas
+
+
 def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     env_cfgs = getattr(cfg, "environments", None)
@@ -120,6 +169,7 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
                     "index": 0,
                 }
             )
+    _apply_domain_mix_replicas(cfg, specs, default_replicas)
     return specs
 
 

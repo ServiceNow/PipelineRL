@@ -2,7 +2,7 @@ import logging
 import os
 from typing import Literal
 from pydantic import BaseModel
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 import torch
 
 logger = logging.getLogger(__name__)
@@ -268,7 +268,54 @@ class WorldMap:
                         "index": 0,
                     }
                 )
+        self._apply_domain_mix_replicas(cfg, specs)
         return specs
+
+    def _apply_domain_mix_replicas(self, cfg: DictConfig, specs: list[dict]) -> None:
+        domain_mix_cfg = getattr(getattr(cfg, "actor", None), "domain_mix", None)
+        if not domain_mix_cfg:
+            return
+        try:
+            mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+        except Exception:
+            return
+        if not isinstance(mix_weights, dict):
+            return
+        weight_map: dict[str, float] = {}
+        for key, value in mix_weights.items():
+            try:
+                weight = float(value)
+            except (TypeError, ValueError):
+                continue
+            if weight > 0:
+                weight_map[str(key)] = weight
+        if not weight_map:
+            return
+        default_replicas = getattr(cfg.world, "env_replicas_per_actor", None)
+        if default_replicas is None:
+            return
+        try:
+            default_value = float(default_replicas)
+        except (TypeError, ValueError):
+            return
+        if default_value <= 0:
+            return
+        weighted_specs = [spec for spec in specs if spec.get("mode") == "remote" and spec.get("key") in weight_map]
+        if not weighted_specs:
+            return
+        total_weight = sum(weight_map[spec["key"]] for spec in weighted_specs)
+        if total_weight <= 0:
+            return
+        average_weight = total_weight / len(weighted_specs)
+        if average_weight <= 0:
+            return
+        for spec in weighted_specs:
+            key = spec["key"]
+            scaled = default_value * (weight_map[key] / average_weight)
+            replicas = max(1, int(round(scaled)))
+            current = spec.get("replicas_per_actor")
+            if current is None or current == default_replicas:
+                spec["replicas_per_actor"] = replicas
 
     def _place_inference_jobs(self, cfg):
         for _ in range(cfg.world.replicas):
