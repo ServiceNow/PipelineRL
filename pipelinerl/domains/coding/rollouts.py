@@ -5,29 +5,19 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import aiohttp
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.utils import get_environment_jobs, resolve_environment_key
+from pipelinerl.domains.math.rollouts import RewardTable, length_penalty
 
 from .verifier_api import verify_coding_solution_rpc
-
-
-@dataclass
-class CodingRewardConfig:
-    compile_error_penalty: float
-    runtime_error_penalty: float
-    timeout_penalty: float
-    empty_response_penalty: float
-    partial_credit_weight: float
-    full_pass_bonus: float
 
 
 class CodingMetrics(BaseMetrics):
@@ -49,40 +39,53 @@ def _format_task(problem: dict[str, Any]) -> str:
     return str(problem)
 
 
-def _load_reward_cfg(cfg: DictConfig) -> CodingRewardConfig:
-    rewards_cfg = cfg.actor.get("coding_rewards")
-    if isinstance(rewards_cfg, DictConfig):
-        rewards_dict = OmegaConf.to_container(rewards_cfg, resolve=True)
-    else:
-        rewards_dict = rewards_cfg or {}
-    return CodingRewardConfig(
-        compile_error_penalty=float(rewards_dict.get("compile_error_penalty", -1.0)),
-        runtime_error_penalty=float(rewards_dict.get("runtime_error_penalty", -0.3)),
-        timeout_penalty=float(rewards_dict.get("timeout_penalty", -0.5)),
-        empty_response_penalty=float(rewards_dict.get("empty_response_penalty", -1.5)),
-        partial_credit_weight=float(rewards_dict.get("partial_credit_weight", 1.0)),
-        full_pass_bonus=float(rewards_dict.get("full_pass_bonus", 0.75)),
-    )
+def _determine_answer_status(verification: dict[str, Any]) -> Literal["correct", "wrong", "no_answer", "unparsable"]:
+    if verification.get("empty_response"):
+        return "no_answer"
+    if verification.get("compile_error") or verification.get("timeout_error"):
+        return "unparsable"
+    total = int(verification.get("total") or 0)
+    passed = int(verification.get("passed") or 0)
+    if total > 0 and passed == total:
+        return "correct"
+    return "wrong"
 
 
-def _compute_reward(result: dict[str, Any], rewards: CodingRewardConfig) -> float:
-    if result.get("empty_response"):
-        return rewards.empty_response_penalty
-    if result.get("compile_error"):
-        return rewards.compile_error_penalty
-    if result.get("timeout_error"):
-        return rewards.timeout_penalty
+def _compute_reward(
+    cfg: DictConfig,
+    rewards: RewardTable,
+    *,
+    answer_status: Literal["correct", "wrong", "no_answer", "unparsable"],
+    finished: bool,
+    output_tokens: int,
+    max_tokens: int | None,
+) -> tuple[float, float]:
+    match (answer_status, finished):
+        case ("wrong", False):
+            reward = rewards.wrong_answer_not_finished
+        case ("wrong", True):
+            reward = rewards.wrong_answer_finished
+        case ("no_answer", False):
+            reward = rewards.no_answer_not_finished
+        case ("no_answer", True):
+            reward = rewards.no_answer_finished
+        case ("unparsable", False):
+            reward = rewards.unparsable_not_finished
+        case ("unparsable", True):
+            reward = rewards.unparsable_finished
+        case ("correct", False):
+            reward = rewards.correct_answer_not_finished
+        case ("correct", True):
+            reward = rewards.correct_answer_finished
+        case _:
+            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{finished}")
 
-    passed = int(result.get("passed") or 0)
-    total = int(result.get("total") or 0)
-    reward = 0.0
-    if total > 0:
-        reward += (passed / total) * rewards.partial_credit_weight
-        if passed == total:
-            reward += rewards.full_pass_bonus
-    if result.get("runtime_error") and passed < total:
-        reward += rewards.runtime_error_penalty
-    return reward
+    reward *= cfg.actor.discount_factor ** output_tokens
+    overlong_penalty = 0.0
+    if rewards.buffer_tokens and max_tokens is not None:
+        overlong_penalty = length_penalty(max_tokens, output_tokens, rewards.buffer_tokens)
+        reward += overlong_penalty
+    return reward, overlong_penalty
 
 
 async def _run_verification(
@@ -150,9 +153,20 @@ async def generate_coding_rollout(
         extra_info=extra_info,
     )
 
-    rewards_cfg = _load_reward_cfg(cfg)
-    reward = _compute_reward(verification, rewards_cfg)
-    reward *= cfg.actor.discount_factor ** llm_call.output_length_tokens
+    rewards_cfg = RewardTable(**dict(cfg.rewards))
+    answer_status = _determine_answer_status(verification)
+    try:
+        max_tokens = llm.parameters["max_tokens"]
+    except (KeyError, TypeError):
+        max_tokens = None
+    reward, _ = _compute_reward(
+        cfg,
+        rewards_cfg,
+        answer_status=answer_status,
+        finished=trace.finished,
+        output_tokens=llm_call.output_length_tokens,
+        max_tokens=max_tokens,
+    )
     trace.reward = reward
 
     coding_metadata = {
