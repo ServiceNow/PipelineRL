@@ -1,0 +1,8 @@
+# @package actor.domain_mix
+
+math: 0.2
+guessing: 0.1
+counting: 0.1
+chartqa: 0.1
+miniwob: 0.1
+coding: 0.4
