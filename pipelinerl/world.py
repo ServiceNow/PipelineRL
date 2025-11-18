@@ -264,7 +264,7 @@ class WorldMap:
                     {
                         "key": "default",
                         "mode": getattr(cfg.world, "environment_mode", "remote"),
-                        "replicas_per_actor": getattr(cfg.world, "env_replicas_per_actor", 1),
+                        "replicas_per_actor": getattr(cfg.world, "env_replicas_per_actor", None),
                         "index": 0,
                     }
                 )
