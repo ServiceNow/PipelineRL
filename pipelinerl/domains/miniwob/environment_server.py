@@ -29,7 +29,7 @@ class WebEnvironmentServer:
         """
         Serve the web environment in TapeAgent.
         """
-        env_server = EnvironmentServer(n_envs=self.n_envs, host=self.host, port=port, max_session_inactivity_secs=self.max_session_inactivity_secs)
+        env_server = EnvironmentServer(n_envs=self.n_envs, host=self.host, port=port)
         env_server.launch(OmegaConf.create({
             "_target_": self.web_env_target,
             "exp_path": self.exp_path,
