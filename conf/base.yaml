@@ -2,6 +2,7 @@ defaults:
   - finetune: actor_critic
   - rewards: pure_success
   - streams: files
+  - domain_mix: null
   - _self_
 
 seed: 42
@@ -135,4 +136,3 @@ wandb:
   wandb_dir: null
   # Comma-separated list of keywords to tag the run.
   tags: []
-

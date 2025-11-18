@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
   - /domain_rollouts@domain_rollouts: base
+  - domain_mix: null
 
 actor:
   rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
@@ -16,13 +17,6 @@ actor:
     chartqa: ${domain_rollouts.chartqa}
     miniwob: ${domain_rollouts.miniwob}
     coding: ${domain_rollouts.coding}
-  coding_rewards:
-    compile_error_penalty: -1.0
-    runtime_error_penalty: -0.3
-    timeout_penalty: -0.5
-    empty_response_penalty: -1.5
-    partial_credit_weight: 1.0
-    full_pass_bonus: 0.75
   coding_time_limit_s: 15.0
   coding_per_test_timeout_s: 10.0
   coding_memory_limit_bytes: 1073741824
