@@ -62,3 +62,6 @@ environments:
     memory_limit_bytes: ${actor.coding_memory_limit_bytes}
 
 environment_key: null
+
+world:
+  env_replicas_per_actor: 1
