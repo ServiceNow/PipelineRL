@@ -1,3 +1,4 @@
+from typing import Callable
 import torch
 from pydantic import BaseModel
 import logging
@@ -73,3 +74,9 @@ def create_sentinel_example(n_tokens: int, tokenizer=None, model_version=0) -> d
         "model_version": model_version,
     }
     return example
+
+def dummy_eval_callback(config_name: str) -> Callable:
+    def dummy(*args, **kwargs):
+        return {}
+
+    return dummy
