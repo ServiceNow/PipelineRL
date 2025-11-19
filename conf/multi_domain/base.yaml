@@ -10,6 +10,7 @@ actor:
     {task}
   task_prompt: ""
   ensure_boxed_answers: false
+  domain_mix: null
   domain_rollouts:
     math: ${domain_rollouts.math}
     guessing: ${domain_rollouts.guessing}
@@ -17,6 +18,7 @@ actor:
     chartqa: ${domain_rollouts.chartqa}
     miniwob: ${domain_rollouts.miniwob}
     coding: ${domain_rollouts.coding}
+    fn_calling: ${domain_rollouts.fn_calling}
   coding_time_limit_s: 15.0
   coding_per_test_timeout_s: 10.0
   coding_memory_limit_bytes: 1073741824
@@ -39,6 +41,17 @@ dataset_loader_params:
       max_examples_per_split: 2048
       trust_remote_code: true
       huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+    fn_calling:
+      dataset_id: ServiceNow-AI/mixed-training-text-datasets
+      dataset_config: 80k-if-math-coding-fncalling-stem
+      split_ratios:
+        train: 0.9
+        validation: 0.05
+        test: 0.05
+      allowed_call_types: []
+      max_examples_per_split: 2048
+      trust_remote_code: true
+      huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
 
 environments:
   - key: math
@@ -54,6 +67,11 @@ environments:
     run_timeout_s: ${actor.coding_per_test_timeout_s}
     request_timeout_s: ${actor.coding_time_limit_s}
     memory_limit_bytes: ${actor.coding_memory_limit_bytes}
+  - key: fn_calling
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.fn_calling.AgenticToolsEnvironment
+    max_workers: 4
 
 environment_key: null
 
