@@ -2,6 +2,7 @@
 math: pipelinerl.domains.math.generate_math_rollout
 guessing: pipelinerl.domains.guessing.generate_guessing_rollout
 counting: pipelinerl.domains.counting.generate_counting_rollout
-miniwob: pipelinerl.miniwob.rollouts.generate_miniwob_rollout
+miniwob: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
 chartqa: pipelinerl.domains.chartqa.generate_chartqa_rollout
 coding: pipelinerl.domains.coding.generate_coding_rollout
+fn_calling: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
