@@ -19,6 +19,7 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  domain_mix: null
 environment: null
 preprocess:
   input: actor
