@@ -1,5 +1,3 @@
-"""Utilities to load coding domain problems from the ServiceNow dataset."""
-
 from __future__ import annotations
 
 import json
@@ -28,16 +26,12 @@ DEFAULT_CALL_TYPES = ("assert", "std")
 
 @dataclass(frozen=True)
 class DatasetSpec:
-    """Structured description of a dataset entry with optional split suffix."""
-
     name: str
     split: str = "train"
 
 
 @dataclass
-class ServiceNowOptions:
-    """Configuration knobs for slicing the ServiceNow coding dataset."""
-
+class DatasetOptions:
     dataset_id: str = DEFAULT_DATASET_ID
     dataset_config: str | None = DEFAULT_DATASET_CONFIG
     split_ratios: Sequence[tuple[str, float]] = DEFAULT_SPLIT_RATIOS
@@ -50,21 +44,21 @@ class ServiceNowOptions:
 _DATASET_CACHE: dict[tuple[str, str | None, bool], Dataset] = {}
 
 
-def _normalize_loader_options(loader_kwargs: Dict[str, Any]) -> ServiceNowOptions:
+def _normalize_loader_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
     def _to_native(value: Any) -> Any:
         if isinstance(value, DictConfig):
             return OmegaConf.to_container(value, resolve=True)
         return value
 
-    options = ServiceNowOptions()
+    options = DatasetOptions()
     if loader_kwargs:
         raw_ratios = _to_native(loader_kwargs.get("split_ratios"))
         if isinstance(raw_ratios, dict):
             options.split_ratios = tuple(raw_ratios.items())
-        dataset_config = loader_kwargs.get("servicenow_config") or loader_kwargs.get("dataset_config")
+        dataset_config = loader_kwargs.get("dataset_config")
         if dataset_config:
             options.dataset_config = str(dataset_config)
-        dataset_id = loader_kwargs.get("servicenow_dataset_id") or loader_kwargs.get("dataset_id")
+        dataset_id = loader_kwargs.get("dataset_id")
         if dataset_id:
             options.dataset_id = str(dataset_id)
         if "max_examples_per_split" in loader_kwargs:
@@ -89,7 +83,7 @@ def _parse_dataset_name(entry: str) -> DatasetSpec:
     return DatasetSpec(name=name.strip(), split=split.strip() or "train")
 
 
-def _load_servicenow_dataset(options: ServiceNowOptions) -> Dataset:
+def _load_dataset(options: DatasetOptions) -> Dataset:
     cache_key = (options.dataset_id, options.dataset_config, options.trust_remote_code)
     if cache_key in _DATASET_CACHE:
         return _DATASET_CACHE[cache_key]
@@ -108,7 +102,7 @@ def _load_servicenow_dataset(options: ServiceNowOptions) -> Dataset:
         ds = _materialize_dataset()
     except DatasetGenerationError as exc:
         logger.warning(
-            "Standard load_dataset failed for %s (%s): %s. Forcing re-download.",
+            "load_dataset failed for %s (%s): %s. Forcing re-download.",
             options.dataset_id,
             options.dataset_config,
             exc,
@@ -132,7 +126,7 @@ def _load_servicenow_dataset(options: ServiceNowOptions) -> Dataset:
                     options.dataset_config,
                     stream_exc,
                 )
-                ds = _load_servicenow_snapshot(options)
+                ds = _load_snapshot(options)
 
     ds = ds.filter(lambda sample: sample.get("ability") == "code")
     _DATASET_CACHE[cache_key] = ds
@@ -145,7 +139,7 @@ def _load_servicenow_dataset(options: ServiceNowOptions) -> Dataset:
     return ds
 
 
-def _load_servicenow_snapshot(options: ServiceNowOptions) -> Dataset:
+def _load_snapshot(options: DatasetOptions) -> Dataset:
     if not options.dataset_config:
         raise RuntimeError("Snapshot fallback requires a dataset_config but none was provided.")
 
@@ -175,9 +169,7 @@ def _load_servicenow_snapshot(options: ServiceNowOptions) -> Dataset:
 
     table = pa.concat_tables(tables)
     logger.info(
-        "Loaded %d ServiceNow rows via snapshot fallback (%d shards)",
-        table.num_rows,
-        len(tables),
+        f"Loaded {table.num_rows} rows via snapshot fallback ({len(tables)} shards)",
     )
     return Dataset.from_table(table)
 
@@ -221,7 +213,7 @@ def _decode_extra_info(raw_extra: Any) -> dict[str, Any]:
     return {}
 
 
-def _build_servicenow_record(sample: dict, dataset_label: str, allowed_call_types: Sequence[str]) -> dict | None:
+def _build_record(sample: dict, dataset_label: str, allowed_call_types: Sequence[str]) -> dict | None:
     reward_model = sample.get("reward_model") or {}
     reward_raw = reward_model.get("ground_truth")
     if reward_raw is None:
@@ -249,13 +241,13 @@ def _build_servicenow_record(sample: dict, dataset_label: str, allowed_call_type
     }
 
 
-def _load_servicenow_split(
+def _load_split(
     spec: DatasetSpec,
     *,
-    options: ServiceNowOptions,
+    options: DatasetOptions,
     seed: int | None,
 ) -> list[dict]:
-    dataset = _load_servicenow_dataset(options)
+    dataset = _load_dataset(options)
     indices = _slice_indices(len(dataset), spec.split, options.split_ratios, seed)
     if not indices:
         logger.warning("Requested split '%s' produced zero samples", spec.split)
@@ -263,16 +255,14 @@ def _load_servicenow_split(
     subset = dataset.select(indices)
     samples: list[dict] = []
     for sample in subset:
-        record = _build_servicenow_record(sample, f"{spec.name}@{spec.split}", options.allowed_call_types)
+        record = _build_record(sample, f"{spec.name}@{spec.split}", options.allowed_call_types)
         if record is None:
             continue
         samples.append(record)
         if options.max_examples_per_split and len(samples) >= options.max_examples_per_split:
             break
     logger.info(
-        "Loaded %d ServiceNow samples for %s",
-        len(samples),
-        f"{spec.name}@{spec.split}",
+        f"Loaded {len(samples)} samples for {spec.name}@{spec.split}",
     )
     return samples
 
@@ -293,8 +283,8 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
     aggregated: list[dict] = []
     for entry in dataset_names:
         spec = _parse_dataset_name(entry)
-        if spec.name in {"mixed-training-text-datasets", "servicenow"}:
-            aggregated.extend(_load_servicenow_split(spec, options=options, seed=seed))
+        if spec.name in {"mixed-training-text-datasets"}:
+            aggregated.extend(_load_split(spec, options=options, seed=seed))
         else:
             raise ValueError(f"Unsupported coding dataset '{spec.name}'")
 
