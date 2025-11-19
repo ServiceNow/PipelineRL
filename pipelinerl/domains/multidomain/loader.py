@@ -6,7 +6,8 @@ from pipelinerl.domains.guessing.guessing import load_problems as load_guessing_
 from pipelinerl.domains.counting.counting import load_problems as load_counting_problems
 from pipelinerl.domains.chartqa.load_datasets import load_problems as load_chartqa_problems
 from pipelinerl.domains.coding.dataset import load_problems as load_coding_problems
-from pipelinerl.miniwob.load_tasks import load_tasks as load_miniwob_tasks
+from pipelinerl.domains.fn_calling.dataset import load_problems as load_fn_calling_problems
+from pipelinerl.domains.miniwob.load_tasks import load_tasks as load_miniwob_tasks
 
 
 def _load_math(dataset_names: Sequence[str], *, seed=None, **_: dict) -> List[Dict]:
@@ -19,6 +20,10 @@ def _load_guessing(dataset_names: Sequence[str], **_: dict) -> List[Dict]:
 
 def _load_coding(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
     return load_coding_problems(list(dataset_names), **loader_kwargs)
+
+
+def _load_fn_calling(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_fn_calling_problems(list(dataset_names), **loader_kwargs)
 
 
 def _load_counting(dataset_names: Sequence[str], **_: dict) -> List[Dict]:
@@ -40,6 +45,7 @@ DOMAIN_LOADERS = {
     "counting": _load_counting,
     "chartqa": _load_chartqa,
     "miniwob": _load_miniwob,
+    "fn_calling": _load_fn_calling,
 }
 
 
