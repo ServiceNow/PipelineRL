@@ -1,0 +1,5 @@
+# @package actor.domain_mix
+
+math: 0.4
+coding: 0.3
+fn_calling: 0.3
