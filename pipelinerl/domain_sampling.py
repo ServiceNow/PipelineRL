@@ -58,6 +58,7 @@ class DomainWeightedSampler:
         self.total_weight = total
 
     def _pick_domain(self) -> str:
+        """keep samples independent and proportional to the weights"""
         r = self.random.random() * self.total_weight
         for domain, threshold in zip(self.domains, self.thresholds):
             if r < threshold:
@@ -67,6 +68,3 @@ class DomainWeightedSampler:
     def sample(self) -> dict:
         domain = self._pick_domain()
         return self.random.choice(self.samples_by_domain[domain])
-
-
-__all__ = ["DomainWeightedSampler"]
