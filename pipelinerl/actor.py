@@ -22,7 +22,6 @@ import wandb
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
-from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.shared_memory_array import SharedMemoryQueue
