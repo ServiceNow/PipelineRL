@@ -52,10 +52,22 @@ def load_datasets(
     defaults = {
         "dataset_id": mixed_dataset.DEFAULT_DATASET_ID,
         "dataset_config": DEFAULT_DATASET_CONFIG,
-        "allowed_call_types": mixed_dataset.DEFAULT_CALL_TYPES,
+        # fn_calling loads all call_types (no filtering), unlike coding which filters to assert/std
+        "allowed_call_types": (),
         "ability_filter": ABILITY_FILTER,
     }
     options = {**defaults, **loader_kwargs}
+
+    # Validate that allowed_call_types is empty for fn_calling domain
+    final_call_types = options.get("allowed_call_types")
+    if final_call_types:
+        logger.warning(
+            "fn_calling domain received non-empty allowed_call_types=%s. "
+            "This may filter out valid fn_calling samples. "
+            "Consider using allowed_call_types=[] for this domain.",
+            final_call_types,
+        )
+
     samples = mixed_dataset.load_datasets(resolution.resolved, seed=seed, **options)
 
     for sample in samples:
