@@ -30,6 +30,70 @@ def _format_task(problem: dict[str, Any]) -> str:
     return str(problem)
 
 
+def _normalize_messages(raw_messages: Any) -> list[dict[str, str]]:
+    """Convert dataset prompts into chat messages compatible with vLLM."""
+
+    if not isinstance(raw_messages, list):
+        return []
+    if len(raw_messages) == 1 and isinstance(raw_messages[0], list):
+        raw_messages = raw_messages[0]
+
+    messages: list[dict[str, str]] = []
+    pending_assistant: list[str] = []
+
+    def flush_pending() -> None:
+        nonlocal pending_assistant
+        if not pending_assistant:
+            return
+        content = "\n\n".join(text for text in pending_assistant if text.strip())
+        if content:
+            messages.append({"role": "assistant", "content": content})
+        pending_assistant = []
+
+    for entry in raw_messages:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        content = entry.get("content")
+        if not isinstance(content, str):
+            continue
+
+        match role:
+            case "system":
+                flush_pending()
+                messages.append({"role": "system", "content": content})
+            case "user":
+                flush_pending()
+                messages.append({"role": "user", "content": content})
+            case "assistant" | "output_text":
+                pending_assistant.append(content)
+            case "thinking" | "plan" | "replan":
+                # Drop intermediate reasoning to keep prompts shorter.
+                continue
+            case "tool":
+                flush_pending()
+                name = entry.get("name")
+                tool_id = entry.get("tool_call_id") or entry.get("id")
+                if not isinstance(name, str) or not name:
+                    continue
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": name,
+                        "content": content,
+                        **({"tool_call_id": tool_id} if isinstance(tool_id, str) else {}),
+                    }
+                )
+            case _:
+                # For function-call style entries nested under assistant.
+                if role == "function" and isinstance(entry.get("name"), str):
+                    pending_assistant.append(content)
+                continue
+
+    flush_pending()
+    return messages
+
+
 def _coerce_dict(data: dict[str, Any] | str | None) -> dict[str, Any]:
     if data is None:
         return {}
@@ -49,10 +113,16 @@ async def generate_fn_calling_rollout(
     problem: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> RolloutResult:
-    messages = []
-    if cfg.actor.system_prompt:
-        messages.append({"role": "system", "content": cfg.actor.system_prompt})
-    messages.append({"role": "user", "content": cfg.actor.task_template.format(task=_format_task(problem))})
+    provided_prompt = problem.get("prompt")
+    messages = _normalize_messages(provided_prompt)
+    if messages:
+        if cfg.actor.system_prompt and messages[0]["role"] != "system":
+            messages.insert(0, {"role": "system", "content": cfg.actor.system_prompt})
+    else:
+        messages = []
+        if cfg.actor.system_prompt:
+            messages.append({"role": "system", "content": cfg.actor.system_prompt})
+        messages.append({"role": "user", "content": cfg.actor.task_template.format(task=_format_task(problem))})
     prompt = Prompt(messages=messages)
 
     start_time = time.time()
@@ -127,6 +197,3 @@ async def generate_fn_calling_rollout(
         latency=latency,
         dataset_name=problem.get("dataset"),
     )
-
-
-__all__ = ["generate_fn_calling_rollout", "FnCallingMetrics"]
