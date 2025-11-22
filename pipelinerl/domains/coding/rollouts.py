@@ -204,6 +204,3 @@ async def generate_coding_rollout(
         latency=latency,
         dataset_name=problem.get("dataset"),
     )
-
-
-__all__ = ["generate_coding_rollout", "CodingMetrics"]
