@@ -670,7 +670,12 @@ def rl_finetuning_worker(
                 assert batch.seq_boundaries is not None
                 update_ring_flash_attn_params(batch.seq_boundaries, seq_parallel_group)
             loss, this_step_rl_metrics = rl_step(
-                model, batch, training_metrics.completed_steps, final_train_steps, rl_config
+                model,
+                batch,
+                training_metrics.completed_steps,
+                final_train_steps,
+                rl_config,
+                seq_parallel_group=seq_parallel_group,
             )
             if is_sentinel_batch:
                 # zero out the loss and do not update the metrics
