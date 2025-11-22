@@ -97,6 +97,25 @@ def _normalize_loader_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
     return options
 
 
+def _ability_matches(value: Any, ability: str | None) -> bool:
+    """Return True when the sample's ability field contains the requested ability.
+
+    The upstream dataset sometimes stores ability as a single string ("code") and
+    sometimes as a list (e.g., ["agentic_fn_calling"]). Filtering must accept both
+    shapes or we drop all fn_calling samples.
+    """
+
+    if ability is None:
+        return True
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value == ability
+    if isinstance(value, (list, tuple, set)):
+        return ability in value
+    return False
+
+
 def parse_dataset_name(entry: str) -> DatasetSpec:
     text = entry.strip()
     if "@" not in text:
@@ -177,7 +196,8 @@ def _load_dataset(options: DatasetOptions) -> Dataset:
                 )
                 ds = _load_snapshot(options)
 
-    ds = ds.filter(lambda sample: sample.get("ability") == ability)
+    if ability:
+        ds = ds.filter(lambda sample: _ability_matches(sample.get("ability"), ability))
     _DATASET_CACHE[cache_key] = ds
     logger.info(
         "Loaded %s (%s) with %d coding samples",
@@ -282,12 +302,22 @@ def _build_record(sample: dict, dataset_label: str, allowed_call_types: Sequence
         return None
 
     extra_info = _decode_extra_info(sample.get("extra_info"))
-    return {
+    record = {
         "dataset": dataset_label,
         "task": task,
         "reward_context": reward_context,
         "extra_info": extra_info,
     }
+
+    # For fn_calling samples, keep the full prompt so multi-turn tool-calling
+    # instructions are available downstream.
+    if sample.get("ability") == "agentic_fn_calling":
+        if len(prompt_messages) == 1 and isinstance(prompt_messages[0], list):
+            record["prompt"] = prompt_messages[0]
+        else:
+            record["prompt"] = prompt_messages
+
+    return record
 
 
 def _load_split(
@@ -351,6 +381,3 @@ def load_problems(dataset_names: List[str] | str | None, **loader_kwargs: dict) 
 
     seed = loader_kwargs.pop("seed", None)
     return load_datasets(dataset_names, seed=seed, **loader_kwargs)
-
-
-__all__ = ["load_datasets", "load_problems", "parse_dataset_name", "DOMAIN_NAME"]
