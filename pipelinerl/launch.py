@@ -449,6 +449,7 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         # Wait for all processes to complete
         # if just one dies non-zero, stop all
         alive = list(processes)
+        logger.info(f"Starting process monitoring with {len(alive)} processes: {[proc.kind for proc in alive]}")
         while alive:
             for proc in list(alive):
                 return_code = proc.handle.poll()
@@ -461,11 +462,13 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
             if alive and all(is_inference_process(proc) for proc in alive):
-                # do not try to tear down inference-only nodes until the first weight update has been published.
-                if trainer_state is not None and trainer_state.propagated_weight_version is None:
-                    time.sleep(1)
+                # shut down inference servers after training is complete
+                if trainer_state is not None and not trainer_state.training_done:
+                    # check if training is completed
+                    logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
+                    trainer_state.wait_for_training_done(timeout=5.0)
                     continue
-                logger.info(f"All pipeline workers finished; stopping {len(alive)} inference server(s)")
+                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} inference server(s)")
                 for proc in list(alive):
                     logger.info(f"Terminating inference server {proc.handle.args}")
                     terminate_with_children(proc.handle.pid)
