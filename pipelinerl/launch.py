@@ -461,6 +461,10 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
             if alive and all(is_inference_process(proc) for proc in alive):
+                # do not try to tear down inference-only nodes until the first weight update has been published.
+                if trainer_state is not None and trainer_state.propagated_weight_version is None:
+                    time.sleep(1)
+                    continue
                 logger.info(f"All pipeline workers finished; stopping {len(alive)} inference server(s)")
                 for proc in list(alive):
                     logger.info(f"Terminating inference server {proc.handle.args}")
