@@ -10,6 +10,7 @@ from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLL
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from pipelinerl.rollouts import TrainingText
 from pipelinerl.processor_factory import get_processor
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,18 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     return images
 
 
+def _to_plain_obj(value):
+    """convert OmegaConf containers into Python types"""
+
+    if isinstance(value, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        return {key: _to_plain_obj(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_obj(item) for item in value]
+    return value
+
+
 async def llm_async_generate(
     llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
 ) -> LLMCall:
@@ -63,11 +76,22 @@ async def llm_async_generate(
             }
         )
 
+    extra_parameters = llm.parameters
+    if isinstance(extra_parameters, (DictConfig, ListConfig)):
+        extra_parameters = OmegaConf.to_container(extra_parameters, resolve=True)
+    if extra_parameters is None:
+        extra_parameters = {}
+    if not isinstance(extra_parameters, dict):
+        raise TypeError(
+            f"LLM parameters must serialize to a mapping, got {type(extra_parameters)}"
+        )
+
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
+    payload = _to_plain_obj({**data, **extra_parameters})
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
-        json=data | llm.parameters,
+        json=payload,
         headers=headers,
         ssl=False,
     ) as response:
