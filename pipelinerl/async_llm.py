@@ -44,18 +44,6 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     return images
 
 
-def _to_plain_obj(value):
-    """Recursively convert OmegaConf containers into standard Python types."""
-
-    if isinstance(value, (DictConfig, ListConfig)):
-        return OmegaConf.to_container(value, resolve=True)
-    if isinstance(value, dict):
-        return {key: _to_plain_obj(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_plain_obj(item) for item in value]
-    return value
-
-
 async def llm_async_generate(
     llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
 ) -> LLMCall:
@@ -88,7 +76,7 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
-    payload = _to_plain_obj({**data, **extra_parameters})
+    payload = OmegaConf.to_object({**data, **extra_parameters}, resolve=True)
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
         json=payload,
