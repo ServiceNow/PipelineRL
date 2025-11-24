@@ -303,8 +303,6 @@ def sequential_iter(problems: list):
         yield problem
 
 
-
-
 class ActorLoop:
     def __init__(
         self,
