@@ -19,6 +19,7 @@ class DomainWeightedSampler:
                 raise ValueError("Each sample must include a 'domain' field for domain_mix to work")
             samples_by_domain[str(domain)].append(sample)
 
+        provided_domains = {str(domain) for domain in weights}
         cleaned_weights: dict[str, float] = {}
         for domain, value in weights.items():
             val = float(value)
@@ -31,14 +32,15 @@ class DomainWeightedSampler:
         if not cleaned_weights:
             raise ValueError("domain_mix must include at least one positive weight")
 
-        missing = set(samples_by_domain) - set(cleaned_weights)
+        # accept zero weights but require the domain to be declared.
+        missing = set(samples_by_domain) - provided_domains
         if missing:
             missing_list = ", ".join(sorted(missing))
             raise ValueError(
                 "domain_mix is missing weights for dataset domains: " + missing_list
             )
 
-        unused = set(cleaned_weights) - set(samples_by_domain)
+        unused = provided_domains - set(samples_by_domain)
         if unused:
             unused_list = ", ".join(sorted(unused))
             raise ValueError(
