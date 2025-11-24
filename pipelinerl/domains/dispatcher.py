@@ -5,8 +5,8 @@ from typing import Awaitable, Callable, Iterable, Mapping
 
 import aiohttp
 from omegaconf import DictConfig
-from tapeagents.llms.trainable import TrainableLLM
 
+from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import RolloutResult
 from pipelinerl.utils import resolve_environment_key
 
