@@ -1,11 +1,9 @@
-from collections import defaultdict, deque
 import os
+from collections import defaultdict, deque
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
-import json
 import logging
-import multiprocessing as mp
 import queue
 import threading
 import time
@@ -13,7 +11,7 @@ from functools import partial
 from multiprocessing import Process, Queue
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
-from queue import Empty, Full
+from queue import Empty
 from typing import List
 
 import datasets
@@ -21,27 +19,25 @@ import transformers
 from litellm import BaseModel, Field
 
 from pipelinerl.finetune.logging_ import flatten_dict_config
-from pipelinerl.shared_memory_array import SharedMemoryArray, SharedMemoryQueue
-from pipelinerl.state import TrainerState
-from pipelinerl.utils import setup_logging, wait_for_inference_servers, init_wandb
-from pipelinerl.world import WorldMap
 from pipelinerl.finetune_loop import calculate_train_steps
+from pipelinerl.shared_memory_array import SharedMemoryQueue
+from pipelinerl.state import TrainerState
+from pipelinerl.utils import init_wandb, setup_logging, wait_for_inference_servers
+from pipelinerl.world import WorldMap
 
 datasets.disable_caching()
-from datasets.arrow_dataset import Dataset
-from datasets.fingerprint import Hasher
+import traceback
+
 from omegaconf import DictConfig
-from tapeagents.llms import TrainableLLM
 
 from pipelinerl.finetune.checkpoints import (
     load_tokenizer,
-    load_training_checkpoint,
 )
-from pipelinerl.finetune.types import PipelineBatchEncoding, TrainingMetrics
-from pipelinerl.finetune.data import preprocess_fn, collate, collate_packed
+from pipelinerl.finetune.data import collate, collate_packed, preprocess_fn
+from pipelinerl.finetune.rl import RLConfig, populate_rl_data
+from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.utils import create_sentinel_batch
-from pipelinerl.finetune.rl import RL_DATA_COLUMNS, RLConfig, populate_rl_data
-import traceback
+from pipelinerl.llm import TrainableLLM
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamRangeSpec,

@@ -2,17 +2,17 @@ import base64
 import io
 import logging
 import time
-from typing import Dict, Any
+from typing import Any, Dict
 
 import aiohttp
 from omegaconf import DictConfig
-from pydantic import BaseModel
 from PIL import Image
+from pydantic import BaseModel
 
-from pipelinerl.rollouts import RolloutResult, BaseMetrics
-from tapeagents.core import Prompt
-from tapeagents.llms.trainable import TrainableLLM
 from pipelinerl.async_llm import llm_async_generate, make_training_text
+from pipelinerl.llm import Prompt, TrainableLLM
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
+
 from .evaluation import evaluate_answer
 
 logger = logging.getLogger(__name__)

@@ -85,7 +85,7 @@ agent:
       Do not use any special characters or code. Do not use new lines, tabs, or any other formatting inside the JSON.
       Do not output anything besides one simple JSON object.
   nodes:
-    - _target_: examples.rl_webagent.agent.WebNode
+    - _target_: pipelinerl.domains.miniwob.agent.WebNode
       name: set_goal
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
@@ -100,7 +100,7 @@ agent:
         - tapeagents.steps.ReasoningThought
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
-    - _target_: examples.rl_webagent.agent.WebNode
+    - _target_: pipelinerl.domains.miniwob.agent.WebNode
       name: reflect
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
@@ -117,7 +117,7 @@ agent:
         - tapeagents.steps.ReasoningThought
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
-    - _target_: examples.rl_webagent.agent.WebNode
+    - _target_: pipelinerl.domains.miniwob.agent.WebNode
       name: act
       system_prompt: ${agent.templates.system_prompt}
       guidance: |
@@ -135,7 +135,7 @@ agent:
       steps_prompt: ${agent.templates.allowed_steps}
       use_known_actions: true
       steps:
-        - examples.rl_webagent.steps.FinalAnswerAction
+        - pipelinerl.domains.miniwob.steps.FinalAnswerAction
       trim_obs_except_last_n: 3  # keep the last 3 observations from the tape in prompt messages
       max_chars_page_observation: 3000  # keep up to 3000 chars in PageObservation steps
       next_node: reflect

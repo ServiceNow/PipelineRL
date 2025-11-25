@@ -14,6 +14,8 @@ from tapeagents.agent import DEFAULT, Agent
 from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
 from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
+from tapeagents.core import LLMOutputParsingFailureAction, Observation
+
 from tapeagents.orchestrator import async_execute_agent
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 from tapeagents.tools.simple_browser import PageObservation
@@ -21,6 +23,9 @@ from tapeagents.tools.simple_browser import PageObservation
 from pipelinerl.async_llm import make_training_text
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.world import Job
+from pipelinerl.llm import TrainableLLM, LLMCall
+
+from .steps import WebTape
 
 logger = logging.getLogger(__name__)
 
@@ -262,8 +267,7 @@ async def _execute_rollout_with_timeout(
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
     n_llm_calls = len(llm_calls)
     llm_calls: list[LLMCall] = [
-        LLMCall(**step.metadata.other["llm_call"])
-        if isinstance(step.metadata.other["llm_call"], dict)
+        LLMCall(**step.metadata.other["llm_call"]) if isinstance(step.metadata.other["llm_call"], dict)
         else step.metadata.other["llm_call"]
         for step in llm_calls
     ]

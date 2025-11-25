@@ -5,8 +5,7 @@ import logging
 import aiohttp
 import numpy as np
 from PIL import Image
-from tapeagents.core import LLMCall, LLMOutput, Prompt, TokenLogprob
-from tapeagents.llms.trainable import TrainableLLM
+from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
 
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from pipelinerl.rollouts import TrainingText
@@ -54,7 +53,6 @@ async def llm_async_generate(
     data = {
         "model": llm.model_name,
         "messages": prompt.messages,
-        "stream": llm.stream,
     }
     if llm.collect_logprobs:
         data.update(
