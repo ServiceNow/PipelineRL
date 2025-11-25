@@ -274,7 +274,6 @@ def rl_step(
     match config.policy_loss:
         case "ppo":
             surr1 = ratio_new_old * log_p_weights
-            assert config.epsilon_low == config.epsilon_high, "PPO requires epsilon_low == epsilon_high"
             clamped_ratio = torch.clamp(ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = clamped_ratio != ratio_new_old
             surr2 = clamped_ratio * log_p_weights
