@@ -274,6 +274,10 @@ def rl_step(
     match config.policy_loss:
         case "ppo":
             surr1 = ratio_new_old * log_p_weights
+            if config.epsilon_low != config.epsilon_high:
+                logger.warning(
+                    "Asymmetric clipping in PPO is not standard and may lead to unexpected behavior."
+                )
             clamped_ratio = torch.clamp(ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = clamped_ratio != ratio_new_old
             surr2 = clamped_ratio * log_p_weights
