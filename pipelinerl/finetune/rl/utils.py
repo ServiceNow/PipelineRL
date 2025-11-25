@@ -60,9 +60,10 @@ def mean_sum(values: torch.Tensor, masks: torch.Tensor, segments: list | None):
     if segments and not is_sentinel_batch:
         # the values are seq packed, we drop the first dimension
         assert values.shape[0] == 1, "seq packed samples must have dimension 0 of 1"
-        masked_sums = torch.stack([mask_sum(values[0, start:end], masks[0, start:end]) for start, end in segments])
-        masked_counts = torch.stack([masks[0, start:end].sum() for start, end in segments])
-        return (masked_sums / masked_counts).sum()
+        masked_means = torch.stack(
+            [mask_mean(values[0, start:end], masks[0, start:end]) for start, end in segments]
+        )
+        return masked_means.sum()
     else:
         return mask_mean(values, masks, -1).sum()
 
