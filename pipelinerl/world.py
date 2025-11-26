@@ -32,10 +32,6 @@ class Job(BaseModel):
     environment_index: int | None = None
 
 
-# Import after Job is defined to avoid circular import with utils.py
-from pipelinerl.utils import collect_environment_specs  # noqa: E402
-
-
 class WorldMap:
     def __init__(self, cfg: DictConfig, verbose: bool = False):
         self._log_info = logger.info if verbose else lambda x: None
@@ -79,6 +75,8 @@ class WorldMap:
         if place_inference_jobs:
             self._place_inference_jobs(cfg)
         self._place_pipeline_stages(cfg)
+        # Lazy import to avoid circular dependency with utils.py
+        from pipelinerl.utils import collect_environment_specs
         self.environment_specs = collect_environment_specs(cfg)
         if any(spec["mode"] == "remote" for spec in self.environment_specs):
             self._place_environments(cfg, self.environment_specs)
