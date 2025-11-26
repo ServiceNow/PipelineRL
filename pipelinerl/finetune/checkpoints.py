@@ -129,6 +129,39 @@ def load_model(args, model_class, current_dir):
             gradient_checkpointing_kwargs={"use_reentrant": args.reentrant_checkpointing}
         )
 
+    # Freeze vision tower if specified
+    freeze_vision_tower = getattr(args, "freeze_vision_tower", False)
+    if freeze_vision_tower:
+        # Try to get vision tower module from the model
+        vision_tower = None
+        if hasattr(model, "visual"):
+            vision_tower = model.visual  # Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL
+        elif hasattr(model, "vision_tower"):
+            vision_tower = model.vision_tower  # LLaVA
+        elif hasattr(model, "vision_model"):
+            vision_tower = model.vision_model  # BLIP-2, InstructBLIP
+
+        if vision_tower is not None:
+            vision_tower.requires_grad_(False)
+
+            # Count frozen parameters
+            total_params = sum(p.numel() for p in model.parameters())
+            frozen_params = sum(p.numel() for p in vision_tower.parameters())
+            trainable_params = total_params - frozen_params
+
+            logger.info(
+                f"Vision tower frozen: {frozen_params:,} params | "
+                f"Trainable: {trainable_params:,} params | "
+                f"Total: {total_params:,} params | "
+                f"Trainable%: {trainable_params / total_params:.2%}"
+            )
+        else:
+            logger.warning(
+                "freeze_vision_tower=True but could not find vision tower. "
+                "Checked attributes: model.visual (Qwen*-VL), model.vision_tower (LlaVA), model.vision_model (BLIP-2, InstructBLIP). "
+                "So setting this parameter does not have any effect."
+            )
+
     get_accelerator().wait_for_everyone()
     return model
 

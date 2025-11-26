@@ -4,11 +4,7 @@ model_class: causal-language-modeling
 # Model name or path of model to be trained.
 config_name: ${..model_path}
 # Freeze vision tower for vision-language models (only applicable for vision2seq-language-modeling)
-# Auto-detects common patterns: visual., vision_tower., vision_model., vision_embed_tokens., vit., qformer.
 freeze_vision_tower: false
-# Optional: Manually specify parameter prefixes to freeze (e.g., ["visual.", "qformer."])
-# If null, auto-detection will be used when freeze_vision_tower=true
-vision_encoder_prefixes: null
 # Optimizer type, supported: adamw_torch, adafactor, cpuadam, lion
 optim: adamw_torch
 # use half precision training, full bf16 without mixed precision copies at all
