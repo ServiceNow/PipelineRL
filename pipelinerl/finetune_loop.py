@@ -352,6 +352,57 @@ def run_finetuning_loop(
     model = load_model(args, args.model_class, current_dir)
     logger.info(f"Model loaded in dtype {model.dtype}")
 
+    # Freeze vision tower if specified
+    freeze_vision_tower = getattr(args, "freeze_vision_tower", False)
+    vision_encoder_prefixes = getattr(args, "vision_encoder_prefixes", None)
+
+    if freeze_vision_tower:
+        # Auto-detect common vision encoder patterns if not specified
+        if vision_encoder_prefixes is None:
+            common_prefixes = [
+                "visual.",              # Qwen-VL, Qwen2-VL
+                "vision_tower.",        # LLaVA
+                "vision_model.",        # InstructBLIP, BLIP-2
+                "vision_embed_tokens.", # Phi-3-Vision
+                "vit.",                 # CogVLM
+                "qformer.",             # BLIP-2 Q-Former
+            ]
+            vision_encoder_prefixes = common_prefixes
+
+        vision_encoder_parameters = set()
+
+        # Check which prefixes exist in the model
+        for prefix in common_prefixes:
+            if any(name.startswith(prefix) for name, _ in model.named_parameters()):
+                vision_encoder_parameters.add(prefix)
+
+        if not vision_encoder_parameters:
+            logger.warning(
+                "freeze_vision_tower=True but could not auto-detect vision encoder. "
+                "No parameters matching common patterns: " + ", ".join(common_prefixes) + ". "
+                "Set 'vision_encoder_prefixes' in config to specify manually."
+            )
+        else:
+            logger.debug(f"Freezing vision encoder with prefixes: {vision_encoder_prefixes}")
+            total_params = 0
+            frozen_params = 0
+            frozen_param_names = []
+
+            for name, param in model.named_parameters():
+                total_params += param.numel()
+                if name in vision_encoder_parameters:
+                    param.requires_grad = False
+                    frozen_params += param.numel()
+                    frozen_param_names.append(name)
+
+            trainable_params = total_params - frozen_params
+            logger.info(
+                f"Frozen vision encoder: {frozen_params:,} params | "
+                f"Trainable: {trainable_params:,} params | "
+                f"Total: {total_params:,} params | "
+                f"Trainable%: {100 * trainable_params / total_params:.2f}%"
+            )
+
     dt = log_time(dt, time_stats, "finetune/model_load")
 
     data_stream = SingleStreamSpec(
