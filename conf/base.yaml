@@ -1,5 +1,5 @@
 defaults:
-  - finetune: actor_critic
+  - finetune: base
   - rewards: pure_success
   - streams: files
   - domain_mix: null

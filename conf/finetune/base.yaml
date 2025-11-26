@@ -96,7 +96,8 @@ rl:
   final_kl_coef: ${..rl.kl_coef} 
   entropy_bonus: 0.0
   reward_minus_kl_coef: 0.0
-  epsilon: 4
+  epsilon_low: 2e-2
+  epsilon_high: 2e-2
   use_advantages: true
   relu_log_p_weights: false
   clamp_log_ratio_ref_new_value: 5

@@ -96,6 +96,7 @@ async def llm_async_generate(
             logger.warning(f"Empty completion {data}")
 
         parsed_logprobs = []
+        finish_reason = None
         if llm.collect_logprobs:
             completion_logprobs = data["choices"][0]["logprobs"]["content"]
             for logprob in completion_logprobs:
