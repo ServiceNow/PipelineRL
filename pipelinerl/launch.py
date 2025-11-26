@@ -159,6 +159,10 @@ def run_actor_llm(
         str(world_map.weight_update_group_size),
     ]
 
+    # Add quantization if specified
+    if cfg.vllm_config.get("quantization"):
+        cmd.extend(["--quantization", cfg.vllm_config.quantization])
+
     # Add vLLM kwargs as separate arguments
     if cfg.vllm_config.vllm_kwargs:
         for k, v in cfg.vllm_config.vllm_kwargs.items():
