@@ -76,7 +76,7 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
-    payload = OmegaConf.to_object({**data, **extra_parameters}, resolve=True)
+    payload = {**data, **extra_parameters}
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
         json=payload,
