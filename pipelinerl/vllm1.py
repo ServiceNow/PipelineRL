@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from pipelinerl.finetune_loop import WeightUpdateRequest
 from typing import Any, Protocol, runtime_checkable
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign
@@ -91,6 +92,7 @@ class WorkerExtension:
             loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
             if len(loaded_params) != 1:
                 raise ValueError(f"model {info.name} not found in model state dict")
+        pipelinerl.vllm_quantization.invalidate_fp32_cache()
         logger.info("Weight update received")
 
 
