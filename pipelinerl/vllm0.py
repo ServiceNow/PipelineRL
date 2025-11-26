@@ -36,6 +36,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 import torch.distributed as dist
 from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign
@@ -95,6 +96,7 @@ def make_worker_class(multi_step: bool):
                     loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])
                 if len(loaded_params) != 1:
                     raise ValueError(f"model {info.name} not found in model state dict")
+            pipelinerl.vllm_quantization.invalidate_fp32_cache()
             logger.info("Weight update received")
 
     return NewWorkerClass
