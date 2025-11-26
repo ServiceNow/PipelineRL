@@ -54,6 +54,8 @@ test_llm:
 
 vllm_config:
   use_v1: false
+  # Set to bf16_last_layer_fp32 for FP32 lm_head precision
+  quantization: null
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
