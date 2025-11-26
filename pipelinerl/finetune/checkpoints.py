@@ -149,12 +149,18 @@ def load_model(args, model_class, current_dir):
             frozen_params = sum(p.numel() for p in vision_tower.parameters())
             trainable_params = total_params - frozen_params
 
-            logger.info(
-                f"Vision tower frozen: {frozen_params:,} params | "
-                f"Trainable: {trainable_params:,} params | "
-                f"Total: {total_params:,} params | "
-                f"Trainable%: {trainable_params / total_params:.2%}"
-            )
+            if total_params > 0:
+                logger.info(
+                    f"Vision tower frozen: {frozen_params:,} params | "
+                    f"Trainable: {trainable_params:,} params | "
+                    f"Total: {total_params:,} params | "
+                    f"Trainable%: {trainable_params / total_params:.2%}"
+                )
+            else:
+                logger.warning(
+                    "Total parameters is 0, cannot compute trainable percentage. "
+                    "This indicates freeze_vision_tower may not have been applied correctly or the model has a different structure than expected."
+                )
         else:
             logger.warning(
                 "freeze_vision_tower=True but could not find vision tower. "
