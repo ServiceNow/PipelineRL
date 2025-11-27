@@ -78,6 +78,18 @@ def validate_config(cfg: DictConfig):
         if not hasattr(cfg.finetune.rl, "value_loss_coef") or cfg.finetune.rl.value_loss_coef <= 0.0:
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
 
+    # Check for asymmetric PPO clipping
+    if cfg.finetune.rl.policy_loss == "ppo" and cfg.finetune.rl.epsilon_low != cfg.finetune.rl.epsilon_high:
+        if cfg.finetune.model_class == "causal-language-modeling-with-value-head":
+            logger.warning(
+                "Asymmetric clipping with value head has not been tested and it may lead to unexpected behavior. "
+                "It was recommended in DAPO (https://arxiv.org/abs/2503.14476) for GRPO (PPO without value head and group_size > 1)."
+            )
+        else:
+            logger.warning(
+                "Using asymmetric clipping. Note: this was recommended in DAPO (https://arxiv.org/abs/2503.14476) for GRPO."
+            )
+
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
     kwargs = cfg.vllm_config.vllm_kwargs
