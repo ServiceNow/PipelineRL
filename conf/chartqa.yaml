@@ -52,3 +52,4 @@ vllm_config:
   vllm_kwargs:
     max-num-seqs: 64
     max-num-batched-tokens: 32768
+    mm-processor-kwargs: '{"min_pixels": 784, "max_pixels": 1003520, "use_fast": true}' # 28*28 to 1280*28*28
