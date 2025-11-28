@@ -19,7 +19,8 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
-  async_batch_size: 4
+  async_batch_size: 1 # if ==1, rollout function will be called as synchronous
+  task_submission_delay_sec: 0.5
   collect_logprobs: true
 
 environment: null
