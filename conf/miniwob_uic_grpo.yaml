@@ -1,14 +1,14 @@
 defaults:
-  - miniwob
+  - miniwob_grpo
   - _self_
 
 train_dataset_names:
-  - massimo_train
+  - uic_train
 test_dataset_names:
-  - massimo_train_heldout_goals
-  - massimo_test
+  - uic_train_train_heldout_goals
+  - uic_test
 
-reward_computation: massimo
+reward_computation: uic
 
 finetune:
   gradient_accumulation_passes: 512

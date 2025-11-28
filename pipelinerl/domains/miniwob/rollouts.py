@@ -14,16 +14,14 @@ from tapeagents.agent import DEFAULT, Agent
 from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
 from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
-from tapeagents.core import LLMOutputParsingFailureAction, Observation
-
 from tapeagents.orchestrator import async_execute_agent
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 from tapeagents.tools.simple_browser import PageObservation
 
 from pipelinerl.async_llm import make_training_text
+from pipelinerl.llm import LLMCall, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.world import Job
-from pipelinerl.llm import TrainableLLM, LLMCall
 
 from .steps import WebTape
 
@@ -255,7 +253,7 @@ async def _execute_rollout_with_timeout(
 
     if cfg.reward_computation == "nico":
         reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
-    elif cfg.reward_computation == "massimo":
+    elif cfg.reward_computation == "uic":
         reward = float(raw_reward>0)
         if reward == 0.0:
             reward = -1.0
