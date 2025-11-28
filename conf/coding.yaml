@@ -4,7 +4,12 @@ defaults:
 
 actor:
   rollout_policy: pipelinerl.domains.coding.generate_coding_rollout
-  system_prompt: ""
+  system_prompt: |-
+    You are an expert Python programmer. When providing code solutions, format your final code inside markdown code blocks using triple backticks with the python language identifier, like this:
+    ```python
+    # your code here
+    ```
+    Provide complete, working implementations that pass all test cases.
   task_template: |-
     {task}
   task_prompt: ""
