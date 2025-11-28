@@ -157,7 +157,19 @@ def preprocess_dataset(
         entry["step_index"] = entry["metadata"]["step_index"]
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
-    dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    try:
+        dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    except Exception as e:
+        logger.error(f"Error in populate_rl_data: {e}", extra={
+            "data": data,
+            "dataset": dataset,
+            "tokenizer": tokenizer,
+            "eos_token_id": tokenizer.eos_token_id,
+            "rl_config": rl_config,
+            "llm": llm,
+            "seq_length": seq_length,
+        })
+        raise
     return dataset
 
 

@@ -78,6 +78,13 @@ def validate_config(cfg: DictConfig):
         if not hasattr(cfg.finetune.rl, "value_loss_coef") or cfg.finetune.rl.value_loss_coef <= 0.0:
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
 
+    # Check that model being tuned to the max length accepted by inference
+    if cfg.finetune.seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
+        raise ValueError(
+            f"seq_length {cfg.finetune.seq_length} must be greater than or equal to "
+            f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
+        )
+
     # Check for asymmetric PPO clipping
     if cfg.finetune.rl.policy_loss == "ppo" and cfg.finetune.rl.epsilon_low != cfg.finetune.rl.epsilon_high:
         if cfg.finetune.model_class == "causal-language-modeling-with-value-head":
