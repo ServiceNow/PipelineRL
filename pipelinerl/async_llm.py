@@ -10,6 +10,7 @@ from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLL
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from pipelinerl.rollouts import TrainingText
 from pipelinerl.processor_factory import get_processor
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,18 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     return images
 
 
+def _to_plain_obj(value):
+    """convert OmegaConf containers into Python types"""
+
+    if isinstance(value, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        return {key: _to_plain_obj(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_obj(item) for item in value]
+    return value
+
+
 async def llm_async_generate(
     llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
 ) -> LLMCall:
@@ -63,11 +76,22 @@ async def llm_async_generate(
             }
         )
 
+    extra_parameters = llm.parameters
+    if isinstance(extra_parameters, (DictConfig, ListConfig)):
+        extra_parameters = OmegaConf.to_container(extra_parameters, resolve=True)
+    if extra_parameters is None:
+        extra_parameters = {}
+    if not isinstance(extra_parameters, dict):
+        raise TypeError(
+            f"LLM parameters must serialize to a mapping, got {type(extra_parameters)}"
+        )
+
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
+    payload = _to_plain_obj({**data, **extra_parameters})
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
-        json=data | llm.parameters,
+        json=payload,
         headers=headers,
         ssl=False,
     ) as response:
@@ -83,6 +107,7 @@ async def llm_async_generate(
             logger.warning(f"Empty completion {data}")
 
         parsed_logprobs = []
+        finish_reason = None
         if llm.collect_logprobs:
             completion_logprobs = data["choices"][0]["logprobs"]["content"]
             for logprob in completion_logprobs:
@@ -100,6 +125,7 @@ async def llm_async_generate(
                     except Exception as e:
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
+        finish_reason = data["choices"][0].get("finish_reason")
     except Exception as e:
         logger.exception(f"Failed to parse llm response: {data}")
         raise e
@@ -108,6 +134,8 @@ async def llm_async_generate(
     llm_call = llm.log_output(prompt, output, count_tokens=False)
     llm_call.prompt_length_tokens = data["usage"]["prompt_tokens"]
     llm_call.output_length_tokens = data["usage"]["completion_tokens"]
+    if finish_reason:
+        llm_call.llm_info["finish_reason"] = finish_reason
     assert llm_call is not None, "llm_call is None"
     llm_call.logprobs = parsed_logprobs
     return llm_call
@@ -204,7 +232,12 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
     logprobs = [lp.logprob for lp in llm_call.logprobs]
-    finished = llm_call.output.content.endswith(tokenizer.eos_token)
+    finish_reason = llm_call.llm_info.get("finish_reason")
+    if finish_reason is not None:
+        finished = finish_reason != "length"
+    else:
+        eos_token = tokenizer.eos_token or ""
+        finished = bool(eos_token) and llm_call.output.content.endswith(eos_token)
     prompt_tokens = llm_call.prompt_length_tokens
     output_tokens = llm_call.output_length_tokens
 
