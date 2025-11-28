@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, TextIO
 
@@ -24,6 +25,12 @@ os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
+
+@dataclass
+class LaunchedProcess:
+    kind: str
+    handle: subprocess.Popen
 
 def _popen(
     cmd: list[str],
@@ -70,12 +77,24 @@ def validate_config(cfg: DictConfig):
         if not hasattr(cfg.finetune.rl, "value_loss_coef") or cfg.finetune.rl.value_loss_coef <= 0.0:
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
 
+    # Check that model being tuned to the max length accepted by inference
     if cfg.finetune.seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
         raise ValueError(
             f"seq_length {cfg.finetune.seq_length} must be greater than or equal to "
             f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
         )
 
+    # Check for asymmetric PPO clipping
+    if cfg.finetune.rl.policy_loss == "ppo" and cfg.finetune.rl.epsilon_low != cfg.finetune.rl.epsilon_high:
+        if cfg.finetune.model_class == "causal-language-modeling-with-value-head":
+            logger.warning(
+                "Asymmetric clipping with value head has not been tested and it may lead to unexpected behavior. "
+                "It was recommended in DAPO (https://arxiv.org/abs/2503.14476) for GRPO (PPO without value head and group_size > 1)."
+            )
+        else:
+            logger.warning(
+                "Using asymmetric clipping. Note: this was recommended in DAPO (https://arxiv.org/abs/2503.14476) for GRPO."
+            )
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
@@ -111,12 +130,14 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
-        yield _popen(
+        proc = _popen(
             cmd,
             env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
             stdout=log_file,
             stderr=err_file,
         )
+    if proc is not None:
+        yield LaunchedProcess(kind="preprocessor_llm", handle=proc)
 
 
 def run_actor_llm(
@@ -195,12 +216,14 @@ def run_actor_llm(
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
-        yield _popen(
+        proc = _popen(
             cmd,
             env={**env, "CUDA_VISIBLE_DEVICES": gpu_str},
             stdout=log_file,
             stderr=err_file,
         )
+    if proc is not None:
+        yield LaunchedProcess(kind="actor_llm", handle=proc)
 
 
 def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
@@ -221,10 +244,12 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     ]
     logger.info(f"Running actor with command: {' '.join(cmd)}")
     save_command(exp_dir / "actor", cmd)
-    yield _popen(
+    proc = _popen(
         cmd,
         env=dict(os.environ),
     )
+    if proc is not None:
+        yield LaunchedProcess(kind="actor", handle=proc)
 
 
 def run_environment(cfg: DictConfig, job: Job):
@@ -248,12 +273,14 @@ def run_environment(cfg: DictConfig, job: Job):
     log_file_path = str(run_dir / "stdout.log")
     err_file_path = str(run_dir / "stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
-        yield _popen(
+        proc = _popen(
             cmd,
             env=dict(os.environ),
             stdout=log_file,
             stderr=err_file,
         )
+    if proc is not None:
+        yield LaunchedProcess(kind="environment", handle=proc)
 
 
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
@@ -347,7 +374,9 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     save_command(exp_dir / "finetune", cmd)
     env = dict(os.environ)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
-    yield _popen(cmd, env=env)
+    proc = _popen(cmd, env=env)
+    if proc is not None:
+        yield LaunchedProcess(kind="finetune", handle=proc)
 
 
 def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
@@ -368,10 +397,12 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
     ]
     logger.info(f"Running preprocess with command: {' '.join(cmd)}")
     save_command(exp_dir / "preprocess", cmd)
-    yield _popen(
+    proc = _popen(
         cmd,
         env=dict(os.environ),
     )
+    if proc is not None:
+        yield LaunchedProcess(kind="preprocessor", handle=proc)
 
 
 def run_redis(cfg: DictConfig):
@@ -391,7 +422,9 @@ def run_redis(cfg: DictConfig):
     ]
     logger.info(f"Running redis with command: {' '.join(cmd)}")
     save_command(Path(cfg.output_dir) / "redis", cmd)
-    yield _popen(cmd, env=dict(os.environ))
+    proc = _popen(cmd, env=dict(os.environ))
+    if proc is not None:
+        yield LaunchedProcess(kind="redis", handle=proc)
 
 
 def save_command(script_dir: Path, cmd, env: dict | None = None):
@@ -436,7 +469,11 @@ def clean_up(exp_dir, force_restart):
                 pass
 
 
-def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], debug_mode: bool = False):
+def is_inference_process(proc: LaunchedProcess) -> bool:
+    return proc.kind in {"actor_llm", "preprocessor_llm"}
+
+
+def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False):
     if not debug_mode:
         trainer_state = TrainerState(exp_path)
         trainer_state.start_listening()
@@ -448,8 +485,8 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
         logger.info("\nShutting down processes...")
         # Terminate all running processes
         for proc in processes:
-            logger.info(f"Terminating {proc.args}")
-            terminate_with_children(proc.pid)
+            logger.info(f"Terminating {proc.handle.args}")
+            terminate_with_children(proc.handle.pid)
 
     logger.info("I have launched everyone, waiting for them to finish...")
 
@@ -458,14 +495,35 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
 
     try:
         # Wait for all processes to complete
-        # if just one dies, stop all
-        while True:
-            for proc in processes:
-                if (return_code := proc.poll()) is not None:
-                    # print which process terminate and with what code
-                    logger.error(f"Process {proc.args} terminated with code {proc.returncode}")
+        # if just one dies non-zero, stop all
+        alive = list(processes)
+        logger.info(f"Starting process monitoring with {len(alive)} processes: {[proc.kind for proc in alive]}")
+        while alive:
+            for proc in list(alive):
+                return_code = proc.handle.poll()
+                if return_code is None:
+                    continue
+                if return_code != 0:
+                    logger.error(f"Process {proc.handle.args} terminated with code {return_code}")
                     gently_stop_all_processes()
                     sys.exit(1)
+                logger.info(f"Process {proc.handle.args} finished cleanly")
+                alive.remove(proc)
+            if alive and all(is_inference_process(proc) for proc in alive):
+                # shut down inference servers after training is complete
+                if trainer_state is not None and not trainer_state.training_done:
+                    # check if training is completed
+                    logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
+                    trainer_state.wait_for_training_done(timeout=5.0)
+                    continue
+                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} inference server(s)")
+                for proc in list(alive):
+                    logger.info(f"Terminating inference server {proc.handle.args}")
+                    terminate_with_children(proc.handle.pid)
+                for proc in list(alive):
+                    proc.handle.wait()
+                    logger.info(f"Inference server {proc.handle.args} stopped")
+                    alive.remove(proc)
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
             #     and (version := trainer_state.propagated_weight_version is not None)

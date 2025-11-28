@@ -1,4 +1,5 @@
 import random
+
 from browsergym.miniwob import ALL_MINIWOB_TASKS
 
 DEBUG_SPLIT = [
@@ -34,7 +35,7 @@ EASY_SPLIT = [
     "miniwob.tic-tac-toe",
     "miniwob.use-autocomplete-nodelay"
 ]
-MASSIMO_TRAIN_SPLIT = [
+UIC_TRAIN_SPLIT = [
     "miniwob.ascending-numbers",
     "miniwob.bisect-angle",
     "miniwob.book-flight",
@@ -135,7 +136,7 @@ MASSIMO_TRAIN_SPLIT = [
     "miniwob.use-spinner",
     "miniwob.visual-addition",
 ]
-MASSIMO_TEST_SPLIT = [
+UIC_TEST_SPLIT = [
     "miniwob.buy-ticket",
     "miniwob.click-button",
     "miniwob.click-option",
@@ -182,40 +183,36 @@ def load_tasks(dataset_names: list[str], train_split: float = 0.6, seeds: list[i
     for name in dataset_names:
         if name == "debug":
             tasks.extend([
-                # {"dataset": "miniwob.debug", "task": task, "seed": 0} for task in DEBUG_SPLIT
-                {"dataset": task, "task": task, "seed": 0} for task in DEBUG_SPLIT
+                {"dataset": "miniwob.debug", "task": task, "seed": 0} for task in DEBUG_SPLIT
             ])
         elif name == "easy":
             tasks.extend([
-                # {"dataset": "miniwob.easy", "task": task, "seed": 0} for task in EASY_SPLIT
-                {"dataset": task, "task": task, "seed": 0} for task in EASY_SPLIT
+                {"dataset": "miniwob.easy", "task": task, "seed": 0} for task in EASY_SPLIT
             ])
         elif name == "train":
             tasks.extend([
-                # {"dataset": "miniwob.train", "task": task, "seed": seed}
-                {"dataset": task, "task": task, "seed": seed}
+                {"dataset": "miniwob.train", "task": task, "seed": seed}
                 for task in TRAIN_SPLIT for seed in seeds
             ])
         elif name == "test":
             tasks.extend([
-                # {"dataset": "miniwob.test", "task": task, "seed": seed}
-                {"dataset": task, "task": task, "seed": seed}
+                {"dataset": "miniwob.test", "task": task, "seed": seed}
                 for task in TEST_SPLIT for seed in seeds
             ])
-        elif name == "massimo_train":
+        elif name == "uic_train":
             tasks.extend([
-                {"dataset": task, "task": task, "seed": seed}
-                for task in MASSIMO_TRAIN_SPLIT for seed in range(3,10)  # seeds 0-2 are used for held out goals in Mass setup
+                {"dataset": "miniwob.uic_train", "task": task, "seed": seed}
+                for task in UIC_TRAIN_SPLIT for seed in range(3,10)  # seeds 0-2 are used for held out goals in Mass setup
             ])
-        elif name == "massimo_train_heldout_goals":
+        elif name == "uic_train_heldout_goals":
             tasks.extend([
-                {"dataset": task, "task": task, "seed": seed}
-                for task in MASSIMO_TRAIN_SPLIT for seed in range(3)  # seeds 0-2 are used for held out goals in Mass setup
+                {"dataset": "miniwob.uic_train_heldout_goals", "task": task, "seed": seed}
+                for task in UIC_TRAIN_SPLIT for seed in range(3)  # seeds 0-2 are used for held out goals in Mass setup
             ])
-        elif name == "massimo_test":
+        elif name == "uic_test":
             tasks.extend([
-                {"dataset": task, "task": task, "seed": seed}
-                for task in MASSIMO_TEST_SPLIT for seed in range(10)
+                {"dataset": "miniwob.uic_test", "task": task, "seed": seed}
+                for task in UIC_TEST_SPLIT for seed in range(10)
             ])
     return tasks
 

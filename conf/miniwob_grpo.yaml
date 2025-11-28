@@ -5,6 +5,6 @@ defaults:
 
 finetune:
   seq_length: 16384  # input + output tokens
-  max_train_steps: 5000  # 1000 optim steps = 1000 * bs samples
+  max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
   train_batch_size: 1
   gradient_accumulation_passes: 1024

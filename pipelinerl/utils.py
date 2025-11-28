@@ -15,8 +15,7 @@ from importlib.metadata import distributions
 from transformers import PreTrainedTokenizer
 
 from pipelinerl.world import Job
-from tapeagents.llms import LLMOutput
-from tapeagents.core import Prompt
+from pipelinerl.llm import LLMOutput, Prompt
 
 import wandb
 from wandb.sdk import wandb_run

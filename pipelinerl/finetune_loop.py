@@ -87,8 +87,6 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
     return aggregated_metrics
 
 
-
-
 def run_data_loader(
     data_stream: SingleStreamSpec,
     batch_queue: Queue[PipelineBatchEncoding | Exception],
@@ -137,13 +135,19 @@ class WeightUpdateSuccess(BaseModel):
     version: int
     timestamp: float = time.time()
 
- 
+
 class SamplesProcessed(BaseModel):
     kind: Literal["samples_processed"] = "samples_processed"
     samples_processed: int
     timestamp: float = time.time()
 
-TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | SamplesProcessed
+
+class TrainingDone(BaseModel):
+    kind: Literal["training_done"] = "training_done"
+    timestamp: float = time.time()
+
+
+TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | SamplesProcessed | TrainingDone
 
 
 class WeightUpdateManager:
@@ -153,6 +157,7 @@ class WeightUpdateManager:
         self.update_stream = update_stream
         self.actor_update_group = actor_update_group
         self.thread_pool = ThreadPoolExecutor(max_workers=len(llm_urls))
+        self._shutdown = False
 
     def _request_weight_update(self, url: str, message: WeightUpdateRequest):
         response = None
@@ -170,6 +175,11 @@ class WeightUpdateManager:
         for url in self.llm_urls:
             futures.append(self.thread_pool.submit(self._request_weight_update, url, message))
         return futures
+
+    def shutdown(self):
+        if not self._shutdown:
+            self.thread_pool.shutdown(wait=True)
+            self._shutdown = True
 
     def send_weight_update(
         self,
@@ -449,7 +459,7 @@ def run_finetuning_loop(
         data_stream=data_stream,
         batch_queue=batch_queue,
     )
-    data_loader_thread = threading.Thread(target=data_loader_worker_fn, args=())
+    data_loader_thread = threading.Thread(target=data_loader_worker_fn, args=(), daemon=True)
 
     get_accelerator().wait_for_everyone()
     model.train()
@@ -482,6 +492,8 @@ def run_finetuning_loop(
             seq_parallel_group, 
         )
     finally:
+        if weight_update_manager is not None:
+            weight_update_manager.shutdown()
         if actor_update_group:
             dist.destroy_process_group(actor_update_group)
         raise RuntimeError("Finetuning loop finished, exiting worker thread")
@@ -535,6 +547,11 @@ def rl_finetuning_worker(
     final_train_steps = calculate_train_steps(args, args.interrupt_train_steps)
     if training_metrics.completed_steps == final_train_steps:
         logger.info("Training is already completed")
+        # need to inform inference servers even if training was already completed
+        if get_accelerator().is_main_process:
+            logger.info("Signaling training completion to inference servers...")
+            with write_to_streams(weight_update_stream) as writer:
+                writer.write(TrainingDone())
         return
 
     first_pass = True
@@ -637,12 +654,15 @@ def rl_finetuning_worker(
                 model.set_gradient_accumulation_boundary(True)
                 model.step()
                 grad_norm = model.get_global_grad_norm() if hasattr(model, "get_global_grad_norm") else None
-                if isinstance(training_metrics.grad_norm, torch.Tensor):
+                if isinstance(grad_norm, torch.Tensor):
                     grad_norm = grad_norm.item()
                 training_metrics.grad_norm = grad_norm if grad_norm is not None else -1.0
             else:
                 max_grad_norm = args.get("gradient_clipping_threshold", None)
-                training_metrics.grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
+                grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), max_grad_norm)
+                if isinstance(grad_norm, torch.Tensor):
+                    grad_norm = grad_norm.item()
+                training_metrics.grad_norm = grad_norm
                 optimizer.step()
                 optimizer.zero_grad()
         
@@ -661,7 +681,12 @@ def rl_finetuning_worker(
                 assert batch.seq_boundaries is not None
                 update_ring_flash_attn_params(batch.seq_boundaries, seq_parallel_group)
             loss, this_step_rl_metrics = rl_step(
-                model, batch, training_metrics.completed_steps, final_train_steps, rl_config
+                model,
+                batch,
+                training_metrics.completed_steps,
+                final_train_steps,
+                rl_config,
+                seq_parallel_group=seq_parallel_group,
             )
             if is_sentinel_batch:
                 # zero out the loss and do not update the metrics
@@ -864,6 +889,11 @@ def rl_finetuning_worker(
             json.dump(asdict(training_metrics), wf, indent=4, sort_keys=True)
         with open(output_dir / "rl_summary.json", "w") as wf:
             json.dump(rl_metrics, wf, indent=4, sort_keys=True)
+
+        # notify inference nodes that training is finished
+        logger.info("Signaling training completion to inference servers...")
+        with write_to_streams(weight_update_stream) as writer:
+            writer.write(TrainingDone())
 
     torch.cuda.empty_cache()
 

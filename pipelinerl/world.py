@@ -1,9 +1,9 @@
 import logging
 import os
-from typing import Literal
-from pydantic import BaseModel
-from omegaconf import DictConfig
+
 import torch
+from omegaconf import DictConfig
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -188,10 +188,7 @@ class WorldMap:
             self.add_job(kind="preprocessor", replica_idx=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
 
     def _place_environments(self, cfg):
-        # Scale environment servers to be the same as llm servers
-        env_replicas_per_actor = getattr(cfg.world, "env_replicas_per_actor", 1)
-        total_env_replicas = cfg.world.replicas * self.llms_per_actor * env_replicas_per_actor
-        for worker_idx in range(total_env_replicas):
+        for worker_idx in range(cfg.world.env_replicas):
             node = self.get_least_busy_node()
             envs_at_node = len([job for job in self.job_map[node] if job.kind == "environment"])
             self.add_job(

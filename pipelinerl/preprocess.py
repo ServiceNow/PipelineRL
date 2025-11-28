@@ -1,11 +1,9 @@
-from collections import defaultdict, deque
 import os
+from collections import defaultdict, deque
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
-import json
 import logging
-import multiprocessing as mp
 import queue
 import threading
 import time
@@ -13,7 +11,7 @@ from functools import partial
 from multiprocessing import Process, Queue
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
-from queue import Empty, Full
+from queue import Empty
 from typing import List
 
 import datasets
@@ -21,26 +19,25 @@ import transformers
 from litellm import BaseModel, Field
 
 from pipelinerl.finetune.logging_ import flatten_dict_config
-from pipelinerl.shared_memory_array import SharedMemoryArray, SharedMemoryQueue
+from pipelinerl.finetune_loop import calculate_train_steps
+from pipelinerl.shared_memory_array import SharedMemoryQueue
 from pipelinerl.state import TrainerState
-from pipelinerl.utils import setup_logging, wait_for_inference_servers, init_wandb
+from pipelinerl.utils import init_wandb, setup_logging, wait_for_inference_servers
 from pipelinerl.world import WorldMap
 
 datasets.disable_caching()
-from datasets.arrow_dataset import Dataset
-from datasets.fingerprint import Hasher
+import traceback
+
 from omegaconf import DictConfig
-from tapeagents.llms import TrainableLLM
 
 from pipelinerl.finetune.checkpoints import (
     load_tokenizer,
-    load_training_checkpoint,
 )
-from pipelinerl.finetune.types import PipelineBatchEncoding, TrainingMetrics
-from pipelinerl.finetune.data import preprocess_fn, collate, collate_packed
+from pipelinerl.finetune.data import collate, collate_packed, preprocess_fn
+from pipelinerl.finetune.rl import RLConfig, populate_rl_data
+from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.utils import create_sentinel_batch
-from pipelinerl.finetune.rl import RL_DATA_COLUMNS, RLConfig, populate_rl_data
-import traceback
+from pipelinerl.llm import TrainableLLM
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamRangeSpec,
@@ -160,7 +157,19 @@ def preprocess_dataset(
         entry["step_index"] = entry["metadata"]["step_index"]
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
-    dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    try:
+        dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    except Exception as e:
+        logger.error(f"Error in populate_rl_data: {e}", extra={
+            "data": data,
+            "dataset": dataset,
+            "tokenizer": tokenizer,
+            "eos_token_id": tokenizer.eos_token_id,
+            "rl_config": rl_config,
+            "llm": llm,
+            "seq_length": seq_length,
+        })
+        raise
     return dataset
 
 
@@ -384,7 +393,7 @@ def run_preprocessing_loop(
         pop_old_data=pop_old_data,
     )
     # Start the dataset loader thread using Thread
-    dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn)
+    dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn, daemon=True)
     dataset_loader_thread.start()
     
     # Initialize TrainerState
@@ -400,6 +409,8 @@ def run_preprocessing_loop(
         logger.info("Normal mode, waiting for finetune loop to start")
         trainer_state.start_listening()
         trainer_state.wait_for_model_version()
+    final_train_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
+    samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
     # Load published samples from state file
     llms = [
@@ -485,6 +496,12 @@ def run_preprocessing_loop(
                 writing_took = 0
                 num_filtered_out = 0
                 while True:
+                    if (
+                        trainer_state.samples_processed is not None
+                        and trainer_state.samples_processed >= samples_target
+                    ):
+                        logger.info("Trainer signalled completion; stopping preprocessor loop")
+                        break
                     llm = llms[next_llm_index] if llms else None
                     if not input_queue.full():
                         try:
@@ -668,4 +685,3 @@ def run_preprocessing_loop(
                     if worker.is_alive():
                         worker.terminate()
                         worker.join(timeout=1.0)
-
