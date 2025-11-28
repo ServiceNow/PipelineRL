@@ -170,26 +170,6 @@ def _load_aime_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
     return add_ids(samples)
 
 
-def _load_aime_2025_opencompass(upsample_factor: int = 0) -> list[dict]:
-    configs = ["AIME2025-I", "AIME2025-II"]
-    dataset_name = "aime_2025" + ("" if upsample_factor > 0 else "_original")
-
-    samples: list[dict] = []
-    for config_name in configs:
-        ds = load_dataset("opencompass/AIME2025", config_name, split="test")
-        samples.extend([s for s in process_math(ds, dataset_name) if s is not None])
-
-    original_size = len(samples)
-    if upsample_factor > 0:
-        samples *= upsample_factor
-
-    logger.info(
-        f"Loading aime 2025 (OpenCompass) dataset: {len(samples)} samples"
-        + (f" (upsampled from {original_size})" if upsample_factor > 0 else "")
-    )
-    return add_ids(samples)
-
-
 def _load_amc_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
     amc_dataset = load_dataset("AI-MO/aimo-validation-amc", split="train", trust_remote_code=True)
     amc_dataset = amc_dataset.filter(lambda x: str(year) in x["url"])
@@ -354,12 +334,6 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
 
     if "aime_2024_original" in dataset_names:
         datasets += _load_aime_dataset(2024)
-
-    if "aime_2025" in dataset_names:
-        datasets += _load_aime_2025_opencompass(upsample_factor=16)
-
-    if "aime_2025_original" in dataset_names:
-        datasets += _load_aime_2025_opencompass()
 
     if "amc_2022" in dataset_names:
         # TODO: AMC 2022 is 43 problems, is that to be expected?

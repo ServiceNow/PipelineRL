@@ -154,7 +154,7 @@ environment:
   _target_: examples.rl_webagent.environment.WebEnvironment
   exp_path: null
   headless: true
-  observation_format: axtree
+  observation_format: html
 
 # DATASET CONFIGURATION
 dataset_loader: pipelinerl.domains.miniwob.load_tasks.load_tasks

@@ -7,18 +7,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from datasets import Dataset
 from pydantic import BaseModel, Field
-from transformers import PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 
 from pipelinerl.finetune.rl.utils import per_segment_sums
 from pipelinerl.finetune.types import PipelineBatchEncoding
-
-from .utils import (
-    mean_sum,
-    replace_dataset_column,
-    sum_sum,
-)
+from pipelinerl.finetune.rl.utils import sum_sum
 
 # FIXME: remove a warnings, but might be worth investigating
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -40,8 +34,7 @@ RL_DATA_COLUMNS = [
 class RLConfig(BaseModel):
     policy_loss: str = Field(
         default="ppo",
-        description="Policy Loss to use for RL",
-        choices=["ppo", "reinforce", "gspo"],
+        description="Policy Loss to use for RL, one of ['ppo', 'reinforce', 'gspo']",
     )
     use_advantages: bool = Field(
         default=True,

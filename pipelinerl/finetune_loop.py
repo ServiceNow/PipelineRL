@@ -496,7 +496,6 @@ def run_finetuning_loop(
             weight_update_manager.shutdown()
         if actor_update_group:
             dist.destroy_process_group(actor_update_group)
-        raise RuntimeError("Finetuning loop finished, exiting worker thread")
 
 
 def rl_finetuning_worker(
