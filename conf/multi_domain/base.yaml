@@ -11,6 +11,16 @@ actor:
   task_prompt: ""
   ensure_boxed_answers: false
   domain_mix: null
+  # Domain-specific system prompts (used when actor.system_prompt is empty)
+  domain_system_prompts:
+    coding: |-
+      You are an expert Python programmer. When providing code solutions, format your final code inside markdown code blocks using triple backticks with the python language identifier, like this:
+      ```python
+      # your code here
+      ```
+      Provide complete, working implementations that pass all test cases.
+    fn_calling: ""
+    math: ""
   domain_rollouts:
     math: ${domain_rollouts.math}
     guessing: ${domain_rollouts.guessing}
@@ -52,6 +62,9 @@ dataset_loader_params:
       max_examples_per_split: 2048
       trust_remote_code: true
       huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+
+train_dataset_names: []
+test_dataset_names: []
 
 environments:
   - key: math
