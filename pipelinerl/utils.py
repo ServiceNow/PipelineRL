@@ -168,6 +168,11 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
                     "index": 0,
                 }
             )
+
+    active_domains = _domain_mix_weights(cfg)
+    if active_domains:
+        specs = [spec for spec in specs if spec.get("key") in active_domains]
+
     _apply_domain_mix_replicas(cfg, specs, default_replicas)
     return specs
 
