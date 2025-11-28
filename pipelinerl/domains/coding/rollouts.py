@@ -123,6 +123,17 @@ def _coerce_dict(data: dict[str, Any] | str | None) -> dict[str, Any]:
         return {}
 
 
+def _get_system_prompt(cfg: DictConfig) -> str:
+    """Get the system prompt, preferring domain-specific prompt if global is empty."""
+    if cfg.actor.system_prompt:
+        return cfg.actor.system_prompt
+    # Fall back to domain-specific system prompt
+    domain_prompts = getattr(cfg.actor, "domain_system_prompts", None)
+    if domain_prompts:
+        return domain_prompts.get("coding", "") or ""
+    return ""
+
+
 async def generate_coding_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -130,8 +141,9 @@ async def generate_coding_rollout(
     session: aiohttp.ClientSession,
 ) -> RolloutResult:
     messages = []
-    if cfg.actor.system_prompt:
-        messages.append({"role": "system", "content": cfg.actor.system_prompt})
+    system_prompt = _get_system_prompt(cfg)
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
     user_task = cfg.actor.task_template.format(task=_format_task(problem))
     messages.append({"role": "user", "content": user_task})
     prompt = Prompt(messages=messages)
