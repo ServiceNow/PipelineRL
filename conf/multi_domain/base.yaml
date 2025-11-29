@@ -1,0 +1,92 @@
+# @package _global_
+defaults:
+  - /domain_rollouts@domain_rollouts: base
+  - domain_mix: null
+
+actor:
+  rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
+  system_prompt: ""
+  task_template: |-
+    {task}
+  task_prompt: ""
+  ensure_boxed_answers: false
+  domain_mix: null
+  # Domain-specific system prompts (used when actor.system_prompt is empty)
+  domain_system_prompts:
+    coding: |-
+      You are an expert Python programmer. When providing code solutions, format your final code inside markdown code blocks using triple backticks with the python language identifier, like this:
+      ```python
+      # your code here
+      ```
+      Provide complete, working implementations that pass all test cases.
+    fn_calling: ""
+    math: ""
+  domain_rollouts:
+    math: ${domain_rollouts.math}
+    guessing: ${domain_rollouts.guessing}
+    counting: ${domain_rollouts.counting}
+    chartqa: ${domain_rollouts.chartqa}
+    miniwob: ${domain_rollouts.miniwob}
+    coding: ${domain_rollouts.coding}
+    fn_calling: ${domain_rollouts.fn_calling}
+  coding_time_limit_s: 15.0
+  coding_per_test_timeout_s: 10.0
+  coding_memory_limit_bytes: 1073741824
+  coding_compile_timeout_s: 10.0
+  coding_sandbox_url: ${oc.env:CODING_SANDBOX_URL, "http://sandbox:8080/run_code"}
+
+dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
+dataset_loader_params:
+  per_domain_params:
+    coding:
+      dataset_id: ServiceNow-AI/mixed-training-text-datasets
+      dataset_config: 80k-if-math-coding-fncalling-stem
+      split_ratios:
+        train: 0.9
+        validation: 0.05
+        test: 0.05
+      allowed_call_types:
+        - assert
+        - std
+      max_examples_per_split: 2048
+      trust_remote_code: true
+      huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+    fn_calling:
+      dataset_id: ServiceNow-AI/mixed-training-text-datasets
+      dataset_config: 80k-if-math-coding-fncalling-stem
+      split_ratios:
+        train: 0.9
+        validation: 0.05
+        test: 0.05
+      allowed_call_types: []
+      max_examples_per_split: 2048
+      trust_remote_code: true
+      huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+
+train_dataset_names: []
+test_dataset_names: []
+
+environments:
+  - key: math
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.math.MathEnvironment
+  - key: coding
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.coding.CodingSandboxEnvironment
+    sandbox_url: ${actor.coding_sandbox_url}
+    compile_timeout_s: ${actor.coding_compile_timeout_s}
+    run_timeout_s: ${actor.coding_per_test_timeout_s}
+    request_timeout_s: ${actor.coding_time_limit_s}
+    memory_limit_bytes: ${actor.coding_memory_limit_bytes}
+  - key: fn_calling
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.fn_calling.AgenticToolsEnvironment
+    max_workers: 4
+
+environment_key: null
+
+world:
+  env_replicas_per_actor: 1
