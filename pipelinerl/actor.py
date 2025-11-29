@@ -530,6 +530,12 @@ class ActorLoop:
                 assert isinstance(rollout_results[0], RolloutResult)
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
+                # Track completions per domain for adaptive sampling
+                if domain_sampler is not None:
+                    for r in rollout_results:
+                        if r.domain:
+                            domain_sampler.record_completion(r.domain)
+
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
                 all_text_dumps = []
