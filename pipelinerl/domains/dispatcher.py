@@ -84,6 +84,11 @@ async def generate_multidomain_rollout(
     result = rollout_fn(cfg, llm, problem, session)
     if inspect.isawaitable(result):
         result = await result  # type: ignore[assignment]
+
+    # Ensure domain is set on the result for completion tracking
+    if result.domain is None:
+        result.domain = domain
+
     return result  # type: ignore[return-value]
 
 
