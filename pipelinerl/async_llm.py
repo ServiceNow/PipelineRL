@@ -4,15 +4,19 @@ import logging
 
 import aiohttp
 import numpy as np
-from PIL import Image
-from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
-
-from pipelinerl.finetune.data import MASKED_TOKEN_ID
-from pipelinerl.rollouts import TrainingText
-from pipelinerl.processor_factory import get_processor
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from PIL import Image
+
+from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
+from pipelinerl.processor_factory import get_processor
+from pipelinerl.rollouts import TrainingText
 
 logger = logging.getLogger(__name__)
+
+# -100 is the default "ignore_index" in nn.CrossEntropyLoss
+# Defined here to avoid importing dependencies from finetune.data
+# Do not replace. Import from finetune module breaks ray parallelization!
+MASKED_TOKEN_ID = -100
 
 
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:

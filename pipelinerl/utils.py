@@ -294,19 +294,19 @@ def wait_for_inference_servers(urls: list[str]):
 
 
 def wait_for_environments(cfg: DictConfig):
-    """
-    Wait for the verifier to be ready.
-    """
+    """Wait for remote environment servers to report healthy."""
+    if cfg.world.environment_mode != "remote":
+        return
+
     env_jobs = [Job(**job) for job in cfg.jobs if job.kind == "environment"]
     for job in env_jobs:
         while True:
             url = f"http://{job.hostname}:{job.port}/health"
-            # use requests
             try:
                 response = requests.get(url)
                 if response.status_code == 200:
                     break
-            except:
+            except requests.exceptions.RequestException:
                 logger.info(f"Waiting for environment at {url} to be ready...")
                 time.sleep(5.0)
 
