@@ -157,7 +157,20 @@ def preprocess_dataset(
         entry["step_index"] = entry["metadata"]["step_index"]
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
-    dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    try:
+        dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
+    except Exception as e:
+        logger.exception(
+            "Error in populate_rl_data: {}".format({
+                "Data": data,
+                "Dataset": dataset,
+                "Tokenizer eos_token_id": tokenizer.eos_token_id,
+                "RL config": rl_config,
+                "LLM": llm,
+                "Seq length": seq_length,
+            }), 
+        )
+        raise e
     return dataset
 
 
@@ -450,7 +463,8 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
-    with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    max_stream_size = cfg.preprocess.max_stream_size
+    with write_to_streams(output_stream, max_stream_size=max_stream_size) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)

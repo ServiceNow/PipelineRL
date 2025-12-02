@@ -18,6 +18,8 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  # Maximum number of entries to retain in the actor data stream (Redis only for now)
+  max_stream_size: 1000000
 environment: null
 preprocess:
   input: actor
@@ -26,7 +28,7 @@ preprocess:
   chunk_n_groups: 2
   # queue for loaded raw groups
   raw_queue_size: 8
-  # queue for processed chunks of multiple groups  
+  # queue for processed chunks of multiple groups
   input_queue_size: 32
   # queue for ready chunks for multiple groups
   output_queue_size: 32
@@ -36,9 +38,11 @@ preprocess:
   ring_buffer_size: 128
   # "virtual" sample queue per lead trainer
   max_ready_samples_per_lead: 64
-  pop_old_data: ${..pop_old_data} 
+  pop_old_data: ${..pop_old_data}
   shared_memory_entry_size: 100000000
   log_every_n_samples: 128
+  # Maximum number of entries to retain in the training data stream (Redis only for now)
+  max_stream_size: 1000000
 llm:
   parameters:
     # changed
