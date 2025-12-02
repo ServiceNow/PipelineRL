@@ -8,7 +8,8 @@ finetune:
   seq_length: 8000
   gradient_accumulation_passes: 512
   seq_packing: false
-  freeze_vision_tower: true
+  epsilon_high: 4.0
+  epsilon_low: 0.0
 
 llm:
   parameters:
@@ -25,13 +26,15 @@ actor:
   system_prompt: You are an expert at analyzing charts and graphs. Please examine the chart carefully and answer the question accurately. Remember to provide your final answer in a boxed format, like \\boxed{{your answer}}.
   task_template: |-
     Question: {question}
-    
+
     Please analyze the chart step by step and put your final answer within \\boxed{{}}.
   llm_max_rollouts: 16
   shared_memory_entry_size: 2000000000
+  max_stream_size: 1000
 
 preprocess:
   shared_memory_entry_size: 2000000000
+  max_stream_size: 1000
 
 environment: null
 
