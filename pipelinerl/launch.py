@@ -60,8 +60,6 @@ def validate_config(cfg: DictConfig):
             raise ValueError("Only Qwen2.5-VL models are supported for vision language modeling")
         if cfg.finetune.seq_packing:
             raise ValueError("Vision language models cannot use sequence packing (seq_packing must be false)")
-        if cfg.finetune.train_batch_size > 1:
-            raise ValueError("Vision language models cannot use batch size > 1 (train_batch_size must be 1)")
     
     if cfg.finetune.seq_parallel > 1:
         if not cfg.finetune.seq_packing:
@@ -494,6 +492,7 @@ def debug_link_streams(cfg: DictConfig, topics: list[str]):
     if not cfg.debug.streams_from:
         raise ValueError("Need to specify streams_from for debug mode")
     stream_dir = Path(cfg.output_dir) / "streams"
+    stream_dir.mkdir(parents=True, exist_ok=True)
     for topic in topics:
         source_topic_dir = Path(cfg.debug.streams_from) / "streams" / topic
         target_topic_dir = stream_dir / topic
