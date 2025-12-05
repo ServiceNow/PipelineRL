@@ -76,8 +76,7 @@ world:
   preprocessor_fraction: 0
   finetune_fraction: 4
 
-  # Number of environment servers per actor VLLM server
-  env_replicas_per_actor: 1
+  env_replicas: 1
 
   actor_group_port: 9000
   environment_start_port: 7777
