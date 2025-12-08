@@ -6,8 +6,7 @@ defaults:
 
 seed: 42
 
-# Use FP32 for lm_head computation in both training and inference (vLLM).
-# Improves numerical precision for RL training. See https://arxiv.org/abs/2510.13786
+# use FP32 for lm_head computation in both training and inference.
 fp32_lm_head: false
 
 finetune:
