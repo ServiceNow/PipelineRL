@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 from pipelinerl.finetune_loop import WeightUpdateRequest
+from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from typing import Any, Protocol, runtime_checkable
 import pipelinerl.torch_utils
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
@@ -83,11 +84,8 @@ class WorkerExtension:
         torch.cuda.synchronize(self.device)
         logger.info("Start receiving weight update")
         for info in request.parameters_info:
-            model_dtype = self.model_config.dtype
-            assert info.dtype == str(model_dtype), (
-                f"mismatch dtype: src {info.dtype}, dst {self.model_config.dtype}"
-            )
-            buffer = torch.empty(tuple(info.shape), dtype=model_dtype, device=self.device)
+            target_dtype = string_to_dtype(info.dtype)
+            buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
             torch.distributed.broadcast(buffer, src=0, group=self.process_group)
             loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
             if len(loaded_params) != 1:

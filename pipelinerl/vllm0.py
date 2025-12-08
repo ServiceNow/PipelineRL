@@ -35,6 +35,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 import torch.distributed as dist
 from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
+from pipelinerl.vllm_quantization import string_to_dtype  # reuse dtype mapping
 import pipelinerl.torch_utils
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 
@@ -82,11 +83,8 @@ def make_worker_class(multi_step: bool):
         def receive_weight_update(self, request: WeightUpdateRequest):
             torch.cuda.synchronize(self.device)
             for info in request.parameters_info:
-                model_dtype = self.model_config.dtype
-                assert info.dtype == str(model_dtype), (
-                    f"mismatch dtype: src {info.dtype},\ dst {self.model_config.dtype}"
-                )
-                buffer = torch.empty(tuple(info.shape), dtype=model_dtype, device=self.device)
+                target_dtype = string_to_dtype(info.dtype)
+                buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
                 torch.distributed.broadcast(buffer, src=0, group=self.process_group)
                 if isinstance(self.model_runner, MultiStepModelRunner):
                     loaded_params = self.model_runner._base_model_runner.model.load_weights(
