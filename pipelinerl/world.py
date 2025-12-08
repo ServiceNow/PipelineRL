@@ -39,9 +39,17 @@ class WorldMap:
         if self.world_size > 1:
             self.master_addr = os.environ["MASTER_ADDR"]
             # e.g.: dns-f6c9712f-4d9b-4c8d-a648-f8d94cf12113-0
-            for rank in range(self.world_size):
-                basename = self.master_addr[: self.master_addr.rfind("-")]
-                self.address_map[rank] = f"{basename}-{rank}"
+            if hasattr(cfg.world, "hostfile"):
+                with open(cfg.world.hostfile, "r") as f:
+                    hosts = [row.split()[0] for row in f.readlines()]
+                    self.master_addr = hosts[0]
+                    # This assumes the hostfile is provided in order
+                    # TODO: @TundeAtSN: This is a strong assumption.
+                    self.address_map = {idx: row for idx, row in enumerate(hosts)}
+            else:
+                for rank in range(self.world_size):
+                    basename = self.master_addr[: self.master_addr.rfind("-")]
+                    self.address_map[rank] = f"{basename}-{rank}"
         else:
             self.master_addr = "localhost"
             self.address_map[0] = "localhost"

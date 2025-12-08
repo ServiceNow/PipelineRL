@@ -238,8 +238,12 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     if world_map.world_size > 1:
         # DeepSpeed multi-node args
         assert cfg.use_deepspeed
-        assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-        hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+        if hasattr(cfg.world, "hostfile"):
+            with open(cfg.world.hostfile, "r") as f:
+                hosts = [row.split()[0] for row in f.readlines()]
+        else:
+            assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
+            hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
         filter_parts = []
         for rank, job_list in world_map.job_map.items():
             for job in job_list:
@@ -298,9 +302,10 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     cmd += [
         "--num_processes",
         str(world_map.total_finetune_gpus),
-        "pipelinerl/entrypoints/run_finetune.py",
+        "-m",
+        "pipelinerl.entrypoints.run_finetune",
         "--config-dir",
-        f"{exp_dir}/conf",
+        f"{exp_dir}/conf", 
         "--config-name",
         "exp_config",
         f"output_dir={exp_dir}",
@@ -463,6 +468,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
     all_job_kinds = ["actor", "environment", "actor_llm", "preprocessor", "preprocessor_llm", "finetune"]
     if job_kind_filter is None:
         job_kind_filter = all_job_kinds
+        
     for job in world_map.my_jobs():
         if job.kind not in all_job_kinds:
             raise ValueError(f"Unknown job kind {job.kind}")
@@ -550,14 +556,21 @@ def main(cfg: DictConfig):
             redis.flushall()
 
         if world_map.world_size > 1:
-            assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-            hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
-            hostfile_lines = [f"{host} slots=8" for host in hosts]
-            deepspeed_hostfile_content = "\n".join(hostfile_lines)
             hostfile_path = str(exp_dir / "hostfile.txt")
-            with open(hostfile_path, "w") as f:
-                f.write(deepspeed_hostfile_content)
-            logger.info(f"Deepspeed hostfile content:\n{deepspeed_hostfile_content}")
+
+            if hasattr(cfg.world, "hostfile"):
+                shutil.copy(cfg.world.hostfile, hostfile_path)
+            else:
+                assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
+                hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+                hostfile_lines = [f"{host} slots=8" for host in hosts]
+                deepspeed_hostfile_content = "\n".join(hostfile_lines)
+            
+                with open(hostfile_path, "w") as f:
+                    f.write(deepspeed_hostfile_content)
+                
+                logger.info(f"Deepspeed hostfile content:\n{deepspeed_hostfile_content}")
+
             logger.info(f"Orchestrator 0 created hostfile at {hostfile_path}")
 
         with write_to_streams(lead_launcher_stream) as stream:
