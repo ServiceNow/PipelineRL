@@ -7,6 +7,8 @@ config_name: ${..model_path}
 optim: adamw_torch
 # use half precision training, full bf16 without mixed precision copies at all
 load_as_bf16: True
+# use FP32 for lm_head computation to improve numerical precision in RL training
+fp32_lm_head: ${..fp32_lm_head}
 use_flash_attention: true
 attn_implementation: flash_attention_2
 auto_device_map: False
