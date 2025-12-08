@@ -2,10 +2,12 @@ import contextlib
 import os
 import shutil
 import typing
+from functools import wraps
 from pathlib import Path
 from typing import Any, Type
 
 import torch
+import torch.nn as nn
 import transformers
 from packaging import version
 from transformers import (
@@ -27,6 +29,48 @@ from .value_model import AutoModelForCausalLMWithValueHead
 def is_deepspeed_model(model) -> bool:
     """Check if model is a DeepSpeed engine instance."""
     return model.__class__.__name__.endswith("DeepSpeedEngine")
+
+
+def apply_fp32_lm_head(model: nn.Module) -> nn.Module:
+    """Cast lm_head weights to FP32 and compute logits in FP32.
+
+    This mirrors the inference-side quantization config so trainer and actor
+    use matching FP32 logits computation.
+    """
+    # Handle wrapped models (e.g., AutoModelForCausalLMWithValueHead)
+    if isinstance(model, AutoModelForCausalLMWithValueHead):
+        apply_fp32_lm_head(model.pretrained_model)
+        return model
+
+    # try to get lm_head via HuggingFace API
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        logger.warning("Could not find lm_head layer for FP32 fix via get_output_embeddings()")
+        return model
+
+    if not isinstance(lm_head, nn.Linear):
+        logger.warning(f"lm_head is not nn.Linear ({type(lm_head).__name__}), skipping FP32 fix")
+        return model
+
+    if lm_head.weight.dtype != torch.float32:
+        lm_head.weight.data = lm_head.weight.data.float()
+    if lm_head.bias is not None and lm_head.bias.dtype != torch.float32:
+        lm_head.bias.data = lm_head.bias.data.float()
+
+    original_forward = lm_head.forward
+
+    @wraps(original_forward)
+    def fp32_forward(x: torch.Tensor) -> torch.Tensor:
+        # upcast to FP32
+        x_fp32 = x.float() if x.dtype != torch.float32 else x
+        # compute in FP32 (upcast done automatically by PyTorch)
+        weight = lm_head.weight.float()
+        bias = lm_head.bias.float() if lm_head.bias is not None else None
+        return torch.nn.functional.linear(x_fp32, weight, bias)
+
+    lm_head.forward = fp32_forward
+    logger.info(f"Applied FP32 fix to lm_head ({type(lm_head).__name__})")
+    return model
 
 
 def get_auto_model_class(
@@ -121,8 +165,12 @@ def load_model(args, model_class, current_dir):
         logger.info(f"Initializing model {model_cls} from {args.config_name}")
 
     logger.info(f"Loading args: {loading_args}")
-    
+
     model = model_cls.from_pretrained(model_to_load, **loading_args)
+
+    # apply FP32 fix to lm_head for numerical precision
+    if getattr(args, "fp32_lm_head", False):
+        model = apply_fp32_lm_head(model)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(
