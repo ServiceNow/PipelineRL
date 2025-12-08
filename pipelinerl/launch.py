@@ -120,7 +120,13 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
         str(cfg.seed + preprocessor_llm_idx),
     ]
 
-    # Add vLLM kwargs as separate arguments
+    # add quantization
+    if cfg.get("fp32_lm_head"):
+        cmd.extend(["--quantization", "bf16_last_layer_fp32"])
+    elif cfg.vllm_config.get("quantization"):
+        cmd.extend(["--quantization", cfg.vllm_config.quantization])
+
+    # add vLLM kwargs as separate arguments
     for k, v in kwargs.items():
         cmd.append(f"--{k}")
         if v not in [None, ""]:
@@ -178,11 +184,13 @@ def run_actor_llm(
         str(world_map.weight_update_group_size),
     ]
 
-    # Add quantization if specified
-    if cfg.vllm_config.get("quantization"):
+    # add quantization
+    if cfg.get("fp32_lm_head"):
+        cmd.extend(["--quantization", "bf16_last_layer_fp32"])
+    elif cfg.vllm_config.get("quantization"):
         cmd.extend(["--quantization", cfg.vllm_config.quantization])
 
-    # Add vLLM kwargs as separate arguments
+    # add vLLM kwargs as separate arguments
     if cfg.vllm_config.vllm_kwargs:
         for k, v in cfg.vllm_config.vllm_kwargs.items():
             cmd.append(f"--{k}")
