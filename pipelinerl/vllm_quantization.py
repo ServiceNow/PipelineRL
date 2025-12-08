@@ -93,7 +93,7 @@ def _is_tied_embedding(prefix: str) -> bool:
     return False
 
 
-def _string_to_dtype(value: str) -> torch.dtype:
+def string_to_dtype(value: str) -> torch.dtype:
     """Convert string representation to torch dtype."""
     normalized = value.lower().replace("torch.", "").strip()
     mapping = {
@@ -125,7 +125,7 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
 
     # String representation
     if isinstance(config, str):
-        return _string_to_dtype(config)
+        return string_to_dtype(config)
 
     # HuggingFace model config or similar objects
     dtype = getattr(config, "dtype", None)
@@ -133,7 +133,7 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
         if isinstance(dtype, torch.dtype):
             return dtype
         if isinstance(dtype, str):
-            return _string_to_dtype(dtype)
+            return string_to_dtype(dtype)
 
     # Also check torch_dtype (common in HF configs)
     torch_dtype = getattr(config, "torch_dtype", None)
@@ -141,7 +141,7 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
         if isinstance(torch_dtype, torch.dtype):
             return torch_dtype
         if isinstance(torch_dtype, str):
-            return _string_to_dtype(torch_dtype)
+            return string_to_dtype(torch_dtype)
 
     # Dictionary-based configs
     if isinstance(config, dict):
@@ -152,7 +152,7 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
             if isinstance(value, torch.dtype):
                 return value
             if isinstance(value, str):
-                return _string_to_dtype(value)
+                return string_to_dtype(value)
 
     return torch.bfloat16
 
