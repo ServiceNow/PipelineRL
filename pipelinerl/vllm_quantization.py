@@ -1,18 +1,3 @@
-"""
-Mixed-precision quantization configuration for vLLM.
-
-This module provides a custom quantization config that keeps most layers in bfloat16
-for efficiency while forcing the final lm_head layer to float32 for numerical precision
-in logits computation. This is particularly important for RL training where small
-precision errors in log probabilities can accumulate.
-
-Usage:
-    Launch vLLM with: --quantization bf16_last_layer_fp32
-
-    The module must be imported before vLLM initializes to register the config:
-        import pipelinerl.vllm_quantization
-"""
-
 import logging
 import threading
 from typing import Callable
@@ -28,7 +13,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 logger = logging.getLogger(__name__)
 
-# Global weight version counter for cache invalidation
 _weight_version: int = 0
 _weight_version_lock = threading.Lock()
 
@@ -51,7 +35,7 @@ def get_weight_version() -> int:
     return _weight_version
 
 
-# Known lm_head layer name patterns across different model architectures
+# known lm_head layer name patterns across different model architectures
 LM_HEAD_PATTERNS = frozenset({
     "lm_head",
     "output",
@@ -60,7 +44,7 @@ LM_HEAD_PATTERNS = frozenset({
     "head",
 })
 
-# Known embedding layer name patterns for tied weight detection
+# known embedding layer name patterns for tied weight detection
 EMBEDDING_PATTERNS = frozenset({
     "embed_tokens",
     "tok_embeddings",
@@ -119,15 +103,15 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
     if config is None:
         return torch.bfloat16
 
-    # Direct torch dtype
+    # direct torch dtype
     if isinstance(config, torch.dtype):
         return config
 
-    # String representation
+    # string representation
     if isinstance(config, str):
         return string_to_dtype(config)
 
-    # HuggingFace model config or similar objects
+    # HuggingFace model config
     dtype = getattr(config, "dtype", None)
     if dtype is not None:
         if isinstance(dtype, torch.dtype):
@@ -135,7 +119,7 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
         if isinstance(dtype, str):
             return string_to_dtype(dtype)
 
-    # Also check torch_dtype (common in HF configs)
+    # check torch_dtype
     torch_dtype = getattr(config, "torch_dtype", None)
     if torch_dtype is not None:
         if isinstance(torch_dtype, torch.dtype):
@@ -143,7 +127,7 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
         if isinstance(torch_dtype, str):
             return string_to_dtype(torch_dtype)
 
-    # Dictionary-based configs
+    # dict based configs
     if isinstance(config, dict):
         for key in ("default_dtype", "torch_dtype", "activation_dtype", "dtype"):
             value = config.get(key)
@@ -202,7 +186,7 @@ class BF16WithLastLayerFP32(QuantizationConfig):
 
         if isinstance(layer, VocabParallelEmbedding):
             if is_lm_head:
-                # Explicit lm_head embedding (rare but possible)
+                # explicit lm_head embedding
                 logger.debug(
                     "Layer %s (%s): FP32 embedding (lm_head)",
                     prefix, layer.__class__.__name__
@@ -211,7 +195,7 @@ class BF16WithLastLayerFP32(QuantizationConfig):
                 return _FP32UnembedEmbeddingMethod()
 
             if is_tied_embed:
-                # Tied embedding: keep BF16 storage but compute logits in FP32
+                # tied embedding: keep BF16 storage but compute logits in FP32
                 logger.debug(
                     "Layer %s (%s): tied embedding, FP32 logits matmul",
                     prefix, layer.__class__.__name__
@@ -219,7 +203,7 @@ class BF16WithLastLayerFP32(QuantizationConfig):
                 self._fp32_layer_count += 1
                 return _FP32UnembedEmbeddingMethod()
 
-            # Regular embedding, leave unmodified
+            # regular embedding, leave unmodified
             logger.debug(
                 "Layer %s (%s): unmodified embedding",
                 prefix, layer.__class__.__name__
@@ -235,14 +219,14 @@ class BF16WithLastLayerFP32(QuantizationConfig):
                 self._fp32_layer_count += 1
                 return _FP32LinearMethod()
 
-            # Regular linear layer, use default dtype
+            # regular linear layer, use default dtype
             logger.debug(
                 "Layer %s (%s): %s linear",
                 prefix, layer.__class__.__name__, self.default_dtype
             )
             return _ForcedDTypeLinearMethod(self.default_dtype)
 
-        # Unknown layer type, leave unmodified
+        # unknown layer type, leave unmodified
         logger.debug(
             "Layer %s (%s): unmodified (unknown type)",
             prefix, layer.__class__.__name__
@@ -336,11 +320,11 @@ class _FP32LinearMethod(UnquantizedLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply linear transformation with FP32 upcast for inputs."""
-        # Upcast input to FP32 if needed
+        # upcast input to FP32 if needed
         if x.dtype != torch.float32:
             x = x.to(torch.float32)
 
-        # Weight should already be FP32 from create_weights
+        # weight should already be FP32 here from create_weights
         return super().apply(layer, x, bias)
 
 
@@ -357,7 +341,6 @@ class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
     """
 
     # Class-level cache for FP32 weights, keyed by (layer_id, device)
-    # Using a class attribute allows proper cleanup and avoids memory leaks
     _fp32_cache: dict[tuple[int, torch.device], tuple[torch.Tensor, int]] = {}
     _cache_lock = threading.Lock()
 
@@ -368,11 +351,11 @@ class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply embedding lookup or unembedding matmul with FP32 precision."""
-        # Upcast activations to FP32
+        # upcast activations to FP32
         x32 = x if x.dtype == torch.float32 else x.to(torch.float32)
         target_device = x32.device
 
-        # Get FP32 weights, using cache if valid
+        # get FP32 weights, use cache if valid
         w32 = self._get_fp32_weight(layer, target_device)
 
         # Handle bias
@@ -390,7 +373,7 @@ class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
         """Get FP32 weight tensor, using cache if valid."""
         w_param = layer.weight
 
-        # Fast path: weight is already FP32 on correct device
+        # fast path: weight is already FP32 on correct device
         if w_param.dtype == torch.float32 and w_param.device == target_device:
             return w_param
 
@@ -409,7 +392,7 @@ class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
                 ):
                     return cached_weight
 
-            # Cache miss or invalid - create new FP32 copy
+            # cache miss or invalid - create new FP32 copy
             w32 = w_param.to(device=target_device, dtype=torch.float32)
             self._fp32_cache[cache_key] = (w32, current_version)
 
