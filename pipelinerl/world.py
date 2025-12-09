@@ -71,7 +71,7 @@ class WorldMap:
         if place_inference_jobs:
             self._place_inference_jobs(cfg)
         self._place_pipeline_stages(cfg)
-        if cfg.environment:
+        if cfg.environment and cfg.world.environment_mode == "remote":
             self._place_environments(cfg)
 
         # Place the finetune workers on the remaining gpus, take all remaining GPUs

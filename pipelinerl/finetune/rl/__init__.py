@@ -2,22 +2,17 @@ import logging
 import os
 from functools import partial
 from typing import Any
-from pydantic import BaseModel, Field
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from datasets import Dataset
-from transformers import PreTrainedModel
-from pipelinerl.finetune.types import PipelineBatchEncoding
-from pipelinerl.finetune.rl.utils import per_segment_sums
+from pydantic import BaseModel, Field
+from transformers.modeling_utils import PreTrainedModel
 
-from .utils import (
-    sum_sum,
-    mean_sum,
-    replace_dataset_column,
-)
+from pipelinerl.finetune.rl.utils import per_segment_sums
+from pipelinerl.finetune.types import PipelineBatchEncoding
+from pipelinerl.finetune.rl.utils import sum_sum
 
 # FIXME: remove a warnings, but might be worth investigating
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -39,8 +34,7 @@ RL_DATA_COLUMNS = [
 class RLConfig(BaseModel):
     policy_loss: str = Field(
         default="ppo",
-        description="Policy Loss to use for RL",
-        choices=["ppo", "reinforce", "gspo"],
+        description="Policy Loss to use for RL, one of ['ppo', 'reinforce', 'gspo']",
     )
     use_advantages: bool = Field(
         default=True,
@@ -418,7 +412,11 @@ def rl_step(
 
 
 def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
-    """Populate RL-specific columns (advantages, overflow, num_labels) using a leave-one-out baseline."""
+    """
+    Populates a dataset with reinforcement learning specific data columns including
+    rewards, advantages, and token weights.
+    Uses leave-one-out (LOO) reward mean: each rollout's baseline excludes its own reward.
+    """
     # Convert to pandas for processing
     df_init = pd.DataFrame(dataset)
     assert isinstance(df_init, pd.DataFrame)
@@ -450,7 +448,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         "group_tokens",
     ]
 
-    # Step 2: calculate advantages for each sample
+    # Step 2: calculate advantages for each sample (with LOO mean)
     df_advantages = pd.merge(
         df_init[["group_id", "rollout_index", "step_index", "rewards"]],
         df_grouped,
@@ -458,6 +456,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         how="left"
     )
     assert len(df_advantages) == len(df_init)
+
     def calculate_advantages(row):
         rewards = row["rewards"]
         group_sum = row["rollout_reward_sum"]
@@ -487,7 +486,6 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     # Step 3: bring advantages and group level stats back to the main df
     df = df_init.drop(columns=["advantages", "group_tokens"])
     df = pd.merge(df, df_advantages, on=["group_id", "rollout_index", "step_index"], how="left")
-    # Debug print lengths of all dataframes
     assert len(df) == len(df_init)
 
     # Step 4: make token-level overflow and mean group length information

@@ -9,12 +9,11 @@ world:
   preprocessor_fraction: 0
   finetune_fraction: 6
 
-# debug:
-#   mode: actor
-save_tapes: False
+save_tapes: false
 
 output_dir: results/miniwob/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: meta-llama/Llama-3.1-8B-Instruct
+use_ray: true
 
 finetune:
   seq_length: 16384  # input + output tokens
@@ -25,6 +24,7 @@ finetune:
 eval_every_n_versions: 10240  # 1024 effective bs * 10 "optim steps"
 
 llm:
+  use_cache: false
   parameters:
     max_tokens: 4096  # output tokens
     temperature: 1.0
@@ -36,13 +36,20 @@ test_llm:
     top_k: 50
 
 vllm_config:
+  use_v1: false
   vllm_kwargs:
-    max_model_len: 16384  # input + output tokens
+    max-num-seqs: 256
+    max-num-batched-tokens: 32000
+    max_model_len: 16384
+    gpu-memory-utilization: 0.9
 
 actor:
   rollout_policy: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
+  llm_max_rollouts: 256
+  problem_queue_size: 256
+  async_batch_size: 1
+  rollout_workers: 32
   shared_memory_entry_size: 100000000
-  llm_max_rollouts: 32
 
 preprocess:
   n_workers: 32  # Increase from 8
@@ -144,12 +151,7 @@ agent:
 # ENVIRONMENT CONFIGURATION
 start_attempts: 3  # number of attempts to start each task
 environment:
-  _target_: pipelinerl.domains.miniwob.environment_server.WebEnvironmentServer
-  miniwob_url: ???
-  n_envs: 32
-  host: "0.0.0.0"
-  env_call_timeout: 60  # timeout for each environment call (e.g. start_task, act, etc.)
-  web_env_target: examples.rl_webagent.environment.WebEnvironment
+  _target_: examples.rl_webagent.environment.WebEnvironment
   exp_path: null
   headless: true
   observation_format: html

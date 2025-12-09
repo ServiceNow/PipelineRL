@@ -5,17 +5,20 @@ import multiprocessing as mp
 import os
 import queue
 import random
+import sys
 import time
 from collections import defaultdict
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from queue import Empty
-from typing import Dict, List
+from typing import Any, Awaitable, Callable, Dict, List
 
 import aiohttp
 import hydra
+import numpy as np
+import ray
 import uvloop
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 
 import wandb
@@ -32,8 +35,7 @@ from pipelinerl.streams import (
     set_streams_backend,
     write_to_streams,
 )
-
-from .utils import (
+from pipelinerl.utils import (
     always_or_never_success_stats,
     calculate_stats,
     setup_logging,
@@ -57,8 +59,9 @@ class SlidingWindowData(BaseModel):
 
 
 class SlidingWindowAggregator:
-    def __init__(self, window_size: int):
+    def __init__(self, window_size: int, min_samples: int = 5):
         self.window_size = window_size
+        self.min_samples = min_samples
         self.data = SlidingWindowData()
 
     def update(self, prompt_tokens: list[int], output_tokens: list[int]):
@@ -71,8 +74,11 @@ class SlidingWindowAggregator:
             self.data.timestamps.pop(0)
 
     def get_stats(self):
-        if len(self.data.prompt_tokens_window) < self.window_size:
+        if len(self.data.prompt_tokens_window) < self.min_samples:
+            logger.warning("Not enough data to compute sliding stats")
             return None
+        elif len(self.data.prompt_tokens_window) < self.window_size:
+            logger.warning(f"Compute sliding stats over just {len(self.data.prompt_tokens_window)} samples")
 
         # 1. How many samples do we produce per second?
         # 2. How many output tokens do we produce per second?
@@ -103,9 +109,12 @@ class SlidingWindowAggregator:
         }
 
 
-
 def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
+
+
+def get_number_of_tokens_in_result(result: RolloutResult) -> int:
+    return sum(training_text.prompt_tokens + training_text.output_tokens for training_text in result.training_texts)
 
 
 async def schedule_rollouts(
@@ -133,19 +142,17 @@ async def schedule_rollouts(
     active_rollouts = [0] * len(llms)
     started_rollouts = 0
     finished_rollouts = 0
+    token_count = 0
     # Track rollouts per problem group
     group_rollouts = {}
     rollout_policy = hydra.utils.get_method(cfg.actor.rollout_policy)
-    logger.info(f"Use rollout policy: {rollout_policy}")
+    logger.info(f"Use rollout policy: {rollout_policy.__name__}")
 
     final_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
     def is_trainer_finished() -> bool:
-        return (
-            trainer_state.samples_processed is not None
-            and trainer_state.samples_processed >= samples_target
-        )
+        return trainer_state.samples_processed is not None and trainer_state.samples_processed >= samples_target
 
     def handle_rollout_exception(exc: Exception):
         if isinstance(exc, aiohttp.ClientError) and is_trainer_finished():
@@ -168,13 +175,16 @@ async def schedule_rollouts(
         llm_index: int,
         session: aiohttp.ClientSession,
     ):
-        nonlocal started_rollouts, finished_rollouts
+        nonlocal started_rollouts, finished_rollouts, token_count
         try:
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
-            rollout_result = await rollout_policy(cfg, llm, problem, session)
+            logger.info(f"Starting rollout policy for problem {problem['id']}")
+            rollout_result: RolloutResult = await rollout_policy(cfg, llm, problem, session)
+            logger.info(f"Finished rollout policy for problem {problem['id']}")
             rollout_result.model_version = model_version
+            token_count += get_number_of_tokens_in_result(rollout_result)
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
             rollout_result.group_id = full_group_id
@@ -204,18 +214,22 @@ async def schedule_rollouts(
     logger.info("Starting rollout scheduler")
     connector = aiohttp.TCPConnector(limit=50000, limit_per_host=50000, keepalive_timeout=1.0)
     timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
+    old_finished_rollouts = 0
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         while True:
             if is_trainer_finished():
                 logger.info(f"{scheduler_name}: trainer signalled completion; stopping rollout scheduler")
                 break
             if time.time() - last_logged > 10.0 and sum(active_rollouts):
+                if finished_rollouts > old_finished_rollouts:
+                    old_finished_rollouts = finished_rollouts
                 logger.info(
                     f"{scheduler_name}: "
                     f"rollouts in progress: {sum(active_rollouts)}, "
                     f"groups in progress: {len(group_rollouts)}, "
                     f"rollouts started so far: {started_rollouts}, "
                     f"rollouts finished so far: {finished_rollouts}, "
+                    f"total tokens produced so far: {token_count}, "
                     f"groups started so far: {group_id}, "
                     f"max group size in bytes: {result_queue.max_actual_entry_size()}, "
                 )
@@ -238,7 +252,6 @@ async def schedule_rollouts(
                 await asyncio.sleep(0.01)
                 continue
             active_rollouts[next_llm] += 1
-            started_rollouts += 1
             assert problem is not None
             loop.create_task(
                 rollout_and_maybe_produce_result(
@@ -249,6 +262,7 @@ async def schedule_rollouts(
                     session=session,
                 )
             )
+            started_rollouts += 1
             group_rollout_index += 1
     logger.info("Rollout scheduler finished")
 
@@ -302,40 +316,52 @@ class ActorLoop:
         self.sliding_aggregator = SlidingWindowAggregator(window_size=cfg.actor.throughput_window_size)
         self.llms = llms
         self.loop_start_time = -1
-        self.cfg = cfg
+        self.cfg: DictConfig = cfg
         self.is_training = is_training
         self.is_scheduling_paused = False
         self.debug_mode = bool(cfg.debug.mode)
+        self.cfg: DictConfig = cfg
 
+        self.smm: SharedMemoryManager | None = None
+        self.problem_queue: SharedMemoryQueue | None = None
+        self.result_queue: SharedMemoryQueue | None = None
+        self.rollout_errors = 0
+        logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
+
+    def start_backend(self):
+        self.smm = SharedMemoryManager()
+        self.smm.start()
+
+        # Use SharedMemoryQueue instead of separate problem_queue, result_queue, and io_buffer
+        self.problem_queue = SharedMemoryQueue(
+            self.smm, self.cfg.actor.problem_queue_size, self.cfg.actor.shared_memory_entry_size
+        )
+        self.result_queue = SharedMemoryQueue(
+            self.smm, self.cfg.actor.result_queue_size, self.cfg.actor.shared_memory_entry_size
+        )
+
+        logger.info(
+            f"Problem queue size: {self.problem_queue.max_size}, result queue size: {self.result_queue.max_size}"
+        )
+        logger.info(f"Result queue buffer size: {self.result_queue.get_memory_size() / 2**30} Gb")
+
+        # Create and start multiple rollout processes
+        attempts = self.cfg.attempts if self.is_training else 1
         # Determine the number of processes to use
         num_processes = min(self.cfg.actor.rollout_workers, len(self.llms))
-        attempts = self.cfg.attempts if is_training else 1
 
         # Divide LLMs approximately equally across processes
         llm_groups = [[] for _ in range(num_processes)]
         for i, llm in enumerate(self.llms):
             llm_groups[i % num_processes].append((i, llm))
 
-        self.smm = SharedMemoryManager()
-        self.smm.start()
-
-        
-        # Use SharedMemoryQueue instead of separate problem_queue, result_queue, and io_buffer
-        self.problem_queue = SharedMemoryQueue(self.smm, self.cfg.actor.problem_queue_size, cfg.actor.shared_memory_entry_size)
-        self.result_queue = SharedMemoryQueue(self.smm, self.cfg.actor.result_queue_size, cfg.actor.shared_memory_entry_size)
-        
-        logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
-        logger.info(f"Problem queue size: {self.problem_queue.max_size}, result queue size: {self.result_queue.max_size}")
-        logger.info(f"Result queue buffer size: {self.result_queue.get_memory_size() / 2**30} Gb")
-
-        # Create and start multiple rollout processes
         self.rollout_processes = []
         for llm_group in llm_groups:
             assert llm_group
             llm_idxs = [llm[0] for llm in llm_group]
             llms = [llm[1] for llm in llm_group]
             scheduler_name = (
-                f"{'train' if is_training else 'test'} scheduler for llms {','.join([str(i) for i in llm_idxs])}"
+                f"{'train' if self.is_training else 'test'} scheduler for llms {','.join([str(i) for i in llm_idxs])}"
             )
             process = mp.Process(
                 target=rollout_maker_entrypoint,
@@ -349,15 +375,15 @@ class ActorLoop:
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
-    
+
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
-        
-        metrics['overflow'] = all([not training_text.finished for training_text in result.training_texts ])
-        metrics['num_turns'] = len(result.training_texts)
-        metrics['prompt_tokens'] = [training_text.prompt_tokens for training_text in result.training_texts]
-        metrics['output_tokens'] = [training_text.output_tokens for training_text in result.training_texts]
-        
+
+        metrics["overflow"] = all([not training_text.finished for training_text in result.training_texts])
+        metrics["num_turns"] = len(result.training_texts)
+        metrics["prompt_tokens"] = [training_text.prompt_tokens for training_text in result.training_texts]
+        metrics["output_tokens"] = [training_text.output_tokens for training_text in result.training_texts]
+
         return metrics
 
     def update_stats(self, rollout_results: List[RolloutResult]):
@@ -368,8 +394,10 @@ class ActorLoop:
             group_id = result.group_id
             self.latency_list.append(result.latency)
             self.model_versions_list.append(result.model_version)
-            domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
+            domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result)
             all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
+            all_metrics["used_python"] = int(all_metrics.get("used_python", False))
+            all_metrics["used_math_answer"] = int(all_metrics.get("used_math_answer", False))
             for k, v in all_metrics.items():
                 if isinstance(v, list):
                     self.stats[k][dataset_name][group_id] += v
@@ -377,16 +405,18 @@ class ActorLoop:
                     self.stats[k][dataset_name][group_id].append(v)
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
-        
-        prompt_length_tokens = [training_text.prompt_tokens for result in rollout_results for training_text in result.training_texts]
-        output_length_tokens = [training_text.output_tokens for result in rollout_results for training_text in result.training_texts]
+
+        prompt_length_tokens = [
+            training_text.prompt_tokens for result in rollout_results for training_text in result.training_texts
+        ]
+        output_length_tokens = [
+            training_text.output_tokens for result in rollout_results for training_text in result.training_texts
+        ]
         self.sliding_aggregator.update(prompt_length_tokens, output_length_tokens)
         sliding_window_stats = self.sliding_aggregator.get_stats()
         if sliding_window_stats is not None:
             for k, v in sliding_window_stats.items():
                 self.sliding_stats[k].append(v)
-        
-
 
     def run(self, dataset: list[tuple[str, dict]]):
         loop_start_time = time.time()
@@ -438,6 +468,7 @@ class ActorLoop:
             can_submit_before_update = math.inf
 
         logger.info(f"Start {'train' if self.is_training else 'test'} actor loop")
+        rollouts_last_minute = []
         with (
             write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
@@ -447,8 +478,13 @@ class ActorLoop:
                 yield
 
                 final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
-                samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
-                if self.trainer_state.samples_processed is not None and self.trainer_state.samples_processed >= samples_target:
+                samples_target = (
+                    final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
+                )
+                if (
+                    self.trainer_state.samples_processed is not None
+                    and self.trainer_state.samples_processed >= samples_target
+                ):
                     logger.info("Trainer signalled completion; stopping actor loop")
                     break
 
@@ -464,23 +500,22 @@ class ActorLoop:
                 if not self.is_scheduling_paused:
                     while True:
                         blocked_by_lag = submitted_groups == can_submit_before_update and self.is_training
-                        if not blocked_by_lag and not self.problem_queue.full():
+                        if not blocked_by_lag and self.have_capacity():
                             try:
                                 try:
                                     problem = next(problem_iter)
-                                    self.problem_queue.put(problem, block=False)
+                                    self.submit_problem(problem)
                                     submitted_groups += 1
-                                except queue.Full:            
+                                except queue.Full:
                                     assert False, "Problem queue was not full just a moment ago, but now it is full"
                             except StopIteration:
                                 break
-                        else:
-                            break
+                        break
 
                 # Second, try return a result
                 try:
                     # Directly get the result from the SharedMemoryQueue
-                    rollout_results = self.result_queue.get(block=False)
+                    rollout_results = self.get_new_results()
                 except queue.Empty:
                     continue
 
@@ -489,16 +524,17 @@ class ActorLoop:
                     raise rollout_results
 
                 assert isinstance(rollout_results, list)
+                if len(rollout_results) == 0:
+                    continue
                 assert isinstance(rollout_results[0], RolloutResult)
-                assert len(rollout_results) == attempts, (
-                    f"Expected {attempts} rollouts, got {len(rollout_results)}"
-                )
+                assert len(rollout_results) == attempts, f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
                 published_samples += group_samples
-                samples_in_queue = self.result_queue.qsize() * attempts
+                samples_in_queue = self.results_ready_to_publish()
                 all_text_dumps = []
                 for r in rollout_results:
+                    rollouts_last_minute.append(time.perf_counter())
                     for text in r.training_texts:
                         all_text_dumps.append(text.model_dump())
                 data_stream_writer.write(all_text_dumps)
@@ -512,37 +548,43 @@ class ActorLoop:
                 self.update_stats(rollout_results=rollout_results)
 
                 finished_groups += 1
+                logger.info(
+                    f"Finished {'train' if self.is_training else 'test'} groups {finished_groups} out of {expected_rollouts}"
+                )
                 time_to_publish_train_stats = (
-                    self.is_training
-                    and trainer_version_to_publish is not None
-                ) or self.debug_mode 
+                    self.is_training and trainer_version_to_publish is not None
+                ) or self.debug_mode
                 time_to_publish_test_stats = finished_groups == expected_rollouts
+
+                # leave only the rollouts that are in the last minute
+                rollouts_last_minute = [t for t in rollouts_last_minute if t > time.perf_counter() - 60]
 
                 # Publish stats at every new model version or if all tapes are finished
                 if time_to_publish_train_stats or time_to_publish_test_stats:
                     if self.is_training:
                         loop_stats = {
                             "published_samples": published_samples,
-                            "problem_queue_size": self.problem_queue.qsize(),
-                            "result_queue_size": self.result_queue.qsize(),
+                            "problem_queue_size": self.problem_queue_size(),
+                            "result_queue_size": self.result_queue_size(),
                             "finished_groups": finished_groups,
-                            "trainer_model_version": trainer_version_to_publish, 
+                            "trainer_model_version": trainer_version_to_publish,
                             "time_since_start": time.time() - loop_start_time,
+                            "groups_in_progress": in_progress,
+                            "rollout_errors": self.rollout_errors,
+                            "rollouts_per_min": len(rollouts_last_minute),
                         }
                         trainer_version_to_publish = None
                     else:
-                        loop_stats = {
-                            "trainer_model_version": last_trainer_version
-                            }
+                        loop_stats = {"trainer_model_version": last_trainer_version}
 
                     self.publish_stats(
                         stats_writer=stats_writer,
                         loop_stats=loop_stats,
                     )
 
-
-                if finished_groups == expected_rollouts:
+                if expected_rollouts >= 0 and finished_groups + self.rollout_errors >= expected_rollouts:
                     logger.info(f"Finished {expected_rollouts} rollouts, stopping actor loop")
+                    self.stop_tasks()
                     break
 
     def publish_stats(self, stats_writer: StreamWriter, loop_stats: Dict):
@@ -558,31 +600,269 @@ class ActorLoop:
                     stats[f"{dataset_name}/{metric_name}_{agg}"] = sub_stats
 
         stats |= (
-            {
-                f"{split_name}{k}": v
-                for k, v in always_or_never_success_stats(self.stats["success"]).items()
-            }
-            | {
-                f"{split_name}latency_" + k: v
-                for k, v in calculate_stats(self.latency_list).items()
-            }
-            | {
-                f"{split_name}model_version_" + k: v
-                for k, v in calculate_stats(self.model_versions_list).items()
-            }
+            {f"{split_name}{k}": v for k, v in always_or_never_success_stats(self.stats["success"]).items()}
+            | {f"{split_name}latency_" + k: v for k, v in calculate_stats(self.latency_list).items()}
+            | {f"{split_name}model_version_" + k: v for k, v in calculate_stats(self.model_versions_list).items()}
         )
 
         stats |= loop_stats
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
+
+        rename_suffixes = {
+            "num_python_calls_mean": "python_calls_mean",
+            "used_python_mean": "python_usage_rate",
+            "num_math_answer_calls_mean": "math_answer_calls_mean",
+            "used_math_answer_mean": "math_answer_usage_rate",
+        }
+
+        for key in list(stats.keys()):
+            for old_suffix, new_suffix in rename_suffixes.items():
+                if key.endswith(old_suffix):
+                    prefix = key[: -len(old_suffix)]
+                    stats[f"{prefix}{new_suffix}"] = stats[key]
+                    break
+
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
         self.init_stats()  # Reset stats for the next iteration
 
+    def have_capacity(self) -> bool:
+        return not self.problem_queue.full()
+
+    def submit_problem(self, problem: dict):
+        self.problem_queue.put(problem, block=False)
+
+    def stop_tasks(self):
+        pass
+
+    def get_new_results(self) -> list[RolloutResult]:
+        return self.result_queue.get(block=False)
+
+    def results_ready_to_publish(self) -> int:
+        return self.result_queue_size() * self.cfg.attempts
+
+    def problem_queue_size(self) -> int:
+        return self.problem_queue.qsize()
+
+    def result_queue_size(self) -> int:
+        return self.result_queue.qsize()
+
+
+class ActorLoopRay(ActorLoop):
+    """
+    Loop that runs the ray tasks for n_jobs to perform rollouts in parallel
+    """
+
+    def __init__(self, cfg: DictConfig, *args, **kwargs):
+        assert cfg.attempts % cfg.actor.async_batch_size == 0, (
+            f"attempts {cfg.attempts} must be divisible by actor.async_batch_size {cfg.actor.async_batch_size}"
+        )
+        super().__init__(cfg, *args, **kwargs)
+        self.cfg_dict: dict = OmegaConf.to_container(self.cfg, resolve=True)  # type: ignore
+        self.unfinished_tasks = []
+        self.llms_by_url = {llm.get_base_url(): llm for llm in self.llms}
+        self.llms_utilization = {llm.get_base_url(): 0 for llm in self.llms}
+        self.scheduler_name = f"{'train' if self.is_training else 'test'} ray scheduler"
+        self.problem_id = 0
+        self.attempts = self.cfg.attempts if self.is_training else 1
+        self.unfinished_groups = defaultdict(list)  # up to `attempts` rollout results for each problem
+        self.finished_groups = []
+        self.token_count = 0
+        self.finished_rollouts_count = 0
+        self.log_dir = Path(self.cfg.output_dir) / "actor" / "ray"
+
+    def start_backend(self):
+        logger.info(f"Initializing Ray with {self.cfg.actor.rollout_workers} workers..")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        ray_context = ray.init(
+            num_cpus=self.cfg.actor.rollout_workers,
+            dashboard_host="0.0.0.0",
+            include_dashboard=True,
+            log_to_driver=True,
+            ignore_reinit_error=True,
+        )
+        logger.info(f"Ray initialized, dashboard at {ray_context.dashboard_url}")
+
+        assert self.trainer_state.propagated_weight_version is not None
+        rollout_policy = hydra.utils.get_method(self.cfg.actor.rollout_policy)
+
+        def rollout_wrapper(cfg_dict: dict, llm: TrainableLLM, problems: list[dict]) -> list[RolloutResult]:
+            assert len(problems) == 1, "Sync mode should only be used with 1 problem at a time"
+            cfg = OmegaConf.create(cfg_dict)
+            problem = problems[0]
+            group_id = problem["_group_id"]
+            attempt = problem["_attempt"]
+            log_file = Path(cfg.output_dir) / "actor" / "ray" / f"{group_id}.log"
+            sys.stdout = open(log_file, "a", buffering=1)
+            sys.stderr = sys.stdout
+            logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
+            logger.info(f"Running sync rollout for task {group_id}_{attempt}")
+            start_ts = time.perf_counter()
+            rollout_result: RolloutResult = rollout_policy(cfg, llm, problem)
+            rollout_result.latency = time.perf_counter() - start_ts
+            rollout_result.llm_url = llm.get_base_url()
+            rollout_result.group_id = group_id
+            rollout_result.attempt = attempt
+            logger.info(f"Task {group_id}_{attempt} finished in {rollout_result.latency:.2f} seconds")
+            return [rollout_result]
+
+        async def run_rollouts_with_session(
+            cfg: DictConfig, llm: TrainableLLM, problems: list[dict]
+        ) -> list[RolloutResult]:
+            connector = aiohttp.TCPConnector(
+                limit=cfg.actor.async_batch_size, limit_per_host=cfg.actor.async_batch_size, keepalive_timeout=1.0
+            )
+            timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                # Run all rollouts in parallel using asyncio.gather
+                async def run_rollout(problem) -> RolloutResult:
+                    group_id = problem["_group_id"]
+                    attempt = problem["_attempt"]
+                    logger.info(f"Running async rollout loop for task {group_id}_{attempt}")
+                    start_ts = time.perf_counter()
+                    rollout_result = await rollout_policy(cfg, llm, problem, session)
+                    rollout_result.latency = time.perf_counter() - start_ts
+                    rollout_result.llm_url = llm.get_base_url()
+                    rollout_result.group_id = group_id
+                    rollout_result.attempt = attempt
+                    logger.info(f"Task {group_id}_{attempt} finished in {rollout_result.latency:.2f} seconds")
+                    return rollout_result
+
+                tasks = [run_rollout(problem) for problem in problems]
+                rollout_results = await asyncio.gather(*tasks)
+            return rollout_results
+
+        def rollout_async_batch_wrapper(cfg_dict: dict, llm: TrainableLLM, problems: list[dict]) -> list[RolloutResult]:
+            cfg = OmegaConf.create(cfg_dict)
+            group_id = problems[0]["_group_id"]
+            log_file = Path(cfg.output_dir) / "actor" / "ray" / f"{group_id}_async_{len(problems)}.log"
+            sys.stdout = open(log_file, "a", buffering=1)
+            sys.stderr = sys.stdout
+            logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
+            logger.info(f"Running async rollouts for group {group_id} with {len(problems)} problems")
+            rollout_results = asyncio.run(run_rollouts_with_session(cfg, llm, problems))
+            return rollout_results
+
+        if self.cfg.actor.async_batch_size > 1:
+            logger.info("Using async mode")
+            self.ray_remote = ray.remote()(rollout_async_batch_wrapper)
+        else:
+            logger.info("Using sync mode")
+            self.ray_remote = ray.remote()(rollout_wrapper)
+        self.start_time = time.time()
+
+    def have_capacity(self) -> bool:
+        have_capacity = len(self.unfinished_tasks) < self.cfg.actor.problem_queue_size
+        have_llm_capacity = any(
+            self.llms_utilization[llm_url] < (self.cfg.actor.llm_max_rollouts - self.attempts)
+            for llm_url in self.llms_utilization
+        )
+        have_capacity = have_capacity and have_llm_capacity
+        return have_capacity
+
+    def submit_problem(self, problem: dict):
+        # Make a list of cfg.attempts identical problems (deepcopies can be used if necessary)
+        problems = []
+        for attempt in range(self.attempts):
+            p = problem.copy()
+            p["_group_id"] = f"{self.scheduler_name}_{self.problem_id}"
+            p["_attempt"] = attempt
+            problems.append(p)
+
+        # Split problems into batches of up to cfg.async_batch_size
+        batches = [
+            problems[i : i + self.cfg.actor.async_batch_size]
+            for i in range(0, len(problems), self.cfg.actor.async_batch_size)
+        ]
+        for batch_idx, problem_batch in enumerate(batches):
+            llm_url, task_count = min(self.llms_utilization.items(), key=lambda x: x[1])
+            logger.info(
+                f"Submitting problem {self.problem_id} batch {batch_idx + 1}/{len(batches)} to the least busy LLM {llm_url} with {task_count} tasks"
+            )
+            llm = self.llms_by_url[llm_url]
+            task_ref = self.ray_remote.remote(self.cfg_dict, llm, problem_batch)
+            time.sleep(self.cfg.actor.task_submission_delay_sec)
+            self.llms_utilization[llm_url] += len(problem_batch)
+            self.unfinished_tasks.append(task_ref)
+        self.problem_id += 1
+
+    def stop_tasks(self):
+        ray.shutdown()
+
+    def receive_finished_tasks(self):
+        num_returns = min(100, len(self.unfinished_tasks))  # query up to 100 tasks at a time
+        try:
+            finished_tasks, unfinished_tasks = ray.wait(self.unfinished_tasks, num_returns=num_returns, timeout=0.1)
+        except Exception as e:
+            logger.error(f"Error waiting for finished ray tasks: {e}")
+            return
+        if len(finished_tasks) > 0:
+            logger.info(f"Found {len(finished_tasks)} finished tasks, {len(unfinished_tasks)} unfinished tasks left")
+        self.unfinished_tasks = unfinished_tasks
+        dt = time.time() - self.start_time
+        rollout_results: list[RolloutResult] = []
+        for finished_task in finished_tasks:
+            try:
+                rollout_results += ray.get(finished_task)
+            except Exception as e:
+                logger.error(f"Error getting finished ray task: {e}")
+                self.rollout_errors += self.cfg.actor.async_batch_size
+                continue
+        logger.info(f"Received {len(rollout_results)} rollout results from {len(finished_tasks)} finished tasks")
+        for rollout_result in rollout_results:
+            rollout_result.model_version = self.trainer_state.propagated_weight_version
+            rollout_index = len(self.unfinished_groups[rollout_result.group_id])
+            for step_index, tr_text in enumerate(rollout_result.training_texts):
+                # Downstream in the pipeline we'll need these fields in every sample
+                tr_text.metadata["model_version"] = rollout_result.model_version
+                tr_text.metadata["rollout_index"] = rollout_index
+                tr_text.metadata["step_index"] = step_index
+                tr_text.group_id = rollout_result.group_id
+            if self.llms_utilization[rollout_result.llm_url] > 0:
+                self.llms_utilization[rollout_result.llm_url] -= 1
+            else:
+                logger.warning(f"LLM {rollout_result.llm_url} utilization is 0, but got a result")  # should not happen
+            self.token_count += get_number_of_tokens_in_result(rollout_result)
+            self.finished_rollouts_count += 1
+            self.unfinished_groups[rollout_result.group_id].append(rollout_result)
+
+            if len(self.unfinished_groups[rollout_result.group_id]) == self.attempts:
+                logger.info(f"Problem {rollout_result.group_id} group finished")
+                group = self.unfinished_groups[rollout_result.group_id]
+                random.shuffle(group)
+                self.finished_groups.append(group)
+                del self.unfinished_groups[rollout_result.group_id]
+                logger.info(f"{len(self.finished_groups)} finished groups ready to return")
+        logger.info(
+            f"Ray {'train' if self.is_training else 'test'} actor loop: "
+            f"rollouts in progress: {len(self.unfinished_tasks)}, "
+            f"groups in progress: {len(self.unfinished_groups)}, "
+            f"rollouts finished: {self.finished_rollouts_count}, "
+            f"total tokens: {self.token_count}, "
+            f"gen speed: {self.token_count / dt:.2f} tokens/sec, "
+            f"time elapsed: {dt:.2f} sec,\n"
+            f"LLMs utilization: {self.llms_utilization}"
+        )
+
+    def get_new_results(self) -> list[list[RolloutResult]]:
+        self.receive_finished_tasks()
+        if len(self.finished_groups) > 0:
+            logger.info(f"have {len(self.finished_groups)} finished problems, pop one")
+            return self.finished_groups.pop(0)
+        return []
+
+    def problem_queue_size(self) -> int:
+        return len(self.unfinished_tasks)
+
+    def result_queue_size(self) -> int:
+        return len(self.finished_groups)
+
 
 def run_actor_loop(cfg: DictConfig):
     set_streams_backend(**cfg.streams)
+    actor_loop_class = ActorLoopRay if cfg.use_ray else ActorLoop
 
     # set seed for reproducibility (mostly intended for dataset loading)
     random.seed(cfg.seed)
@@ -603,7 +883,7 @@ def run_actor_loop(cfg: DictConfig):
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)
     # Get dataset loader parameters if they exist in config, otherwise use empty dict
-    dataset_loader_params = cfg.get('dataset_loader_params', {})
+    dataset_loader_params = cfg.get("dataset_loader_params", {})
     # Use **dataset_loader_params to pass parameters only if they exist
     train_dataset = dataset_loader(cfg.train_dataset_names, **dataset_loader_params)
     test_dataset = dataset_loader(cfg.test_dataset_names, **dataset_loader_params)
@@ -617,12 +897,19 @@ def run_actor_loop(cfg: DictConfig):
         actor_model_path = finetune_model_path
     else:
         actor_model_path = cfg.model_path
-    
+
+    # Align client-side context size with vLLM server max_model_len when available
+    try:
+        _context_size = int(cfg.vllm_config.vllm_kwargs.max_model_len)
+    except Exception:
+        _context_size = 32000
+
     train_llms = [
         TrainableLLM(
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
+            context_size=_context_size,
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
         )
@@ -633,6 +920,7 @@ def run_actor_loop(cfg: DictConfig):
             base_url=url,
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
+            context_size=_context_size,
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
         )
@@ -648,13 +936,12 @@ def run_actor_loop(cfg: DictConfig):
         trainer_state.start_listening()
         trainer_state.wait_for_model_version()
 
-    train_loop = ActorLoop(
+    train_loop = actor_loop_class(
         data_stream=data_stream, cfg=cfg, trainer_state=trainer_state, stats_stream=stats_stream, llms=train_llms
     )
-    train_loop_run = train_loop.run(
-        dataset=train_dataset,
-    )
-    test_loop = ActorLoop(
+    train_loop.start_backend()
+    train_loop_run = train_loop.run(dataset=train_dataset)
+    test_loop = actor_loop_class(
         data_stream=test_data_stream,
         cfg=cfg,
         trainer_state=trainer_state,
@@ -683,9 +970,8 @@ def run_actor_loop(cfg: DictConfig):
             and test_loop_run is None
         ):
             logger.info("Create test loop")
-            test_loop_run = test_loop.run(
-                dataset=test_dataset,
-            )
+            test_loop.start_backend()
+            test_loop_run = test_loop.run(dataset=test_dataset)
             train_loop.is_scheduling_paused = True
             current_eval = next_regular_eval
 
