@@ -192,6 +192,125 @@ class RedisStreamReader(StreamReader):
                 yield pickle.loads(entry[b"data"])
 
 
+class RedisSharedStreamWriter(StreamWriter):
+    """Redis writer that supports multiple producers appending to a single stream."""
+
+    def __init__(
+        self,
+        stream: SingleStreamSpec,
+        mode: Literal["w", "a"] = "a",
+        *,
+        writer_id: str | None = None,
+        maxlen: int = 1_000_000,
+    ):
+        self.stream = stream
+        assert isinstance(_backend, RedisConfig)
+        self._redis = connect_to_redis(_backend)
+        self._stream_name = str(self.stream)
+        self._counter_key = f"stream:{self._stream_name}:next_index"
+        self._writer_id = str(writer_id) if writer_id is not None else None
+        self._maxlen = maxlen
+
+        if mode not in {"w", "a"}:
+            raise ValueError(f"Invalid mode: {mode}. Only 'w' and 'a' are supported.")
+
+        if mode == "w":
+            last_entry = self._redis.xrevrange(self._stream_name, count=1)
+            if last_entry:
+                raise ValueError(f"Stream {self.stream} already exists. Cannot overwrite it.")
+            self._redis.delete(self._counter_key)
+            self._redis.set(self._counter_key, -1)
+        else:
+            if not self._redis.exists(self._counter_key):
+                last_entry = self._redis.xrevrange(self._stream_name, count=1)
+                if last_entry:
+                    _, entry = last_entry[0]
+                    raw_index = entry.get(b"index")
+                    next_index = int(raw_index.decode("utf-8")) + 1 if raw_index else 0
+                else:
+                    next_index = 0
+                self._redis.set(self._counter_key, next_index - 1)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._redis.close()
+
+    def write(self, data, partition: int | None = None):
+        if partition is not None:
+            raise ValueError("Shared Redis streams do not support manual partition overrides")
+
+        serialized = _serialize_with_orjson(data)
+        entry_index = self._redis.incr(self._counter_key)
+        record: dict[str, Any] = {
+            "index": str(entry_index),
+            "data": serialized,
+            "ts": f"{time.time():.6f}",
+        }
+        if self._writer_id is not None:
+            record["writer"] = self._writer_id
+        self._redis.xadd(self._stream_name, record, maxlen=self._maxlen, approximate=True)
+
+
+class RedisSharedStreamReader(StreamReader):
+    """Redis reader that validates fan-in ordering for a shared stream."""
+
+    def __init__(self, stream: SingleStreamSpec, *, fail_on_gap: bool = True):
+        self.stream = stream
+        assert isinstance(_backend, RedisConfig)
+        self._redis = connect_to_redis(_backend)
+        self._stream_name = str(self.stream)
+        self._last_id = 0
+        self._expected_index: int | None = None
+        self._fail_on_gap = fail_on_gap
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._redis.close()
+
+    def _update_expected_index(self, entry: dict[bytes, bytes]):
+        raw_index = entry.get(b"index")
+        if raw_index is None:
+            return
+
+        index_value = int(raw_index.decode("utf-8"))
+        if self._expected_index is None:
+            self._expected_index = index_value
+        elif index_value != self._expected_index:
+            message = (
+                f"Index mismatch for shared stream {self.stream}: expected {self._expected_index}, got {index_value}"
+            )
+            if self._fail_on_gap:
+                raise ValueError(message)
+            logger.warning(message)
+            self._expected_index = index_value
+
+        self._expected_index += 1
+
+    def read(self):
+        block = int(_REREAD_DELAY * 1000)
+        while True:
+            response = self._redis.xread({self._stream_name: self._last_id}, count=1, block=block)
+            if not response:
+                continue
+
+            stream_name, result = response[0]
+            assert stream_name.decode("utf-8") == self._stream_name
+            assert isinstance(result, list) and len(result) == 1
+            entry_id, entry = result[0]
+            self._last_id = entry_id
+            self._update_expected_index(entry)
+
+            payload = entry.get(b"data")
+            if payload is None:
+                raise ValueError(f"Shared stream entry missing 'data' field: {entry}")
+
+            yield orjson.loads(payload)
+
+
 class RoundRobinRedisStreamWriter(StreamWriter):
     # TODO: share the connection across writers
 
@@ -246,6 +365,32 @@ def stream_file(stream_dir: Path, shard_id: int) -> Path:
 StreamSpec = SingleStreamSpec | StreamRangeSpec
 
 
+def _to_json_ready(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+
+    if isinstance(value, numpy.ndarray):
+        return value
+
+    if isinstance(value, numpy.generic):
+        return value.item()
+
+    if isinstance(value, dict):
+        return {key: _to_json_ready(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_to_json_ready(item) for item in value]
+
+    return value
+
+
+def _serialize_with_orjson(data: Any) -> bytes:
+    return orjson.dumps(_to_json_ready(data), option=orjson.OPT_SERIALIZE_NUMPY)
+
+
 class FileStreamWriter(StreamWriter):
     def __init__(self, stream: SingleStreamSpec, mode: Literal["w", "a"] = "a"):
         self.stream = stream
@@ -266,13 +411,8 @@ class FileStreamWriter(StreamWriter):
         if partition is not None:
             raise ValueError()
         # Textual streams are so useful, that we try hard to jsonify the given object.
-        if isinstance(data, BaseModel):
-            data_dict = data.model_dump()
-            for key, value in data_dict.items():
-                if isinstance(value, torch.Tensor):
-                    data_dict[key] = value.numpy()
-            data = data_dict
-        self._file.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY).decode("utf-8"))
+        payload = _serialize_with_orjson(data)
+        self._file.write(payload.decode("utf-8"))
         self._file.write("\n")
         self._file.flush()
 
@@ -387,32 +527,57 @@ class RoundRobinFileStreamWriter(StreamWriter):
 # Below are the public stream APIs. Easy to replace files with Redis or another pubsub system.
 
 
-def read_stream(stream: SingleStreamSpec) -> StreamReader:
-    """Start reading the stream from the beginning"""
+def read_stream(stream: SingleStreamSpec, *, shared: bool = False, fail_on_gap: bool = True) -> StreamReader:
+    """Start reading the stream from the beginning.
+
+    When ``shared`` is True, multiple producers are assumed to append to the same
+    Redis stream and the reader will validate ordering using the stored index
+    metadata.
+    """
     raise_if_backend_not_set()
     if not isinstance(stream, SingleStreamSpec):
         raise ValueError(f"Invalid stream spec: {stream}")
     if isinstance(_backend, RedisConfig):
+        if shared:
+            return RedisSharedStreamReader(stream, fail_on_gap=fail_on_gap)
         return RedisStreamReader(stream)
     elif _backend == "files":
+        if shared:
+            raise ValueError("Shared stream mode is only supported with the Redis backend")
         return FileStreamReader(stream)
     else:
         assert False
 
 
-def write_to_streams(streams: StreamSpec, mode: Literal["w", "a"] = "a") -> StreamWriter:
-    """Append to the end of the stream."""
+def write_to_streams(
+    streams: StreamSpec,
+    mode: Literal["w", "a"] = "a",
+    *,
+    shared: bool = False,
+    writer_id: str | None = None,
+) -> StreamWriter:
+    """Append to the end of the stream.
+
+    Set ``shared`` to True when multiple producers must append to the same Redis
+    stream and ServiceNow/Fast-LLM will perform downstream sharding.
+    """
     raise_if_backend_not_set()
     if not isinstance(streams, (SingleStreamSpec, StreamRangeSpec)):
         raise ValueError(f"Invalid stream spec: {streams}")
     if isinstance(_backend, RedisConfig):
         if isinstance(streams, SingleStreamSpec):
+            if shared:
+                return RedisSharedStreamWriter(streams, mode, writer_id=writer_id)
             return RedisStreamWriter(streams, mode)
         elif isinstance(streams, StreamRangeSpec):
+            if shared:
+                raise ValueError("Shared Redis streams only support SingleStreamSpec inputs")
             return RoundRobinRedisStreamWriter(streams, mode)
         else:
             assert False
     elif _backend == "files":
+        if shared:
+            raise ValueError("Shared stream mode is only supported with the Redis backend")
         if isinstance(streams, SingleStreamSpec):
             return FileStreamWriter(streams, mode)
         elif isinstance(streams, StreamRangeSpec):
