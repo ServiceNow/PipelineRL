@@ -321,6 +321,7 @@ PipelineRL is organized as a modular, Hydra-driven pipeline with 6 core componen
 - Defined in `pipelinerl/streams.py`.
 - Implements `SingleStreamSpec` and `StreamRangeSpec` for file-system or Redis-based queues.
 - `write_to_streams(...)` and `read_stream(...)` provide a JSON-line protocol for inter-process messaging.
+- Pass `shared=True` to these helpers when multiple actors must fan-in to a single Redis stream (e.g., ServiceNow/Fast-LLM trainer). The shared mode encodes payloads via `orjson`, tags them with a global index, and lets the trainer perform downstream sharding safely.
 - Available backends:
   - File system: default.
   - Redis: requires Redis server.
