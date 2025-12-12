@@ -476,6 +476,9 @@ class ActorLoop:
                             try:
                                 try:
                                     problem = next(problem_iter)
+                                    # Add metadata for tape saving
+                                    problem["_is_training"] = self.is_training
+                                    problem["_model_version"] = self.trainer_state.propagated_weight_version
                                     self.submit_problem(problem)
                                     submitted_groups += 1
                                 except queue.Full:

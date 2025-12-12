@@ -158,6 +158,9 @@ def preprocess_dataset(
         entry["model_version"] = entry["metadata"]["model_version"]
         entry["rollout_index"] = entry["metadata"]["rollout_index"]
         entry["step_index"] = entry["metadata"]["step_index"]
+        # Extract raw_success from metadata for raw advantage calculation (default to reward if not present)
+        raw_success = entry["metadata"].get("raw_success", entry["reward"])
+        entry["raw_rewards"] = [raw_success] * len(entry["labels"])
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
     dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
@@ -286,11 +289,11 @@ def process_chunk(
 
 def filter_zero_advantage_groups(dataset: list[dict], epsilon: float = 1e-6) -> tuple[list[dict], int]:
     """
-    Filter out groups where all advantages are zero.
+    Filter out groups where all raw_advantages are zero.
     
     Args:
-        dataset: List of dataset entries with group_id and advantages
-        epsilon: Threshold for considering advantage non-zero
+        dataset: List of dataset entries with group_id and raw_advantages
+        epsilon: Threshold for considering raw_advantage non-zero
         
     Returns:
         Tuple of (filtered_entries, num_filtered_out)
@@ -307,12 +310,12 @@ def filter_zero_advantage_groups(dataset: list[dict], epsilon: float = 1e-6) -> 
     
     num_filtered_out = 0
     
-    # Filter groups based on advantage values
+    # Filter groups based on raw_advantage values
     for group_id, entries in groups.items():
         has_non_zero_advantage = False
         for entry in entries:
-            # advantages is a list, check if any absolute value is > epsilon
-            if any(abs(adv) > epsilon for adv in entry["advantages"]):
+            # raw_advantages is a list, check if any absolute value is > epsilon
+            if any(abs(adv) > epsilon for adv in entry["raw_advantages"]):
                 has_non_zero_advantage = True
                 break
         
@@ -506,6 +509,11 @@ def run_preprocessing_loop(
                         dataset = output_queue.get(timeout=0.001)
                         if isinstance(dataset, Exception):
                             raise dataset
+                        # Check for error dict before processing
+                        if isinstance(dataset, dict) and "error" in dataset:
+                            logger.error(f"Got exception from the result queue: {dataset['error']}")
+                            logger.error(f"Traceback: {dataset['traceback']}")
+                            raise Exception(dataset['error'])
                         if rl_config.filter_zero_advantage_groups:
                             dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
                             total_filtered_out += num_filtered_out
@@ -516,10 +524,6 @@ def run_preprocessing_loop(
                         pass
                     
                     if dataset:
-                        if isinstance(dataset, dict) and "error" in dataset:
-                            logger.error(f"Got exception from the result queue: {dataset['error']}")
-                            logger.error(f"Traceback: {dataset['traceback']}")
-                            raise Exception(dataset['error'])
                         for entry in dataset:
                             buffer.append(entry)
                         processed_chunks += 1

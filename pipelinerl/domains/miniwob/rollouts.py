@@ -3,13 +3,15 @@ import logging
 import os
 import random
 import time
+from typing import Any
 
 import aiohttp
 from examples.rl_webagent.environment import WebEnvironment
+from examples.rl_webagent.generic_agent import GenericWebAgent
 from examples.rl_webagent.steps import WebTape
 from hydra.utils import instantiate
-from omegaconf import DictConfig
-from tapeagents.agent import DEFAULT, Agent
+from omegaconf import DictConfig, OmegaConf
+from tapeagents.agent import DEFAULT
 from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
 from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 class MiniwobMetrics(BaseMetrics):
     reward: float
+    raw_success: float  # 1.0 if raw_reward > 0, else 0.0 (used for raw advantage calculation)
     success: bool
     no_error: bool
     no_answer: bool
@@ -63,6 +66,40 @@ def tape_contains_an_error(tape: WebTape) -> bool:
     )
 
 
+def _create_generic_agent(
+    cfg: DictConfig,
+    llm: TrainableLLM,
+    actions: Any,
+    tools_description: Any,
+) -> GenericWebAgent:
+    generic_cfg: dict[str, Any] = {}
+    if "generic_agent" in cfg:
+        raw_cfg = cfg.generic_agent
+        if isinstance(raw_cfg, DictConfig):
+            generic_cfg = OmegaConf.to_container(raw_cfg, resolve=True)  # type: ignore[assignment]
+        elif isinstance(raw_cfg, dict):
+            generic_cfg = raw_cfg
+    use_examples = generic_cfg.get("use_examples", True)
+    max_iterations = generic_cfg.get("max_iterations", 10)
+    max_retries = generic_cfg.get("max_retries")
+    agent = GenericWebAgent.create(llm, max_iterations=max_iterations, use_examples=use_examples)
+    agent.known_actions = actions
+    agent.tools_description = tools_description
+
+    max_chars = generic_cfg.get("max_chars_page_observation")
+    include_think_in_history = generic_cfg.get("include_think_in_history", True)
+    for node in agent.nodes:
+        if max_chars is not None and hasattr(node, "max_chars_page_observation"):
+            node.max_chars_page_observation = max_chars
+        if max_retries is not None and hasattr(node, "max_retries"):
+            node.max_retries = max_retries
+            node.current_retries = 0
+        if hasattr(node, "include_think_in_history"):
+            node.include_think_in_history = include_think_in_history
+
+    return agent
+
+
 def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) -> RolloutResult:
     # make agent and env
     # set the llm
@@ -73,9 +110,15 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
 
     start_time = time.perf_counter()
 
-    agent, env = get_agent_and_env_from_config(cfg)
-    env_agent_creation_time = time.perf_counter() - start_time
-    environment: WebEnvironment = env
+    creation_start = time.perf_counter()
+    if getattr(cfg, "use_generic_agent", False):
+        environment = instantiate(cfg.environment)
+        environment.initialize()
+        logger.info(f"Environment tools: {environment.tools_description()}")
+        agent = _create_generic_agent(cfg, llm, environment.actions(), environment.tools_description())
+    else:
+        agent, environment = get_agent_and_env_from_config(cfg)
+    env_agent_creation_time = time.perf_counter() - creation_start
     try:
         agent.llms = {DEFAULT: llm}
         logger.info(f"Agent and environment loaded, using llm {llm.model_name} at {llm.get_base_url()}")
@@ -99,7 +142,7 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
         )
         logger.info(f"Running agent for task {problem['dataset']}/{problem['task']}/{problem['seed']}")
         ex_t = time.perf_counter()
-        tape = execute_agent(agent, tape, env, max_loops=cfg.agent_max_loops)
+        tape = execute_agent(agent, tape, environment, max_loops=cfg.agent_max_loops)
         execution_time = time.perf_counter() - ex_t
     finally:
         close_t = time.perf_counter()
@@ -114,6 +157,13 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
     # save the tape as we go
     if cfg.save_tapes:
         try:
+            # Add metadata for tracking
+            tape.metadata.other.update({
+                "split": "train" if problem.get("_is_training", True) else "test",
+                "model_version": problem.get("_model_version", -1),
+                "llm_model_name": llm.model_name,
+                "llm_base_url": llm.get_base_url(),
+            })
             tape_name = problem.get("_task_id", tape.metadata.id)
             save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape_name)
         except Exception as e:
@@ -126,22 +176,6 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
         # in Miniwob, the observation "reward" is defined as RAW_REWARD_GLOBAL > 0
         # see here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/src/browsergym/miniwob/base.py#L188
         # Let's take directly the RAW_REWARD_GLOBAL from the metadata
-        # raw_reward = last_obs.metadata.other.get("reward", 0.0)
-        raw_reward = last_obs.metadata.other.get("info", {}).get("task_info", {}).get("REWARD_GLOBAL", -1.0)
-    else:
-        raw_reward = -1.0
-
-    # get the number of LLMOutputParsingFailureAction in the tape
-    n_step_errors = len([step for step in tape.steps if isinstance(step, LLMOutputParsingFailureAction)])
-    # get the number of PageObservation steps in the tape
-    n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
-
-    if obs_steps:
-        last_obs = obs_steps[-1]
-        # in Miniwob, the observation "reward" is defined as RAW_REWARD_GLOBAL > 0
-        # see here: https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/miniwob/src/browsergym/miniwob/base.py#L188
-        # Let's take directly the RAW_REWARD_GLOBAL from the metadata
-        # raw_reward = last_obs.metadata.other.get("reward", 0.0)
         raw_reward = last_obs.metadata.other.get("info", {}).get("task_info", {}).get("REWARD_GLOBAL", -1.0)
     else:
         raw_reward = -1.0
@@ -155,13 +189,16 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
     if cfg.reward_computation == "nico":
         reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
     elif cfg.reward_computation == "massimo":
-        reward = float(raw_reward>0)
+        discount_factor = cfg.actor.discount_factor
+        reward = float(raw_reward > 0)
         if reward == 0.0:
             reward = -1.0
-        reward *= 0.98 ** n_page_observations
+        reward *= discount_factor ** n_page_observations
     else:
         raise ValueError(f"Invalid reward configuration: {cfg.reward_computation}")
 
+    # Raw success: 1.0 if task succeeded, 0.0 otherwise (for raw advantage calculation)
+    raw_success = 1.0 if raw_reward > 0 else 0.0
 
     # (3) Get LLM calls from Tape
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
@@ -186,6 +223,7 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     for text in training_texts:
         text.reward = reward
+        text.metadata["raw_success"] = raw_success  # Store raw success for raw advantage calculation
         all_finished &= 1 if text.input_ids[-1] == llm.tokenizer.eos_token_id else 0
 
     latency = time.perf_counter() - start_time
@@ -197,6 +235,7 @@ def generate_miniwob_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) 
     n_other_steps = len(tape.steps) - n_observations
     metrics = MiniwobMetrics(
         reward=reward,
+        raw_success=raw_success,
         success=reward > 0.5,
         no_error=no_error,
         no_answer=reward < 0,
@@ -283,7 +322,10 @@ async def generate_miniwob_rollout_async(
                 actions = await env.a_actions()
                 tools_description = await env.a_tools_description()
                 logger.debug(f"Available tools: {tools_description}")
-                agent: Agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
+                if getattr(cfg, "use_generic_agent", False):
+                    agent = _create_generic_agent(cfg, llm, actions, tools_description)
+                else:
+                    agent = instantiate(cfg.agent, known_actions=actions, tools_description=tools_description)
                 agent.llms = {DEFAULT: llm}
                 tape = await async_execute_agent(agent, tape, env, session, max_loops=cfg.agent_max_loops)
             except Exception as e:
@@ -296,6 +338,13 @@ async def generate_miniwob_rollout_async(
 
     # save the tape as we go
     if cfg.save_tapes:
+        # Add metadata for tracking
+        tape.metadata.other.update({
+            "split": "train" if problem.get("_is_training", True) else "test",
+            "model_version": problem.get("_model_version", -1),
+            "llm_model_name": llm.model_name,
+            "llm_base_url": llm.get_base_url(),
+        })
         save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape.metadata.id)
 
     # (3) Compute rewards
@@ -315,13 +364,17 @@ async def generate_miniwob_rollout_async(
     n_step_errors = len([step for step in tape.steps if isinstance(step, LLMOutputParsingFailureAction)])
     # get the number of PageObservation steps in the tape
     n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
+    discount_factor = cfg.actor.discount_factor
+    if cfg.reward_computation == "nico":
+        reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
+    elif cfg.reward_computation == "massimo":
+        reward = float(raw_reward > 0)
+        if reward <= 0.0:
+            reward = -1.0
+        reward *= discount_factor**n_page_observations
 
-    # reward = raw_reward * 0.99**n_step_errors if no_error and raw_reward >= 0 else -1.0
-    # massimo's setup:
-    reward = float(raw_reward > 0)
-    if reward == 0.0:
-        reward = -1.0
-    reward *= 0.98**n_page_observations
+    # Raw success: 1.0 if task succeeded, 0.0 otherwise (for raw advantage calculation)
+    raw_success = 1.0 if raw_reward > 0 else 0.0
 
     # (3) Get LLM calls from Tape
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
@@ -340,6 +393,7 @@ async def generate_miniwob_rollout_async(
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     for text in training_texts:
         text.reward = reward
+        text.metadata["raw_success"] = raw_success  # Store raw success for raw advantage calculation
         all_finished &= 1 if text.input_ids[-1] == llm.tokenizer.eos_token_id else 0
 
     latency = time.time() - start_time
@@ -349,6 +403,7 @@ async def generate_miniwob_rollout_async(
     n_other_steps = len(tape.steps) - n_observations
     metrics = MiniwobMetrics(
         reward=reward,
+        raw_success=raw_success,
         success=reward > 0.5,
         no_error=no_error,
         no_answer=reward < 0,

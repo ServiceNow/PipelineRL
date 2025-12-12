@@ -1,40 +1,8 @@
 import random
 from browsergym.miniwob import ALL_MINIWOB_TASKS
 
-DEBUG_SPLIT = [
-    "miniwob.buy-ticket",
-    "miniwob.bisect-angle",
-    "miniwob.choose-list",
-    "miniwob.click-checkboxes-large",
-    "miniwob.click-checkboxes-soft",
-]
-EASY_SPLIT = [
-    "miniwob.click-color",
-    "miniwob.click-test-2",
-    "miniwob.click-test-transfer",
-    "miniwob.enter-password",
-    "miniwob.focus-text-2",
-    "miniwob.identify-shape",
-    "miniwob.navigate-tree",
-    "miniwob.phone-book",
-    "miniwob.read-table",
-    "miniwob.use-autocomplete",
-    "miniwob.use-autocomplete",
-    "miniwob.buy-ticket",
-    "miniwob.click-checkboxes-soft",
-    "miniwob.click-collapsible-2",
-    "miniwob.click-collapsible-2-nodelay",
-    "miniwob.click-collapsible-nodelay",
-    "miniwob.click-dialog-2",
-    "miniwob.click-tab-2",
-    "miniwob.click-tab-2-medium",
-    "miniwob.form-sequence-3",
-    "miniwob.hot-cold",
-    "miniwob.multi-orderings",
-    "miniwob.tic-tac-toe",
-    "miniwob.use-autocomplete-nodelay"
-]
-MASSIMO_TRAIN_SPLIT = [
+# Main curated train/test splits for final experiments
+TRAIN = [
     "miniwob.ascending-numbers",
     "miniwob.bisect-angle",
     "miniwob.book-flight",
@@ -135,7 +103,8 @@ MASSIMO_TRAIN_SPLIT = [
     "miniwob.use-spinner",
     "miniwob.visual-addition",
 ]
-MASSIMO_TEST_SPLIT = [
+
+TEST = [
     "miniwob.buy-ticket",
     "miniwob.click-button",
     "miniwob.click-option",
@@ -160,62 +129,116 @@ MASSIMO_TEST_SPLIT = [
     "miniwob.unicode-test",
     "miniwob.use-slider",
 ]
-TRAIN_SPLIT = None
-TEST_SPLIT = None
+
+# Easy tasks (smaller curated subset)
+EASY_TRAIN = [
+    "miniwob.click-color",
+    "miniwob.click-test-2",
+    "miniwob.click-test-transfer",
+    "miniwob.enter-password",
+    "miniwob.focus-text-2",
+    "miniwob.identify-shape",
+    "miniwob.navigate-tree",
+    "miniwob.phone-book",
+    "miniwob.read-table",
+    "miniwob.use-autocomplete",
+    "miniwob.focus-text",
+    "miniwob.buy-ticket",
+    "miniwob.click-checkboxes-soft",
+    "miniwob.click-collapsible-2",
+    "miniwob.click-collapsible-2-nodelay",
+    "miniwob.click-collapsible-nodelay",
+    "miniwob.click-dialog-2",
+    "miniwob.click-tab-2",
+    "miniwob.click-tab-2-medium",
+    "miniwob.form-sequence-3",
+    "miniwob.hot-cold",
+    "miniwob.multi-orderings",
+    "miniwob.tic-tac-toe",
+    "miniwob.use-autocomplete-nodelay",
+]
+EASY_TEST = [
+    "miniwob.click-color",
+    "miniwob.click-test-2",
+    "miniwob.click-test-transfer",
+    "miniwob.enter-password",
+    "miniwob.focus-text-2",
+    "miniwob.identify-shape",
+    "miniwob.navigate-tree",
+    "miniwob.phone-book",
+    "miniwob.read-table",
+    "miniwob.use-autocomplete",
+    "miniwob.use-autocomplete",
+    "miniwob.buy-ticket",
+    "miniwob.click-checkboxes-soft",
+    "miniwob.click-collapsible-2",
+    "miniwob.click-collapsible-2-nodelay",
+    "miniwob.click-collapsible-nodelay",
+    "miniwob.click-dialog-2",
+    "miniwob.click-tab-2",
+    "miniwob.click-tab-2-medium",
+    "miniwob.form-sequence-3",
+    "miniwob.hot-cold",
+    "miniwob.multi-orderings",
+    "miniwob.tic-tac-toe",
+    "miniwob.use-autocomplete-nodelay",
+]
+
+# Debug tasks (tiny subset for quick testing)
+DEBUG_TRAIN = [
+    "miniwob.click-dialog",
+    "miniwob.click-checkboxes",
+]
+DEBUG_TEST = [
+    "miniwob.click-tab",
+    "miniwob.click-menu",
+]
 
 
-def load_tasks(dataset_names: list[str], train_split: float = 0.6, seeds: list[int] = [0, 1, 2, 3, 4]):
-    # set global variables if needed
-    global TRAIN_SPLIT, TEST_SPLIT
-    if TRAIN_SPLIT is None or TEST_SPLIT is None:
-        # Make a copy of tasks to avoid modifying the original
-        all_tasks = list(ALL_MINIWOB_TASKS)
-        # Use fixed seed for consistent shuffling
-        rng = random.Random(1406)
-        rng.shuffle(all_tasks)
-
-        n_train_tasks = int(len(ALL_MINIWOB_TASKS) * train_split)
-        TRAIN_SPLIT = [t.get_task_id() for t in ALL_MINIWOB_TASKS[:n_train_tasks]]
-        TEST_SPLIT = [t.get_task_id() for t in ALL_MINIWOB_TASKS[n_train_tasks:]]
-
+def load_tasks(dataset_names: list[str], train_seeds: list[int] = None, test_seeds: list[int] = None):
+    """Load MiniWoB tasks by split name.
+    
+    Supported splits:
+    - train, test: main curated train/test splits for final experiments
+    - easy_train, easy_test: smaller easy task subsets
+    - debug_train, debug_test: tiny subsets for quick testing
+    
+    Args:
+        dataset_names: List of split names to load
+        train_seeds: Seeds for train/easy_train/debug_train splits 
+                     (default: [3,4,5,6,7,8,9] - matches finetuning/benchmarks.py)
+        test_seeds: Seeds for test/easy_test/debug_test splits 
+                    (default: [0,1,2] - held out seeds for evaluation)
+    """
+    # MiniWoB seed configuration (from finetuning/core/benchmarks.py):
+    # - All seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    # - Train seeds: [3, 4, 5, 6, 7, 8, 9] (7 seeds for training)
+    # - Held-out/test seeds: [0, 1, 2] (3 seeds for evaluation)
+    if train_seeds is None:
+        train_seeds = [3, 4, 5, 6, 7, 8, 9]
+    if test_seeds is None:
+        test_seeds = [0, 1, 2]
+    
+    split_map = {
+        "train": (TRAIN, train_seeds),
+        "test": (TEST, test_seeds),
+        "easy_train": (EASY_TRAIN, train_seeds),
+        "easy_test": (EASY_TEST, test_seeds),
+        "debug_train": (DEBUG_TRAIN, train_seeds),
+        "debug_test": (DEBUG_TEST, test_seeds),
+    }
+    
     tasks = []
     for name in dataset_names:
-        if name == "debug":
-            tasks.extend([
-                # {"dataset": "miniwob.debug", "task": task, "seed": 0} for task in DEBUG_SPLIT
-                {"dataset": task, "task": task, "seed": 0} for task in DEBUG_SPLIT
-            ])
-        elif name == "easy":
-            tasks.extend([
-                # {"dataset": "miniwob.easy", "task": task, "seed": 0} for task in EASY_SPLIT
-                {"dataset": task, "task": task, "seed": 0} for task in EASY_SPLIT
-            ])
-        elif name == "train":
-            tasks.extend([
-                # {"dataset": "miniwob.train", "task": task, "seed": seed}
-                {"dataset": task, "task": task, "seed": seed}
-                for task in TRAIN_SPLIT for seed in seeds
-            ])
-        elif name == "test":
-            tasks.extend([
-                # {"dataset": "miniwob.test", "task": task, "seed": seed}
-                {"dataset": task, "task": task, "seed": seed}
-                for task in TEST_SPLIT for seed in seeds
-            ])
-        elif name == "massimo_train":
-            tasks.extend([
-                {"dataset": task, "task": task, "seed": seed}
-                for task in MASSIMO_TRAIN_SPLIT for seed in range(3,10)  # seeds 0-2 are used for held out goals in Mass setup
-            ])
-        elif name == "massimo_train_heldout_goals":
-            tasks.extend([
-                {"dataset": task, "task": task, "seed": seed}
-                for task in MASSIMO_TRAIN_SPLIT for seed in range(3)  # seeds 0-2 are used for held out goals in Mass setup
-            ])
-        elif name == "massimo_test":
-            tasks.extend([
-                {"dataset": task, "task": task, "seed": seed}
-                for task in MASSIMO_TEST_SPLIT for seed in range(10)
-            ])
+        if name not in split_map:
+            raise ValueError(f"Unknown split '{name}'. Valid: {list(split_map.keys())}")
+        
+        task_list, split_seeds = split_map[name]
+        tasks.extend([
+            {"dataset": task, "task": task, "seed": seed}
+            for task in task_list
+            for seed in split_seeds
+        ])
+    
     return tasks
 

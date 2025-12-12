@@ -91,7 +91,7 @@ class RLConfig(BaseModel):
     )
     filter_zero_advantage_groups: bool = Field(
         default=False,
-        description="Filter out groups where all advantages are zero during preprocessing",
+        description="Filter out groups where all raw_advantages are zero during preprocessing",
     )
     value_loss_coef: float = Field(
         default=0.0,
@@ -382,18 +382,20 @@ def rl_step(
 def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
     """
     Populates a dataset with reinforcement learning specific data columns including
-    rewards, advantages, and token weights.
+    rewards, advantages, raw_rewards, raw_advantages, and token weights.
     Uses leave-one-out (LOO) reward mean: each rollout's baseline excludes its own reward.
     """
     # Convert to pandas for processing
     df_init = pd.DataFrame(dataset)
     assert isinstance(df_init, pd.DataFrame)
 
-    # Step 1: calculate group-level statistics
+    # Step 1: calculate group-level statistics for rewards
     df_stats = df_init[["group_id", "rollout_index", "step_index"]].copy()
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
     # We assume that rewards for all tokens are the same
     df_stats["rollout_reward"] = df_init["rewards"].apply(lambda x: x[0])
+    # Also extract raw_rewards for raw advantage calculation
+    df_stats["rollout_raw_reward"] = df_init["raw_rewards"].apply(lambda x: x[0])
     # Check that the reward is the same for each step in the rollout
     assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1
     # Only keep step_index == 0
@@ -404,6 +406,8 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             rollout_reward_sum=("rollout_reward", "sum"),
             rollout_reward_count=("rollout_reward", "count"),
             rollout_reward_std=("rollout_reward", "std"),
+            rollout_raw_reward_sum=("rollout_raw_reward", "sum"),
+            rollout_raw_reward_std=("rollout_raw_reward", "std"),
             group_tokens=("num_tokens", "mean"),
         )
         .reset_index()
@@ -413,12 +417,14 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         "rollout_reward_sum",
         "rollout_reward_count",
         "rollout_reward_std",
+        "rollout_raw_reward_sum",
+        "rollout_raw_reward_std",
         "group_tokens",
     ]
 
     # Step 2: calculate advantages for each sample (with LOO mean)
     df_advantages = pd.merge(
-        df_init[["group_id", "rollout_index", "step_index", "rewards"]],
+        df_init[["group_id", "rollout_index", "step_index", "rewards", "raw_rewards"]],
         df_grouped,
         on="group_id",
         how="left"
@@ -444,16 +450,39 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             advantages = [(r - loo_mean) for r in rewards]
         return advantages
 
+    def calculate_raw_advantages(row):
+        """Calculate advantages using raw success rewards (1.0 or -1.0)"""
+        raw_rewards = row["raw_rewards"]
+        group_sum = row["rollout_raw_reward_sum"]
+        group_count = row["rollout_reward_count"]
+        current_reward = raw_rewards[0]
+
+        # Leave-one-out mean
+        if group_count > 1:
+            loo_mean = (group_sum - current_reward) / (group_count - 1)
+        else:
+            loo_mean = current_reward
+
+        std = row["rollout_raw_reward_std"]
+        if config.divide_advantage_by_std:
+            advantages = [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in raw_rewards]
+        else:
+            advantages = [(r - loo_mean) for r in raw_rewards]
+        return advantages
+
     df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
+    df_advantages["raw_advantages"] = df_advantages.apply(calculate_raw_advantages, axis=1)
     df_advantages = df_advantages.drop(
-        columns=["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
+        columns=["rewards", "raw_rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std", "rollout_raw_reward_sum", "rollout_raw_reward_std"]
     )
     assert df_advantages.columns.tolist() == [
-        "group_id", "rollout_index", "step_index", "group_tokens", "advantages"
+        "group_id", "rollout_index", "step_index", "group_tokens", "advantages", "raw_advantages"
     ]
 
     # Step 3: bring advantages and group level stats back to the main df
-    df = df_init.drop(columns=["advantages", "group_tokens"])
+    # Drop columns if they exist (they may not exist on first pass)
+    cols_to_drop = [c for c in ["advantages", "raw_advantages", "group_tokens"] if c in df_init.columns]
+    df = df_init.drop(columns=cols_to_drop) if cols_to_drop else df_init.copy()
     df = pd.merge(df, df_advantages, on=["group_id", "rollout_index", "step_index"], how="left")
     assert len(df) == len(df_init)
 
@@ -469,11 +498,13 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
 
     # Step 5: move the results back to the dataset
     advantages_list = df["advantages"].tolist()
+    raw_advantages_list = df["raw_advantages"].tolist()
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()
     num_labels_list = df["num_labels"].tolist()
     for i, entry in enumerate(dataset):
         entry["advantages"] = advantages_list[i]
+        entry["raw_advantages"] = raw_advantages_list[i]
         entry["group_tokens"] = group_tokens_list[i]
         entry["overflow"] = overflow_list[i]
         entry["num_labels"] = num_labels_list[i]

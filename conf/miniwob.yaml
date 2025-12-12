@@ -1,7 +1,7 @@
 defaults:
   - base
   - override streams: redis
-  - override finetune: ppo
+  - override finetune: grpo
   - _self_
 
 world:
@@ -19,19 +19,22 @@ finetune:
   seq_length: 16384  # input + output tokens
   max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
   train_batch_size: 1
-  gradient_accumulation_passes: 1024
+  gradient_accumulation_passes: 512
+  rl:
+    filter_zero_advantage_groups: true
+    divide_advantage_by_std: true
 
-eval_every_n_versions: 10240  # 1024 effective bs * 10 "optim steps"
+eval_every_n_versions: 1024  # 1024 effective bs * 10 "optim steps"
 
 llm:
   use_cache: false
   parameters:
     max_tokens: 4096  # output tokens
-    temperature: 1.0
+    temperature: 0.25
 test_llm:
   parameters:
     max_tokens: ${...llm.parameters.max_tokens}
-    temperature: 0.0
+    temperature: 0.01
     top_p: 1.0
     top_k: 50
 
@@ -50,6 +53,7 @@ actor:
   async_batch_size: 1
   rollout_workers: 32
   shared_memory_entry_size: 100000000
+  discount_factor: 0.98  # discount factor for reward computation
 
 preprocess:
   n_workers: 32  # Increase from 8
@@ -67,10 +71,17 @@ preprocess:
   shared_memory_entry_size: 1000000000  # Increase from 100M
 
 # AGENT CONFIGURATION
-agent_max_loops: 10  # max number of agent - environment interactions for each task
-agent_attempts: 3  # number of attempts to run the agent (retry on errors)
+agent_max_loops: 15  # max number of agent - environment interactions for each task
 rollout_timeout: 600  # overall timeout for entire rollout in seconds (10 minutes)
-reward_computation: nico
+reward_computation: massimo # discounted reward based on the length of the trajectory and nico reward is discounted on number of retries at a step
+
+use_generic_agent: true  # use GenericWebAgent vs TapeAgents Agent
+generic_agent:
+  max_iterations: 15
+  use_examples: true
+  max_chars_page_observation: 10000
+  max_retries: 3
+  include_think_in_history: true
 agent:
   _target_: tapeagents.agent.Agent
   name : web_agent
@@ -154,13 +165,14 @@ environment:
   _target_: examples.rl_webagent.environment.WebEnvironment
   exp_path: null
   headless: true
-  observation_format: axtree
+  observation_format: html
 
 # DATASET CONFIGURATION
 dataset_loader: pipelinerl.domains.miniwob.load_tasks.load_tasks
+# Available splits: train/test (main), easy_train/easy_test, debug_train/debug_test
 dataset_loader_params:
-  train_split: 0.6  # 0.6 of tasks for training, 0.4 for testing
-  seeds: [0, 42, 1337, 900, 103]
+  train_seeds: null # seeds for train-like splits
+  test_seeds: null  # seeds for test-like splits
 train_dataset_names:
   - train
 test_dataset_names:
