@@ -262,99 +262,127 @@ def run_environment(cfg: DictConfig, job: Job):
 
 
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
-    if cfg.use_fsdp and cfg.use_deepspeed:
-        raise ValueError("Cannot use both FSDP and DeepSpeed")
+    save_dir = exp_dir / "finetune"
+
     cmd = [
-        "python",
-        "-m",
-        "accelerate.commands.launch",
+        "conda",
+        "run",
+        "-n",
+        "fast-llm"
     ]
-    if world_map.world_size > 1:
-        # DeepSpeed multi-node args
-        assert cfg.use_deepspeed
-        assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-        hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
-        filter_parts = []
-        for rank, job_list in world_map.job_map.items():
-            for job in job_list:
-                if job.kind == "finetune":
-                    filter_parts.append(f"{hosts[rank]}:{','.join(map(str, job.gpus))}")
-        deepspeed_include_filter = "@".join(filter_parts)
-        logger.info(f"Deepspeed include filter: {deepspeed_include_filter}")
-        # Orchestrator rank must have already created hostfile.txt
-        hostfile_path = str(exp_dir / "hostfile.txt")
-        cmd += [
-            "--num_machines",
-            str(len(world_map.nodes_with_finetuning())),
-            "--machine_rank",
-            str(world_map.my_finetuning_rank()),
-            "--main_process_ip",
-            str(os.environ.get("MASTER_ADDR")),
-            "--main_process_port",
-            str(os.environ.get("MASTER_PORT")),
-            "--deepspeed_hostfile",
-            hostfile_path,
-            "--deepspeed_inclusion_filter",
-            deepspeed_include_filter,
-            "--deepspeed_multinode_launcher",
-            "nossh"
-        ]
-    # get path to this file
-    this_file_path = Path(os.path.dirname(os.path.abspath(__file__)))
-    if cfg.use_deepspeed:
-        # DeepSpeed single-node args
-        cmd += [
-            "--use_deepspeed",
-            "--deepspeed_config_file",
-            str(this_file_path / f"../conf/deepspeed/{cfg.deepspeed_config}.json"),
-        ]
-    # DeepSpeed and non-DeepSpeed args
-    accelerate_config = cfg.accelerate_config
-    if accelerate_config is None:
-        if cfg.use_deepspeed:
-            accelerate_config = "deepspeed"
-        elif cfg.use_fsdp:
-            accelerate_config = "fsdp_mp"
-        else:
-            accelerate_config = "base_mp"
+
     cmd += [
-        "--config_file",
-        str(this_file_path / f"../conf/accelerate/{accelerate_config}.yaml"),
-        "--rdzv_backend",
-        "c10d",
+        "fast-llm",
+        "train",
+        "gpt",
+        "--config",
+        "qwen25_05B-instruct.yaml",
+        f"run.experiment_dir={save_dir}"
     ]
-    if gpus:
-        gpus_str = str(",".join([str(gpu) for gpu in gpus])) if len(gpus) < world_map.node_size else "all"
-        cmd += [
-            "--gpu-ids",
-            gpus_str,
-        ]
-    cmd += [
-        "--num_processes",
-        str(world_map.total_finetune_gpus),
-        "pipelinerl/entrypoints/run_finetune.py",
-        "--config-dir",
-        f"{exp_dir}/conf",
-        "--config-name",
-        "exp_config",
-        f"output_dir={exp_dir}",
-        f"hydra.run.dir={exp_dir}/finetune",
-        # TODO: figure out why we can't build WorldMap in run_finetune.py
-        # Current workaround: pass the essential information as follows:
-        f"+me.weight_update_group_init_method=tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
-        f"+me.weight_update_group_world_size={world_map.weight_update_group_size}",
-        f"+me.llm_urls={'+'.join(world_map.get_actor_urls())}",
-    ]
-    if cfg.debug.mode in ["finetune", "open_loop", "finetune+preprocessor"]:
-        cmd.append("finetune.send_weight_updates=False")
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
     save_command(exp_dir / "finetune", cmd)
     env = dict(os.environ)
-    env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
+    env["PYTHONHASHSEED"] = "42"
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
     proc = _popen(cmd, env=env)
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
+
+# def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
+#     if cfg.use_fsdp and cfg.use_deepspeed:
+#         raise ValueError("Cannot use both FSDP and DeepSpeed")
+#     cmd = [
+#         "python",
+#         "-m",
+#         "accelerate.commands.launch",
+#     ]
+#     if world_map.world_size > 1:
+#         # DeepSpeed multi-node args
+#         assert cfg.use_deepspeed
+#         assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
+#         hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+#         filter_parts = []
+#         for rank, job_list in world_map.job_map.items():
+#             for job in job_list:
+#                 if job.kind == "finetune":
+#                     filter_parts.append(f"{hosts[rank]}:{','.join(map(str, job.gpus))}")
+#         deepspeed_include_filter = "@".join(filter_parts)
+#         logger.info(f"Deepspeed include filter: {deepspeed_include_filter}")
+#         # Orchestrator rank must have already created hostfile.txt
+#         hostfile_path = str(exp_dir / "hostfile.txt")
+#         cmd += [
+#             "--num_machines",
+#             str(len(world_map.nodes_with_finetuning())),
+#             "--machine_rank",
+#             str(world_map.my_finetuning_rank()),
+#             "--main_process_ip",
+#             str(os.environ.get("MASTER_ADDR")),
+#             "--main_process_port",
+#             str(os.environ.get("MASTER_PORT")),
+#             "--deepspeed_hostfile",
+#             hostfile_path,
+#             "--deepspeed_inclusion_filter",
+#             deepspeed_include_filter,
+#             "--deepspeed_multinode_launcher",
+#             "nossh"
+#         ]
+#     # get path to this file
+#     this_file_path = Path(os.path.dirname(os.path.abspath(__file__)))
+#     if cfg.use_deepspeed:
+#         # DeepSpeed single-node args
+#         cmd += [
+#             "--use_deepspeed",
+#             "--deepspeed_config_file",
+#             str(this_file_path / f"../conf/deepspeed/{cfg.deepspeed_config}.json"),
+#         ]
+#     # DeepSpeed and non-DeepSpeed args
+#     accelerate_config = cfg.accelerate_config
+#     if accelerate_config is None:
+#         if cfg.use_deepspeed:
+#             accelerate_config = "deepspeed"
+#         elif cfg.use_fsdp:
+#             accelerate_config = "fsdp_mp"
+#         else:
+#             accelerate_config = "base_mp"
+#     cmd += [
+#         "--config_file",
+#         str(this_file_path / f"../conf/accelerate/{accelerate_config}.yaml"),
+#         "--rdzv_backend",
+#         "c10d",
+#     ]
+#     if gpus:
+#         gpus_str = str(",".join([str(gpu) for gpu in gpus])) if len(gpus) < world_map.node_size else "all"
+#         cmd += [
+#             "--gpu-ids",
+#             gpus_str,
+#         ]
+#     cmd += [
+#         "--num_processes",
+#         str(world_map.total_finetune_gpus),
+#         "pipelinerl/entrypoints/run_finetune.py",
+#         "--config-dir",
+#         f"{exp_dir}/conf",
+#         "--config-name",
+#         "exp_config",
+#         f"output_dir={exp_dir}",
+#         f"hydra.run.dir={exp_dir}/finetune",
+#         # TODO: figure out why we can't build WorldMap in run_finetune.py
+#         # Current workaround: pass the essential information as follows:
+#         f"+me.weight_update_group_init_method=tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
+#         f"+me.weight_update_group_world_size={world_map.weight_update_group_size}",
+#         f"+me.llm_urls={'+'.join(world_map.get_actor_urls())}",
+#     ]
+#     if cfg.debug.mode in ["finetune", "open_loop", "finetune+preprocessor"]:
+#         cmd.append("finetune.send_weight_updates=False")
+
+#     logger.info(f"Running finetune with command: {' '.join(cmd)}")
+#     save_command(exp_dir / "finetune", cmd)
+#     env = dict(os.environ)
+#     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
+#     proc = _popen(cmd, env=env)
+#     if proc is not None:
+#         yield LaunchedProcess(kind="finetune", handle=proc)
 
 
 def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
