@@ -47,8 +47,8 @@ params = {
     
     # -------------------- DATASET --------------------
     # Dataset splits to use (train/test, easy_train/easy_test, debug_train/debug_test)
-    "train_dataset_names": ["debug_train"],
-    "test_dataset_names": ["debug_test"],
+    "train_dataset_names": ["train"],
+    "test_dataset_names": ["test"],
     # Seeds for dataset loading
     # "dataset_loader_params.train_seeds": [0],
     # "dataset_loader_params.test_seeds": [0],
