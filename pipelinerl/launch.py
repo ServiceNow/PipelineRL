@@ -121,7 +121,13 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     ]
 
     # add quantization
-    if cfg.get("fp32_lm_head"):
+    if cfg.get("fp32_lm_head", False):
+        explicit_quant = cfg.vllm_config.get("quantization")
+        if explicit_quant and explicit_quant != "bf16_last_layer_fp32":
+            logger.warning(
+                f"fp32_lm_head=true overrides explicit vllm_config.quantization='{explicit_quant}' "
+                f"with 'bf16_last_layer_fp32'"
+            )
         cmd.extend(["--quantization", "bf16_last_layer_fp32"])
     elif cfg.vllm_config.get("quantization"):
         cmd.extend(["--quantization", cfg.vllm_config.quantization])
@@ -185,7 +191,13 @@ def run_actor_llm(
     ]
 
     # add quantization
-    if cfg.get("fp32_lm_head"):
+    if cfg.get("fp32_lm_head", False):
+        explicit_quant = cfg.vllm_config.get("quantization")
+        if explicit_quant and explicit_quant != "bf16_last_layer_fp32":
+            logger.warning(
+                f"fp32_lm_head=true overrides explicit vllm_config.quantization='{explicit_quant}' "
+                f"with 'bf16_last_layer_fp32'"
+            )
         cmd.extend(["--quantization", "bf16_last_layer_fp32"])
     elif cfg.vllm_config.get("quantization"):
         cmd.extend(["--quantization", cfg.vllm_config.quantization])
