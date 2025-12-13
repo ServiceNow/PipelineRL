@@ -16,13 +16,17 @@ logger = logging.getLogger(__name__)
 _weight_version: int = 0
 _weight_version_lock = threading.Lock()
 
+_FP32_CACHE_ACTIVE = False
+
+
+def activate_fp32_cache() -> None:
+    """Enable FP32 cache mode. Called when bf16_last_layer_fp32 quant config is instantiated."""
+    global _FP32_CACHE_ACTIVE
+    _FP32_CACHE_ACTIVE = True
+
 
 def increment_weight_version() -> int:
-    """Increment the global weight version counter.
-
-    Call this after weight updates to invalidate cached FP32 copies.
-    Returns the new version number.
-    """
+    """Increment weight version counter to invalidate cached FP32 copies. Returns new version."""
     global _weight_version
     with _weight_version_lock:
         _weight_version += 1
@@ -143,22 +147,11 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
 
 @register_quantization_config("bf16_last_layer_fp32")
 class BF16WithLastLayerFP32(QuantizationConfig):
-    """
-    Mixed-precision configuration: BF16 for most layers, FP32 for lm_head.
-
-    This configuration improves numerical stability in the final logits computation
-    while maintaining memory efficiency for the rest of the model. Particularly
-    useful for RL training where log probability precision matters.
-
-    Features:
-        - Automatic detection of lm_head layers across architectures
-        - Support for tied embeddings (shared input/output embeddings)
-        - Cache invalidation for weight updates during online RL
-        - Configurable default dtype for non-final layers
-    """
+    """Mixed-precision config: BF16 for most layers, FP32 for lm_head."""
 
     def __init__(self, config: object | None = None):
         super().__init__()
+        activate_fp32_cache()  # Enable cache invalidation for this mode
         self.default_dtype = _resolve_dtype_from_config(config)
         self._layer_count = 0
         self._fp32_layer_count = 0
@@ -329,16 +322,7 @@ class _FP32LinearMethod(UnquantizedLinearMethod):
 
 
 class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
-    """
-    Embedding method for tied weights: BF16 storage, FP32 logits computation.
-
-    This method keeps embedding weights in their original dtype (typically BF16)
-    for memory efficiency during forward embedding lookups, but performs the
-    final logits matmul (unembedding) in FP32 for numerical precision.
-
-    The FP32 weight cache is automatically invalidated when the global weight
-    version changes (call increment_weight_version() after weight updates).
-    """
+    """Embedding method for tied weights: BF16 storage, FP32 logits computation."""
 
     # Class-level cache for FP32 weights, keyed by (layer_id, device)
     _fp32_cache: dict[tuple[int, torch.device], tuple[torch.Tensor, int]] = {}
@@ -404,18 +388,16 @@ class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
 
     @classmethod
     def clear_cache(cls) -> None:
-        """Clear all cached FP32 weights. Call after model changes."""
+        """Clear all cached FP32 weights."""
         with cls._cache_lock:
             cls._fp32_cache.clear()
         logger.debug("FP32 weight cache cleared")
 
 
 def invalidate_fp32_cache() -> None:
-    """Invalidate FP32 weight caches after weight updates.
-
-    Call this function after receiving weight updates in online RL to ensure
-    the next forward pass uses fresh FP32 copies of the updated weights.
-    """
+    """Invalidate FP32 weight caches. No-op if bf16_last_layer_fp32 not active."""
+    if not _FP32_CACHE_ACTIVE:
+        return
     increment_weight_version()
     _FP32UnembedEmbeddingMethod.clear_cache()
     logger.debug("FP32 caches invalidated")
