@@ -30,7 +30,7 @@ def increment_weight_version() -> int:
     global _weight_version
     with _weight_version_lock:
         _weight_version += 1
-        logger.debug("Weight version incremented to %d", _weight_version)
+        logger.debug(f"Weight version incremented to {_weight_version}")
         return _weight_version
 
 
@@ -155,11 +155,7 @@ class BF16WithLastLayerFP32(QuantizationConfig):
         self.default_dtype = _resolve_dtype_from_config(config)
         self._layer_count = 0
         self._fp32_layer_count = 0
-        logger.info(
-            "Initialized %s: default_dtype=%s, lm_head forced to fp32",
-            self.get_name(),
-            self.default_dtype,
-        )
+        logger.info(f"Initialized {self.get_name()}: default_dtype={self.default_dtype}, lm_head forced to fp32")
 
     def __repr__(self) -> str:
         return (
@@ -180,50 +176,32 @@ class BF16WithLastLayerFP32(QuantizationConfig):
         if isinstance(layer, VocabParallelEmbedding):
             if is_lm_head:
                 # explicit lm_head embedding
-                logger.debug(
-                    "Layer %s (%s): FP32 embedding (lm_head)",
-                    prefix, layer.__class__.__name__
-                )
+                logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): FP32 embedding (lm_head)")
                 self._fp32_layer_count += 1
                 return _FP32UnembedEmbeddingMethod()
 
             if is_tied_embed:
                 # tied embedding: keep BF16 storage but compute logits in FP32
-                logger.debug(
-                    "Layer %s (%s): tied embedding, FP32 logits matmul",
-                    prefix, layer.__class__.__name__
-                )
+                logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): tied embedding, FP32 logits matmul")
                 self._fp32_layer_count += 1
                 return _FP32UnembedEmbeddingMethod()
 
             # regular embedding, leave unmodified
-            logger.debug(
-                "Layer %s (%s): unmodified embedding",
-                prefix, layer.__class__.__name__
-            )
+            logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): unmodified embedding")
             return None
 
         if isinstance(layer, LinearBase):
             if is_lm_head:
-                logger.debug(
-                    "Layer %s (%s): FP32 linear (lm_head)",
-                    prefix, layer.__class__.__name__
-                )
+                logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): FP32 linear (lm_head)")
                 self._fp32_layer_count += 1
                 return _FP32LinearMethod()
 
             # regular linear layer, use default dtype
-            logger.debug(
-                "Layer %s (%s): %s linear",
-                prefix, layer.__class__.__name__, self.default_dtype
-            )
+            logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): {self.default_dtype} linear")
             return _ForcedDTypeLinearMethod(self.default_dtype)
 
         # unknown layer type, leave unmodified
-        logger.debug(
-            "Layer %s (%s): unmodified (unknown type)",
-            prefix, layer.__class__.__name__
-        )
+        logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): unmodified (unknown type)")
         return None
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
@@ -380,10 +358,7 @@ class _FP32UnembedEmbeddingMethod(UnquantizedEmbeddingMethod):
             w32 = w_param.to(device=target_device, dtype=torch.float32)
             self._fp32_cache[cache_key] = (w32, current_version)
 
-            logger.debug(
-                "Created FP32 weight cache for layer %d on %s (version %d)",
-                layer_id, target_device, current_version
-            )
+            logger.debug(f"Created FP32 weight cache for layer {layer_id} on {target_device} (version {current_version})")
             return w32
 
     @classmethod
