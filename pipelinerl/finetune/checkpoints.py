@@ -34,15 +34,18 @@ def is_deepspeed_model(model) -> bool:
 def apply_fp32_lm_head(model: nn.Module) -> nn.Module:
     """Cast lm_head weights to FP32 and compute logits in FP32.
 
-    This mirrors the inference-side quantization config so trainer and actor
+    mirror the inference-side quantization config so trainer and actor
     use matching FP32 logits computation.
+
+    handle tied embeddings correctly by only casting at compute time when
+    lm_head.weight is shared with input embeddings.
     """
-    # Handle wrapped models (e.g., AutoModelForCausalLMWithValueHead)
-    if isinstance(model, AutoModelForCausalLMWithValueHead):
+    # generic unwrap for wrapper models
+    if hasattr(model, "pretrained_model"):
         apply_fp32_lm_head(model.pretrained_model)
         return model
 
-    # try to get lm_head via HuggingFace API
+    # get lm_head via HuggingFace API
     lm_head = model.get_output_embeddings()
     if lm_head is None:
         logger.warning("Could not find lm_head layer for FP32 fix via get_output_embeddings()")
@@ -52,24 +55,37 @@ def apply_fp32_lm_head(model: nn.Module) -> nn.Module:
         logger.warning(f"lm_head is not nn.Linear ({type(lm_head).__name__}), skipping FP32 fix")
         return model
 
-    if lm_head.weight.dtype != torch.float32:
-        lm_head.weight.data = lm_head.weight.data.float()
-    if lm_head.bias is not None and lm_head.bias.dtype != torch.float32:
-        lm_head.bias.data = lm_head.bias.data.float()
+    # find tied embeddings
+    tied = False
+    if hasattr(model, "get_input_embeddings"):
+        inp_emb = model.get_input_embeddings()
+        if inp_emb is not None and hasattr(inp_emb, "weight"):
+            tied = (lm_head.weight is inp_emb.weight)
+
+    # safe to convert storage to FP32 if not tied
+    if not tied and lm_head.weight.dtype != torch.float32:
+        lm_head.to(dtype=torch.float32)
 
     original_forward = lm_head.forward
 
     @wraps(original_forward)
     def fp32_forward(x: torch.Tensor) -> torch.Tensor:
-        # upcast to FP32
-        x_fp32 = x.float() if x.dtype != torch.float32 else x
-        # compute in FP32 (upcast done automatically by PyTorch)
-        weight = lm_head.weight.float()
-        bias = lm_head.bias.float() if lm_head.bias is not None else None
-        return torch.nn.functional.linear(x_fp32, weight, bias)
+        # always compute in FP32
+        x32 = x if x.dtype == torch.float32 else x.float()
+
+        # if tied, weight storage stays original dtype; cast for compute only
+        w = lm_head.weight
+        w32 = w if w.dtype == torch.float32 else w.float()
+
+        b = lm_head.bias
+        b32 = None
+        if b is not None:
+            b32 = b if b.dtype == torch.float32 else b.float()
+
+        return torch.nn.functional.linear(x32, w32, b32)
 
     lm_head.forward = fp32_forward
-    logger.info(f"Applied FP32 fix to lm_head ({type(lm_head).__name__})")
+    logger.info(f"Applied FP32 lm_head forward (tied={tied})")
     return model
 
 
