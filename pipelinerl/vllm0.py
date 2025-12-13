@@ -82,8 +82,11 @@ def make_worker_class(multi_step: bool):
 
         def receive_weight_update(self, request: WeightUpdateRequest):
             torch.cuda.synchronize(self.device)
+            expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
             for info in request.parameters_info:
                 target_dtype = string_to_dtype(info.dtype)
+                if target_dtype not in expected_dtypes:
+                    logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
                 buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
                 torch.distributed.broadcast(buffer, src=0, group=self.process_group)
                 if isinstance(self.model_runner, MultiStepModelRunner):
@@ -168,8 +171,8 @@ class WeightUpdateManager:
 
 async def run_server(args, **uvicorn_kwargs) -> None:
     # COPIED FROM vllm/entrypoints/openai/api_server.py, vllm version 0.6.6.post1
-    logger.info("vLLM API server version %s", version)
-    logger.info("args: %s", args)
+    logger.info(f"vLLM API server version {version}")
+    logger.info(f"args: {args}")
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
