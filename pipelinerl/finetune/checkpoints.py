@@ -31,7 +31,17 @@ def is_deepspeed_model(model) -> bool:
     return model.__class__.__name__.endswith("DeepSpeedEngine")
 
 
-def apply_fp32_lm_head(model: nn.Module) -> nn.Module:
+def find_layer_by_prefix(model: nn.Module, prefix: str) -> nn.Module | None:
+    """find a layer by name prefix (lm_head, etc)"""
+    prefix_lower = prefix.lower()
+    for name, module in model.named_modules():
+        name_lower = name.lower()
+        if name_lower.endswith(prefix_lower) or name_lower.endswith(f".{prefix_lower}"):
+            return module
+    return None
+
+
+def apply_fp32_lm_head(model: nn.Module, layer_prefix: str = "lm_head") -> nn.Module:
     """Cast lm_head weights to FP32 and compute logits in FP32.
 
     mirror the inference-side quantization config so trainer and actor
@@ -42,13 +52,19 @@ def apply_fp32_lm_head(model: nn.Module) -> nn.Module:
     """
     # generic unwrap for wrapper models
     if hasattr(model, "pretrained_model"):
-        apply_fp32_lm_head(model.pretrained_model)
+        apply_fp32_lm_head(model.pretrained_model, layer_prefix)
         return model
 
-    # get lm_head via HuggingFace API
+    # get lm_head via HF API
     lm_head = model.get_output_embeddings()
+
+    # fallback to explicit prefix lookup
     if lm_head is None:
-        logger.warning("Could not find lm_head layer for FP32 fix via get_output_embeddings()")
+        logger.info(f"get_output_embeddings() returned None, trying explicit prefix '{layer_prefix}'")
+        lm_head = find_layer_by_prefix(model, layer_prefix)
+
+    if lm_head is None:
+        logger.warning(f"Could not find lm_head layer via get_output_embeddings() or prefix '{layer_prefix}'")
         return model
 
     if not isinstance(lm_head, nn.Linear):
@@ -186,7 +202,8 @@ def load_model(args, model_class, current_dir):
 
     # apply FP32 fix to lm_head for numerical precision
     if getattr(args, "fp32_lm_head", False):
-        model = apply_fp32_lm_head(model)
+        layer_prefix = getattr(args, "fp32_layer_prefix", "lm_head")
+        model = apply_fp32_lm_head(model, layer_prefix=layer_prefix)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(
