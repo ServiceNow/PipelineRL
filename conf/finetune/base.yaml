@@ -9,6 +9,8 @@ optim: adamw_torch
 load_as_bf16: True
 # use FP32 for lm_head computation to improve numerical precision in RL training
 fp32_lm_head: ${..fp32_lm_head}
+# layer name prefix for FP32 computation (used as fallback if get_output_embeddings() fails)
+fp32_layer_prefix: ${..fp32_layer_prefix}
 use_flash_attention: true
 attn_implementation: flash_attention_2
 auto_device_map: False
