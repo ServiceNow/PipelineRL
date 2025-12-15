@@ -1,6 +1,6 @@
 import logging
+import os
 import threading
-from typing import Callable
 
 import torch
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
@@ -12,6 +12,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 logger = logging.getLogger(__name__)
+
+_FP32_LAYER_PREFIX_ENV = "PIPELINERL_FP32_LAYER_PREFIX"
+_DEFAULT_FP32_LAYER_PREFIX = "lm_head"
 
 _weight_version: int = 0
 _weight_version_lock = threading.Lock()
@@ -39,46 +42,23 @@ def get_weight_version() -> int:
     return _weight_version
 
 
-# known lm_head layer name patterns across different model architectures
-LM_HEAD_PATTERNS = frozenset({
-    "lm_head",
-    "output",
-    "cls.predictions",  # BERT-style
-    "classifier",
-    "head",
-})
-
-# known embedding layer name patterns for tied weight detection
-EMBEDDING_PATTERNS = frozenset({
-    "embed_tokens",
-    "tok_embeddings",
-    "word_embeddings",
-    "wte",
-    "wpe",  # GPT-2 position embeddings (not tied, but worth knowing)
-    "token_embedding",
-})
+def _get_fp32_layer_prefix() -> str:
+    """Get the FP32 layer prefix from environment or use default."""
+    return os.environ.get(_FP32_LAYER_PREFIX_ENV, _DEFAULT_FP32_LAYER_PREFIX)
 
 
-def _is_lm_head_layer(prefix: str) -> bool:
-    """Check if a layer prefix indicates an lm_head / output projection layer."""
+def _is_fp32_target_layer(prefix: str, target_prefix: str) -> bool:
+    """Check if a layer prefix matches the target FP32 layer.
+
+    Matches if:
+    - prefix ends with target_prefix (e.g., "model.lm_head" matches "lm_head")
+    - prefix ends with ".{target_prefix}" for nested paths
+    """
+    if not target_prefix:
+        return False
     prefix_lower = prefix.lower()
-    for pattern in LM_HEAD_PATTERNS:
-        # Check for exact match at end or as a component
-        if prefix_lower.endswith(pattern) or prefix_lower.endswith(f".{pattern}"):
-            return True
-        # Check for pattern as a path component (with dots on both sides or at start)
-        if f".{pattern}." in prefix_lower or prefix_lower.startswith(f"{pattern}."):
-            return True
-    return False
-
-
-def _is_tied_embedding(prefix: str) -> bool:
-    """Check if a layer prefix indicates an embedding that might be tied to lm_head."""
-    prefix_lower = prefix.lower()
-    for pattern in EMBEDDING_PATTERNS:
-        if pattern in prefix_lower:
-            return True
-    return False
+    target_lower = target_prefix.lower()
+    return prefix_lower.endswith(target_lower) or prefix_lower.endswith(f".{target_lower}")
 
 
 def string_to_dtype(value: str) -> torch.dtype:
@@ -147,20 +127,26 @@ def _resolve_dtype_from_config(config: object | None) -> torch.dtype:
 
 @register_quantization_config("bf16_last_layer_fp32")
 class BF16WithLastLayerFP32(QuantizationConfig):
-    """Mixed-precision config: BF16 for most layers, FP32 for lm_head."""
+    """Mixed-precision config: BF16 for most layers, FP32 for target layer.
+    """
 
     def __init__(self, config: object | None = None):
         super().__init__()
         activate_fp32_cache()  # Enable cache invalidation for this mode
         self.default_dtype = _resolve_dtype_from_config(config)
+        self.fp32_layer_prefix = _get_fp32_layer_prefix()
         self._layer_count = 0
         self._fp32_layer_count = 0
-        logger.info(f"Initialized {self.get_name()}: default_dtype={self.default_dtype}, lm_head forced to fp32")
+        logger.info(
+            f"Initialized {self.get_name()}: default_dtype={self.default_dtype}, "
+            f"fp32_layer_prefix='{self.fp32_layer_prefix}'"
+        )
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"default_dtype={self.default_dtype}, "
+            f"fp32_layer_prefix='{self.fp32_layer_prefix}', "
             f"layers={self._layer_count}, "
             f"fp32_layers={self._fp32_layer_count})"
         )
@@ -170,37 +156,30 @@ class BF16WithLastLayerFP32(QuantizationConfig):
     ) -> LinearMethodBase | None:
         """Return the appropriate quantization method for the given layer."""
         self._layer_count += 1
-        is_lm_head = _is_lm_head_layer(prefix)
-        is_tied_embed = _is_tied_embedding(prefix)
+        is_fp32_target = _is_fp32_target_layer(prefix, self.fp32_layer_prefix)
 
         if isinstance(layer, VocabParallelEmbedding):
-            if is_lm_head:
-                # explicit lm_head embedding
-                logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): FP32 embedding (lm_head)")
+            if is_fp32_target:
+                # Target layer as embedding (e.g., tied weights)
+                logger.debug(f"Layer {prefix}: FP32 embedding (target: {self.fp32_layer_prefix})")
                 self._fp32_layer_count += 1
                 return _FP32UnembedEmbeddingMethod()
 
-            if is_tied_embed:
-                # tied embedding: keep BF16 storage but compute logits in FP32
-                logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): tied embedding, FP32 logits matmul")
-                self._fp32_layer_count += 1
-                return _FP32UnembedEmbeddingMethod()
-
-            # regular embedding, leave unmodified
-            logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): unmodified embedding")
+            # Regular embedding, leave unmodified
+            logger.debug(f"Layer {prefix}: unmodified embedding")
             return None
 
         if isinstance(layer, LinearBase):
-            if is_lm_head:
-                logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): FP32 linear (lm_head)")
+            if is_fp32_target:
+                logger.debug(f"Layer {prefix}: FP32 linear (target: {self.fp32_layer_prefix})")
                 self._fp32_layer_count += 1
                 return _FP32LinearMethod()
 
-            # regular linear layer, use default dtype
-            logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): {self.default_dtype} linear")
+            # Regular linear layer, use default dtype
+            logger.debug(f"Layer {prefix}: {self.default_dtype} linear")
             return _ForcedDTypeLinearMethod(self.default_dtype)
 
-        # unknown layer type, leave unmodified
+        # Unknown layer type, leave unmodified
         logger.debug(f"Layer {prefix} ({layer.__class__.__name__}): unmodified (unknown type)")
         return None
 
