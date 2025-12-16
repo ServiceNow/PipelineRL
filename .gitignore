@@ -129,6 +129,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+i3-logic/
 
 # Spyder project settings
 .spyderproject
@@ -186,3 +187,4 @@ results/
 data/
 cache/
 dump.rdb
+ScratchPad
