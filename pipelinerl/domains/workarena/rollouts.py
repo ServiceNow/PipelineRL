@@ -1,16 +1,20 @@
 import logging
 import os
 import time
+from typing import Any
 
+from examples.rl_webagent.generic_agent import GenericWebAgent
 from examples.rl_webagent.steps import WebTape
 from examples.workarena.agent import WorkArenaAgent
 from examples.workarena.environment import WorkArenaEnvironment
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+from tapeagents.agent import DEFAULT
 from tapeagents.core import LLMCall, LLMOutputParsingFailureAction, Observation
 from tapeagents.io import save_json_tape
 from tapeagents.llms.trainable import TrainableLLM
 from tapeagents.orchestrator import execute_agent
+from tapeagents.tools.simple_browser import PageObservation
 
 from pipelinerl.async_llm import make_training_text
 from pipelinerl.domains.workarena.load_tasks import get_task_by_id
@@ -21,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 class WorkarenaMetrics(BaseMetrics):
     reward: float
+    raw_success: float  # 1.0 if task succeeded, else 0.0 (used for raw advantage calculation)
     success: bool
     no_error: bool
     no_answer: bool
@@ -58,11 +63,38 @@ def tape_contains_an_error(tape: WebTape) -> bool:
     )
 
 
-def compute_reward(tape: WebTape, success: bool, result: dict) -> float:
-    """
-    TODO: Improve this
-    """
-    return 1.0 if success else -1.0
+def _create_generic_agent(
+    cfg: DictConfig,
+    llm: TrainableLLM,
+    actions: Any,
+    tools_description: Any,
+) -> GenericWebAgent:
+    generic_cfg: dict[str, Any] = {}
+    if "generic_agent" in cfg:
+        raw_cfg = cfg.generic_agent
+        if isinstance(raw_cfg, DictConfig):
+            generic_cfg = OmegaConf.to_container(raw_cfg, resolve=True)  # type: ignore[assignment]
+        elif isinstance(raw_cfg, dict):
+            generic_cfg = raw_cfg
+    use_examples = generic_cfg.get("use_examples", True)
+    max_iterations = generic_cfg.get("max_iterations", 10)
+    max_retries = generic_cfg.get("max_retries")
+    agent = GenericWebAgent.create(llm, max_iterations=max_iterations, use_examples=use_examples)
+    agent.known_actions = actions
+    agent.tools_description = tools_description
+
+    max_chars = generic_cfg.get("max_chars_page_observation")
+    include_think_in_history = generic_cfg.get("include_think_in_history", True)
+    for node in agent.nodes:
+        if max_chars is not None and hasattr(node, "max_chars_page_observation"):
+            node.max_chars_page_observation = max_chars
+        if max_retries is not None and hasattr(node, "max_retries"):
+            node.max_retries = max_retries
+            node.current_retries = 0
+        if hasattr(node, "include_think_in_history"):
+            node.include_think_in_history = include_think_in_history
+
+    return agent
 
 
 def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict) -> RolloutResult:
@@ -75,12 +107,18 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
 
     start_time = time.perf_counter()
 
+    creation_start = time.perf_counter()
     environment: WorkArenaEnvironment = instantiate(cfg.environment)
     environment.initialize()
-    agent = WorkArenaAgent.create(llm)
-    logger.info(f"Agent and environment loaded, using llm {llm.model_name} at {llm.get_base_url()}")
-    env_agent_creation_time = time.perf_counter() - start_time
+    if getattr(cfg, "use_generic_agent", False):
+        logger.info(f"Environment tools: {environment.tools_description()}")
+        agent = _create_generic_agent(cfg, llm, environment.actions(), environment.tools_description())
+    else:
+        agent = WorkArenaAgent.create(llm)
+    env_agent_creation_time = time.perf_counter() - creation_start
     try:
+        agent.llms = {DEFAULT: llm}
+        logger.info(f"Agent and environment loaded, using llm {llm.model_name} at {llm.get_base_url()}")
         task_entrypoint = get_task_by_id(problem["task"])
         start_attempts = cfg.start_attempts
         t = time.perf_counter()
@@ -128,12 +166,36 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     # save the tape as we go
     if cfg.save_tapes:
         try:
+            # Add metadata for tracking
+            tape.metadata.other.update({
+                "split": "train" if problem.get("_is_training", True) else "test",
+                "model_version": problem.get("_model_version", -1),
+                "llm_model_name": llm.model_name,
+                "llm_base_url": llm.get_base_url(),
+            })
             tape_name = problem.get("_task_id", tape.metadata.id)
             save_json_tape(tape, os.path.join(cfg.output_dir, "tapes"), tape_name)
         except Exception as e:
             logger.error(f"Error saving tape {tape_name}: {e}")
 
-    reward = compute_reward(tape, success, result)
+    # Compute reward with discount factor (matching MiniWoB massimo reward computation)
+    n_step_errors = len([step for step in tape.steps if isinstance(step, LLMOutputParsingFailureAction)])
+    n_page_observations = len([step for step in tape.steps if isinstance(step, PageObservation)])
+    no_error = not tape_contains_an_error(tape)
+    
+    if cfg.reward_computation == "nico":
+        reward = 1.0 * 0.99**n_step_errors if no_error and success else -1.0
+    elif cfg.reward_computation == "massimo":
+        discount_factor = cfg.actor.discount_factor
+        reward = 1.0 if success else -1.0
+        if reward > 0:
+            reward *= discount_factor ** n_page_observations
+    else:
+        # Default: simple reward
+        reward = 1.0 if success else -1.0
+    
+    # Raw success: 1.0 if task succeeded, 0.0 otherwise (for raw advantage calculation)
+    raw_success = 1.0 if success else 0.0
 
     # (3) Get LLM calls from Tape
     llm_calls = [step for step in tape.steps if step.metadata.other.get("llm_call") is not None]
@@ -164,6 +226,7 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
     training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
     for text in training_texts:
         text.reward = reward
+        text.metadata["raw_success"] = raw_success  # Store raw success for raw advantage calculation
         all_finished &= 1 if text.input_ids[-1] == llm.tokenizer.eos_token_id else 0
 
     latency = time.perf_counter() - start_time
@@ -173,11 +236,9 @@ def generate_workarena_rollout(cfg: DictConfig, llm: TrainableLLM, problem: dict
         [s for s in tape.steps if isinstance(s, Observation)]
     )  # TODO: is this not the same n_page_observations??
     n_other_steps = len(tape.steps) - n_observations
-    n_step_errors = len([step for step in tape.steps if isinstance(step, LLMOutputParsingFailureAction)])
-    n_page_observations = len([step for step in tape.steps if step.__class__.__name__ == "PageObservation"])
-    no_error = not tape_contains_an_error(tape)
     metrics = WorkarenaMetrics(
         reward=reward,
+        raw_success=raw_success,
         success=reward > 0.5,
         no_error=no_error,
         no_answer=reward < 0,

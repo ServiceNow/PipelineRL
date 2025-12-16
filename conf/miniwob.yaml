@@ -173,6 +173,7 @@ dataset_loader: pipelinerl.domains.miniwob.load_tasks.load_tasks
 dataset_loader_params:
   train_seeds: null # seeds for train-like splits
   test_seeds: null  # seeds for test-like splits
+  total_eval_episodes: 100  # number of eval episodes (cycles through seeds)
 train_dataset_names:
   - train
 test_dataset_names:

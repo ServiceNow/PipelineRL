@@ -72,6 +72,7 @@ vllm_config:
     pipeline-parallel-size: 1
     generation-config: vllm
     max_model_len: 16000
+    reasoning-parser: null
 
 world:
   replicas: 1

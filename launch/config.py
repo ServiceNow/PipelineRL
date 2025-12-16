@@ -56,7 +56,7 @@ DEFAULT_RESOURCES = {
     "1gpu": {"n_gpus": 1, "gpu_mem": 80, "n_cpus": 24, "mem": 188},
     "2gpu": {"n_gpus": 2, "gpu_mem": 80, "n_cpus": 48, "mem": 375},
     "4gpu": {"n_gpus": 4, "gpu_mem": 80, "n_cpus": 96, "mem": 750},
-    "8gpu": {"n_gpus": 8, "gpu_mem": 80, "n_cpus": 192, "mem": 1500},
+    "8gpu": {"n_gpus": 8, "gpu_mem": 80, "n_cpus": 192, "mem": 1500}, #NOTE: 27 cpus per GPU is not working
 }
 
 # Default max run time (4 days in seconds)

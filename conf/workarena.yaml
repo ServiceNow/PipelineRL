@@ -1,7 +1,7 @@
 defaults:
   - base
   - override streams: redis
-  - override finetune: ppo
+  - override finetune: grpo
   - _self_
 
 world:
@@ -19,9 +19,12 @@ finetune:
   seq_length: 16384  # input + output tokens
   max_train_steps: 1000  # 1000 optim steps = 1000 * bs samples
   train_batch_size: 1
-  gradient_accumulation_passes: 1024
+  gradient_accumulation_passes: 512
+  rl:
+    filter_zero_advantage_groups: true
+    divide_advantage_by_std: true
 
-eval_every_n_versions: 10240  # 1024 effective bs * 10 "optim steps"
+eval_every_n_versions: 1024  # 1024 effective bs * 10 "optim steps"
 
 llm:
   use_cache: false
@@ -51,6 +54,7 @@ actor:
   rollout_workers: 32
   shared_memory_entry_size: 100000000
   collect_logprobs: false
+  discount_factor: 0.98  # discount factor for reward computation
 
 preprocess:
   n_workers: 32  # Increase from 8
@@ -71,6 +75,15 @@ preprocess:
 agent_max_loops: 30  # max number of agent - environment interactions for each task
 agent_attempts: 3  # number of attempts to run the agent (retry on errors)
 rollout_timeout: 600  # overall timeout for entire rollout in seconds (10 minutes)
+reward_computation: massimo # discounted reward based on the length of the trajectory and nico reward is discounted on number of retries at a step
+
+use_generic_agent: true  # use GenericWebAgent vs TapeAgents Agent
+generic_agent:
+  max_iterations: 30
+  use_examples: true
+  max_chars_page_observation: 10000
+  max_retries: 3
+  include_think_in_history: false
 agent:
   _target_: examples.workarena.agent.WorkArenaAgent
 
@@ -80,12 +93,16 @@ environment:
   _target_: pipelinerl.domains.workarena.environment.WorkArenaEnvironment
   exp_path: ${output_dir}/browser
   headless: true
+  observation_format: axtree
 
 # DATASET CONFIGURATION
 dataset_loader: pipelinerl.domains.workarena.load_tasks.load_tasks
+# Available splits: train/test (main), debug_train/debug_test
 dataset_loader_params:
-  seeds: [0, 42, 1337, 900, 103]
+  train_seeds: null  # seeds for train splits (default: [10-999])
+  test_seeds: null   # seeds for test splits (default: [0-999])
+  total_eval_episodes: 100  # number of eval episodes (cycles through seeds)
 train_dataset_names:
-  - l1
+  - train
 test_dataset_names:
-  - l1
+  - test
