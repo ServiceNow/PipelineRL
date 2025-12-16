@@ -1,0 +1,16 @@
+defaults:
+    - base
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.logic.rollouts.generate_logic_rollout
+  system_prompt: You are a helpful assistant.
+  task_template: |-
+    {task}
+environment:
+  _target_: pipelinerl.domains.logic.verifier_api.LogicEnvironment
+dataset_loader: pipelinerl.domains.logic.load_datasets.load_datasets
+train_dataset_names:
+  - logic
+test_dataset_names:
+  - logic
