@@ -43,8 +43,11 @@ class WorldMap:
                 basename = self.master_addr[: self.master_addr.rfind("-")]
                 self.address_map[rank] = f"{basename}-{rank}"
         else:
-            self.master_addr = "localhost"
-            self.address_map[0] = "localhost"
+            # self.master_addr = "localhost"
+            # self.address_map[0] = "localhost"
+            # Force IPv4 to avoid IPv6/Proxy issues on Compute Canada
+            self.master_addr = "127.0.0.1"
+            self.address_map[0] = "127.0.0.1"
 
         self._log_info(f"--- INITIALIZE WORLD MAP (this is rank {self.my_rank}) ---")
 

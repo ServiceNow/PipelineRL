@@ -1,0 +1,139 @@
+defaults:
+  - finetune: base
+  - rewards: pure_success
+  - streams: files
+  - _self_
+
+seed: 42
+
+finetune:
+  seed: ${..seed}
+
+actor:
+  log_each_n_secs: 0
+  llm_max_rollouts: 64
+  rollout_workers: 1
+  discount_factor: 1
+  problem_queue_size: 64
+  result_queue_size: 64
+  throughput_window_size: 50
+  shared_memory_entry_size: 10000000
+environment: null
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 8
+  chunk_n_groups: 2
+  # queue for loaded raw groups
+  raw_queue_size: 8
+  # queue for processed chunks of multiple groups  
+  input_queue_size: 32
+  # queue for ready chunks for multiple groups
+  output_queue_size: 32
+  # queue for accumulating samples before further processing
+  dataset_buffer_size: 0
+  # ring buffer to replace old samples with new ones when training is slow
+  ring_buffer_size: 128
+  # "virtual" sample queue per lead trainer
+  max_ready_samples_per_lead: 64
+  pop_old_data: ${..pop_old_data} 
+  shared_memory_entry_size: 100000000
+  log_every_n_samples: 128
+llm:
+  parameters:
+    # changed
+    max_tokens: 8192
+    # changed
+    temperature: 1.0
+test_llm:
+  parameters: 
+    max_tokens: 8192
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 50
+
+vllm_config:
+  use_v1: false
+  vllm_kwargs:
+    dtype: bfloat16
+    gpu-memory-utilization: 0.9
+    num-scheduler-steps: 1
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
+    max-num-seqs: ${actor.llm_max_rollouts}
+    max-num-batched-tokens: 1024
+    enable-chunked-prefill: ""
+    return-tokens-as-token-ids: ""
+    tensor-parallel-size: 1
+    pipeline-parallel-size: 1
+    generation-config: vllm
+    max_model_len: 10000
+
+world: # 3 + 1 GPUs # KUSHA: Can also do 2+2 here depending on what's faster
+  replicas: 1
+  
+  actor_fraction: 3
+  preprocessor_fraction: 0
+  finetune_fraction: 1
+
+  env_replicas: 1
+
+  actor_group_port: 9000
+  environment_start_port: 7777
+# this will be autocreated based on the config
+jobs: []
+
+eval_every_n_versions: 78000
+
+# changed
+model_path: Qwen/Qwen3-4B # /scratch/k/ksareen/pipeline-rl/models/Qwen2.5-1.5B # 
+
+# will use default based on the chosen backend
+accelerate_config: null
+use_deepspeed: true
+deepspeed_config: deepspeed_stage3_bf16
+use_fsdp: false
+fsdp:
+  param_dtype: fp32
+  reduce_dtype: fp32
+  buffer_dtype: fp32
+
+output_dir: ???
+force_restart: false
+pop_old_data: true
+max_lag: null
+attempts: ${finetune.attempts}
+train_subset: null
+debug:
+  mode: ""
+  streams_from: null
+  place_inference_workers: true
+  use_existing_llms: false
+
+me:
+  # Which job is this one? This will be autopopulated
+  job_idx: null
+
+hydra:
+  run:
+    dir: ${output_dir}
+
+wandb:
+  use_wandb: true
+  wandb_id: null
+  wandb_name: null
+  # W&B entity name
+  wandb_entity_name: kusha_sareen
+  # W&B project name
+  wandb_project_name: pipeline-rl
+  # W&B resume policy
+  wandb_resume: always
+  # Whether to use only the basename or the full path as the run name
+  wandb_use_basename: True
+  wandb_workspace_root: /scratch/k/ksareen/pipeline-rl
+  # set the group in your config
+  wandb_group: null
+  wandb_dir: null
+  # Comma-separated list of keywords to tag the run.
+  tags: []
+

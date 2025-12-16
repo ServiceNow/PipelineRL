@@ -259,6 +259,12 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
         logger.info(f"Loading deepscaler preview train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
 
+    if "numina" in dataset_names:
+        dataset = load_dataset("AI-MO/NuminaMath-CoT", split="train", trust_remote_code=True)
+        samples = [s for s in process_math(dataset, "numina") if s is not None]
+        logger.info(f"Loading NuminaMath preview train dataset: {len(samples)} samples")
+        datasets += add_ids(samples)
+
     if "math_test" in dataset_names:
         # math_dataset = load_math("test")
         dataset = load_dataset("hendrycks/competition_math", split="test", trust_remote_code=True)
@@ -334,6 +340,15 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
 
     if "aime_2024_original" in dataset_names:
         datasets += _load_aime_dataset(2024)
+
+    if "aime_2025" in dataset_names:
+        upsample_factor = 16
+        dataset = load_dataset("math-ai/aime25", split="test", trust_remote_code=True)
+        samples = [s for s in process_aime_and_amc(dataset, dataset_name='aime') if s is not None]
+        if upsample_factor > 0:
+            samples *= upsample_factor
+        logger.info(f"Loading aime_2025 dataset: {len(samples)} samples")
+        datasets += add_ids(samples)
 
     if "amc_2022" in dataset_names:
         # TODO: AMC 2022 is 43 problems, is that to be expected?

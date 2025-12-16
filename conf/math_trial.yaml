@@ -1,0 +1,18 @@
+defaults:
+    - trial
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.math.generate_math_rollout
+  system_prompt: Please reason step by step, and put your final answer within \boxed{}.
+  task_template: |-
+    {task}
+environment:
+  _target_: pipelinerl.domains.math.MathEnvironment
+dataset_loader: pipelinerl.domains.math.load_datasets
+train_dataset_names:
+  - numina
+test_dataset_names:
+  - aime_2025
+  # - amc_2023
+  # - math_500

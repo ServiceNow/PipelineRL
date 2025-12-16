@@ -1,7 +1,7 @@
 import logging
 import os
 from functools import partial
-from typing import Any
+from typing import Any, List
 from pydantic import BaseModel, Field
 
 import numpy as np
@@ -17,7 +17,9 @@ from .utils import (
     sum_sum,
     mean_sum,
     replace_dataset_column,
+    mask_mean,
 )
+from .gae import compute_gae_advantages
 
 # FIXME: remove a warnings, but might be worth investigating
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -100,6 +102,28 @@ class RLConfig(BaseModel):
         description="Coefficient for the value loss in the final loss",
     )
 
+    use_policy_gae: bool = Field(
+        default=False,
+        description="Use GAE lambda for the policy advantage calculation",
+    )
+    policy_gae_lambda: float = Field(
+        default=0.95,
+        description="Coefficient for policy GAE",
+    )
+
+    adaptive_policy_gae: bool = Field(
+        default=False,
+        description="Adaptive GAE lambda for the policy based on the sequence length",
+    )
+    adaptive_policy_gae_coef: float = Field(
+        default=0.05,
+        description="Adaptive coefficient, based on VAPO",
+    )
+
+    positive_example_sft_coef: float = Field(
+        default = 0.0,
+        description = "Coefficient for SFT Loss added for only positive examples"
+    )
 
 def make_rl_data_callback(args, current_dir, rl_config, model):
     if rl_config:
@@ -127,7 +151,6 @@ def linear_decay_coef(current_step: int, max_step: int, initial_coef: float, fin
 
     """
     return initial_coef + (final_coef - initial_coef) * current_step / max_step
-
 
 def rl_step(
     model: PreTrainedModel,
@@ -182,6 +205,7 @@ def rl_step(
     else:
         num_sequences = masks.shape[0]
         segments = None
+
 
     model_inputs = {
         "input_ids": batch.input_ids,
@@ -240,13 +264,68 @@ def rl_step(
     assert torch.isfinite(log_ratio_ref_new).all(), f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
 
     if has_value_head:
-        # Get value predictions if available
         value_predictions = outputs.value[:, :-1] # no target for the last token 
-        # Compute value-based advantages: A(s,a) = MC_return - V(s)
-        # where MC_return is the Monte Carlo return (rewards) and V(s) is the value prediction
-        #FIXME: if this works better it should be a config
-        #advantages = rewards - torch.clamp(value_predictions, 0, 1)
-        advantages = rewards - value_predictions
+
+        # KUSHA: implement here the GAE calculation
+        # KUSHA: maybe we should follow the comment and clamp the value predictions?
+        if config.use_policy_gae:
+            if config.adaptive_policy_gae:
+                # define lengths, it might be easier if we have one lamda per token
+
+                valid = masks_shifted
+
+                if not batch.is_packed:
+                    # length per sequence (count of valid tokens in that row)
+                    lengths_seq = valid.sum(dim=1).to(dtype=value_predictions.dtype)  # [B]
+
+                    # adaptive lambda per sequence, then broadcast to tokens
+                    lengths_seq = lengths_seq.clamp(min=1.0)  # avoid div-by-zero
+                    lam_seq = 1.0 - 1.0 / (config.adaptive_policy_gae_coef * lengths_seq)  # [B]
+                    lam_seq = lam_seq.clamp(min=0.0, max=1.0)
+
+                    lamda = lam_seq[:, None].expand_as(valid).to(dtype=value_predictions.dtype)  # [B, T-1]
+
+                else:
+                    # length per segment (packed sequences)
+                    ones = valid.to(dtype=value_predictions.dtype)  # [B, T-1]
+                    zeros = torch.zeros_like(ones)
+
+                    # tok_count is number of valid tokens per segment
+                    _, _, tok_count = per_segment_sums(
+                        batch.segment_ids,
+                        valid,
+                        ones,
+                        zeros,
+                        seq_parallel_group=seq_parallel_group,
+                    ) 
+
+                    tok_count = tok_count.to(dtype=value_predictions.dtype).clamp(min=1.0)  # [num_segments]
+
+                    lam_seg = 1.0 - 1.0 / (config.adaptive_policy_gae_coef * tok_count)  # [num_segments]
+                    lam_seg = lam_seg.clamp(min=0.0, max=1.0)
+
+                    # map segment lambdas back to tokens
+                    lamda = lam_seg[batch.segment_ids].to(dtype=value_predictions.dtype)  # [B, T-1]
+
+            else:
+                lamda = config.policy_gae_lambda
+
+            # logger.info("DEBUG")
+            # logger.info(rewards.shape)
+            # logger.info(rewards)
+            # logger.info(value_predictions.shape)
+            # logger.info(value_predictions)
+            # logger.info(lamda)
+            # logger.info(len(segments))
+            # logger.info(segments)
+            advantages, _ = compute_gae_advantages(rewards=rewards, value_pred=value_predictions, lamda=lamda, segments=segments, logger=logger)
+        else:
+            # Get value predictions if available
+            # Compute value-based advantages: A(s,a) = MC_return - V(s)
+            # where MC_return is the Monte Carlo return (rewards) and V(s) is the value prediction
+            #FIXME: if this works better it should be a config
+            #advantages = rewards - torch.clamp(value_predictions, 0, 1)
+            advantages = rewards - value_predictions
     else:
         advantages = batch.advantages[:, 1:]
 
@@ -334,7 +413,45 @@ def rl_step(
 
         policy_loss_total = -sum_sum(loss, masks_shifted, segments)
 
+    if config.positive_example_sft_coef > 0:
+        sft_nll = -new_logprobs  # [B, T-1]
+
+        if not batch.is_packed:
+            positive_seq = ((rewards == 1) & masks_shifted).any(dim=1)  # [B]
+            positive_mask = positive_seq[:, None].expand_as(masks_shifted)  # [B, T-1]
+            sft_mask = masks_shifted & positive_mask
+        else:
+            positive_token = ((rewards == 1) & masks_shifted).to(dtype=sft_nll.dtype)  # [B, T-1]
+
+            zero = torch.zeros_like(positive_token)
+            pos_sum, _, tok_count = per_segment_sums(
+                batch.segment_ids,
+                masks_shifted,
+                positive_token,
+                zero,
+                seq_parallel_group=seq_parallel_group,
+            )
+            positive_segment = (pos_sum > 0)  # [num_segments]
+
+            seg_ids_shifted = batch.segment_ids[:, 1:]          # [B, T-1] shift segment_ids
+            positive_mask = positive_segment[seg_ids_shifted].bool()
+            sft_mask = masks_shifted & positive_mask            # both [B, T-1]
+            
+
+        if int(sft_mask.sum().item()) == 0:
+            sft_loss_total = sft_nll[..., :1].sum() * 0.0
+        else:
+            # weight with other losses ? KUSHA: should we do this?
+            # KUSHA: is sum_sum fine here? doesn't 
+            # sft_loss = sft_nll * tokens_weights
+            sft_loss = sft_nll
+            sft_loss_total = mask_mean(sft_loss, sft_mask)
+
+        policy_loss_total += config.positive_example_sft_coef * sft_loss_total
+
     if has_value_head:
+        # KUSHA: this is equivalent to GAE with lambda = 1.0 for the value network
+
         # Get the value predictions
         values = outputs.value
         # Use the already extracted and shifted rewards as value labels
@@ -413,6 +530,10 @@ def rl_step(
         stats["value_mse"] = sum_sum(
             torch.square(value_predictions - value_labels) / num_labels_in_seq, masks_shifted, segments
         ).item()
+
+    if config.positive_example_sft_coef > 0:
+        stats["sft_loss"] = sft_loss_total.item()
+
 
     return final_loss, stats
 

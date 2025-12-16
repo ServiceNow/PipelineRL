@@ -1,0 +1,10 @@
+defaults:
+    - math_trial
+    - override finetune: vapo
+    - _self_
+
+# remove when not debug
+# test_dataset_names: null 
+
+# debug:
+#     debug_mode: finetune

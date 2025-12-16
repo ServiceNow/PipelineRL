@@ -20,7 +20,9 @@ from pipelinerl.world import Job, WorldMap
 logger = logging.getLogger(__name__)
 
 # All the launch commands in this file pass the environment to child processes
-os.environ["PYTHONPATH"] = f"/home/toolkit/TapeAgents"
+current_path = os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONPATH"] = f"/home/toolkit/TapeAgents:{current_path}"
+
 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 os.environ["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
