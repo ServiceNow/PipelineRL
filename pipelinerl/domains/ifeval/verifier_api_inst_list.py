@@ -38,14 +38,11 @@ def ifeval_reward_func(answer: str, reward_context: dict) -> str:
         constraint_dict = constraint_dict[0]
     if isinstance(constraint_dict, str):
         constraint_dict = json.loads(constraint_dict)
-    
-    # Remove thinking section if present
-    cleaned_answer = answer
-
+        
     instruction_keys = constraint_dict["instruction_id"]
     args_list = constraint_dict["kwargs"]
     
-    if len(answer) == 0 or len(cleaned_answer) == 0:
+    if len(answer) == 0 or len(answer) == 0:
         logger.warning("Empty prediction received for ifeval_reward_func.")
         return "incorrect"
     
@@ -60,7 +57,7 @@ def ifeval_reward_func(answer: str, reward_context: dict) -> str:
         instruction_instance = instruction_cls(instruction_key)
         instruction_instance.build_description(**args)
         
-        if answer.strip() and instruction_instance.check_following(cleaned_answer):
+        if answer.strip() and instruction_instance.check_following(answer):
             rewards.append(1.0)
         else:
             rewards.append(0.0)

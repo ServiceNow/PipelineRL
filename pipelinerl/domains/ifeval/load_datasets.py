@@ -51,7 +51,7 @@ def load_ifeval_dataset(source: IFEvalSource, seed: int | None = None):
     if source == IFEvalSource.IFEVAL_INST_LIST:
         dataset = load_dataset(
             "ServiceNow-AI/instruction_following_rl", 
-            "v0",
+            "v1",
             split="train",
             token=os.environ.get("HF_TOKEN")
         )
