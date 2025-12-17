@@ -72,9 +72,9 @@ vllm_config:
 world: # 3 + 1 GPUs # KUSHA: Can also do 2+2 here depending on what's faster
   replicas: 1
   
-  actor_fraction: 3
+  actor_fraction: 2
   preprocessor_fraction: 0
-  finetune_fraction: 1
+  finetune_fraction: 2
 
   env_replicas: 1
 
