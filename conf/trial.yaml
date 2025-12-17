@@ -42,12 +42,12 @@ preprocess:
 llm:
   parameters:
     # changed
-    max_tokens: 8192
+    max_tokens: 4096
     # changed
     temperature: 1.0
 test_llm:
   parameters: 
-    max_tokens: 8192
+    max_tokens: 4096
     temperature: 1.0
     top_p: 0.95
     top_k: 50
@@ -67,7 +67,7 @@ vllm_config:
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
-    max_model_len: 10000
+    max_model_len: 8000
 
 world: # 3 + 1 GPUs # KUSHA: Can also do 2+2 here depending on what's faster
   replicas: 1
@@ -86,7 +86,7 @@ jobs: []
 eval_every_n_versions: 78000
 
 # changed
-model_path: Qwen/Qwen3-4B # /scratch/k/ksareen/pipeline-rl/models/Qwen2.5-1.5B # 
+model_path: Qwen/Qwen3-4B-Instruct-2507 # /scratch/k/ksareen/pipeline-rl/models/Qwen2.5-1.5B # 
 
 # will use default based on the chosen backend
 accelerate_config: null

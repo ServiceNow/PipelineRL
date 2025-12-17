@@ -26,7 +26,7 @@ force_restart: ${..force_restart}
 # Rewind dataloder to the last used position if training resumed from existing checkpoint
 resume_dataloader: False
 # Batch size for training.
-train_batch_size: 1
+train_batch_size: 1 # KUSHA: not sure what to use here?
 # Batch size for evaluation.
 valid_batch_size: 4
 # Value of weight decay.
@@ -38,7 +38,7 @@ gradient_clipping_threshold: 0.3
 # Learning rate scheduler type (indexed by completed_steps).
 lr_scheduler_type: cosine # could be cosine, constant_with_warmup
 # Number of warmup (completed) steps in the learning rate schedule.
-num_warmup_steps: 50
+num_warmup_steps: 10
 # Number of gradient accumulation steps.
 gradient_accumulation_passes: 1024
 # Use gradient checkpointing to reduce memory footprint.
@@ -58,7 +58,8 @@ interrupt_train_steps: -1
 # Maximum number of evaluation (completed) steps. If -1 the full dataset is evaluated.
 max_eval_steps: -1
 # Sequence lengths used for training.
-seq_length: 12000
+seq_length: 8000 # KUSHA: this is longer than it needs to be, some of the question in numina are long, instead i should just filter those out
+
 seq_packing: true
 output_dir: ${..output_dir}/finetune
 # Training seed.
@@ -70,7 +71,7 @@ keep_intermediate_checkpoints: True
 # Whether to allow loading external model code
 trust_remote_code: false
 # Whether to empty the cache every training pass. Usually not worth it except for very large models if OOM
-cuda_empty_cache: True
+cuda_empty_cache: false
 sft_config_name: null
 n_examples: 0 # 0 means do not limit number of samples
 log_each_n_steps: 1
@@ -85,7 +86,7 @@ queue_size: 32
 max_lag: ${..max_lag}
 weight_update_interval: 1
 pop_old_data: ${..pop_old_data}
-attempts: 8
+attempts: 4
 eval_callback:
   _target_: pipelinerl.finetune.utils.dummy_eval_callback
   config_name: ""
@@ -96,7 +97,7 @@ rl:
   final_kl_coef: ${..rl.kl_coef} 
   entropy_bonus: 0.0
   reward_minus_kl_coef: 0.0
-  epsilon_low: 2e-2 
+  epsilon_low: 2e-2 # KUSHA: this seems like an order of magnitude low???
   epsilon_high: 2e-2 
   use_advantages: true
   relu_log_p_weights: false
