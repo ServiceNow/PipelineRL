@@ -326,7 +326,7 @@ class FileStreamReader(StreamReader):
                 for line in read_jsonl_stream(self._file):
                     yield line
                     cur_retries = 0
-            except json.JSONDecodeError as e:
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 # Sometimes when the stream file is being written to as the as time as we reading it,
                 # we get lines like \0x00\0x00\0x00\0x00\0x00\0x00\0x00\0x00 that break the JSON decoder.
                 # We have to reopen the file and seek to the previous position to try again.

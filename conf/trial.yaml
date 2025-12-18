@@ -1,7 +1,7 @@
 defaults:
   - finetune: base
   - rewards: pure_success
-  - streams: files
+  - streams: redis
   - _self_
 
 seed: 42

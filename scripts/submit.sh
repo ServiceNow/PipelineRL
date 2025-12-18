@@ -1,15 +1,17 @@
 algo="vapo";
+id=0;
 # KUSHA: set your account in your .env
 source .env
 
-while getopts a: flag
+while getopts a:i: flag
 do
     case "${flag}" in
         a) algo=${OPTARG};;
+        i) id=${OPTARG};;
     esac
 done
 
-echo "Starting job: $algo"
+echo "Starting job: $algo, $id"
 NAME=""${algo}""
 
 sbatch <<EOT
@@ -33,5 +35,5 @@ cd ~/PipelineRL
 
 source .env
 
-bash scripts/run.sh -a $algo -c math_trial
+bash scripts/run.sh -a $algo -c math_trial -i $id
 EOT

@@ -1,3 +1,5 @@
+# this documents roughly my process setting up the library on compute canada, please don't try to run the script but follow the process step-by-step
+
 module load StdEnv/2023 rust/1.91.0
 module load httpproxy
 module load gcc
@@ -22,3 +24,10 @@ pip install pandas==2.2.3+computecanada --force-reinstall
 # also tried changing this external thing but it didn't work
 pip install "triton<3.3.0"
 pip install datasets==2.21.0
+
+# redis installation
+cd $HOME
+wget https://download.redis.io/redis-stable.tar.gz
+tar -xzvf redis-stable.tar.gz
+cd redis-stable
+make
