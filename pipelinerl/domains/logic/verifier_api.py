@@ -64,7 +64,7 @@ def logic_reward_func(answer, reward_context, extra_info):
     verifier = get_verifier(extra_info)
     logger.info(f"Shiva-logic_reward_func called with answer: {answer}, reward_context: {reward_context}, extra_info: {extra_info}")
     
-    verification_passed = verifier.verify(data=reward_context,test_solution_str=answer)
+    verification_passed = verifier.verify(reward_context, answer)
     task_status = 'correct' if verification_passed else 'incorrect'
 
     logger.info(f"Shiva-logic_reward_func: reward_context: {reward_context}, task_status: {task_status}")
@@ -111,6 +111,7 @@ class LogicEnvironment:
         with ProcessPoolExecutor(max_workers=4) as process_pool:
             @app.post("/verify_answer")
             async def verify(request: dict):
+                logger.info(f"Shiva-Received verification request: {request}")
                 generation = request["generation"]
                 reward_context = request['reward_context']
                 extra_info = request.get('extra_info', {})

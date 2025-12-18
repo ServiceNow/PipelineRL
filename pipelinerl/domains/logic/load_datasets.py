@@ -41,9 +41,8 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
     if "logic" in dataset_names:
         dataset = load_dataset(
             "ServiceNow-AI/mixed-training-text-datasets", 
-            split="train",
-            trust_remote_code=True,
-            token=os.environ.get("HF_TOKEN"))
+            "prime-intellect-logic",
+            token=os.environ.get("HF_TOKEN"))['train']
         
         dataset = dataset.filter(lambda sample: sample['ability'] == 'logic' and json.loads(sample['extra_info']).get('task', '') in verifier_classes)
         logger.info(f"Shiva-Loaded dataset of size {len(dataset)}")
