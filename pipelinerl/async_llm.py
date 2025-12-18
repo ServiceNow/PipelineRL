@@ -15,7 +15,7 @@ from pipelinerl.processor_factory import get_processor
 
 logger = logging.getLogger(__name__)
 
-from omegaconf import ListConfig, DictConfig
+from omegaconf import ListConfig, DictConfig, OmegaConf
 
 def omegaconf_to_native(obj):
     if isinstance(obj, ListConfig):
@@ -57,6 +57,18 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     return images
 
 
+def _to_plain_obj(value):
+    """convert OmegaConf containers into Python types"""
+
+    if isinstance(value, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        return {key: _to_plain_obj(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_obj(item) for item in value]
+    return value
+    
+
 async def llm_async_generate(
     llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
 ) -> LLMCall:
@@ -78,20 +90,22 @@ async def llm_async_generate(
             }
         )
 
-    # logger.info(f"Came here=====")
-    # logger.info(f"LLM call data: {data | llm.parameters}")
-    # logger.info(f"POST request to {llm.base_url}/v1/chat/completions")
-    # logger.info('================================')
-    # for k,v in (data | llm.parameters).items():
-    #     logger.info(f"Key: {k}, Value: {v}")
-    #     logger.info(f"{type(k)}: {type(v)}")
-    # logger.info('================================')
+    extra_parameters = llm.parameters
+    if isinstance(extra_parameters, (DictConfig, ListConfig)):
+        extra_parameters = OmegaConf.to_container(extra_parameters, resolve=True)
+    if extra_parameters is None:
+        extra_parameters = {}
+    if not isinstance(extra_parameters, dict):
+        raise TypeError(
+            f"LLM parameters must serialize to a mapping, got {type(extra_parameters)}"
+        )
 
-    # logger.info(f"Attempting JSON conversion: {json.dumps(convert_dict(data | llm.parameters))}")
-    
+    logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
+
+    payload = _to_plain_obj({**data, **extra_parameters})
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
-        json=convert_dict(data | llm.parameters),
+        json=payload,
         headers=headers,
         ssl=False,
     ) as response:
