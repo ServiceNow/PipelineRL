@@ -2,6 +2,6 @@ defaults:
   - base
   - _self_
 
-attempts: 4
+attempts: 5
 rl:
   policy_loss: ppo

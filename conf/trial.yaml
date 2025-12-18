@@ -83,10 +83,10 @@ world: # 3 + 1 GPUs # KUSHA: Can also do 2+2 here depending on what's faster
 # this will be autocreated based on the config
 jobs: []
 
-eval_every_n_versions: 78000
+eval_every_n_versions: 16000 # KUSHA: what is a version? version is number of rl_steps * gradient_accumulation_size I think, this should be every 50 steps
 
 # changed
-model_path: Qwen/Qwen3-4B-Instruct-2507 # /scratch/k/ksareen/pipeline-rl/models/Qwen2.5-1.5B # 
+model_path: Qwen/Qwen3-4B-Instruct-2507 
 
 # will use default based on the chosen backend
 accelerate_config: null

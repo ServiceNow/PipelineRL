@@ -30,17 +30,17 @@ train_batch_size: 1 # KUSHA: not sure what to use here?
 # Batch size for evaluation.
 valid_batch_size: 4
 # Value of weight decay.
-weight_decay: 0.01
+weight_decay: 0
 # Learning rate for training.
 learning_rate: 1e-6
 # How much to clip the gradient (no clipping if null)
-gradient_clipping_threshold: 0.3
+gradient_clipping_threshold: 1.0
 # Learning rate scheduler type (indexed by completed_steps).
 lr_scheduler_type: cosine # could be cosine, constant_with_warmup
 # Number of warmup (completed) steps in the learning rate schedule.
-num_warmup_steps: 10
+num_warmup_steps: 20
 # Number of gradient accumulation steps.
-gradient_accumulation_passes: 1024
+gradient_accumulation_passes: 256 # KUSHA: 50 * 16 = 320 trajectories per update
 # Use gradient checkpointing to reduce memory footprint.
 gradient_checkpointing: true
 # see https://medium.com/pytorch/how-activation-checkpointing-enables-scaling-up-training-deep-learning-models-7a93ae01ff2d
@@ -58,7 +58,7 @@ interrupt_train_steps: -1
 # Maximum number of evaluation (completed) steps. If -1 the full dataset is evaluated.
 max_eval_steps: -1
 # Sequence lengths used for training.
-seq_length: 8000 # KUSHA: this is longer than it needs to be, some of the question in numina are long, instead i should just filter those out
+seq_length: 12000
 
 seq_packing: true
 output_dir: ${..output_dir}/finetune
@@ -97,8 +97,8 @@ rl:
   final_kl_coef: ${..rl.kl_coef} 
   entropy_bonus: 0.0
   reward_minus_kl_coef: 0.0
-  epsilon_low: 2e-2 # KUSHA: this seems like an order of magnitude low???
-  epsilon_high: 2e-2 
+  epsilon_low: 0.2 # 2e-2 # KUSHA: this seems like an order of magnitude low???
+  epsilon_high: 0.2 # 2e-2 
   use_advantages: true
   relu_log_p_weights: false
   clamp_log_ratio_ref_new_value: 5

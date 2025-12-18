@@ -2,8 +2,8 @@ defaults:
   - ppo
   - _self_
 
-rl: # asymmetric clipping
-  epsilon_low: 0.2
+rl: 
+  epsilon_low: 0.2 # asymmetric clipping
   epsilon_high: 0.28
   filter_zero_advantage_groups: false # should be true. initially lot of stuff filtered
   group_normalization: false # need to double check the implementation of this one

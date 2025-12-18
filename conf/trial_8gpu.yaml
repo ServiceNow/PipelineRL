@@ -1,0 +1,12 @@
+defaults:
+    - trial
+    - _self_
+
+world: # 6 + 2 GPUs, # KUSHA: it's worth trying other ratios here
+  replicas: 1
+  
+  actor_fraction: 6
+  preprocessor_fraction: 0
+  finetune_fraction: 2
+
+deepspeed_config: deepspeed_stage3_bf16

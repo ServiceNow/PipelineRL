@@ -1,0 +1,1 @@
+bash scripts/run.sh -a grpo -c math_trial_debug

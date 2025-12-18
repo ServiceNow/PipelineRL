@@ -3,9 +3,6 @@ defaults:
     - override finetune: vapo
     - _self_
 
-wandb:
-    wandb_name: q3_vapo
-
 # remove when not debug
 # test_dataset_names: null 
 

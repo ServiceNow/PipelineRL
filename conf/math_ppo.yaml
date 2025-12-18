@@ -3,10 +3,6 @@ defaults:
     - override finetune: ppo
     - _self_
 
-
-wandb:
-    wandb_name: q3_ppo
-
 # remove when not debug
 # test_dataset_names: null 
 
