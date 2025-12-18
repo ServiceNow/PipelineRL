@@ -10,6 +10,22 @@ actor:
 environment:
   _target_: pipelinerl.domains.math.MathEnvironment
 dataset_loader: pipelinerl.domains.math.load_datasets
+
+finetune:
+  seq_length: 18000
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 18000
+
+llm:
+  parameters: 
+    max_tokens: 16000
+
+test_llm:
+  parameters: 
+    max_tokens: 16000
+
 train_dataset_names:
 - open_reasoner_zero_57k
 - open_reasoner_zero_extended_72k 
