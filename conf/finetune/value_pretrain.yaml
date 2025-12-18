@@ -7,10 +7,9 @@ attempts: 1
 
 # No policy updates
 weight_decay: 0
-learning_rate: 0
+learning_rate: 0 # KUSHA: todo: fix this to set only the policy loss to 0
 
 rl:
   value_loss_coef: 1
-  policy_loss: ppo
 
 # KUSHA: I think we need to initialize the value model from some reward model? Which one to use?

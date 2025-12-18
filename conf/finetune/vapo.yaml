@@ -11,3 +11,4 @@ rl:
   adaptive_policy_gae: true
   adaptive_policy_gae_coef: 0.05
   positive_example_sft_coef: 0.1
+  policy_loss: gspo #  ppo or gspo

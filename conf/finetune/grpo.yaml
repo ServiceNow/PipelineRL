@@ -4,4 +4,4 @@ defaults:
 
 attempts: 5
 rl:
-  policy_loss: ppo
+  policy_loss: gspo # ppo or gspo
