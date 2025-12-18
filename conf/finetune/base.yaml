@@ -62,7 +62,7 @@ interrupt_train_steps: -1
 # Maximum number of evaluation (completed) steps. If -1 the full dataset is evaluated.
 max_eval_steps: -1
 # Sequence lengths used for training.
-seq_length: 12000
+seq_length: 8000 # 12000 before fp32 lm head
 
 seq_packing: true
 output_dir: ${..output_dir}/finetune

@@ -1,0 +1,7 @@
+defaults:
+  - trial
+  - _self_
+
+fp32_lm_head: false # KUSHA: could also be false
+finetune:
+  seq_length: 12000
