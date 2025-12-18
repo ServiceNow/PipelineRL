@@ -25,8 +25,10 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 from pipelinerl.finetune_loop import WeightUpdateRequest
+from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from typing import Any, Protocol, runtime_checkable
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign
@@ -81,16 +83,17 @@ class WorkerExtension:
     def receive_weight_update(self: LikeWorker, request: WeightUpdateRequest):
         torch.cuda.synchronize(self.device)
         logger.info("Start receiving weight update")
+        expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
         for info in request.parameters_info:
-            model_dtype = self.model_config.dtype
-            assert info.dtype == str(model_dtype), (
-                f"mismatch dtype: src {info.dtype}, dst {self.model_config.dtype}"
-            )
-            buffer = torch.empty(tuple(info.shape), dtype=model_dtype, device=self.device)
+            target_dtype = string_to_dtype(info.dtype)
+            if target_dtype not in expected_dtypes:
+                logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
+            buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
             torch.distributed.broadcast(buffer, src=0, group=self.process_group)
             loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
             if len(loaded_params) != 1:
                 raise ValueError(f"model {info.name} not found in model state dict")
+        pipelinerl.vllm_quantization.invalidate_fp32_cache()
         logger.info("Weight update received")
 
 
@@ -119,8 +122,8 @@ class WeightUpdateManager:
 
 async def run_server(args, **uvicorn_kwargs) -> None:
     # COPIED FROM vllm/entrypoints/openai/api_server.py, vllm version 0.6.6.post1
-    logger.info("vLLM API server version %s", version)
-    logger.info("args: %s", args)
+    logger.info(f"vLLM API server version {version}")
+    logger.info(f"args: {args}")
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
@@ -172,8 +175,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         await weight_update_manager.receive_weight_update(request)
         return {"status": "ok"}
 
-    model_config = await engine.get_model_config()
-    await init_app_state(engine, model_config, app.state, args)
+    await init_app_state(engine, engine_config, app.state, args)
     shutdown_task = await serve_http(
         app,
         sock,

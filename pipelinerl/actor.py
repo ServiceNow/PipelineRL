@@ -4,24 +4,25 @@ import math
 import multiprocessing as mp
 import os
 import queue
-from queue import Empty
 import random
 import time
 from collections import defaultdict
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
+from queue import Empty
+from typing import Dict, List
 
 import aiohttp
 import hydra
 import uvloop
 from omegaconf import DictConfig
 from pydantic import BaseModel, Field
-from tapeagents.llms import TrainableLLM
-from typing import Dict, List
 
 import wandb
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
-from pipelinerl.rollouts import RolloutResult, BaseMetrics
+from pipelinerl.finetune_loop import calculate_train_steps
+from pipelinerl.llm import TrainableLLM
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.shared_memory_array import SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import (
@@ -137,6 +138,29 @@ async def schedule_rollouts(
     rollout_policy = hydra.utils.get_method(cfg.actor.rollout_policy)
     logger.info(f"Use rollout policy: {rollout_policy}")
 
+    final_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
+    samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
+
+    def is_trainer_finished() -> bool:
+        return (
+            trainer_state.samples_processed is not None
+            and trainer_state.samples_processed >= samples_target
+        )
+
+    def handle_rollout_exception(exc: Exception):
+        if isinstance(exc, aiohttp.ClientError) and is_trainer_finished():
+            logger.info(
+                f"{scheduler_name}: rollout task encountered {exc.__class__.__name__} after trainer completion; ignoring"
+            )
+            return
+        logger.error("Exception in rollout, stop all other rollout tasks", exc_info=exc)
+        current_task = asyncio.current_task(loop=loop)
+        for task in asyncio.all_tasks(loop=loop):
+            if task != current_task:
+                task.cancel()
+        result_queue.put(exc)
+        logger.error("Stopped all tasks and put exception in the result queue")
+
     async def rollout_and_maybe_produce_result(
         problem: dict,
         group_id: int,
@@ -169,14 +193,7 @@ async def schedule_rollouts(
                 del group_rollouts[group_id]
             finished_rollouts += 1
         except Exception as e:
-            # Cancel all tasks except the current one
-            logger.error("Exception in rollout, stop all other rollout tasks", exc_info=e)
-            current_task = asyncio.current_task(loop=loop)
-            for task in asyncio.all_tasks(loop=loop):
-                if task != current_task:
-                    task.cancel()
-            result_queue.put(e)
-            logger.error("Stopped all tasks and put exception in the result queue")
+            handle_rollout_exception(e)
         finally:
             active_rollouts[llm_index] -= 1
 
@@ -190,6 +207,9 @@ async def schedule_rollouts(
     timeout = aiohttp.ClientTimeout(total=3600.0, connect=3600.0, sock_read=3600.0)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         while True:
+            if is_trainer_finished():
+                logger.info(f"{scheduler_name}: trainer signalled completion; stopping rollout scheduler")
+                break
             if time.time() - last_logged > 10.0 and sum(active_rollouts):
                 logger.info(
                     f"{scheduler_name}: "
@@ -197,6 +217,7 @@ async def schedule_rollouts(
                     f"groups in progress: {len(group_rollouts)}, "
                     f"rollouts started so far: {started_rollouts}, "
                     f"rollouts finished so far: {finished_rollouts}, "
+                    f"groups started so far: {group_id}, "
                     f"max group size in bytes: {result_queue.max_actual_entry_size()}, "
                 )
                 last_logged = time.time()
@@ -426,6 +447,12 @@ class ActorLoop:
                 # the user function must do next(...) to run each iteration
                 yield
 
+                final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
+                samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
+                if self.trainer_state.samples_processed is not None and self.trainer_state.samples_processed >= samples_target:
+                    logger.info("Trainer signalled completion; stopping actor loop")
+                    break
+
                 if self.trainer_state.propagated_weight_version > last_trainer_version:
                     if max_lag is not None:
                         assert groups_per_update is not None
@@ -464,6 +491,9 @@ class ActorLoop:
 
                 assert isinstance(rollout_results, list)
                 assert isinstance(rollout_results[0], RolloutResult)
+                assert len(rollout_results) == attempts, (
+                    f"Expected {attempts} rollouts, got {len(rollout_results)}"
+                )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
                 published_samples += group_samples
@@ -480,7 +510,6 @@ class ActorLoop:
                     f" {in_progress} groups in progress"
                 )
 
-                    
                 self.update_stats(rollout_results=rollout_results)
 
                 finished_groups += 1
@@ -596,9 +625,7 @@ def run_actor_loop(cfg: DictConfig):
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
             parameters=cfg.llm.parameters,
-            use_cache=False,
             collect_logprobs=True,
-            observe_llm_calls=False,
         )
         for url in llm_urls
     ]
@@ -608,9 +635,7 @@ def run_actor_loop(cfg: DictConfig):
             model_name=str(actor_model_path),
             tokenizer_name=str(actor_model_path),
             parameters=cfg.test_llm.parameters,
-            use_cache=False,
             collect_logprobs=True,
-            observe_llm_calls=False,
         )
         for url in llm_urls
     ]
@@ -677,4 +702,8 @@ def run_actor_loop(cfg: DictConfig):
                 logger.info("Test loop finished")
 
         # 3. Keep running the training loop
-        _ = next(train_loop_run)
+        try:
+            _ = next(train_loop_run)
+        except StopIteration:
+            logger.info("Train loop finished")
+            break

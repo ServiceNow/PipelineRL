@@ -2,10 +2,12 @@ import contextlib
 import os
 import shutil
 import typing
+from functools import wraps
 from pathlib import Path
 from typing import Any, Type
 
 import torch
+import torch.nn as nn
 import transformers
 from packaging import version
 from transformers import (
@@ -27,6 +29,80 @@ from .value_model import AutoModelForCausalLMWithValueHead
 def is_deepspeed_model(model) -> bool:
     """Check if model is a DeepSpeed engine instance."""
     return model.__class__.__name__.endswith("DeepSpeedEngine")
+
+
+def find_layer_by_prefix(model: nn.Module, prefix: str) -> nn.Module | None:
+    """find a layer by name prefix (lm_head, etc)"""
+    prefix_lower = prefix.lower()
+    for name, module in model.named_modules():
+        name_lower = name.lower()
+        if name_lower.endswith(prefix_lower) or name_lower.endswith(f".{prefix_lower}"):
+            return module
+    return None
+
+
+def apply_fp32_lm_head(model: nn.Module, layer_prefix: str = "lm_head") -> nn.Module:
+    """Cast lm_head weights to FP32 and compute logits in FP32.
+
+    mirror the inference-side quantization config so trainer and actor
+    use matching FP32 logits computation.
+
+    handle tied embeddings correctly by only casting at compute time when
+    lm_head.weight is shared with input embeddings.
+    """
+    # generic unwrap for wrapper models
+    if hasattr(model, "pretrained_model"):
+        apply_fp32_lm_head(model.pretrained_model, layer_prefix)
+        return model
+
+    # get lm_head via HF API
+    lm_head = model.get_output_embeddings()
+
+    # fallback to explicit prefix lookup
+    if lm_head is None:
+        logger.info(f"get_output_embeddings() returned None, trying explicit prefix '{layer_prefix}'")
+        lm_head = find_layer_by_prefix(model, layer_prefix)
+
+    if lm_head is None:
+        logger.warning(f"Could not find lm_head layer via get_output_embeddings() or prefix '{layer_prefix}'")
+        return model
+
+    if not isinstance(lm_head, nn.Linear):
+        logger.warning(f"lm_head is not nn.Linear ({type(lm_head).__name__}), skipping FP32 fix")
+        return model
+
+    # find tied embeddings
+    tied = False
+    if hasattr(model, "get_input_embeddings"):
+        inp_emb = model.get_input_embeddings()
+        if inp_emb is not None and hasattr(inp_emb, "weight"):
+            tied = (lm_head.weight is inp_emb.weight)
+
+    # safe to convert storage to FP32 if not tied
+    if not tied and lm_head.weight.dtype != torch.float32:
+        lm_head.to(dtype=torch.float32)
+
+    original_forward = lm_head.forward
+
+    @wraps(original_forward)
+    def fp32_forward(x: torch.Tensor) -> torch.Tensor:
+        # always compute in FP32
+        x32 = x if x.dtype == torch.float32 else x.float()
+
+        # if tied, weight storage stays original dtype; cast for compute only
+        w = lm_head.weight
+        w32 = w if w.dtype == torch.float32 else w.float()
+
+        b = lm_head.bias
+        b32 = None
+        if b is not None:
+            b32 = b if b.dtype == torch.float32 else b.float()
+
+        return torch.nn.functional.linear(x32, w32, b32)
+
+    lm_head.forward = fp32_forward
+    logger.info(f"Applied FP32 lm_head forward (tied={tied})")
+    return model
 
 
 def get_auto_model_class(
@@ -121,8 +197,13 @@ def load_model(args, model_class, current_dir):
         logger.info(f"Initializing model {model_cls} from {args.config_name}")
 
     logger.info(f"Loading args: {loading_args}")
-    
+
     model = model_cls.from_pretrained(model_to_load, **loading_args)
+
+    # apply FP32 fix to lm_head for numerical precision
+    if getattr(args, "fp32_lm_head", False):
+        layer_prefix = getattr(args, "fp32_layer_prefix", "lm_head")
+        model = apply_fp32_lm_head(model, layer_prefix=layer_prefix)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(

@@ -1,10 +1,14 @@
 defaults:
-  - finetune: actor_critic
+  - finetune: base
   - rewards: pure_success
   - streams: files
   - _self_
 
 seed: 42
+
+# use FP32 for lm_head computation in both training and inference.
+fp32_lm_head: false
+fp32_layer_prefix: "lm_head"  # "lm_head" | "output" | "embed_out" | "head"
 
 finetune:
   seed: ${..seed}
@@ -47,13 +51,14 @@ llm:
     temperature: 1.0
 test_llm:
   parameters: 
-    max_tokens: 16000
+    max_tokens: 8192
     temperature: 1.0
     top_p: 0.95
     top_k: 50
 
 vllm_config:
   use_v1: false
+  quantization: null  # or bf16_last_layer_fp32
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
@@ -67,6 +72,7 @@ vllm_config:
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
+    max_model_len: 10000
 
 world:
   replicas: 1
@@ -75,7 +81,7 @@ world:
   preprocessor_fraction: 0
   finetune_fraction: 4
 
-  env_replicas: 2
+  env_replicas: 1
 
   actor_group_port: 9000
   environment_start_port: 7777

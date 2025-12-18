@@ -6,18 +6,16 @@ import shutil
 import time
 from pathlib import Path
 import traceback
-from typing import Dict, Mapping, List, Any, Union
+from typing import Dict, Mapping, List, Any
 import numpy as np
 from omegaconf import DictConfig
 import psutil
 import requests
 from importlib.metadata import distributions
 from transformers import PreTrainedTokenizer
-from collections import defaultdict
 
 from pipelinerl.world import Job
-from tapeagents.llms import LLMOutput
-from tapeagents.core import Prompt
+from pipelinerl.llm import LLMOutput, Prompt
 
 import wandb
 from wandb.sdk import wandb_run
@@ -239,6 +237,9 @@ def calculate_stats(stats: List | Dict[Any, Any]) -> Dict[str, float]:
     if not isinstance(stats, list):
         raise TypeError(f"Expected stats to be a list, got {type(stats)}")
 
+    if len(stats) == 0:
+        return {}
+
     aggregated_stats = {
         "max": float(max(stats)),
         "min": float(min(stats)),
@@ -321,7 +322,7 @@ def better_crashing(entrypoint_name: str):
         # get process if of the current process
         process_id = os.getpid()
         terminate_with_children(process_id)
-        logger.error(f"I should not even be here...")
+        logger.error("I should not even be here...")
         import sys
 
         sys.exit(1)
