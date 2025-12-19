@@ -347,6 +347,66 @@ def write_micro_batch_slices(
         data_writer.write(micro_batch, lead_trainer_id)
 
 
+def convert_to_fast_llm_format(entry: dict) -> dict:
+    """Convert a preprocessed sample entry to Fast-LLM streaming format.
+
+    Fast-LLM expects:
+    - tokens: list of token IDs
+    - tokens_dtype: string dtype (e.g., "int32")
+    - loss_masking_spans (optional): list of (start, end) tuples where loss IS computed
+    """
+    input_ids = entry["input_ids"]
+
+    # Convert to list if tensor
+    if hasattr(input_ids, "tolist"):
+        tokens = input_ids.tolist()
+    else:
+        tokens = list(input_ids)
+
+    result = {
+        "tokens": tokens,
+        "tokens_dtype": "int32",
+    }
+
+    # Convert labels to loss_masking_spans if present
+    # In PipelineRL, labels=-100 means "don't compute loss" (padding/prompt)
+    # In Fast-LLM, loss_masking_spans are ranges where loss IS computed
+    if "labels" in entry:
+        labels = entry["labels"]
+        if hasattr(labels, "tolist"):
+            labels = labels.tolist()
+        else:
+            labels = list(labels)
+
+        # Find contiguous spans where labels != -100 (loss is computed)
+        spans = []
+        in_span = False
+        span_start = 0
+        for i, label in enumerate(labels):
+            if label != -100 and not in_span:
+                # Start new span
+                in_span = True
+                span_start = i
+            elif label == -100 and in_span:
+                # End current span
+                spans.append((span_start, i))
+                in_span = False
+        # Close final span if still open
+        if in_span:
+            spans.append((span_start, len(labels)))
+
+        if spans:
+            result["loss_masking_spans"] = spans
+
+    return result
+
+
+def write_sample_for_fast_llm(data_writer: StreamWriter, entry: dict):
+    """Write a single sample to the stream in Fast-LLM format."""
+    fast_llm_sample = convert_to_fast_llm_format(entry)
+    data_writer.write(fast_llm_sample)
+
+
 def run_preprocessing_loop(
     
     cfg: DictConfig,
@@ -373,13 +433,24 @@ def run_preprocessing_loop(
         wait_for_inference_servers(llm_urls)
 
     input_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)
-    output_stream = StreamRangeSpec(
-        exp_path=exp_root_dir,
-        topic=cfg.preprocess.output,
-        partition_range=(0, max(world_map.total_finetune_gpus, 1)),
-    )
+    # For Fast-LLM: use SingleStreamSpec with shared=True (uses orjson serialization)
+    # For standard PipelineRL: use StreamRangeSpec with partitions per GPU
+    if cfg.use_fast_llm:
+        output_stream = SingleStreamSpec(
+            exp_path=exp_root_dir,
+            topic=cfg.preprocess.output,
+            partition=0,  # Single stream for Fast-LLM
+        )
+        use_shared_stream = True
+    else:
+        output_stream = StreamRangeSpec(
+            exp_path=exp_root_dir,
+            topic=cfg.preprocess.output,
+            partition_range=(0, max(world_map.total_finetune_gpus, 1)),
+        )
+        use_shared_stream = False
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
-    logger.info("Streams initialized")
+    logger.info(f"Streams initialized (shared={use_shared_stream})")
 
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
@@ -397,7 +468,7 @@ def run_preprocessing_loop(
     dataset_loader_thread.start()
     
     # Initialize TrainerState
-    trainer_state = TrainerState(exp_root_dir)
+    trainer_state = TrainerState(exp_root_dir, use_fast_llm=cfg.use_fast_llm)
     if cfg.debug.mode == "preprocessor":
         logger.info("Debug mode: preprocessor")
         trainer_state.debug_mode_init()
@@ -462,7 +533,7 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
-    with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    with write_to_streams(output_stream, shared=use_shared_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
@@ -573,7 +644,15 @@ def run_preprocessing_loop(
                     start_writing = time.time()
                     while (len(processed_entries_queue) > 0 and not batch_done) or (cfg.preprocess.dataset_buffer_size and not batch_done):
                         logger.debug(f"[inner loop] trainer {trainer_id} has {samples_per_trainer[trainer_id]} samples, target is {target_samples_per_lead}")
-                        if cfg.finetune.seq_packing:
+
+                        # Fast-LLM path: write individual samples directly (Fast-LLM does its own packing)
+                        if cfg.use_fast_llm:
+                            while len(processed_entries_queue) > 0:
+                                entry = processed_entries_queue.popleft()
+                                write_sample_for_fast_llm(data_writer, entry)
+                                published_samples += 1
+                            batch_done = True  # Always mark done for Fast-LLM (no batching)
+                        elif cfg.finetune.seq_packing:
                             if samples_per_trainer[trainer_id] == target_samples_per_lead:
                                 logger.debug(f"[inner loop] trainer {trainer_id} has all {target_samples_per_lead} samples, creating sentinel batch")
                                 sentinel_batch = create_sentinel_batch(
