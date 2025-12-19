@@ -42,8 +42,7 @@ def postprocess_generation(generation: str) -> str:
     except Exception as e:
         logger.warning(f"Postprocessing failed: {e}")
             
-    return generation.strip()
-
+    return generation.replace("<|end|>", "").strip()
 
 
 async def generate_logic_rollout(
@@ -89,7 +88,7 @@ async def generate_logic_rollout(
         case _:
             raise ValueError(f"Unknown answer status: {answer_status}")
 
-    logger.info(f"Shiva-Code verification result: {answer_status}, reward: {reward}")
+    logger.info(f"Logic verification result: {answer_status}, reward: {reward}")
     trace = make_training_text(llm, llm_call)
 
     reward *= discount_factor**llm_call.output_length_tokens

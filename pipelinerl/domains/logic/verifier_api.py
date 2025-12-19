@@ -62,12 +62,12 @@ def get_verifier(extra_info):
 
 def logic_reward_func(answer, reward_context, extra_info):
     verifier = get_verifier(extra_info)
-    logger.info(f"Shiva-logic_reward_func called with answer: {answer}, reward_context: {reward_context}, extra_info: {extra_info}")
+    logger.info(f"Logic reward_func called with verifier: {verifier}")
     
     verification_passed = verifier.verify(reward_context, answer)
     task_status = 'correct' if verification_passed else 'incorrect'
 
-    logger.info(f"Shiva-logic_reward_func: reward_context: {reward_context}, task_status: {task_status}")
+    logger.info(f"Logic verification result: {task_status}")
     return task_status        
 
 
@@ -111,12 +111,9 @@ class LogicEnvironment:
         with ProcessPoolExecutor(max_workers=4) as process_pool:
             @app.post("/verify_answer")
             async def verify(request: dict):
-                logger.info(f"Shiva-Received verification request: {request}")
                 generation = request["generation"]
                 reward_context = request['reward_context']
                 extra_info = request.get('extra_info', {})
-
-                logger.info(f"Shiva-Received verification request with generation: {generation} and reward_context: {reward_context}")
 
                 # Run verification in the process pool to avoid blocking the main thread
                 loop = asyncio.get_event_loop()

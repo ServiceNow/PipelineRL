@@ -45,11 +45,11 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
             token=os.environ.get("HF_TOKEN"))['train']
         
         dataset = dataset.filter(lambda sample: sample['ability'] == 'logic' and json.loads(sample['extra_info']).get('task', '') in verifier_classes)
-        logger.info(f"Shiva-Loaded dataset of size {len(dataset)}")
+        logger.info(f"Loaded dataset of size {len(dataset)}")
         dataset = dataset.shuffle(seed=seed) if seed is not None else dataset
         # TODO: Marker remove the limit of 5 samples.
-        samples = [s for s in process_logic(dataset, "logic") if s is not None][:5]
-        logger.info(f"Shiva-Filtered dataset of size {len(dataset)}")
+        samples = [s for s in process_logic(dataset, "logic") if s is not None]
+        logger.info(f"Filtered dataset of size {len(dataset)}")
         logger.info(f"Loading ServiceNow-AI/mixed-training-text-datasets train dataset - logic samples: {len(samples)} samples")
         datasets += add_ids(samples)
 
