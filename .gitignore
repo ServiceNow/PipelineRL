@@ -188,3 +188,4 @@ data/
 cache/
 dump.rdb
 ScratchPad
+pipelinerl/core*
