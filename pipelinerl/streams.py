@@ -238,9 +238,8 @@ class RedisSharedStreamWriter(StreamWriter):
         self._redis.close()
 
     def write(self, data, partition: int | None = None):
-        if partition is not None:
-            raise ValueError("Shared Redis streams do not support manual partition overrides")
-
+        # Note: partition is ignored for shared streams - all data goes to a single stream
+        # This is intentional for Fast-LLM integration where Fast-LLM handles its own sharding
         serialized = _serialize_with_orjson(data)
         entry_index = self._redis.incr(self._counter_key)
         record: dict[str, Any] = {
