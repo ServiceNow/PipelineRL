@@ -2,6 +2,9 @@ defaults:
     - base
     - _self_
 
+# Enable Fast-LLM integration (disables vLLM weight updates until NCCL broadcast is implemented)
+use_fast_llm: true
+
 actor:
   rollout_policy: pipelinerl.domains.math.generate_math_rollout
   system_prompt: Please reason step by step, and put your final answer within \boxed{}.

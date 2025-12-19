@@ -115,6 +115,16 @@ debug:
   place_inference_workers: true
   use_existing_llms: false
 
+# Fast-LLM integration: when true, disables vLLM weight updates (no NCCL group)
+# and uses Fast-LLM trainer events for state synchronization.
+# TODO(fast-llm): Once data flows from actors -> Redis -> Fast-LLM training loop,
+# enable NCCL weight broadcast by setting events.weights_broadcast.enabled=true in
+# the Fast-LLM config (qwen25_05B-instruct.yaml). This requires:
+# 1. Configuring NCCL rendezvous in Fast-LLM (rdvz_master_address, port, world_size, rank)
+# 2. Implementing the vLLM weight receiver to accept broadcasted weights
+# 3. Setting use_fast_llm=false once NCCL is working (or removing this flag entirely)
+use_fast_llm: false
+
 me:
   # Which job is this one? This will be autopopulated
   job_idx: null
