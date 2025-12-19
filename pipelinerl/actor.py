@@ -261,7 +261,7 @@ def rollout_maker_entrypoint(
     llms: list[TrainableLLM],
     scheduler_name: str,
 ):
-    trainer_state = TrainerState(Path(cfg.output_dir))
+    trainer_state = TrainerState(Path(cfg.output_dir), use_fast_llm=cfg.use_fast_llm)
     if cfg.debug.mode:
         trainer_state.propagated_weight_version = 0
     else:
@@ -641,7 +641,7 @@ def run_actor_loop(cfg: DictConfig):
 
     wait_for_inference_servers(llm_urls)
     wait_for_environments(cfg)
-    trainer_state = TrainerState(exp_path)
+    trainer_state = TrainerState(exp_path, use_fast_llm=cfg.use_fast_llm)
     if cfg.debug.mode:
         trainer_state.debug_mode_init()
     else:
