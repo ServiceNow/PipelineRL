@@ -215,7 +215,10 @@ def run_actor_llm(
             if v not in [None, ""]:
                 cmd.append(str(v))
 
-    if cfg.debug.mode:
+    # Disable weight updates in debug mode or when using Fast-LLM (no NCCL group yet)
+    # TODO(fast-llm): Remove the use_fast_llm check once NCCL weight broadcast is implemented.
+    # When Fast-LLM broadcasts weights via NCCL, vLLM should join the group and receive updates.
+    if cfg.debug.mode or cfg.use_fast_llm:
         cmd.append("--disable-weight-updates")
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
@@ -295,11 +298,16 @@ def run_environment(cfg: DictConfig, job: Job):
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
     save_dir = exp_dir / "finetune"
 
+    # Get absolute path to config file
+    config_path = Path(__file__).parent.parent / "qwen25_05B-instruct.yaml"
+
     cmd = [
         "conda",
         "run",
         "-n",
-        "fast-llm"
+        "fast-llm",
+        "--cwd",
+        str(config_path.parent),  # Set working directory for fast-llm
     ]
 
     cmd += [
@@ -307,7 +315,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         "train",
         "gpt",
         "--config",
-        "qwen25_05B-instruct.yaml",
+        str(config_path),
         f"run.experiment_dir={save_dir}"
     ]
 
@@ -503,9 +511,9 @@ def is_inference_process(proc: LaunchedProcess) -> bool:
     return proc.kind in {"actor_llm", "preprocessor_llm"}
 
 
-def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False):
+def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False, use_fast_llm: bool = False):
     if not debug_mode:
-        trainer_state = TrainerState(exp_path)
+        trainer_state = TrainerState(exp_path, use_fast_llm=use_fast_llm)
         trainer_state.start_listening()
     else:
         trainer_state = None
@@ -716,7 +724,7 @@ def main(cfg: DictConfig):
     if os.environ.get("DRY_RUN", "0") == "1":
         assert not processes
         return
-    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode))
+    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode), cfg.use_fast_llm)
 
 
 if __name__ == "__main__":
