@@ -37,11 +37,21 @@ class WorldMap:
         self.my_rank = int(os.environ.get("RANK", 0))
         self.address_map = {}
         if self.world_size > 1:
-            self.master_addr = os.environ["MASTER_ADDR"]
-            # e.g.: dns-f6c9712f-4d9b-4c8d-a648-f8d94cf12113-0
-            for rank in range(self.world_size):
-                basename = self.master_addr[: self.master_addr.rfind("-")]
-                self.address_map[rank] = f"{basename}-{rank}"
+            env_hosts = os.environ.get("PIPELINERL_HOSTS")
+            if env_hosts:
+                hosts = [host.strip() for host in env_hosts.split(",") if host.strip()]
+                if len(hosts) != self.world_size:
+                    raise ValueError(
+                        f"PIPELINERL_HOSTS must list {self.world_size} hosts (got {len(hosts)}): {env_hosts}"
+                    )
+                self.address_map = {rank: host for rank, host in enumerate(hosts)}
+                self.master_addr = hosts[0]
+            else:
+                self.master_addr = os.environ["MASTER_ADDR"]
+                # e.g.: dns-f6c9712f-4d9b-4c8d-a648-f8d94cf12113-0
+                for rank in range(self.world_size):
+                    basename = self.master_addr[: self.master_addr.rfind("-")]
+                    self.address_map[rank] = f"{basename}-{rank}"
         else:
             self.master_addr = "localhost"
             self.address_map[0] = "localhost"
@@ -265,3 +275,4 @@ class WorldMap:
 
     def get_preprocessor_urls(self) -> list[str]:
         return [job.url for job in self.get_all_jobs() if job.kind == "preprocessor_llm"]
+
