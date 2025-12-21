@@ -295,16 +295,18 @@ def run_environment(cfg: DictConfig, job: Job):
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
     if cfg.use_fsdp and cfg.use_deepspeed:
         raise ValueError("Cannot use both FSDP and DeepSpeed")
+    run_dir = exp_dir / "finetune"
+    os.makedirs(run_dir, exist_ok=True)
     cmd = [
         "python",
         "-m",
         "accelerate.commands.launch",
     ]
-    if world_map.world_size > 1:
+    finetune_nodes = len(world_map.nodes_with_finetuning())
+    if finetune_nodes > 1:
         # DeepSpeed multi-node args
         assert cfg.use_deepspeed
-        assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-        hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+        hosts = [world_map.address_map[rank] for rank in range(world_map.world_size)]
         filter_parts = []
         for rank, job_list in world_map.job_map.items():
             for job in job_list:
@@ -316,7 +318,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         hostfile_path = str(exp_dir / "hostfile.txt")
         cmd += [
             "--num_machines",
-            str(len(world_map.nodes_with_finetuning())),
+            str(finetune_nodes),
             "--machine_rank",
             str(world_map.my_finetuning_rank()),
             "--main_process_ip",
@@ -329,6 +331,17 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
             deepspeed_include_filter,
             "--deepspeed_multinode_launcher",
             "nossh"
+        ]
+    else:
+        cmd += [
+            "--num_machines",
+            "1",
+            "--machine_rank",
+            "0",
+            "--main_process_ip",
+            str(os.environ.get("MASTER_ADDR")),
+            "--main_process_port",
+            str(os.environ.get("MASTER_PORT")),
         ]
     # get path to this file
     this_file_path = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -348,11 +361,12 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
             accelerate_config = "fsdp_mp"
         else:
             accelerate_config = "base_mp"
+    rdzv_backend = "c10d" if len(world_map.nodes_with_finetuning()) > 1 else "static"
     cmd += [
         "--config_file",
         str(this_file_path / f"../conf/accelerate/{accelerate_config}.yaml"),
         "--rdzv_backend",
-        "c10d",
+        rdzv_backend,
     ]
     if gpus:
         gpus_str = str(",".join([str(gpu) for gpu in gpus])) if len(gpus) < world_map.node_size else "all"
@@ -380,10 +394,37 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         cmd.append("finetune.send_weight_updates=False")
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
-    save_command(exp_dir / "finetune", cmd)
+    save_command(run_dir, cmd)
     env = dict(os.environ)
+    # Avoid torchrun/accelerate inheriting the outer launcher rank settings.
+    for key in [
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "NODE_RANK",
+        "TORCHELASTIC_RDZV_ENDPOINT",
+        "TORCHELASTIC_RDZV_ID",
+        "TORCHELASTIC_RESTART_COUNT",
+    ]:
+        env.pop(key, None)
+    # clar default Pytorch Elastic Training vars for single-node launch.
+    for key in list(env.keys()):
+        if key.startswith("PET_"):
+            env.pop(key, None)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
-    proc = _popen(cmd, env=env)
+    log_file_path = str(run_dir / "stdout.log")
+    err_file_path = str(run_dir / "stderr.log")
+    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
+        proc = _popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=err_file,
+        )
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
 
@@ -645,9 +686,8 @@ def main(cfg: DictConfig):
             redis = connect_to_redis(cfg.streams)
             redis.flushall()
 
-        if world_map.world_size > 1:
-            assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-            hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+        if len(world_map.nodes_with_finetuning()) > 1:
+            hosts = [world_map.address_map[rank] for rank in range(world_map.world_size)]
             hostfile_lines = [f"{host} slots=8" for host in hosts]
             deepspeed_hostfile_content = "\n".join(hostfile_lines)
             hostfile_path = str(exp_dir / "hostfile.txt")
@@ -693,3 +733,4 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
+
