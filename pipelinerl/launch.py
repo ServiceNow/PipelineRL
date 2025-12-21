@@ -338,11 +338,16 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
             "1",
             "--machine_rank",
             "0",
-            "--main_process_ip",
-            str(os.environ.get("MASTER_ADDR")),
-            "--main_process_port",
-            str(os.environ.get("MASTER_PORT")),
         ]
+        master_addr = os.environ.get("MASTER_ADDR")
+        master_port = os.environ.get("MASTER_PORT")
+        if master_addr and master_port:
+            cmd += [
+                "--main_process_ip",
+                str(master_addr),
+                "--main_process_port",
+                str(master_port),
+            ]
     # get path to this file
     this_file_path = Path(os.path.dirname(os.path.abspath(__file__)))
     if cfg.use_deepspeed:
@@ -416,15 +421,10 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         if key.startswith("PET_"):
             env.pop(key, None)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
-    log_file_path = str(run_dir / "stdout.log")
-    err_file_path = str(run_dir / "stderr.log")
-    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
-        proc = _popen(
-            cmd,
-            env=env,
-            stdout=log_file,
-            stderr=err_file,
-        )
+    proc = _popen(
+        cmd,
+        env=env,
+    )
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
 
