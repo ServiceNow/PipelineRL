@@ -1,0 +1,16 @@
+defaults:
+    - base
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.ifeval.rollouts.generate_ifeval_rollout
+  system_prompt: You are a helpful assistant.
+  task_template: |-
+    {task}
+environment:
+  _target_: pipelinerl.domains.ifeval.verifier_api.IfEvalEnvironment
+dataset_loader: pipelinerl.domains.ifeval.load_datasets.load_datasets
+train_dataset_names:
+  - ifeval
+test_dataset_names:
+  - ifeval

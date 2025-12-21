@@ -1,0 +1,152 @@
+# changed parameters marked below
+defaults:
+  - ifeval
+  - override finetune: base
+  - override rewards: success_and_format
+  - override streams: redis
+  - _self_
+
+wandb:
+  use_wandb: true
+  # W&B id; if given, will resume this run
+  wandb_id: null
+  wandb_name: null
+  # W&B entity name
+  wandb_entity_name: null
+  # W&B project name
+  wandb_project_name: apriel_ifeval
+  # W&B resume policy
+  wandb_resume: always
+  # Whether to use only the basename or the full path as the run name
+  wandb_use_basename: True
+  wandb_workspace_root: /mnt/core_llm_large/shruthan/scratch/PipelineRL/results/exps
+  # set the group in your config
+  wandb_group: null
+  wandb_dir: null
+  tags: []
+
+vllm_config:
+  use_v1: false
+  vllm_kwargs:
+    max_model_len: 32768
+
+finetune:
+  learning_rate: 5e-7
+  max_train_steps: 1024
+  save_checkpoint_steps: 9999999
+  seq_length: 128000
+  gradient_clipping_threshold: 0.1
+  seq_parallel: 4
+  save_final_training_state: false
+  gradient_accumulation_passes: 1024
+  rl:
+    policy_loss: reinforce
+    overlong_filtering: true
+
+rewards:
+  correct: 1.0
+  incorrect: 0.0
+
+actor:
+  sampling:
+    method: random
+    log_each_n_secs: 0
+  llm_max_rollouts: 256
+  rollout_workers: 1
+  log_each_n_secs: 10
+  rollout_policy: pipelinerl.domains.ifeval.rollouts.generate_ifeval_rollout
+  discount_factor: 1
+  system_prompt: ""
+  task_prompt: ""
+  throughput_window_size: 50
+  shared_memory_entry_size: 100000000
+  ensure_boxed_answers: true
+  execution:
+    timeout_secs: 10
+    memory_limit_mb: 1024
+environment:
+  _target_: pipelinerl.domains.ifeval.verifier_api.IfEvalEnvironment
+
+train_dataset_names:
+- ifeval
+
+test_dataset_names:
+  - ifeval
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 1
+  queue_size: 8
+  chunk_n_groups: 8
+  submit_delay: 0.
+  pop_old_data: ${..pop_old_data} 
+  buffer_size: 0
+  shared_memory_entry_size: 100000000
+
+llm:
+  parameters:
+    # changed
+    max_tokens: 20000
+    # changed
+    temperature: 1.0
+    stop:
+      - </s>
+      - '[END FINAL RESPONSE]'
+      - <|end|>
+      - <|assistant|>
+      - <|user|>
+    stop_token_ids: []
+
+test_llm:
+  parameters: 
+    max_tokens: 20000
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 50
+    stop:
+      - </s>
+      - '[END FINAL RESPONSE]'
+      - <|end|>
+      - <|assistant|>
+      - <|user|>
+    stop_token_ids: []
+
+world:
+  replicas: 1
+  
+  actor_fraction: 1
+  preprocessor_fraction: 0
+  finetune_fraction: 1
+
+  env_replicas: 2
+
+  actor_group_port: 10000
+  environment_start_port: 7777  
+# this will be autocreated based on the config
+jobs: []
+
+eval_every_n_versions: 0
+model_path: /mnt/core_llm_large/aman/merge_model/rc2-4-merge-rc2-3---lc3-111325/
+accelerate_config: null
+use_deepspeed: true
+deepspeed_config: deepspeed_stage3_bf16
+use_fsdp: false
+fsdp:
+  param_dtype: fp32
+  reduce_dtype: fp32
+  buffer_dtype: fp32
+
+output_dir: ???
+force_restart: true
+pop_old_data: true
+max_lag: null
+
+me:
+  job_idx: null
+
+debug:
+  mode: ""
+  streams_from: null
+  place_inference_workers: true
+ 
