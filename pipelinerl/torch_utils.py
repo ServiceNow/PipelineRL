@@ -1,5 +1,8 @@
 from datetime import timedelta
+import os
+from urllib.parse import urlparse
 from typing import Any, Optional, Union
+from torch.distributed import TCPStore
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
@@ -23,6 +26,9 @@ def init_extra_process_group(
     group_name: str = None,
     pg_options: Optional[Any] = None,
 ):
+    prev_use_agent_store = os.environ.get("TORCHELASTIC_USE_AGENT_STORE")
+    if prev_use_agent_store:
+        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = "0"
     assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
 
     if store is not None:
@@ -40,6 +46,19 @@ def init_extra_process_group(
         timeout = default_pg_timeout
 
     # backward compatible API
+    if store is None and init_method and init_method.startswith("tcp://"):
+        if world_size <= 0 or rank < 0:
+            raise ValueError("world_size and rank must be set when using tcp:// init_method")
+        parsed = urlparse(init_method)
+        if parsed.hostname is None or parsed.port is None:
+            raise ValueError(f"Invalid tcp init_method: {init_method}")
+        store = TCPStore(
+            host_name=parsed.hostname,
+            port=parsed.port,
+            world_size=world_size,
+            is_master=rank == 0,
+            timeout=timeout,
+        )
     if store is None:
         rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
         store, rank, world_size = next(rendezvous_iterator)
@@ -59,6 +78,11 @@ def init_extra_process_group(
         backend_options=pg_options,
         timeout=timeout,
     )
+
+    if prev_use_agent_store is None:
+        os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+    else:
+        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = prev_use_agent_store
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
