@@ -15,6 +15,18 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 logger = logging.getLogger(__name__)
 
 
+def _to_object(obj):
+    """Recursively convert OmegaConf objects to plain Python containers."""
+    if isinstance(obj, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(obj, resolve=True)
+    elif isinstance(obj, dict):
+        return {k: _to_object(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_to_object(v) for v in obj]
+    else:
+        return obj
+
+
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     """Extract PIL Images from multimodal messages."""
 
@@ -42,18 +54,6 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
                             raise e
 
     return images
-
-
-def _to_plain_obj(value):
-    """convert OmegaConf containers into Python types"""
-
-    if isinstance(value, (DictConfig, ListConfig)):
-        return OmegaConf.to_container(value, resolve=True)
-    if isinstance(value, dict):
-        return {key: _to_plain_obj(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_plain_obj(item) for item in value]
-    return value
 
 
 async def llm_async_generate(
@@ -88,7 +88,9 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
-    payload = _to_plain_obj({**data, **extra_parameters})
+    payload = {**data, **extra_parameters}
+    # TODO: upgrade omegaconf and use OmegaConf.to_object for recursive conversion
+    payload = _to_object(payload)
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
         json=payload,
@@ -101,6 +103,7 @@ async def llm_async_generate(
             response.raise_for_status()
         data = await response.json()
 
+    finish_reason: str | None = None
     try:
         content = data["choices"][0]["message"]["content"]
         if not content:

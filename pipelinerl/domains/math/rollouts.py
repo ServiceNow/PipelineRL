@@ -4,6 +4,8 @@ import time
 import aiohttp
 from omegaconf import DictConfig
 from pydantic import BaseModel
+from pipelinerl.rollouts import RolloutResult, BaseMetrics
+from pipelinerl.utils import get_environment_jobs, resolve_environment_key
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from pipelinerl.llm import Prompt, TrainableLLM
@@ -55,9 +57,10 @@ async def generate_math_rollout(
     rewards = RewardTable(**dict(cfg.rewards))
     discount_factor = cfg.actor.discount_factor
 
-    # math_verify is a fast environment, no support for environment replicas for now
-    env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
-    # choose the job randomly
+    env_key = resolve_environment_key(cfg, default="math")
+    env_jobs = get_environment_jobs(cfg, env_key)
+    if not env_jobs:
+        raise RuntimeError("No environment servers available for math domain")
     env_job = random.choice(env_jobs)
     assert env_job.port is not None
     answer_status = await verify_answer_rpc(

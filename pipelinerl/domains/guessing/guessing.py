@@ -9,6 +9,9 @@ from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 
 
+DOMAIN = "guessing"
+
+
 async def generate_guessing_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -91,10 +94,10 @@ def load_problems(dataset_names: list[str]):
     for name in dataset_names:
         if name == "train":
             problems.extend([
-                {"answer": (2 * i * c) % n + 1, "dataset": "train"} for i in range(512)
+                {"answer": (2 * i * c) % n + 1, "dataset": "train", "domain": DOMAIN} for i in range(512)
             ])
         elif name == "test":
             problems.extend([
-                {"answer": ((2 * i + 1) * c) % n + 1, "dataset": "test"} for i in range(512)
+                {"answer": ((2 * i + 1) * c) % n + 1, "dataset": "test", "domain": DOMAIN} for i in range(512)
             ])
     return problems

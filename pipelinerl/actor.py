@@ -15,12 +15,13 @@ from typing import Dict, List
 import aiohttp
 import hydra
 import uvloop
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 
 import wandb
-from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
+from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.finetune_loop import calculate_train_steps
+from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.shared_memory_array import SharedMemoryQueue
@@ -36,6 +37,7 @@ from pipelinerl.streams import (
 from .utils import (
     always_or_never_success_stats,
     calculate_stats,
+    resolve_environment_key,
     setup_logging,
     wait_for_environments,
     wait_for_inference_servers,
@@ -173,7 +175,23 @@ async def schedule_rollouts(
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
+            domain_value: str | None = None
+            if isinstance(problem, dict):
+                raw_domain = problem.get("domain")
+                if raw_domain:
+                    domain_value = str(raw_domain)
+            elif isinstance(problem, tuple) and len(problem) >= 2 and isinstance(problem[1], dict):
+                raw_domain = problem[1].get("domain")
+                if raw_domain:
+                    domain_value = str(raw_domain)
+
+            if not domain_value:
+                resolved = resolve_environment_key(cfg)
+                domain_value = str(resolved) if resolved else None
+
             rollout_result = await rollout_policy(cfg, llm, problem, session)
+            if domain_value and not rollout_result.domain:
+                rollout_result.domain = domain_value
             rollout_result.model_version = model_version
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
@@ -349,6 +367,7 @@ class ActorLoop:
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
+        self.domain_counts = defaultdict(int)
     
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
@@ -368,6 +387,16 @@ class ActorLoop:
             group_id = result.group_id
             self.latency_list.append(result.latency)
             self.model_versions_list.append(result.model_version)
+            domain_key: str | None = None
+            if getattr(result, "domain", None):
+                domain_key = str(result.domain)
+            elif isinstance(dataset_name, str):
+                domain_key = dataset_name.split("::", 1)[0]
+            elif dataset_name is not None:
+                domain_key = str(dataset_name)
+
+            if domain_key:
+                self.domain_counts[domain_key] += len(result.training_texts)
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
             all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
             for k, v in all_metrics.items():
@@ -404,8 +433,15 @@ class ActorLoop:
         # If training, we expect to sample infinitely
         # for train sample, sample random batches infinitely
         # for test samples, loop through the dataset once
+        domain_sampler = None
         if self.is_training:
             problem_iter = random_iter(dataset)
+            domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
+            if domain_mix_cfg:
+                mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+                if not isinstance(mix_weights, dict):
+                    raise ValueError("actor.domain_mix must be a mapping from domain to weight")
+                domain_sampler = DomainWeightedSampler(dataset, mix_weights)
         else:
             problem_iter = sequential_iter(dataset)
         assert self.trainer_state.propagated_weight_version is not None
@@ -467,7 +503,10 @@ class ActorLoop:
                         if not blocked_by_lag and not self.problem_queue.full():
                             try:
                                 try:
-                                    problem = next(problem_iter)
+                                    if domain_sampler is not None:
+                                        problem = domain_sampler.sample()
+                                    else:
+                                        problem = next(problem_iter)
                                     self.problem_queue.put(problem, block=False)
                                     submitted_groups += 1
                                 except queue.Full:            
@@ -494,6 +533,12 @@ class ActorLoop:
                     f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
+
+                # Track completions per domain for adaptive sampling
+                if domain_sampler is not None:
+                    for r in rollout_results:
+                        if r.domain:
+                            domain_sampler.record_completion(r.domain)
 
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
@@ -573,6 +618,25 @@ class ActorLoop:
         )
 
         stats |= loop_stats
+
+        total_domain_samples = sum(self.domain_counts.values())
+        if total_domain_samples:
+            for domain, count in sorted(self.domain_counts.items()):
+                stats[f"{split_name}domain_mix_count/{domain}"] = count
+                stats[f"{split_name}domain_mix_actual/{domain}"] = count / total_domain_samples
+
+        domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
+        if domain_mix_cfg:
+            mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+            if isinstance(mix_weights, dict):
+                target_total = sum(float(v) for v in mix_weights.values() if float(v) > 0)
+                if target_total > 0:
+                    for domain, weight in mix_weights.items():
+                        stats[f"{split_name}domain_mix_target/{domain}"] = float(weight) / target_total
+                else:
+                    for domain in mix_weights:
+                        stats[f"{split_name}domain_mix_target/{domain}"] = 0.0
+
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
         if self.cfg.wandb.use_wandb:

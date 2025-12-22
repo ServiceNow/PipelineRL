@@ -1,0 +1,55 @@
+defaults:
+  - base
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.coding.generate_coding_rollout
+  system_prompt: |-
+    You are an expert Python programmer. When providing code solutions, format your final code inside markdown code blocks using triple backticks with the python language identifier, like this:
+    ```python
+    # your code here
+    ```
+    Provide complete, working implementations that pass all test cases.
+  task_template: |-
+    {task}
+  task_prompt: ""
+  ensure_boxed_answers: false
+
+  coding_time_limit_s: 15.0
+  coding_per_test_timeout_s: 10.0
+  coding_memory_limit_bytes: 1073741824
+  coding_compile_timeout_s: 10.0
+  coding_sandbox_url: ${oc.env:CODING_SANDBOX_URL, "http://sandbox:8080/run_code"}
+
+dataset_loader: pipelinerl.domains.coding.dataset.load_problems
+dataset_loader_params:
+  dataset_id: ServiceNow-AI/mixed-training-text-datasets
+  dataset_config: 80k-if-math-coding-fncalling-stem
+  split_ratios:
+    train: 0.9
+    validation: 0.05
+    test: 0.05
+  allowed_call_types:
+    - assert
+    - std
+  max_examples_per_split: 2048
+  trust_remote_code: true
+  huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+
+train_dataset_names:
+  - coding@train
+
+test_dataset_names:
+  - coding@validation
+
+environments:
+  - key: coding
+    mode: remote
+    _target_: pipelinerl.domains.coding.CodingSandboxEnvironment
+    sandbox_url: ${actor.coding_sandbox_url}
+    compile_timeout_s: ${actor.coding_compile_timeout_s}
+    run_timeout_s: ${actor.coding_per_test_timeout_s}
+    request_timeout_s: ${actor.coding_time_limit_s}
+    memory_limit_bytes: ${actor.coding_memory_limit_bytes}
+
+environment_key: coding

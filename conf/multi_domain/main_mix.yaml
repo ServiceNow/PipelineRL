@@ -1,0 +1,10 @@
+defaults:
+  - base
+  - domain_mix: main_mix
+  - _self_
+
+actor:
+  domain_rollouts:
+    math: ${domain_rollouts.math}
+    coding: ${domain_rollouts.coding}
+    fn_calling: ${domain_rollouts.fn_calling}

@@ -2,6 +2,7 @@ defaults:
   - finetune: base
   - rewards: pure_success
   - streams: files
+  - domain_mix: null
   - _self_
 
 seed: 42
@@ -22,6 +23,7 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  domain_mix: null
 environment: null
 preprocess:
   input: actor
@@ -141,4 +143,3 @@ wandb:
   wandb_dir: null
   # Comma-separated list of keywords to tag the run.
   tags: []
-

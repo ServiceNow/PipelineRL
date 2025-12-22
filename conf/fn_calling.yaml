@@ -1,0 +1,36 @@
+defaults:
+  - base
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
+  system_prompt: ""
+  task_template: "{task}"
+  task_prompt: ""
+  ensure_boxed_answers: false
+
+dataset_loader: pipelinerl.domains.fn_calling.dataset.load_problems
+dataset_loader_params:
+  dataset_id: ServiceNow-AI/mixed-training-text-datasets
+  dataset_config: 80k-if-math-coding-fncalling-stem
+  split_ratios:
+    train: 0.9
+    validation: 0.05
+    test: 0.05
+  allowed_call_types: []
+  max_examples_per_split: 2048
+  trust_remote_code: true
+  huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+
+train_dataset_names:
+  - fn_calling@train
+
+test_dataset_names:
+  - fn_calling@validation
+
+environments:
+  - key: fn_calling
+    mode: remote
+    _target_: pipelinerl.domains.fn_calling.AgenticToolsEnvironment
+
+environment_key: fn_calling

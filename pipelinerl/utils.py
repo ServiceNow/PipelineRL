@@ -7,11 +7,12 @@ import time
 from pathlib import Path
 import traceback
 from typing import Dict, Mapping, List, Any
+
 import numpy as np
-from omegaconf import DictConfig
 import psutil
 import requests
 from importlib.metadata import distributions
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from transformers import PreTrainedTokenizer
 
 from pipelinerl.world import Job
@@ -22,6 +23,177 @@ from wandb.sdk import wandb_run
 
 logger = logging.getLogger(__name__)
 
+_ENV_METADATA_KEYS = {"key", "mode", "replicas_per_actor"}
+
+
+def _strip_environment_metadata(env_cfg: DictConfig | dict | None):
+    if env_cfg is None:
+        return None
+    if isinstance(env_cfg, DictConfig):
+        data = OmegaConf.to_container(env_cfg, resolve=True)
+    elif isinstance(env_cfg, dict):
+        data = dict(env_cfg)
+    else:
+        return env_cfg
+    for meta_key in _ENV_METADATA_KEYS:
+        data.pop(meta_key, None)
+    return OmegaConf.create(data)
+
+
+def _env_cfg_type(env_cfg, field: str):
+    if isinstance(env_cfg, DictConfig):
+        return env_cfg.get(field, None)
+    if isinstance(env_cfg, dict):
+        return env_cfg.get(field)
+    return None
+
+
+def select_environment_config(cfg: DictConfig, *, key: str | None = None, index: int | None = None):
+    env_cfgs = getattr(cfg, "environments", None)
+    if env_cfgs:
+        if isinstance(env_cfgs, (ListConfig, list)):
+            if key is not None:
+                for env_cfg in env_cfgs:
+                    env_key = _env_cfg_type(env_cfg, "key") or _env_cfg_type(env_cfg, "name")
+                    if env_key is not None and str(env_key) == str(key):
+                        return _strip_environment_metadata(env_cfg)
+            if index is not None and 0 <= index < len(env_cfgs):
+                return _strip_environment_metadata(env_cfgs[index])
+        elif isinstance(env_cfgs, (DictConfig, dict)):
+            if key is not None and key in env_cfgs:
+                return _strip_environment_metadata(env_cfgs[key])
+            if index is not None:
+                for idx, env_key in enumerate(env_cfgs):
+                    if idx == index:
+                        return _strip_environment_metadata(env_cfgs[env_key])
+
+    return getattr(cfg, "environment", None)
+
+
+def _domain_mix_weights(cfg: DictConfig) -> dict[str, float]:
+    domain_mix_cfg = getattr(getattr(cfg, "actor", None), "domain_mix", None)
+    if not domain_mix_cfg:
+        return {}
+    try:
+        mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+    except Exception:
+        return {}
+    if not isinstance(mix_weights, dict):
+        return {}
+    weights: dict[str, float] = {}
+    for key, value in mix_weights.items():
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            weights[str(key)] = weight
+    return weights
+
+
+def _apply_domain_mix_replicas(cfg: DictConfig, specs: list[dict[str, Any]], default_replicas: Any) -> None:
+    weights = _domain_mix_weights(cfg)
+    if not weights:
+        return
+    try:
+        default_value = float(default_replicas)
+    except (TypeError, ValueError):
+        return
+    if default_value <= 0:
+        return
+    weighted_specs = [spec for spec in specs if spec.get("mode") == "remote" and spec.get("key") in weights]
+    if not weighted_specs:
+        return
+    total_weight = sum(weights[spec["key"]] for spec in weighted_specs)
+    if total_weight <= 0:
+        return
+    average_weight = total_weight / len(weighted_specs)
+    if average_weight <= 0:
+        return
+    for spec in weighted_specs:
+        key = spec["key"]
+        scaled = default_value * (weights[key] / average_weight)
+        replicas = max(1, int(round(scaled)))
+        current = spec.get("replicas_per_actor")
+        if current is None or current == default_replicas:
+            spec["replicas_per_actor"] = replicas
+
+
+def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    env_cfgs = getattr(cfg, "environments", None)
+    default_mode = str(getattr(cfg.world, "environment_mode", "remote"))
+    default_replicas = getattr(cfg.world, "env_replicas_per_actor", 1)
+
+    if isinstance(env_cfgs, (ListConfig, list)):
+        iterable = list(env_cfgs)
+        for idx, env_cfg in enumerate(iterable):
+            if env_cfg is None:
+                continue
+            key = _env_cfg_type(env_cfg, "key") or _env_cfg_type(env_cfg, "name")
+            mode = _env_cfg_type(env_cfg, "mode")
+            replicas = _env_cfg_type(env_cfg, "replicas_per_actor")
+            specs.append(
+                {
+                    "key": str(key) if key is not None else f"environment_{idx}",
+                    "mode": str(mode) if mode is not None else default_mode,
+                    "replicas_per_actor": replicas,
+                    "index": idx,
+                }
+            )
+    elif isinstance(env_cfgs, (DictConfig, dict)):
+        items = env_cfgs.items()
+        for idx, (key, env_cfg) in enumerate(items):
+            if env_cfg is None:
+                continue
+            mode = _env_cfg_type(env_cfg, "mode")
+            replicas = _env_cfg_type(env_cfg, "replicas_per_actor")
+            specs.append(
+                {
+                    "key": str(key),
+                    "mode": str(mode) if mode is not None else default_mode,
+                    "replicas_per_actor": replicas,
+                    "index": idx,
+                }
+            )
+    else:
+        single_env = getattr(cfg, "environment", None)
+        if single_env:
+            key = _env_cfg_type(single_env, "key") or _env_cfg_type(single_env, "name")
+            specs.append(
+                {
+                    "key": str(key) if key is not None else "default",
+                    "mode": default_mode,
+                    "replicas_per_actor": default_replicas,
+                    "index": 0,
+                }
+            )
+
+    active_domains = _domain_mix_weights(cfg)
+    if active_domains:
+        specs = [spec for spec in specs if spec.get("key") in active_domains]
+
+    _apply_domain_mix_replicas(cfg, specs, default_replicas)
+    return specs
+
+
+def resolve_environment_key(cfg: DictConfig, default: str | None = None) -> str | None:
+    explicit = cfg.get("environment_key", None) if hasattr(cfg, "get") else None
+    if explicit:
+        return str(explicit)
+    specs = collect_environment_specs(cfg)
+    if len(specs) == 1:
+        return specs[0]["key"]
+    return default
+
+
+def get_environment_jobs(cfg: DictConfig, key: str | None = None) -> list[Job]:
+    jobs_cfg = getattr(cfg, "jobs", [])
+    env_jobs = [Job(**job) for job in jobs_cfg if job["kind"] == "environment"]
+    if key is None:
+        return env_jobs
+    filtered = [job for job in env_jobs if getattr(job, "environment_key", None) == key]
+    return filtered or env_jobs
 
 def init_wandb(
     cfg: DictConfig,
@@ -294,19 +466,27 @@ def wait_for_inference_servers(urls: list[str]):
 
 
 def wait_for_environments(cfg: DictConfig):
-    """
-    Wait for the verifier to be ready.
-    """
-    env_jobs = [Job(**job) for job in cfg.jobs if job.kind == "environment"]
+    """Wait for remote environment servers to report healthy."""
+    specs = collect_environment_specs(cfg)
+    if not any(spec.get("mode") == "remote" for spec in specs):
+        return
+
+    env_jobs = get_environment_jobs(cfg)
+    if not env_jobs:
+        return
     for job in env_jobs:
         while True:
             url = f"http://{job.hostname}:{job.port}/health"
-            # use requests
             try:
                 response = requests.get(url)
                 if response.status_code == 200:
+                    logger.info(
+                        "Environment %s ready at %s",
+                        job.environment_key if job.environment_key is not None else job.replica_idx,
+                        url,
+                    )
                     break
-            except:
+            except requests.exceptions.RequestException:
                 logger.info(f"Waiting for environment at {url} to be ready...")
                 time.sleep(5.0)
 
