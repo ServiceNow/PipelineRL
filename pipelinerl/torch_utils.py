@@ -59,7 +59,6 @@ def init_extra_process_group(
     store: Optional[Store] = None,
     group_name: str = None,
     pg_options: Optional[Any] = None,
-    device_id: Optional[torch.device] = None,
 ):
     assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
 
@@ -94,12 +93,6 @@ def init_extra_process_group(
         pg_options.is_high_priority_stream = False
         logger.info(f"[{group_name}] Created NCCL options: {pg_options}")
 
-    # Ensure CUDA is synchronized before creating NCCL process group
-    if device_id is not None:
-        torch.cuda.synchronize(device_id)
-        logger.info(f"[{group_name}] CUDA synchronized on {device_id}")
-
-    logger.info(f"[{group_name}] Creating process group: rank={rank}, world_size={world_size}, device_id={device_id}")
     pg, _ = _new_process_group_helper(
         world_size,
         rank,
@@ -109,7 +102,6 @@ def init_extra_process_group(
         group_name=group_name,
         backend_options=pg_options,
         timeout=timeout,
-        device_id=device_id,
     )
     logger.info(f"[{group_name}] Process group created successfully")
 
