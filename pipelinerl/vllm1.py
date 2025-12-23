@@ -2,7 +2,8 @@ import logging
 import signal
 import torch
 import uvloop
-from vllm.utils import FlexibleArgumentParser, set_ulimit
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.system_utils import set_ulimit
 from vllm.entrypoints.openai.cli_args import (
     make_arg_parser,
     validate_parsed_serve_args,
@@ -26,8 +27,8 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from pipelinerl.finetune_loop import WeightUpdateRequest
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
+from pipelinerl.torch_utils import stateless_init_process_group
 from typing import Any, Protocol, runtime_checkable
-import pipelinerl.torch_utils
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,6 @@ handler.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-
 
 @runtime_checkable
 class LikeWorker(Protocol):
@@ -72,15 +72,18 @@ class WorkerExtension:
             prefix
             + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
         )
-        self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-            group_name="actor",
-            backend="nccl",
+
+        # Use vLLM's StatelessProcessGroup instead of torch.distributed
+        self.model_update_group = stateless_init_process_group(
             init_method=weight_update_group_init_method,
             rank=self.pg_rank,
             world_size=weight_update_group_world_size,
+            device=self.device,
         )
+        logger.info(prefix + "Actor update process group initialized")
 
-    def receive_weight_update(self: LikeWorker, request: WeightUpdateRequest):
+    def receive_weight_update(self: LikeWorker, request_json: str):
+        request = WeightUpdateRequest.model_validate_json(request_json)
         torch.cuda.synchronize(self.device)
         logger.info("Start receiving weight update")
         expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
@@ -89,7 +92,8 @@ class WorkerExtension:
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
             buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
-            torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+            # Use PyNcclCommunicator's broadcast method instead of torch.distributed
+            self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
             loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
             if len(loaded_params) != 1:
                 raise ValueError(f"model {info.name} not found in model state dict")
@@ -114,8 +118,13 @@ class WeightUpdateManager:
         )
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
+        # Ensure workers are ready by executing a dummy batch first
+        # This synchronizes workers before the NCCL collective
+        # logger.info("Synchronizing workers before weight update...")
+        # await self.engine_client.execute_dummy_batch_async()
+        # logger.info("Workers synchronized, starting weight update")
         await self.engine_client.collective_rpc_async(
-            "receive_weight_update", args=(request,)
+            "receive_weight_update", args=(request.model_dump_json(),)
         )
         logger.info("Weight update processed")
 
@@ -157,7 +166,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         vllm_config=engine_config,
         usage_context=UsageContext.OPENAI_API_SERVER,
         disable_log_stats=engine_args.disable_log_stats,
-        disable_log_requests=engine_args.disable_log_requests,
+        enable_log_requests=engine_args.enable_log_requests,
     )
     assert isinstance(engine.engine_core, AsyncMPClient)
 
@@ -172,10 +181,11 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     @app.post("/receive_weight_update")
     async def _receive_weight_update(request: WeightUpdateRequest):
+        logger.info("Received weight update request")
         await weight_update_manager.receive_weight_update(request)
         return {"status": "ok"}
 
-    await init_app_state(engine, engine_config, app.state, args)
+    await init_app_state(engine, app.state, args)
     shutdown_task = await serve_http(
         app,
         sock,
