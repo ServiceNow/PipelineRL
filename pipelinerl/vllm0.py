@@ -1,3 +1,36 @@
+"""
+DEPRECATED - Kept only for backward compatibility with older vLLM versions.
+
+This module provides a custom vLLM inference server with dynamic weight updates using the legacy V0 engine architecture.
+
+Compatibility:
+    - vLLM versions <= 0.8.x only
+    - The V0 engine was removed in vLLM 0.11.0
+    - Use vllm1.py instead
+"""
+import warnings
+from packaging import version as version_parser
+import vllm
+
+# Check vLLM version compatibility
+vllm_version = version_parser.parse(vllm.__version__)
+
+if vllm_version >= version_parser.parse("0.9.0"):
+    raise ImportError(
+        f"pipelinerl.vllm0 is not compatible with vLLM {vllm.__version__}. "
+        "This module only works with vLLM <= 0.8.x. "
+        "Please use pipelinerl.vllm1 for vLLM >= 0.11.0 instead."
+    )
+
+# Only show deprecation warning for compatible versions
+warnings.warn(
+    "pipelinerl.vllm0 is DEPRECATED and will be removed in a future version. "
+    "This module only works with vLLM <= 0.8.x. "
+    "Please use pipelinerl.vllm1 as it is actively maintained.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import asyncio
 import json
 import logging
@@ -14,7 +47,6 @@ from vllm.entrypoints.openai.cli_args import (
 )
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.api_server import (
-    run_server,
     create_server_socket,
     build_app,
     init_app_state,
