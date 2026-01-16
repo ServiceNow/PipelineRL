@@ -37,6 +37,17 @@ dataset_loader_params:
       trust_remote_code: true
       huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
 
+train_dataset_names:
+  - math::open_reasoner_zero_57k
+  - math::open_reasoner_zero_extended_72k
+  - coding::coding@train
+
+test_dataset_names:
+  - math::aime_2024
+  - math::amc_2023
+  - math::math_500
+  - coding::coding@validation
+
 environments:
   - key: math
     mode: remote

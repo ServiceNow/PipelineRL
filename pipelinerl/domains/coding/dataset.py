@@ -17,6 +17,10 @@ from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
+DOMAIN_NAME = "coding"
+BASE_DATASET_NAME = "mixed-training-text-datasets"
+DATASET_ALIASES = frozenset({DOMAIN_NAME, "code"})
+SUPPORTED_DATASET_NAMES = frozenset({BASE_DATASET_NAME})
 DEFAULT_DATASET_ID = "ServiceNow-AI/mixed-training-text-datasets"
 DEFAULT_DATASET_CONFIG = "80k-if-math-coding-fncalling-stem"
 DEFAULT_SPLIT_ORDER = ("train", "validation", "test")
@@ -31,6 +35,19 @@ class DatasetSpec:
 
 
 @dataclass
+@dataclass(frozen=True)
+class ResolvedDatasetEntry:
+    spec: DatasetSpec
+    label: str
+
+
+@dataclass(frozen=True)
+class DatasetResolution:
+    requested: list[str]
+    entries: list[ResolvedDatasetEntry]
+
+
+@dataclass
 class DatasetOptions:
     dataset_id: str = DEFAULT_DATASET_ID
     dataset_config: str | None = DEFAULT_DATASET_CONFIG
@@ -39,9 +56,11 @@ class DatasetOptions:
     max_examples_per_split: int | None = None
     allowed_call_types: Sequence[str] = DEFAULT_CALL_TYPES
     huggingface_token: str | None = None
+    ability_filter: str = "code"
 
 
-_DATASET_CACHE: dict[tuple[str, str | None, bool], Dataset] = {}
+CacheKey = tuple[str, str | None, bool, str | None]
+_DATASET_CACHE: dict[CacheKey, Dataset] = {}
 
 
 def _normalize_loader_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
@@ -72,10 +91,32 @@ def _normalize_loader_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
         token = loader_kwargs.get("huggingface_token") or loader_kwargs.get("hf_token")
         if token:
             options.huggingface_token = str(token)
+        ability = loader_kwargs.get("ability_filter") or loader_kwargs.get("ability")
+        if ability:
+            options.ability_filter = str(ability)
     return options
 
 
-def _parse_dataset_name(entry: str) -> DatasetSpec:
+def _ability_matches(value: Any, ability: str | None) -> bool:
+    """Return True when the sample's ability field contains the requested ability.
+
+    The upstream dataset sometimes stores ability as a single string ("code") and
+    sometimes as a list (e.g., ["agentic_fn_calling"]). Filtering must accept both
+    shapes or we drop all fn_calling samples.
+    """
+
+    if ability is None:
+        return True
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value == ability
+    if isinstance(value, (list, tuple, set)):
+        return ability in value
+    return False
+
+
+def parse_dataset_name(entry: str) -> DatasetSpec:
     text = entry.strip()
     if "@" not in text:
         return DatasetSpec(name=text)
@@ -83,8 +124,35 @@ def _parse_dataset_name(entry: str) -> DatasetSpec:
     return DatasetSpec(name=name.strip(), split=split.strip() or "train")
 
 
+def _normalize_dataset_names(dataset_names: List[str] | str | None) -> list[str]:
+    if dataset_names is None:
+        return []
+    if isinstance(dataset_names, str):
+        return [dataset_names]
+    return [str(entry) for entry in dataset_names]
+
+
+def _resolve_dataset_requests(dataset_names: List[str] | str | None) -> DatasetResolution:
+    requested = _normalize_dataset_names(dataset_names)
+    entries: list[ResolvedDatasetEntry] = []
+    for entry in requested:
+        spec = parse_dataset_name(entry)
+        base_name = BASE_DATASET_NAME if spec.name in DATASET_ALIASES else spec.name
+        if base_name not in SUPPORTED_DATASET_NAMES:
+            raise ValueError(f"Unsupported coding dataset '{spec.name}'")
+        resolved_spec = DatasetSpec(name=base_name, split=spec.split)
+        entries.append(ResolvedDatasetEntry(spec=resolved_spec, label=f"{spec.name}@{spec.split}"))
+    return DatasetResolution(requested=requested, entries=entries)
+
+
 def _load_dataset(options: DatasetOptions) -> Dataset:
-    cache_key = (options.dataset_id, options.dataset_config, options.trust_remote_code)
+    ability = options.ability_filter
+    cache_key: CacheKey = (
+        options.dataset_id,
+        options.dataset_config,
+        options.trust_remote_code,
+        ability,
+    )
     if cache_key in _DATASET_CACHE:
         return _DATASET_CACHE[cache_key]
 
@@ -128,7 +196,8 @@ def _load_dataset(options: DatasetOptions) -> Dataset:
                 )
                 ds = _load_snapshot(options)
 
-    ds = ds.filter(lambda sample: sample.get("ability") == "code")
+    if ability:
+        ds = ds.filter(lambda sample: _ability_matches(sample.get("ability"), ability))
     _DATASET_CACHE[cache_key] = ds
     logger.info(
         "Loaded %s (%s) with %d coding samples",
@@ -233,12 +302,22 @@ def _build_record(sample: dict, dataset_label: str, allowed_call_types: Sequence
         return None
 
     extra_info = _decode_extra_info(sample.get("extra_info"))
-    return {
+    record = {
         "dataset": dataset_label,
         "task": task,
         "reward_context": reward_context,
         "extra_info": extra_info,
     }
+
+    # For fn_calling samples, keep the full prompt so multi-turn tool-calling
+    # instructions are available downstream.
+    if sample.get("ability") == "agentic_fn_calling":
+        if len(prompt_messages) == 1 and isinstance(prompt_messages[0], list):
+            record["prompt"] = prompt_messages[0]
+        else:
+            record["prompt"] = prompt_messages
+
+    return record
 
 
 def _load_split(
@@ -246,6 +325,7 @@ def _load_split(
     *,
     options: DatasetOptions,
     seed: int | None,
+    dataset_label: str | None = None,
 ) -> list[dict]:
     dataset = _load_dataset(options)
     indices = _slice_indices(len(dataset), spec.split, options.split_ratios, seed)
@@ -254,15 +334,18 @@ def _load_split(
         return []
     subset = dataset.select(indices)
     samples: list[dict] = []
+    label = dataset_label or f"{spec.name}@{spec.split}"
     for sample in subset:
-        record = _build_record(sample, f"{spec.name}@{spec.split}", options.allowed_call_types)
+        record = _build_record(sample, label, options.allowed_call_types)
         if record is None:
             continue
         samples.append(record)
         if options.max_examples_per_split and len(samples) >= options.max_examples_per_split:
             break
     logger.info(
-        f"Loaded {len(samples)} samples for {spec.name}@{spec.split}",
+        "Loaded %d samples for %s",
+        len(samples),
+        label,
     )
     return samples
 
@@ -274,22 +357,21 @@ def _attach_ids(samples: list[dict]) -> list[dict]:
 
 
 def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None, **loader_kwargs: Any) -> List[Dict]:
-    if dataset_names is None:
+    resolution = _resolve_dataset_requests(dataset_names)
+    if not resolution.entries:
+        if dataset_names:
+            logger.warning("No coding dataset entries were resolved for %s", dataset_names)
         return []
-    if isinstance(dataset_names, str):
-        dataset_names = [dataset_names]
 
     options = _normalize_loader_options(loader_kwargs)
     aggregated: list[dict] = []
-    for entry in dataset_names:
-        spec = _parse_dataset_name(entry)
-        if spec.name in {"mixed-training-text-datasets"}:
-            aggregated.extend(_load_split(spec, options=options, seed=seed))
-        else:
-            raise ValueError(f"Unsupported coding dataset '{spec.name}'")
+    for entry in resolution.entries:
+        aggregated.extend(
+            _load_split(entry.spec, options=options, seed=seed, dataset_label=entry.label),
+        )
 
     if not aggregated:
-        logger.warning("No coding datasets were loaded for entries %s", dataset_names)
+        logger.warning("No coding datasets were loaded for entries %s", resolution.requested)
 
     return _attach_ids(aggregated)
 
@@ -299,6 +381,3 @@ def load_problems(dataset_names: List[str] | str | None, **loader_kwargs: dict) 
 
     seed = loader_kwargs.pop("seed", None)
     return load_datasets(dataset_names, seed=seed, **loader_kwargs)
-
-
-__all__ = ["load_datasets", "load_problems"]

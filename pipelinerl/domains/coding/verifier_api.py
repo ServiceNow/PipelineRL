@@ -450,11 +450,3 @@ class CodingSandboxEnvironment:
             return {"status": "ok"}
 
         uvicorn.run(app, host="0.0.0.0", port=port, timeout_keep_alive=60)
-
-
-__all__ = [
-    "CodingSandboxEnvironment",
-    "CodingVerificationSummary",
-    "evaluate_coding_prediction",
-    "verify_coding_solution_rpc",
-]

@@ -22,7 +22,6 @@ import wandb
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
-from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.shared_memory_array import SharedMemoryQueue
@@ -305,8 +304,6 @@ def sequential_iter(problems: list):
         yield problem
 
 
-
-
 class ActorLoop:
     def __init__(
         self,
@@ -536,6 +533,12 @@ class ActorLoop:
                     f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
+
+                # Track completions per domain for adaptive sampling
+                if domain_sampler is not None:
+                    for r in rollout_results:
+                        if r.domain:
+                            domain_sampler.record_completion(r.domain)
 
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
