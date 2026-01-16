@@ -87,8 +87,6 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
     return aggregated_metrics
 
 
-
-
 def run_data_loader(
     data_stream: SingleStreamSpec,
     batch_queue: Queue[PipelineBatchEncoding | Exception],
@@ -137,13 +135,19 @@ class WeightUpdateSuccess(BaseModel):
     version: int
     timestamp: float = time.time()
 
- 
+
 class SamplesProcessed(BaseModel):
     kind: Literal["samples_processed"] = "samples_processed"
     samples_processed: int
     timestamp: float = time.time()
 
-TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | SamplesProcessed
+
+class TrainingDone(BaseModel):
+    kind: Literal["training_done"] = "training_done"
+    timestamp: float = time.time()
+
+
+TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | SamplesProcessed | TrainingDone
 
 
 class WeightUpdateManager:
@@ -198,7 +202,7 @@ class WeightUpdateManager:
             if get_accelerator().is_main_process:
                 parameters_info = [
                     # assume DeepSpeed Stage 3
-                    ParameterInfo(name=name, shape=list(parameter.ds_shape), dtype=str(torch.bfloat16))
+                    ParameterInfo(name=name, shape=list(parameter.ds_shape), dtype=str(parameter.dtype))
                     for name, parameter in named_parameters.items()
                 ]
                 message = WeightUpdateRequest(version=version, parameters_info=parameters_info)
@@ -208,7 +212,7 @@ class WeightUpdateManager:
             for name, parameter in named_parameters.items():
                 with deepspeed.zero.GatheredParameters([parameter]):
                     if get_accelerator().is_main_process:
-                        dist.broadcast(parameter.data.bfloat16(), src=0, group=self.actor_update_group)
+                        dist.broadcast(parameter.data, src=0, group=self.actor_update_group)
             if get_accelerator().is_main_process:
                 logger.info("Wait for HTTP requests")
                 for future in futures:  # type: ignore
@@ -243,14 +247,14 @@ class WeightUpdateManager:
                 assert self.update_stream is not None
                 parameters_info = [
                     # assume DeepSpeed Stage 3
-                    ParameterInfo(name=name, shape=list(parameter.shape), dtype=str(torch.bfloat16))
+                    ParameterInfo(name=name, shape=list(parameter.shape), dtype=str(parameter.dtype))
                     for name, parameter in named_parameters.items()
                 ]
                 messages = WeightUpdateRequest(version=version, parameters_info=parameters_info)
                 futures = self.request_weight_updates(messages)
                 logger.info(f"Published weight update request for version {version}")
                 for _, parameter in named_parameters.items():
-                    dist.broadcast(parameter.data.bfloat16(), src=0, group=self.actor_update_group)
+                    dist.broadcast(parameter.data, src=0, group=self.actor_update_group)
                 dist.barrier(self.actor_update_group)
                 for future in futures:
                     future.result()
@@ -541,6 +545,11 @@ def rl_finetuning_worker(
     final_train_steps = calculate_train_steps(args, args.interrupt_train_steps)
     if training_metrics.completed_steps == final_train_steps:
         logger.info("Training is already completed")
+        # need to inform inference servers even if training was already completed
+        if get_accelerator().is_main_process:
+            logger.info("Signaling training completion to inference servers...")
+            with write_to_streams(weight_update_stream) as writer:
+                writer.write(TrainingDone())
         return
 
     first_pass = True
@@ -670,7 +679,12 @@ def rl_finetuning_worker(
                 assert batch.seq_boundaries is not None
                 update_ring_flash_attn_params(batch.seq_boundaries, seq_parallel_group)
             loss, this_step_rl_metrics = rl_step(
-                model, batch, training_metrics.completed_steps, final_train_steps, rl_config
+                model,
+                batch,
+                training_metrics.completed_steps,
+                final_train_steps,
+                rl_config,
+                seq_parallel_group=seq_parallel_group,
             )
             if is_sentinel_batch:
                 # zero out the loss and do not update the metrics
@@ -873,6 +887,11 @@ def rl_finetuning_worker(
             json.dump(asdict(training_metrics), wf, indent=4, sort_keys=True)
         with open(output_dir / "rl_summary.json", "w") as wf:
             json.dump(rl_metrics, wf, indent=4, sort_keys=True)
+
+        # notify inference nodes that training is finished
+        logger.info("Signaling training completion to inference servers...")
+        with write_to_streams(weight_update_stream) as writer:
+            writer.write(TrainingDone())
 
     torch.cuda.empty_cache()
 

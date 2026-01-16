@@ -1,9 +1,11 @@
 import logging
 import os
+import torch
+
 from typing import Literal
 from pydantic import BaseModel
 from omegaconf import DictConfig, ListConfig, OmegaConf
-import torch
+
 
 logger = logging.getLogger(__name__)
 

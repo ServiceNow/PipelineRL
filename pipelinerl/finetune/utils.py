@@ -29,6 +29,7 @@ def create_sentinel_batch(device, tokenizer=None, model_version=0) -> PipelineBa
     labels = [-100] * length
     attention_mask = [1] * length 
     position_ids = list(range(length))
+    segment_ids = [0] * length  # sentinel batch is a single synthetic segment
 
     # Prepare fields for dummy values (only needed for reward, advantages, etc.)
     zeros = [0.0] * length
@@ -39,6 +40,7 @@ def create_sentinel_batch(device, tokenizer=None, model_version=0) -> PipelineBa
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long).reshape(1, -1),
         "labels": torch.tensor(labels, dtype=torch.long).reshape(1, -1),
         "position_ids": torch.tensor(position_ids, dtype=torch.long).reshape(1, -1),
+        "segment_ids": torch.tensor(segment_ids, dtype=torch.long).reshape(1, -1),
         "rewards": torch.tensor(zeros, dtype=torch.float).reshape(1, -1),
         "advantages": torch.tensor(zeros, dtype=torch.float).reshape(1, -1),
         "ref_logprobs": torch.tensor(zeros, dtype=torch.float).reshape(1, -1),

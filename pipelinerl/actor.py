@@ -235,6 +235,7 @@ async def schedule_rollouts(
                     f"groups in progress: {len(group_rollouts)}, "
                     f"rollouts started so far: {started_rollouts}, "
                     f"rollouts finished so far: {finished_rollouts}, "
+                    f"groups started so far: {group_id}, "
                     f"max group size in bytes: {result_queue.max_actual_entry_size()}, "
                 )
                 last_logged = time.time()
@@ -531,6 +532,9 @@ class ActorLoop:
 
                 assert isinstance(rollout_results, list)
                 assert isinstance(rollout_results[0], RolloutResult)
+                assert len(rollout_results) == attempts, (
+                    f"Expected {attempts} rollouts, got {len(rollout_results)}"
+                )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
                 published_samples += group_samples
@@ -547,7 +551,6 @@ class ActorLoop:
                     f" {in_progress} groups in progress"
                 )
 
-                    
                 self.update_stats(rollout_results=rollout_results)
 
                 finished_groups += 1

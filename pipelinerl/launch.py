@@ -78,6 +78,50 @@ def validate_config(cfg: DictConfig):
         if not hasattr(cfg.finetune.rl, "value_loss_coef") or cfg.finetune.rl.value_loss_coef <= 0.0:
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
 
+    # Check that model being tuned to the max length accepted by inference
+    if cfg.finetune.seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
+        raise ValueError(
+            f"seq_length {cfg.finetune.seq_length} must be greater than or equal to "
+            f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
+        )
+
+    # Check for asymmetric PPO clipping
+    if cfg.finetune.rl.policy_loss == "ppo" and cfg.finetune.rl.epsilon_low != cfg.finetune.rl.epsilon_high:
+        if cfg.finetune.model_class == "causal-language-modeling-with-value-head":
+            logger.warning(
+                "Asymmetric clipping with value head has not been tested and it may lead to unexpected behavior. "
+                "It was recommended in DAPO (https://arxiv.org/abs/2503.14476) for GRPO (PPO without value head and group_size > 1)."
+            )
+        else:
+            logger.warning(
+                "Using asymmetric clipping. Note: this was recommended in DAPO (https://arxiv.org/abs/2503.14476) for GRPO."
+            )
+
+
+def _get_quantization_args(cfg: DictConfig) -> list[str]:
+    """Build quantization CLI args for vLLM."""
+    if cfg.get("fp32_lm_head", False):
+        explicit_quant = cfg.vllm_config.get("quantization")
+        if explicit_quant and explicit_quant != "bf16_last_layer_fp32":
+            logger.warning(
+                f"fp32_lm_head=true overrides explicit vllm_config.quantization='{explicit_quant}' "
+                f"with 'bf16_last_layer_fp32'"
+            )
+        return ["--quantization", "bf16_last_layer_fp32"]
+    elif cfg.vllm_config.get("quantization"):
+        return ["--quantization", cfg.vllm_config.quantization]
+    return []
+
+
+def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
+    """Get environment variables for quantization config."""
+    env = {}
+    if cfg.get("fp32_lm_head", False):
+        # Pass the layer prefix to the quantization config via environment variable
+        prefix = cfg.get("fp32_layer_prefix", "lm_head")
+        env["PIPELINERL_FP32_LAYER_PREFIX"] = prefix
+    return env
+
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
     kwargs = cfg.vllm_config.vllm_kwargs
@@ -101,7 +145,9 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
         str(cfg.seed + preprocessor_llm_idx),
     ]
 
-    # Add vLLM kwargs as separate arguments
+    cmd.extend(_get_quantization_args(cfg))
+
+    # add vLLM kwargs as separate arguments
     for k, v in kwargs.items():
         cmd.append(f"--{k}")
         if v not in [None, ""]:
@@ -111,10 +157,11 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
+            env=env,
             stdout=log_file,
             stderr=err_file,
         )
@@ -159,7 +206,9 @@ def run_actor_llm(
         str(world_map.weight_update_group_size),
     ]
 
-    # Add vLLM kwargs as separate arguments
+    cmd.extend(_get_quantization_args(cfg))
+
+    # add vLLM kwargs as separate arguments
     if cfg.vllm_config.vllm_kwargs:
         for k, v in cfg.vllm_config.vllm_kwargs.items():
             cmd.append(f"--{k}")
@@ -174,10 +223,11 @@ def run_actor_llm(
     save_command(log_dir, cmd)
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
+            env=env,
             stdout=log_file,
             stderr=err_file,
         )
@@ -449,6 +499,7 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         # Wait for all processes to complete
         # if just one dies non-zero, stop all
         alive = list(processes)
+        logger.info(f"Starting process monitoring with {len(alive)} processes: {[proc.kind for proc in alive]}")
         while alive:
             for proc in list(alive):
                 return_code = proc.handle.poll()
@@ -461,7 +512,13 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
             if alive and all(is_inference_process(proc) for proc in alive):
-                logger.info(f"All pipeline workers finished; stopping {len(alive)} inference server(s)")
+                # shut down inference servers after training is complete
+                if trainer_state is not None and not trainer_state.training_done:
+                    # check if training is completed
+                    logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
+                    trainer_state.wait_for_training_done(timeout=5.0)
+                    continue
+                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} inference server(s)")
                 for proc in list(alive):
                     logger.info(f"Terminating inference server {proc.handle.args}")
                     terminate_with_children(proc.handle.pid)
