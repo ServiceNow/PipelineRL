@@ -34,7 +34,6 @@ class DatasetSpec:
     split: str = "train"
 
 
-@dataclass
 @dataclass(frozen=True)
 class ResolvedDatasetEntry:
     spec: DatasetSpec
