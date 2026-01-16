@@ -15,18 +15,6 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 logger = logging.getLogger(__name__)
 
 
-def _to_object(obj):
-    """Recursively convert OmegaConf objects to plain Python containers."""
-    if isinstance(obj, (DictConfig, ListConfig)):
-        return OmegaConf.to_container(obj, resolve=True)
-    elif isinstance(obj, dict):
-        return {k: _to_object(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_to_object(v) for v in obj]
-    else:
-        return obj
-
-
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     """Extract PIL Images from multimodal messages."""
 
@@ -45,24 +33,16 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
                     # Handle base64 format
                     url = content_item["image_url"]["url"]
                     if url.startswith("data:image;base64,"):
-                        try:
-                            base64_data = url.split("data:image;base64,")[1]
-                            image_data = base64.b64decode(base64_data)
-                            image = Image.open(io.BytesIO(image_data))
-                            images.append(image)
-                        except Exception as e:
-                            raise e
+                        base64_data = url.split("data:image;base64,")[1]
+                        image_data = base64.b64decode(base64_data)
+                        image = Image.open(io.BytesIO(image_data))
+                        images.append(image)
 
     return images
 
 
-<<<<<<< HEAD
 def _to_plain_obj(value):
-<<<<<<< HEAD
-    """Recursively convert OmegaConf containers into standard Python types."""
-=======
     """convert OmegaConf containers into Python types"""
->>>>>>> main
 
     if isinstance(value, (DictConfig, ListConfig)):
         return OmegaConf.to_container(value, resolve=True)
@@ -73,8 +53,6 @@ def _to_plain_obj(value):
     return value
 
 
-=======
->>>>>>> 00fd6cb669a70d6ac12d37ad1b272ed5eeb1e702
 async def llm_async_generate(
     llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
 ) -> LLMCall:
@@ -107,9 +85,8 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
-    payload = {**data, **extra_parameters}
-    # TODO: upgrade omegaconf and use OmegaConf.to_object for recursive conversion
-    payload = _to_object(payload)
+    # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
+    payload = _to_plain_obj({**extra_parameters, **data})
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
         json=payload,
@@ -122,7 +99,6 @@ async def llm_async_generate(
             response.raise_for_status()
         data = await response.json()
 
-    finish_reason: str | None = None
     try:
         content = data["choices"][0]["message"]["content"]
         if not content:
@@ -148,9 +124,9 @@ async def llm_async_generate(
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
         finish_reason = data["choices"][0].get("finish_reason")
-    except Exception as e:
+    except Exception:
         logger.exception(f"Failed to parse llm response: {data}")
-        raise e
+        raise
 
     output = LLMOutput(content=content)
     llm_call = llm.log_output(prompt, output, count_tokens=False)
