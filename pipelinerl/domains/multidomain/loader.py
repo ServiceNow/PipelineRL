@@ -7,6 +7,7 @@ from pipelinerl.domains.counting.counting import load_problems as load_counting_
 from pipelinerl.domains.chartqa.load_datasets import load_problems as load_chartqa_problems
 from pipelinerl.domains.coding.dataset import load_problems as load_coding_problems
 from pipelinerl.domains.fn_calling.dataset import load_problems as load_fn_calling_problems
+from pipelinerl.domains.logic.dataset import load_problems as load_logic_problems
 from pipelinerl.domains.miniwob.load_tasks import load_tasks as load_miniwob_tasks
 
 
@@ -24,6 +25,10 @@ def _load_coding(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Di
 
 def _load_fn_calling(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
     return load_fn_calling_problems(list(dataset_names), **loader_kwargs)
+
+
+def _load_logic(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_logic_problems(list(dataset_names), **loader_kwargs)
 
 
 def _load_counting(dataset_names: Sequence[str], **_: dict) -> List[Dict]:
@@ -46,17 +51,39 @@ DOMAIN_LOADERS = {
     "chartqa": _load_chartqa,
     "miniwob": _load_miniwob,
     "fn_calling": _load_fn_calling,
+    "logic": _load_logic,
 }
 
 
-def _parse_entry(entry: str) -> tuple[str, str]:
+def _parse_entry(entry: str) -> tuple[str, str, str | None]:
+    """Parse a dataset entry into (domain, dataset_name, subset).
+
+    Format: '<domain>::<dataset_name>[@subset]'
+    Examples:
+        'coding::coding' -> ('coding', 'coding', None)
+        'coding::coding@train' -> ('coding', 'coding', 'train')
+        'coding::coding@test' -> ('coding', 'coding', 'test')
+    """
     if "::" not in entry:
         raise ValueError(
             f"Dataset entry '{entry}' is missing a domain prefix. "
-            "Expected format '<domain>::<dataset_name>'."
+            "Expected format '<domain>::<dataset_name>[@subset]'."
         )
     domain, dataset = entry.split("::", 1)
-    return domain.strip(), dataset.strip()
+    domain = domain.strip()
+    dataset = dataset.strip()
+
+    # Parse optional @subset suffix
+    subset = None
+    if "@" in dataset:
+        dataset, subset = dataset.rsplit("@", 1)
+        subset = subset.strip()
+        if subset not in ("train", "test"):
+            # Not a subset suffix, restore original
+            dataset = f"{dataset}@{subset}"
+            subset = None
+
+    return domain, dataset, subset
 
 
 def load_datasets(
@@ -71,22 +98,34 @@ def load_datasets(
     if isinstance(dataset_names, str):
         dataset_names = [dataset_names]
 
-    grouped: dict[str, list[str]] = defaultdict(list)
+    # Group by (domain, subset) to handle train/test separately
+    grouped: dict[tuple[str, str | None], list[str]] = defaultdict(list)
     for entry in dataset_names:
-        domain, name = _parse_entry(str(entry))
-        grouped[domain].append(name)
+        domain, name, subset = _parse_entry(str(entry))
+        grouped[(domain, subset)].append(name)
 
     counters: dict[tuple[str, str], int] = defaultdict(int)
     problems: List[Dict] = []
     per_domain_params = dict(per_domain_params or {})
-    for domain, names in grouped.items():
+
+    for (domain, subset), names in grouped.items():
         loader = DOMAIN_LOADERS.get(domain)
         if loader is None:
             raise ValueError(f"No loader registered for domain '{domain}'")
+
+        # Build kwargs: start with global, then domain-specific, then subset override
         domain_kwargs = dict(kwargs)
         if domain in per_domain_params:
             domain_kwargs.update(dict(per_domain_params[domain] or {}))
-        loaded = loader(names, seed=seed, **domain_kwargs)
+
+        # Override subset if specified in dataset name (e.g., @train, @test)
+        if subset is not None:
+            domain_kwargs["subset"] = subset
+
+        # Use explicit seed if provided, otherwise use one from domain_kwargs
+        effective_seed = seed if seed is not None else domain_kwargs.pop("seed", None)
+
+        loaded = loader(names, seed=effective_seed, **domain_kwargs)
         for sample in loaded:
             dataset_name = str(sample.get("dataset", names[0] if names else domain))
             sample.setdefault("domain", domain)
