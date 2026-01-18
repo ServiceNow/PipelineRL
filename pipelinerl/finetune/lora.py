@@ -147,7 +147,7 @@ def merge_lora(lora_model_path):
     assert os.path.exists(lora_model_config), f"{lora_model_config} does not exists"
 
     logger.info(f"Merge lora checkpoint {lora_model_path}")
-    model = lora_load_and_merge(lora_model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    model = lora_load_and_merge(lora_model_path, dtype=torch.bfloat16, low_cpu_mem_usage=True)
     tokenizer = AutoTokenizer.from_pretrained(lora_model_path)
 
     tmp_dir = f"{lora_model_path}_merged"
