@@ -1,11 +1,10 @@
-"""Rollout generation for the fn_calling domain."""
+"""Rollout generation for BFCL v3 function calling domain."""
 
 from __future__ import annotations
 
-import json
 import random
 import time
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from omegaconf import DictConfig
@@ -13,123 +12,81 @@ from omegaconf import DictConfig
 from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from pipelinerl.domains.math.rollouts import RewardTable, length_penalty
-from pipelinerl.domains.fn_calling.verifier_api import verify_fn_calling_answer_rpc
+from pipelinerl.domains.fn_calling.verifier_api import (
+    verify_fn_calling_answer,
+    verify_fn_calling_answer_rpc,
+)
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.utils import get_environment_jobs, resolve_environment_key
 
 
 class FnCallingMetrics(BaseMetrics):
+    """Metrics for function calling rollouts."""
     penalty: float
 
 
-def _format_task(problem: dict[str, Any]) -> str:
-    if problem.get("task"):
-        return str(problem["task"])
-    if problem.get("question"):
-        return str(problem["question"])
-    return str(problem)
+def _build_prompt(cfg: DictConfig, problem: Dict[str, Any]) -> Prompt:
+    """Build the prompt for function calling.
+
+    Args:
+        cfg: Configuration object.
+        problem: Problem dictionary with 'task' and 'extra_info'.
+
+    Returns:
+        Prompt with system message and tools.
+    """
+    messages: List[Dict[str, Any]] = []
+
+    # Add system prompt if configured
+    system_prompt = cfg.actor.get("system_prompt", "")
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    # Add user message with the task
+    task = problem.get("task", "")
+    task_template = cfg.actor.get("task_template", "{task}")
+    user_content = task_template.format(task=task)
+    messages.append({"role": "user", "content": user_content})
+
+    # Get tools from extra_info
+    extra_info = problem.get("extra_info", {})
+    oai_tools = extra_info.get("oai_tools", [])
+
+    return Prompt(messages=messages, tools=oai_tools if oai_tools else None)
 
 
-def _normalize_messages(raw_messages: Any) -> list[dict[str, str]]:
-    """Convert dataset prompts into chat messages compatible with vLLM."""
-
-    if not isinstance(raw_messages, list):
-        return []
-    if len(raw_messages) == 1 and isinstance(raw_messages[0], list):
-        raw_messages = raw_messages[0]
-
-    messages: list[dict[str, str]] = []
-    pending_assistant: list[str] = []
-
-    def flush_pending() -> None:
-        nonlocal pending_assistant
-        if not pending_assistant:
-            return
-        content = "\n\n".join(text for text in pending_assistant if text.strip())
-        if content:
-            messages.append({"role": "assistant", "content": content})
-        pending_assistant = []
-
-    for entry in raw_messages:
-        if not isinstance(entry, dict):
-            continue
-        role = entry.get("role")
-        content = entry.get("content")
-        if not isinstance(content, str):
-            continue
-
-        match role:
-            case "system":
-                flush_pending()
-                messages.append({"role": "system", "content": content})
-            case "user":
-                flush_pending()
-                messages.append({"role": "user", "content": content})
-            case "assistant" | "output_text":
-                pending_assistant.append(content)
-            case "thinking" | "plan" | "replan":
-                # Drop intermediate reasoning to keep prompts shorter.
-                continue
-            case "tool":
-                flush_pending()
-                name = entry.get("name")
-                tool_id = entry.get("tool_call_id") or entry.get("id")
-                if not isinstance(name, str) or not name:
-                    continue
-                messages.append(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "content": content,
-                        **({"tool_call_id": tool_id} if isinstance(tool_id, str) else {}),
-                    }
-                )
-            case _:
-                # For function-call style entries nested under assistant.
-                if role == "function" and isinstance(entry.get("name"), str):
-                    pending_assistant.append(content)
-                continue
-
-    flush_pending()
-    return messages
-
-
-def _coerce_dict(data: dict[str, Any] | str | None) -> dict[str, Any]:
-    if data is None:
-        return {}
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, str) and data.strip():
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            return {}
-    return {}
-
-
-async def generate_fn_calling_rollout(
+async def _run_verification(
     cfg: DictConfig,
-    llm: TrainableLLM,
-    problem: dict[str, Any],
     session: aiohttp.ClientSession,
-) -> RolloutResult:
-    provided_prompt = problem.get("prompt")
-    messages = _normalize_messages(provided_prompt)
-    if messages:
-        if cfg.actor.system_prompt and messages[0]["role"] != "system":
-            messages.insert(0, {"role": "system", "content": cfg.actor.system_prompt})
-    else:
-        messages = []
-        if cfg.actor.system_prompt:
-            messages.append({"role": "system", "content": cfg.actor.system_prompt})
-        messages.append({"role": "user", "content": cfg.actor.task_template.format(task=_format_task(problem))})
-    prompt = Prompt(messages=messages)
+    generation: str,
+    reward_context: Dict[str, Any],
+    tool_calls: Optional[List[Dict[str, Any]]],
+    model_name: str,
+) -> str:
+    """Run verification either locally or via RPC.
 
-    start_time = time.time()
-    llm_call = await llm_async_generate(llm, prompt, session)
-    latency = time.time() - start_time
-    assert llm_call.output.content is not None
+    Args:
+        cfg: Configuration object.
+        session: aiohttp session for RPC calls.
+        generation: Model's text generation.
+        reward_context: Verification context.
+        tool_calls: Structured tool calls from model output.
+        model_name: Model name for verification.
 
+    Returns:
+        Answer status string.
+    """
+    use_local = cfg.actor.get("use_local_bfcl_verifier", False)
+
+    if use_local:
+        return verify_fn_calling_answer(
+            generation=generation,
+            reward_context=reward_context,
+            tool_calls=tool_calls,
+            model_name=model_name,
+        )
+
+    # Use RPC verification
     env_key = resolve_environment_key(cfg, default="fn_calling")
     env_jobs = get_environment_jobs(cfg, env_key)
     if not env_jobs:
@@ -138,19 +95,79 @@ async def generate_fn_calling_rollout(
     if env_job.hostname is None or env_job.port is None:
         raise RuntimeError("fn_calling environment job is missing host/port information")
 
-    reward_context = _coerce_dict(problem.get("reward_context"))
-    extra_info = _coerce_dict(problem.get("extra_info"))
-    answer_status = await verify_fn_calling_answer_rpc(
+    return await verify_fn_calling_answer_rpc(
         session=session,
         host=env_job.hostname,
         port=env_job.port,
-        generation=llm_call.output.content,
+        generation=generation,
         reward_context=reward_context,
-        extra_info=extra_info,
+        tool_calls=tool_calls,
+        model_name=model_name,
     )
 
+
+async def generate_fn_calling_rollout(
+    cfg: DictConfig,
+    llm: TrainableLLM,
+    problem: Dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> RolloutResult:
+    """Generate a rollout for a BFCL function calling problem.
+
+    Args:
+        cfg: Configuration object.
+        llm: Language model to generate with.
+        problem: Problem dictionary containing task, reward_context, extra_info.
+        session: aiohttp session for RPC calls.
+
+    Returns:
+        RolloutResult with training texts and metrics.
+    """
+    # Build prompt with tools
+    prompt = _build_prompt(cfg, problem)
+
+    # Generate response
+    start_time = time.time()
+    llm_call = await llm_async_generate(llm, prompt, session)
+    latency = time.time() - start_time
+    assert llm_call.output.content is not None
+
+    # Extract tool_calls from structured output if available
+    tool_calls = None
+    if hasattr(llm_call.output, "tool_calls") and llm_call.output.tool_calls:
+        tool_calls = [
+            {
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+                "id": getattr(tc, "id", None),
+            }
+            for tc in llm_call.output.tool_calls
+        ]
+
+    # Get reward context
+    reward_context = problem.get("reward_context", {})
+
+    # Get model name for verification
+    model_name = getattr(llm, "model_name", "model")
+    if hasattr(llm, "model"):
+        model_name = llm.model
+
+    # Run verification
+    answer_status = await _run_verification(
+        cfg=cfg,
+        session=session,
+        generation=llm_call.output.content,
+        reward_context=reward_context,
+        tool_calls=tool_calls,
+        model_name=model_name,
+    )
+
+    # Calculate reward
     rewards = RewardTable(**dict(cfg.rewards))
     trace = make_training_text(llm, llm_call)
+
     match (answer_status, trace.finished):
         case ("wrong", False):
             reward = rewards.wrong_answer_not_finished
@@ -171,15 +188,20 @@ async def generate_fn_calling_rollout(
         case _:
             raise ValueError(f"Unexpected fn_calling answer status '{answer_status}'")
 
+    # Apply discount factor
     reward *= cfg.actor.discount_factor ** llm_call.output_length_tokens
+
+    # Apply length penalty if configured
     overlong_penalty = 0.0
     try:
         max_tokens = llm.parameters["max_tokens"]
     except (KeyError, TypeError):
         max_tokens = None
+
     if rewards.buffer_tokens > 0 and max_tokens is not None:
         overlong_penalty = length_penalty(max_tokens, llm_call.output_length_tokens, rewards.buffer_tokens)
         reward += overlong_penalty
+
     trace.reward = reward
     trace.metadata.setdefault("fn_calling", {}).update({"answer_status": answer_status})
 

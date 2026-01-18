@@ -4,33 +4,35 @@ defaults:
 
 actor:
   rollout_policy: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
-  system_prompt: ""
-  task_template: "{task}"
+  system_prompt: |-
+    You are a helpful assistant with access to functions. When the user's request requires using a function, call the appropriate function with the correct arguments. Make function calls in JSON format.
+  task_template: |-
+    {task}
   task_prompt: ""
   ensure_boxed_answers: false
+  # Use local BFCL verifier (no separate K8s job needed)
+  # Set to false to use remote BFCLEnvironment server
+  use_local_bfcl_verifier: true
 
 dataset_loader: pipelinerl.domains.fn_calling.dataset.load_problems
 dataset_loader_params:
-  dataset_id: ServiceNow-AI/mixed-training-text-datasets
-  dataset_config: 80k-if-math-coding-fncalling-stem
-  split_ratios:
-    train: 0.9
-    validation: 0.05
-    test: 0.05
-  allowed_call_types: []
-  max_examples_per_split: 2048
-  trust_remote_code: true
-  huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+  # BFCL v3 test categories (single-turn)
+  categories:
+    - simple
+    - multiple
+    - parallel
+    - parallel_multiple
+  max_examples_per_category: null
+  max_examples: null
+  subset: train  # "train" or "test" (90/10 split by default)
+  train_ratio: 0.9
+  seed: 42
 
 train_dataset_names:
-  - fn_calling@train
+  - fn_calling
 
 test_dataset_names:
-  - fn_calling@validation
+  - fn_calling
 
-environments:
-  - key: fn_calling
-    mode: remote
-    _target_: pipelinerl.domains.fn_calling.AgenticToolsEnvironment
-
+# fn_calling can use local verifier, but remote is also supported
 environment_key: fn_calling
