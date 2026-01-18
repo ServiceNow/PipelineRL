@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import signal
 import torch
@@ -10,7 +11,6 @@ from vllm.entrypoints.openai.cli_args import (
 )
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.api_server import (
-    run_server,
     create_server_socket,
     build_app,
     init_app_state,
@@ -41,12 +41,13 @@ formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+
 @runtime_checkable
 class LikeWorker(Protocol):
     rank: int
     local_rank: int
     device: torch.device
-    model_runner: GPUModelRunner 
+    model_runner: GPUModelRunner
     pg_rank: int
     process_group: Any
     model_config: ModelConfig
@@ -87,23 +88,32 @@ class WorkerExtension:
         torch.cuda.synchronize(self.device)
         logger.info("Start receiving weight update")
         expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
+
         for info in request.parameters_info:
             target_dtype = string_to_dtype(info.dtype)
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
             buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
-            # Use PyNcclCommunicator's broadcast method instead of torch.distributed
             self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
-            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
+            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])  # type: ignore
             if len(loaded_params) != 1:
                 raise ValueError(f"model {info.name} not found in model state dict")
+
         pipelinerl.vllm_quantization.invalidate_fp32_cache()
         logger.info("Weight update received")
 
+    def close_communicator(self):
+        """Closes the communicator when weight synchronization is no longer needed."""
+        if hasattr(self, "model_update_group") and self.model_update_group is not None:
+            del self.model_update_group
+            self.model_update_group = None
+            logger.info("Weight update communicator closed")
+
 
 class WeightUpdateManager:
-    def __init__(self, args, engine_client: AsyncMPClient):
+    def __init__(self, args, engine: AsyncLLM, engine_client: AsyncMPClient):
         self.args = args
+        self.engine = engine
         self.engine_client = engine_client
 
     async def input_process_groups(self):
@@ -118,15 +128,15 @@ class WeightUpdateManager:
         )
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
-        # Ensure workers are ready by executing a dummy batch first
-        # This synchronizes workers before the NCCL collective
-        # logger.info("Synchronizing workers before weight update...")
-        # await self.engine_client.execute_dummy_batch_async()
-        # logger.info("Workers synchronized, starting weight update")
+        logger.info("Starting weight update...")
         await self.engine_client.collective_rpc_async(
             "receive_weight_update", args=(request.model_dump_json(),)
         )
         logger.info("Weight update processed")
+
+    async def close_communicator(self):
+        """Closes the communicator when weight synchronization is no longer needed."""
+        await self.engine_client.collective_rpc_async("close_communicator")
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
@@ -170,7 +180,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     )
     assert isinstance(engine.engine_core, AsyncMPClient)
 
-    weight_update_manager = WeightUpdateManager(args, engine.engine_core)
+    weight_update_manager = WeightUpdateManager(args, engine, engine.engine_core)
     if not args.disable_weight_updates:
         await weight_update_manager.input_process_groups()
 
@@ -181,8 +191,9 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     @app.post("/receive_weight_update")
     async def _receive_weight_update(request: WeightUpdateRequest):
-        logger.info("Received weight update request")
-        await weight_update_manager.receive_weight_update(request)
+        # Fire-and-forget: return immediately, weight update happens in background
+        logger.info("Received weight update request (fire-and-forget)")
+        asyncio.create_task(weight_update_manager.receive_weight_update(request))
         return {"status": "ok"}
 
     await init_app_state(engine, app.state, args)
@@ -204,10 +215,10 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     # NB: Await server shutdown only after the backend context is exited
     await shutdown_task
 
+    # Cleanup
+    if not args.disable_weight_updates:
+        await weight_update_manager.close_communicator()
     sock.close()
-
-    # TODO: proper cleanup
-    # dist.destroy_process_group(actor_update_group)
 
 
 def run_llm():
