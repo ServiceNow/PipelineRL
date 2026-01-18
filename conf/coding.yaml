@@ -15,41 +15,33 @@ actor:
   task_prompt: ""
   ensure_boxed_answers: false
 
-  coding_time_limit_s: 15.0
-  coding_per_test_timeout_s: 10.0
-  coding_memory_limit_bytes: 1073741824
-  coding_compile_timeout_s: 10.0
-  coding_sandbox_url: ${oc.env:CODING_SANDBOX_URL, "http://sandbox:8080/run_code"}
+  # Use local mcp-run-python sandbox (no separate K8s job needed)
+  use_local_sandbox: true
+  sandbox_timeout: 5.0
+  max_tests_per_problem: 15
 
 dataset_loader: pipelinerl.domains.coding.dataset.load_problems
 dataset_loader_params:
-  dataset_id: ServiceNow-AI/mixed-training-text-datasets
-  dataset_config: 80k-if-math-coding-fncalling-stem
-  split_ratios:
-    train: 0.9
-    validation: 0.05
-    test: 0.05
-  allowed_call_types:
-    - assert
-    - std
-  max_examples_per_split: 2048
-  trust_remote_code: true
-  huggingface_token: ${oc.env:CODING_HF_TOKEN, null}
+  # PrimeIntellect INTELLECT-3-RL dataset (open source, curated)
+  # Available configs: code, math, logic, science
+  dataset_id: PrimeIntellect/INTELLECT-3-RL
+  dataset_config: code
+  split: train
+  subset: train  # "train" or "test" (90/10 split)
+  train_ratio: 0.9
+  # Difficulty filtering: keep problems with 10-90% solve rate
+  min_difficulty: 0.1
+  max_difficulty: 0.9
+  difficulty_column: avg@8_qwen3_4b_instruct_2507
+  max_examples: null
+  seed: 42
+  huggingface_token: ${oc.env:HF_TOKEN, null}
 
 train_dataset_names:
-  - coding@train
+  - coding
 
 test_dataset_names:
-  - coding@validation
+  - coding
 
-environments:
-  - key: coding
-    mode: remote
-    _target_: pipelinerl.domains.coding.CodingSandboxEnvironment
-    sandbox_url: ${actor.coding_sandbox_url}
-    compile_timeout_s: ${actor.coding_compile_timeout_s}
-    run_timeout_s: ${actor.coding_per_test_timeout_s}
-    request_timeout_s: ${actor.coding_time_limit_s}
-    memory_limit_bytes: ${actor.coding_memory_limit_bytes}
-
+# No remote environment needed when use_local_sandbox=true
 environment_key: coding

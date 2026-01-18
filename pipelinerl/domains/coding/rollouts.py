@@ -1,8 +1,9 @@
-"""Rollout generation for the coding domain using the sandbox verifier."""
+"""Rollout generation for the coding domain using mcp-run-python sandbox."""
 
 from __future__ import annotations
 
 import json
+import logging
 import random
 import time
 from typing import Any, Literal
@@ -16,7 +17,9 @@ from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.utils import get_environment_jobs, resolve_environment_key
 from pipelinerl.domains.math.rollouts import RewardTable, length_penalty
 
-from .verifier_api import verify_coding_solution_rpc
+from .verifier_api import evaluate_coding_prediction_async, verify_coding_solution_rpc
+
+logger = logging.getLogger(__name__)
 
 
 class CodingMetrics(BaseMetrics):
@@ -95,10 +98,29 @@ async def _run_verification(
     reward_context: dict[str, Any] | str | None,
     extra_info: dict[str, Any] | str | None,
 ) -> dict[str, Any]:
+    """Run verification either locally (in-process) or via RPC.
+
+    If cfg.actor.use_local_sandbox is True, uses mcp-run-python directly.
+    Otherwise, sends verification request to a remote environment server.
+    """
+    use_local = getattr(cfg.actor, "use_local_sandbox", True)
+
+    if use_local:
+        # Run verification in-process using mcp-run-python
+        summary = await evaluate_coding_prediction_async(
+            prediction=prediction,
+            reward_context=reward_context,
+            extra_info=extra_info,
+            timeout_per_test=getattr(cfg.actor, "sandbox_timeout", 5.0),
+            max_tests=getattr(cfg.actor, "max_tests_per_problem", 15),
+        )
+        return summary.to_payload()
+
+    # Fall back to RPC-based verification
     env_key = resolve_environment_key(cfg, default="coding")
     env_jobs = get_environment_jobs(cfg, env_key)
     if not env_jobs:
-        raise RuntimeError("No coding environment servers registered")
+        raise RuntimeError("No coding environment servers registered and use_local_sandbox=False")
     env_job = random.choice(env_jobs)
     if env_job.hostname is None or env_job.port is None:
         raise RuntimeError("Coding environment job is missing host/port information")
