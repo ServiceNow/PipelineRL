@@ -27,8 +27,9 @@ from transformers import PreTrainedTokenizerFast, get_scheduler, set_seed
 from ring_flash_attn import substitute_hf_flash_attn, update_ring_flash_attn_params
 
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead
-from pipelinerl.torch_utils import stateless_init_process_group
+from pipelinerl import torch_utils
 from pipelinerl.finetune.types import PipelineBatchEncoding
+
 from pipelinerl.finetune.checkpoints import (
     load_model,
     load_tokenizer,
@@ -409,14 +410,11 @@ def run_finetuning_loop(
     get_accelerator().wait_for_everyone()
 
     if get_accelerator().is_main_process and args.send_weight_updates:
-        logger.info("Initializing actor process group using StatelessProcessGroup")
-
-        # Explicitly set CUDA device before creating NCCL process group
         current_device = get_accelerator().device
         torch.cuda.set_device(current_device)
+        logger.info("Initializing actor process group using StatelessProcessGroup")
         logger.info(f"Set CUDA device to {current_device} for actor process group (rank 0)")
-
-        actor_update_group = stateless_init_process_group(
+        actor_update_group = torch_utils.stateless_init_process_group(
             init_method=cfg.me.weight_update_group_init_method,
             rank=0,
             world_size=cfg.me.weight_update_group_world_size,
