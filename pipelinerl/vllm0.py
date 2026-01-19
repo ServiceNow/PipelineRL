@@ -4,39 +4,27 @@ DEPRECATED - Kept only for backward compatibility with older vLLM versions.
 This module provides a custom vLLM inference server with dynamic weight updates using the legacy V0 engine architecture.
 
 Compatibility:
-    - vLLM versions <= 0.8.x only
+    - vLLM versions <= 0.10.0 only
     - The V0 engine was removed in vLLM 0.11.0
     - Use vllm1.py instead
 """
-import warnings
 from packaging import version as version_parser
 import vllm
 
 # Check vLLM version compatibility
 vllm_version = version_parser.parse(vllm.__version__)
 
-if vllm_version >= version_parser.parse("0.9.0"):
+if vllm_version > version_parser.parse("0.10.0"):
     raise ImportError(
         f"pipelinerl.vllm0 is not compatible with vLLM {vllm.__version__}. "
-        "This module only works with vLLM <= 0.8.x. "
+        "This module only works with vLLM <= 0.10.0. "
         "Please use pipelinerl.vllm1 for vLLM >= 0.11.0 instead."
     )
 
-# Only show deprecation warning for compatible versions
-warnings.warn(
-    "pipelinerl.vllm0 is DEPRECATED and will be removed in a future version. "
-    "This module only works with vLLM <= 0.8.x. "
-    "Please use pipelinerl.vllm1 as it is actively maintained.",
-    DeprecationWarning,
-    stacklevel=2,
-)
 
 import asyncio
-import json
 import logging
-import os
 import signal
-from pydantic import TypeAdapter
 import torch
 import uvloop
 from vllm import AsyncLLMEngine
@@ -53,7 +41,6 @@ from vllm.entrypoints.openai.api_server import (
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-from vllm.logger import init_logger
 from vllm._version import version
 from vllm.worker.worker import Worker
 from vllm.executor.multiproc_worker_utils import ProcessWorkerWrapper
@@ -65,14 +52,13 @@ from vllm.worker.multi_step_worker import MultiStepWorker
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 
 
-import torch.distributed as dist
 from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse dtype mapping
-import pipelinerl.torch_utils
+from pipelinerl import torch_utils
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 
 logger = logging.getLogger(__name__)
-# configure this logger individually, in order to avoid messign
+# configure this logger individually, in order to avoid messing
 # with the default vllm logger configuration
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -104,13 +90,14 @@ def make_worker_class(multi_step: bool):
                 prefix
                 + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
             )
-            self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-                group_name="actor",
-                backend="nccl",
+            # Use StatelessProcessGroup + PyNcclCommunicator for cross-process NCCL communication
+            self.process_group = torch_utils.stateless_init_process_group(
                 init_method=weight_update_group_init_method,
                 rank=self.pg_rank,
                 world_size=weight_update_group_world_size,
+                device=self.device,
             )
+            logger.info(prefix + "Actor update process group initialized")
 
         def receive_weight_update(self, request: WeightUpdateRequest):
             torch.cuda.synchronize(self.device)
@@ -120,7 +107,7 @@ def make_worker_class(multi_step: bool):
                 if target_dtype not in expected_dtypes:
                     logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
                 buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
-                torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+                self.process_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
                 if isinstance(self.model_runner, MultiStepModelRunner):
                     loaded_params = self.model_runner._base_model_runner.model.load_weights(
                         weights=[(info.name, buffer)]
@@ -187,18 +174,18 @@ class WeightUpdateManager:
             future.get()
 
     async def receive_weight_update(self, message: WeightUpdateRequest):
-        logger.info(f"Received weight update request")
+        logger.info("Received weight update request")
         async with executor_lock:
             if isinstance(self.executor, AsyncRLExecutor):
                 await self.executor.stop_remote_worker_execution_loop_no_lock()
-            logger.info(f"Stopped remote worker")
+            logger.info("Stopped remote worker")
             futures = []
             for worker in self.other_workers:
                 futures.append(worker.execute_method("receive_weight_update", message))
             self.driver_worker.receive_weight_update(message)
             for future in futures:
                 future.get()
-            logger.info(f"All workers received weight updates")
+            logger.info("All workers received weight updates")
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:

@@ -57,7 +57,7 @@ test_llm:
     top_k: 50
 
 vllm_config:
-  use_v1: true
+  use_v1: false
   quantization: null  # or bf16_last_layer_fp32
   vllm_kwargs:
     dtype: bfloat16
@@ -73,9 +73,9 @@ vllm_config:
     # V1 specific settings
     # logprobs-mode: processed_logprobs
     # V0 specific settings
-    # num-scheduler-steps: 1
-    # disable-log-requests: ""
-    # disable-frontend-multiprocessing: ""
+    num-scheduler-steps: 1
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
 
 world:
   replicas: 1
