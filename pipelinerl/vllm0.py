@@ -1,12 +1,9 @@
 """
-DEPRECATED - Kept only for backward compatibility with older vLLM versions.
-
 This module provides a custom vLLM inference server with dynamic weight updates using the legacy V0 engine architecture.
 
 Compatibility:
     - vLLM versions <= 0.10.0 only
-    - The V0 engine was removed in vLLM 0.11.0
-    - Use vllm1.py instead
+    - Use vllm1.py for vLLM >= 0.11.0 as the V0 engine was removed in vLLM 0.11.0
 """
 from packaging import version as version_parser
 import vllm
@@ -218,7 +215,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Build the engine with the bespoke Executor and orker clases
+    # Build the engine with the bespoke Executor and Worker classes
     multi_step = args.num_scheduler_steps > 1
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
