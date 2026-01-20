@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```", re.IGNORECASE)
+# Require newline after language specifier to avoid matching inline mentions like "```python delimiters"
+_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\n([\s\S]*?)```", re.IGNORECASE)
 
 # Sandbox instance (lazily initialized)
 _SANDBOX_INSTANCE = None
@@ -315,8 +316,8 @@ async def evaluate_coding_prediction_async(
         )
         summary.tests.append(test_result)
 
-        # Stop on compile error (no point continuing)
-        if status == "compile_error":
+        # Stop on compile or runtime error (no point continuing)
+        if status in ("compile_error", "runtime_error"):
             break
 
     return summary
