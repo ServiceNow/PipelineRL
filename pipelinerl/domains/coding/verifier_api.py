@@ -120,11 +120,30 @@ def _build_stdin_test_script(user_code: str, stdin_input: str) -> str:
     escaped_input = json.dumps(stdin_input)
     return f'''
 import sys
-from io import StringIO
+from io import StringIO, BytesIO
+
+# Create a stdin wrapper that supports both .read() and .buffer.read()
+class _StdinWrapper:
+    def __init__(self, text):
+        self._text_io = StringIO(text)
+        self._byte_io = BytesIO(text.encode('utf-8'))
+        self.buffer = self._byte_io
+
+    def read(self, *args):
+        return self._text_io.read(*args)
+
+    def readline(self, *args):
+        return self._text_io.readline(*args)
+
+    def readlines(self, *args):
+        return self._text_io.readlines(*args)
+
+    def __iter__(self):
+        return iter(self._text_io)
 
 # Simulate stdin
 _original_stdin = sys.stdin
-sys.stdin = StringIO({escaped_input})
+sys.stdin = _StdinWrapper({escaped_input})
 
 try:
 {_indent_code(user_code, 4)}
