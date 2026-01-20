@@ -18,7 +18,6 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# Require newline after language specifier to avoid matching inline mentions like "```python delimiters"
 _CODE_FENCE_RE = re.compile(r"```(?:python|py)?\n([\s\S]*?)```", re.IGNORECASE)
 
 # Sandbox instance (lazily initialized)
