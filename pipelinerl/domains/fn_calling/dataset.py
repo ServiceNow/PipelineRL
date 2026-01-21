@@ -1,5 +1,3 @@
-"""Dataset loader for BFCL v3 function calling domain."""
-
 from __future__ import annotations
 
 import hashlib
@@ -11,20 +9,41 @@ logger = logging.getLogger(__name__)
 
 DOMAIN_NAME = "fn_calling"
 
-# BFCL v3 test categories (single-turn only for now)
-SINGLE_TURN_CATEGORIES = [
-    "simple",
+# BFCL v4 test categories (single-turn only for now)
+# Non-live categories
+NON_LIVE_CATEGORIES = [
+    "simple_python",
+    "simple_java",
+    "simple_javascript",
     "multiple",
     "parallel",
     "parallel_multiple",
-    "java",
-    "javascript",
-    "relevance",
     "irrelevance",
 ]
 
+# Live categories (real-world APIs)
+LIVE_CATEGORIES = [
+    "live_simple",
+    "live_multiple",
+    "live_parallel",
+    "live_parallel_multiple",
+    "live_irrelevance",
+    "live_relevance",
+]
+
+# All single-turn categories
+SINGLE_TURN_CATEGORIES = NON_LIVE_CATEGORIES + LIVE_CATEGORIES
+
 # Default categories to load (excludes multi-turn for simpler training)
-DEFAULT_CATEGORIES = ["simple", "multiple", "parallel", "parallel_multiple"]
+DEFAULT_CATEGORIES = [
+    "simple_python",
+    "multiple",
+    "parallel",
+    "parallel_multiple",
+]
+
+# All single-turn categories for full evaluation
+ALL_EVAL_CATEGORIES = SINGLE_TURN_CATEGORIES
 
 
 def _lazy_import_bfcl():
@@ -62,7 +81,6 @@ def _load_category(
     """Load samples from a single BFCL test category."""
     bfcl = _lazy_import_bfcl()
 
-    # Load dataset entries (prompts + function definitions)
     dataset_entries = bfcl["load_dataset_entry"](test_category, include_language_specific_hint=False)
     dataset_entries_with_hints = bfcl["load_dataset_entry"](test_category, include_language_specific_hint=True)
 
@@ -79,7 +97,7 @@ def _load_category(
     for i, (entry, entry_with_hints, ground_truth) in enumerate(
         zip(dataset_entries, dataset_entries_with_hints, ground_truth_entries)
     ):
-        # Convert function definitions to OpenAI tool format
+        # need OpenAI tool format
         functions_with_hints = entry_with_hints["function"]
         oai_tools = bfcl["convert_to_tool"](
             functions_with_hints,
@@ -87,11 +105,18 @@ def _load_category(
             bfcl["ModelStyle"].OPENAI_COMPLETIONS,
         )
 
-        # Build the prompt (BFCL uses a list of questions for multi-turn)
+        # prompt (BFCL v4 uses nested lists: [[{'role': 'user', 'content': '...'}]])
         question = entry["question"]
-        if isinstance(question, list):
-            prompt_text = question[0] if question else ""
-        else:
+        prompt_text = ""
+        if isinstance(question, list) and question:
+            first_q = question[0]
+            if isinstance(first_q, list) and first_q:
+                first_q = first_q[0]
+            if isinstance(first_q, dict) and "content" in first_q:
+                prompt_text = first_q["content"]
+            else:
+                prompt_text = str(first_q)
+        elif question:
             prompt_text = str(question)
 
         sample = {
@@ -100,7 +125,7 @@ def _load_category(
             "dataset": f"{DOMAIN_NAME}@{test_category}",
             "reward_context": {
                 "category": test_category,
-                "function": entry["function"],  # Original function defs (no hints)
+                "function": entry["function"],
                 "ground_truth": ground_truth,
                 "is_relevance": is_relevance,
             },
@@ -112,7 +137,6 @@ def _load_category(
         }
         samples.append(sample)
 
-    # Apply max_examples limit
     if max_examples is not None and max_examples > 0:
         samples = samples[:max_examples]
 
@@ -126,10 +150,6 @@ def _split_samples(
     train_ratio: float,
     seed: int,
 ) -> List[Dict[str, Any]]:
-    """Split samples into train/test based on deterministic hashing.
-
-    Uses a hash of the sample ID to ensure consistent splits across runs.
-    """
     if train_ratio <= 0.0:
         return [] if subset == "train" else samples
     if train_ratio >= 1.0:
@@ -137,11 +157,9 @@ def _split_samples(
 
     result = []
     for sample in samples:
-        # Use sample ID for deterministic split
         sample_id = sample.get("extra_info", {}).get("id", "")
         hash_input = f"{sample_id}:{seed}"
         hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
-        # Normalize to [0, 1)
         normalized = (hash_value % 10000) / 10000.0
 
         is_train = normalized < train_ratio
@@ -157,27 +175,15 @@ def load_datasets(
     categories: Optional[List[str]] = None,
     max_examples_per_category: Optional[int] = None,
     max_examples: Optional[int] = None,
-    subset: Literal["train", "test"] = "train",
+    subset: Literal["train", "test", "all"] = "train",
     train_ratio: float = 0.9,
     **loader_kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Load BFCL v3 function calling datasets.
-
-    Args:
-        dataset_names: Ignored (for API compatibility).
-        seed: Random seed for shuffling and splitting.
-        categories: List of BFCL categories to load. Defaults to DEFAULT_CATEGORIES.
-        max_examples_per_category: Maximum samples per category.
-        max_examples: Maximum total samples.
-        subset: Which split to return ("train" or "test").
-        train_ratio: Fraction of data for training (default 0.9).
-        **loader_kwargs: Additional kwargs (ignored for compatibility).
-
-    Returns:
-        List of problem dictionaries.
-    """
     if categories is None:
-        categories = DEFAULT_CATEGORIES
+        if subset == "all":
+            categories = ALL_EVAL_CATEGORIES
+        else:
+            categories = DEFAULT_CATEGORIES
 
     all_samples = []
     for category in categories:
@@ -196,14 +202,12 @@ def load_datasets(
             logger.error(f"Failed to load category '{category}': {e}")
             continue
 
-    # Apply train/test split
-    all_samples = _split_samples(all_samples, subset, train_ratio, seed)
+    if subset != "all":
+        all_samples = _split_samples(all_samples, subset, train_ratio, seed)
 
-    # Shuffle with seed for reproducibility
     rng = random.Random(seed)
     rng.shuffle(all_samples)
 
-    # Apply total max_examples limit
     if max_examples is not None and max_examples > 0:
         all_samples = all_samples[:max_examples]
 
@@ -219,5 +223,4 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Load problems (alias for load_datasets for API compatibility)."""
     return load_datasets(dataset_names, **loader_kwargs)
