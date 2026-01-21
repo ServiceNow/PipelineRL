@@ -6,9 +6,12 @@ from pipelinerl.domains.guessing.guessing import load_problems as load_guessing_
 from pipelinerl.domains.counting.counting import load_problems as load_counting_problems
 from pipelinerl.domains.chartqa.load_datasets import load_problems as load_chartqa_problems
 from pipelinerl.domains.coding.dataset import load_problems as load_coding_problems
+from pipelinerl.domains.coding.livecodebench import load_problems as load_livecodebench_problems
 from pipelinerl.domains.fn_calling.dataset import load_problems as load_fn_calling_problems
 from pipelinerl.domains.logic.dataset import load_problems as load_logic_problems
 from pipelinerl.domains.miniwob.load_tasks import load_tasks as load_miniwob_tasks
+from pipelinerl.domains.ifeval.dataset import load_problems as load_ifeval_problems
+from pipelinerl.domains.ifeval.google_ifeval import load_problems as load_google_ifeval_problems
 
 
 def _load_math(dataset_names: Sequence[str], *, seed=None, **_: dict) -> List[Dict]:
@@ -21,6 +24,10 @@ def _load_guessing(dataset_names: Sequence[str], **_: dict) -> List[Dict]:
 
 def _load_coding(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
     return load_coding_problems(list(dataset_names), **loader_kwargs)
+
+
+def _load_livecodebench(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_livecodebench_problems(list(dataset_names), **loader_kwargs)
 
 
 def _load_fn_calling(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
@@ -43,15 +50,26 @@ def _load_miniwob(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[D
     return load_miniwob_tasks(list(dataset_names), **loader_kwargs)
 
 
+def _load_ifeval(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_ifeval_problems(list(dataset_names), **loader_kwargs)
+
+
+def _load_google_ifeval(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_google_ifeval_problems(list(dataset_names), **loader_kwargs)
+
+
 DOMAIN_LOADERS = {
     "math": _load_math,
     "guessing": _load_guessing,
     "coding": _load_coding,
+    "livecodebench": _load_livecodebench,
     "counting": _load_counting,
     "chartqa": _load_chartqa,
     "miniwob": _load_miniwob,
     "fn_calling": _load_fn_calling,
     "logic": _load_logic,
+    "ifeval": _load_ifeval,
+    "google_ifeval": _load_google_ifeval,
 }
 
 
@@ -78,7 +96,7 @@ def _parse_entry(entry: str) -> tuple[str, str, str | None]:
     if "@" in dataset:
         dataset, subset = dataset.rsplit("@", 1)
         subset = subset.strip()
-        if subset not in ("train", "test"):
+        if subset not in ("train", "test", "all"):
             # Not a subset suffix, restore original
             dataset = f"{dataset}@{subset}"
             subset = None
