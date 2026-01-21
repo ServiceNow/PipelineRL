@@ -9,12 +9,12 @@ import time
 
 import aiohttp
 from omegaconf import DictConfig
-from pydantic import BaseModel
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.utils import get_environment_jobs, resolve_environment_key
+from pipelinerl.domains.math.rollouts import RewardTable
 
 from .verifier_api import verify_logic_answer, verify_logic_answer_rpc, VerificationResult
 
@@ -22,18 +22,6 @@ from .verifier_api import verify_logic_answer, verify_logic_answer_rpc, Verifica
 class Metrics(BaseMetrics):
     """Metrics for logic domain rollouts."""
     pass
-
-
-class RewardTable(BaseModel):
-    """Reward values for different answer statuses."""
-    wrong_answer_not_finished: float = 0.0
-    wrong_answer_finished: float = 0.0
-    no_answer_not_finished: float = 0.0
-    no_answer_finished: float = 0.0
-    error_not_finished: float = 0.0
-    error_finished: float = 0.0
-    correct_answer_not_finished: float = 0.5
-    correct_answer_finished: float = 1.0
 
 
 async def _run_verification(
@@ -121,6 +109,7 @@ async def generate_logic_rollout(
     trace = make_training_text(llm, llm_call)
 
     # Determine reward based on answer status and finished state
+    # Note: "error" status maps to "unparsable" in the shared RewardTable
     answer_status = verification.status
     match (answer_status, trace.finished):
         case ("wrong", False):
@@ -132,15 +121,15 @@ async def generate_logic_rollout(
         case ("no_answer", True):
             reward = rewards.no_answer_finished
         case ("error", False):
-            reward = rewards.error_not_finished
+            reward = rewards.unparsable_not_finished
         case ("error", True):
-            reward = rewards.error_finished
+            reward = rewards.unparsable_finished
         case ("correct", False):
             reward = rewards.correct_answer_not_finished
         case ("correct", True):
             reward = rewards.correct_answer_finished
         case _:
-            reward = 0.0
+            reward = rewards.unparsable_finished if trace.finished else rewards.unparsable_not_finished
 
     # Apply discount factor based on output length
     reward *= discount_factor ** llm_call.output_length_tokens
