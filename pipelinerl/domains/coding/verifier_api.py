@@ -151,7 +151,7 @@ finally:
 
 
 def _build_fn_test_script(user_code: str, fn_name: str, args: list) -> str:
-    """Build script that calls a function with given arguments."""
+    """script that calls a function with given arguments."""
     args_repr = json.dumps(args)
     return f'''
 {user_code}
@@ -164,14 +164,12 @@ print(_result)
 
 
 def _indent_code(code: str, spaces: int) -> str:
-    """Indent code block by specified number of spaces."""
     indent = " " * spaces
     lines = code.split("\n")
     return "\n".join(indent + line if line.strip() else line for line in lines)
 
 
 async def _get_sandbox():
-    """Get or create the sandbox instance."""
     global _SANDBOX_INSTANCE
 
     async with _SANDBOX_LOCK:
@@ -201,7 +199,6 @@ async def _get_sandbox():
 
 
 async def _reset_sandbox():
-    """Reset the sandbox instance after a failure."""
     global _SANDBOX_INSTANCE
 
     async with _SANDBOX_LOCK:
@@ -215,7 +212,6 @@ async def _reset_sandbox():
 
 
 async def _run_in_sandbox(code: str, timeout: float = 10.0, retry_on_error: bool = True) -> dict[str, Any]:
-    """Execute code in the mcp-run-python sandbox."""
     try:
         sandbox_tuple = await asyncio.wait_for(_get_sandbox(), timeout=30.0)
         sandbox = sandbox_tuple[0]
@@ -283,8 +279,6 @@ async def evaluate_coding_prediction_async(
     timeout_per_test: float = 5.0,
     max_tests: int = 15,
 ) -> CodingVerificationSummary:
-    """Run generated code in sandbox and collect pass/fail statistics."""
-
     context = _ensure_dict(reward_context)
     summary = CodingVerificationSummary(
         call_type=context.get("call_type"),
@@ -306,7 +300,6 @@ async def evaluate_coding_prediction_async(
         summary.error = "no_tests"
         return summary
 
-    # Limit number of tests
     num_tests = min(len(inputs), len(outputs), max_tests)
 
     for idx in range(num_tests):
@@ -314,31 +307,25 @@ async def evaluate_coding_prediction_async(
         expected_output = outputs[idx]
         summary.total += 1
 
-        # Build test script based on call type
         if call_type == "std":
             # stdin/stdout style
             script = _build_stdin_test_script(candidate_code, str(test_input))
             expected_str = _normalize_output(str(expected_output))
         elif call_type == "fn" and fn_name:
-            # Function call style
             args = test_input if isinstance(test_input, list) else [test_input]
             script = _build_fn_test_script(candidate_code, fn_name, args)
             expected_str = _normalize_output(str(expected_output))
         else:
-            # Fallback to stdin style
             script = _build_stdin_test_script(candidate_code, str(test_input))
             expected_str = _normalize_output(str(expected_output))
 
-        # Run in sandbox
         result = await _run_in_sandbox(script, timeout=timeout_per_test)
 
-        # Determine test status
         if result["timeout"]:
             status = "timeout"
             summary.timeout_error = True
             summary.error = summary.error or "timeout"
         elif result["status"] == "error" or "Error" in result.get("stderr", ""):
-            # Check for compile vs runtime error
             stderr = result.get("stderr", "")
             if "SyntaxError" in stderr or "IndentationError" in stderr:
                 status = "compile_error"
@@ -349,7 +336,6 @@ async def evaluate_coding_prediction_async(
                 summary.runtime_error = True
                 summary.error = summary.error or "runtime_error"
         else:
-            # Compare output
             actual_output = _normalize_output(result.get("stdout", ""))
             if actual_output == expected_str:
                 status = "passed"
@@ -384,7 +370,6 @@ def evaluate_coding_prediction(
     timeout_per_test: float = 5.0,
     max_tests: int = 15,
 ) -> CodingVerificationSummary:
-    """Synchronous wrapper for evaluate_coding_prediction_async."""
     return asyncio.run(
         evaluate_coding_prediction_async(
             prediction,
@@ -397,7 +382,6 @@ def evaluate_coding_prediction(
 
 
 def _rpc_failure_summary(reason: str, *, status: int | None = None, body: str | None = None) -> dict[str, Any]:
-    """Create a failure summary for RPC errors."""
     details = reason
     if status is not None:
         details = f"{reason}:{status}"
@@ -426,8 +410,6 @@ async def verify_coding_solution_rpc(
     reward_context: dict[str, Any] | str | None,
     extra_info: dict[str, Any] | str | None,
 ) -> dict[str, Any]:
-    """Call a remote coding verifier via HTTP RPC."""
-
     payload = {
         "prediction": prediction,
         "reward_context": reward_context,
@@ -449,8 +431,6 @@ async def verify_coding_solution_rpc(
 
 
 class CodingSandboxEnvironment:
-    """Environment server that uses mcp-run-python for code execution."""
-
     def __init__(
         self,
         *,
@@ -484,7 +464,6 @@ class CodingSandboxEnvironment:
 
 
 async def cleanup_sandbox():
-    """Clean up the sandbox instance."""
     global _SANDBOX_INSTANCE
 
     async with _SANDBOX_LOCK:
