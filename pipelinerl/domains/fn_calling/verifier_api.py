@@ -25,7 +25,6 @@ _TOOL_BLOCK = re.compile(r"<tool_calls>(.*?)</tool_calls>", re.DOTALL | re.IGNOR
 
 
 def _lazy_import_bfcl():
-    """Lazily import BFCL modules."""
     try:
         from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker
         from bfcl_eval.constants.enums import Language
@@ -46,8 +45,7 @@ def _lazy_import_bfcl():
 
 
 def _convert_to_gorilla(oai_tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Convert OpenAI tool_calls format to BFCL Gorilla format.
-
+    """
     {"function": {"name": "add", "arguments": "{\"a\": 1, \"b\": 2}"}}
     -> {"add": {"a": 1, "b": 2}}
     """
@@ -68,28 +66,41 @@ def _convert_to_gorilla(oai_tool_calls: List[Dict[str, Any]]) -> List[Dict[str, 
 
 
 def _parse_tool_calls_from_text(generation: str) -> List[Dict[str, Any]]:
-    """Parse tool_calls from text format (fallback for non-structured outputs)."""
-    match = _TOOL_BLOCK.search(generation)
-    if not match:
+    matches = _TOOL_BLOCK.findall(generation)
+    if not matches:
         return []
 
-    payload = match.group(1).strip()
+    # Use the LAST match (actual model output, not template examples)
+    payload = matches[-1].strip()
     if not payload:
-        return []
+        # If last match is empty, try earlier matches in reverse order
+        for match in reversed(matches[:-1]):
+            if match.strip():
+                payload = match.strip()
+                break
+        if not payload:
+            return []
 
     try:
         data = json.loads(payload)
         if not isinstance(data, list):
             data = [data]
-        # Convert to OpenAI format
         oai_calls = []
         for item in data:
             if isinstance(item, dict):
                 # Check if it's already in OAI format
                 if "function" in item:
                     oai_calls.append(item)
+                # Handle {"name": "func_name", "arguments": {...}} format
+                elif "name" in item and "arguments" in item:
+                    oai_calls.append({
+                        "function": {
+                            "name": item["name"],
+                            "arguments": json.dumps(item["arguments"]) if isinstance(item["arguments"], dict) else str(item["arguments"]),
+                        }
+                    })
                 else:
-                    # Gorilla format: {name: args}
+                    # Gorilla format: {func_name: {args}}
                     for name, args in item.items():
                         oai_calls.append({
                             "function": {
@@ -106,7 +117,6 @@ def _extract_tool_calls(
     generation: str,
     tool_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Extract tool calls from structured output or text."""
     # Prefer structured tool_calls if provided
     if tool_calls:
         return tool_calls
@@ -122,12 +132,6 @@ def verify_fn_calling_answer(
 ) -> AnswerStatus:
     """Verify a function calling answer using BFCL AST checker.
 
-    Args:
-        generation: The model's text generation.
-        reward_context: Contains 'category', 'function', 'ground_truth', 'is_relevance'.
-        tool_calls: Optional structured tool_calls from the model output.
-        model_name: Model name for BFCL's function name conversion.
-
     Returns:
         AnswerStatus: "correct", "wrong", "no_answer", or "unparsable".
     """
@@ -136,10 +140,8 @@ def verify_fn_calling_answer(
     function_def = reward_context.get("function", [])
     ground_truth = reward_context.get("ground_truth")
 
-    # Extract tool calls
     oai_tool_calls = _extract_tool_calls(generation, tool_calls)
 
-    # Handle relevance/irrelevance tests (no AST check needed)
     if is_relevance:
         has_tool_calls = len(oai_tool_calls) > 0
         if "irrelevance" in category:
@@ -149,18 +151,15 @@ def verify_fn_calling_answer(
             # Should make at least one tool call
             return "correct" if has_tool_calls else "no_answer"
 
-    # No tool calls when expected
     if not oai_tool_calls:
         return "no_answer"
 
-    # Convert to Gorilla format for BFCL checker
     try:
         gorilla_tool_calls = _convert_to_gorilla(oai_tool_calls)
     except Exception as e:
         logger.debug(f"Failed to convert tool calls to Gorilla format: {e}")
         return "unparsable"
 
-    # Validate format
     try:
         bfcl = _lazy_import_bfcl()
         is_valid_format = bfcl["is_function_calling_format_output"](gorilla_tool_calls)
@@ -171,12 +170,14 @@ def verify_fn_calling_answer(
         logger.debug(f"Format validation failed: {e}")
         return "unparsable"
 
-    # No ground truth to compare against
     if ground_truth is None:
         logger.warning(f"No ground truth for category '{category}'")
         return "unparsable"
 
-    # Determine language for checker
+    # BFCL returns {'id': ..., 'ground_truth': [...]} but AST checker expects just the list
+    if isinstance(ground_truth, dict) and "ground_truth" in ground_truth:
+        ground_truth = ground_truth["ground_truth"]
+
     if bfcl["is_java"](category):
         language = bfcl["Language"].JAVA
     elif bfcl["is_js"](category):
@@ -184,7 +185,6 @@ def verify_fn_calling_answer(
     else:
         language = bfcl["Language"].PYTHON
 
-    # Run AST checker
     try:
         checker_result = bfcl["ast_checker"](
             function_def,
@@ -208,14 +208,7 @@ def verify_fn_calling_answer(
         return "wrong"
 
 
-# ---------------------------------------------------------------------------
-# RPC / FastAPI server for remote verification
-# ---------------------------------------------------------------------------
-
-
 class FnCallingVerificationRequest(BaseModel):
-    """Request payload for function calling verification."""
-
     generation: str
     reward_context: Dict[str, Any] = Field(default_factory=dict)
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -228,7 +221,6 @@ def _execute_verification(
     tool_calls: Optional[List[Dict[str, Any]]],
     model_name: str,
 ) -> AnswerStatus:
-    """Execute verification in process pool."""
     return verify_fn_calling_answer(
         generation=generation,
         reward_context=reward_context,
@@ -247,20 +239,6 @@ async def verify_fn_calling_answer_rpc(
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     model_name: str = "model",
 ) -> AnswerStatus:
-    """Verify function calling answer via RPC call.
-
-    Args:
-        session: aiohttp session.
-        host: Server hostname.
-        port: Server port.
-        generation: Model's text generation.
-        reward_context: Context with function defs and ground truth.
-        tool_calls: Structured tool calls from model output.
-        model_name: Model name for verification.
-
-    Returns:
-        AnswerStatus from the verification server.
-    """
     payload = {
         "generation": generation,
         "reward_context": reward_context,
@@ -280,8 +258,6 @@ async def verify_fn_calling_answer_rpc(
 
 
 class BFCLEnvironment:
-    """FastAPI wrapper for BFCL v3 function calling verifier."""
-
     def __init__(
         self,
         *,
