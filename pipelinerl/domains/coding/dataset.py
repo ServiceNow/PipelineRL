@@ -15,14 +15,13 @@ logger = logging.getLogger(__name__)
 
 DOMAIN_NAME = "coding"
 DEFAULT_DATASET_ID = "PrimeIntellect/INTELLECT-3-RL"
-DEFAULT_DATASET_CONFIG = "code"  # Options: code, math, logic, science
+DEFAULT_DATASET_CONFIG = "code"
 DEFAULT_SPLIT = "train"
 # Column used for difficulty filtering
 DEFAULT_DIFFICULTY_COLUMN = "avg@8_qwen3_4b_instruct_2507"
 # Default difficulty range: problems with 10-90% solve rate
 DEFAULT_MIN_DIFFICULTY = 0.1
 DEFAULT_MAX_DIFFICULTY = 0.9
-# Train/test split ratio (INTELLECT-3-RL only has 'train' split)
 DEFAULT_TRAIN_RATIO = 0.9
 
 _DATASET_CACHE: dict[str, Dataset] = {}
@@ -33,7 +32,6 @@ class DatasetOptions:
     dataset_id: str = DEFAULT_DATASET_ID
     dataset_config: str = DEFAULT_DATASET_CONFIG
     split: str = DEFAULT_SPLIT
-    # Subset within the split: "train" or "test" (we split ourselves)
     subset: str = "train"
     train_ratio: float = DEFAULT_TRAIN_RATIO
     max_examples: int | None = None
@@ -45,14 +43,12 @@ class DatasetOptions:
 
 
 def _to_native(value: Any) -> Any:
-    """Convert OmegaConf containers to Python types."""
     if isinstance(value, DictConfig):
         return OmegaConf.to_container(value, resolve=True)
     return value
 
 
 def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
-    """Parse loader kwargs into DatasetOptions."""
     options = DatasetOptions()
     if not loader_kwargs:
         return options
@@ -90,7 +86,6 @@ def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
 
 
 def _load_raw_dataset(options: DatasetOptions) -> Dataset:
-    """Load the raw dataset from HuggingFace with caching."""
     cache_key = f"{options.dataset_id}:{options.dataset_config}:{options.split}"
     if cache_key in _DATASET_CACHE:
         logger.debug("Using cached dataset for %s", cache_key)
@@ -114,7 +109,6 @@ def _load_raw_dataset(options: DatasetOptions) -> Dataset:
 
 
 def _parse_tests(info_str: str | None) -> dict[str, Any] | None:
-    """Parse the info field and extract tests."""
     if info_str is None:
         return None
 
@@ -146,8 +140,6 @@ def _parse_tests(info_str: str | None) -> dict[str, Any] | None:
 
 
 def _build_record(sample: dict, idx: int) -> dict | None:
-    """Convert an INTELLECT-3-RL sample to our internal format."""
-    # INTELLECT-3-RL uses 'question' instead of 'prompt'
     prompt = sample.get("question")
     if not prompt:
         return None
@@ -171,7 +163,8 @@ def _build_record(sample: dict, idx: int) -> dict | None:
         # Multi-line string input suggests stdin/stdout style
         call_type = "std"
     else:
-        call_type = "fn"
+        # Single-line stdin problems (no fn_name, no newlines in input)
+        call_type = "std"
 
     # Build reward_context in the format expected by verifier
     reward_context = {
@@ -209,9 +202,14 @@ def _split_dataset(
     INTELLECT-3-RL only has a 'train' split, so we create our own train/test
     split using a deterministic shuffle.
     """
-    if options.subset not in ("train", "test"):
+    if options.subset not in ("train", "test", "all"):
         logger.warning("Invalid subset '%s', defaulting to 'train'", options.subset)
         options.subset = "train"
+
+    # Return full dataset for "all" subset
+    if options.subset == "all":
+        logger.info("Using all data: %d samples", len(dataset))
+        return dataset
 
     # Use seed 42 for consistent splits across runs
     split_seed = 42
@@ -249,7 +247,6 @@ def _filter_by_difficulty(
     dataset: Dataset,
     options: DatasetOptions,
 ) -> Dataset:
-    """Filter dataset by difficulty using solve rate column."""
     if options.min_difficulty is None and options.max_difficulty is None:
         return dataset
 
@@ -290,34 +287,15 @@ def load_datasets(
     seed: int | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Load coding problems from INTELLECT-3-RL dataset.
-
-    Args:
-        dataset_names: Ignored for compatibility. Always uses INTELLECT-3-RL.
-        seed: Random seed for shuffling.
-        **loader_kwargs: Additional options (max_examples, min_difficulty, etc.)
-
-    Returns:
-        List of problem dictionaries with keys:
-        - id: int
-        - problem_id: str
-        - task: str (the problem prompt)
-        - reward_context: dict with inputs, outputs, call_type, fn_name
-        - dataset: str
-        - domain: str
-    """
     if loader_kwargs.get("seed") is None and seed is not None:
         loader_kwargs["seed"] = seed
 
     options = _normalize_options(loader_kwargs)
 
-    # Load raw dataset
     raw_dataset = _load_raw_dataset(options)
 
-    # Split into train/test
     split_dataset = _split_dataset(raw_dataset, options)
 
-    # Filter by difficulty
     filtered_dataset = _filter_by_difficulty(split_dataset, options)
 
     # Convert to our format
@@ -329,12 +307,10 @@ def load_datasets(
 
     logger.info("Built %d valid coding samples", len(samples))
 
-    # Shuffle if seed provided
     if options.seed is not None:
         rng = random.Random(options.seed)
         rng.shuffle(samples)
 
-    # Limit samples if requested
     if options.max_examples is not None and len(samples) > options.max_examples:
         samples = samples[: options.max_examples]
         logger.info("Limited to %d samples", len(samples))
@@ -350,6 +326,5 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Hydra entrypoint that mirrors the math domain loader style."""
     seed = loader_kwargs.pop("seed", None)
     return load_datasets(dataset_names, seed=seed, **loader_kwargs)
