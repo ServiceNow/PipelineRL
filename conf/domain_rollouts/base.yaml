@@ -5,5 +5,7 @@ counting: pipelinerl.domains.counting.generate_counting_rollout
 miniwob: pipelinerl.domains.miniwob.rollouts.generate_miniwob_rollout
 chartqa: pipelinerl.domains.chartqa.generate_chartqa_rollout
 coding: pipelinerl.domains.coding.generate_coding_rollout
+livecodebench: pipelinerl.domains.coding.generate_coding_rollout
 fn_calling: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
 logic: pipelinerl.domains.logic.generate_logic_rollout
+ifeval: pipelinerl.domains.ifeval.generate_ifeval_rollout
