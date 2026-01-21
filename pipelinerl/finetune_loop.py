@@ -213,7 +213,7 @@ class WeightUpdateManager:
             for name, parameter in named_parameters.items():
                 with deepspeed.zero.GatheredParameters([parameter]):
                     if get_accelerator().is_main_process:
-                        # Use PyNcclCommunicator's broadcast method instead of torch.distributed
+                        # Use PyNcclCommunicator's broadcast method as torch.distributed does not work (gets stuck)
                         self.actor_update_group.broadcast(parameter.data, src=0, stream=torch.cuda.current_stream())
             if get_accelerator().is_main_process:
                 logger.info("Wait for HTTP requests")
@@ -256,7 +256,7 @@ class WeightUpdateManager:
                 futures = self.request_weight_updates(messages)
                 logger.info(f"Published weight update request for version {version}")
                 for _, parameter in named_parameters.items():
-                    # Use PyNcclCommunicator's broadcast method instead of torch.distributed
+                    # Use PyNcclCommunicator's broadcast method as torch.distributed does not work (gets stuck)
                     self.actor_update_group.broadcast(parameter.data, src=0, stream=torch.cuda.current_stream())
                 for future in futures:
                     future.result()
