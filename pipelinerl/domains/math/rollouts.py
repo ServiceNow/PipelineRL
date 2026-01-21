@@ -1,3 +1,4 @@
+import logging
 import random
 import time
 
@@ -14,6 +15,8 @@ from pipelinerl.world import Job
 
 from .verifier_api import verify_answer_rpc
 
+logger = logging.getLogger(__name__)
+
 
 class Metrics(BaseMetrics):
     penalty: float
@@ -28,6 +31,29 @@ class RewardTable(BaseModel):
     correct_answer_not_finished: float
     correct_answer_finished: float
     buffer_tokens: int = 0 # 0 means no overlong reward shaping
+
+    def get_reward_range(self) -> tuple[float, float]:
+        values = [
+            self.wrong_answer_not_finished,
+            self.wrong_answer_finished,
+            self.no_answer_not_finished,
+            self.no_answer_finished,
+            self.unparsable_not_finished,
+            self.unparsable_finished,
+            self.correct_answer_not_finished,
+            self.correct_answer_finished,
+        ]
+        return min(values), max(values)
+
+    def log_config(self, domain: str = "unknown") -> None:
+        """Log the reward configuration for debugging."""
+        min_r, max_r = self.get_reward_range()
+        logger.info(
+            f"RewardTable for {domain}: range=[{min_r}, {max_r}], "
+            f"correct_finished={self.correct_answer_finished}, "
+            f"wrong_finished={self.wrong_answer_finished}, "
+            f"buffer_tokens={self.buffer_tokens}"
+        )
 
 def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
     """
