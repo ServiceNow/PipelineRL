@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from typing import Any, Dict, List, Optional
@@ -19,10 +20,38 @@ from pipelinerl.domains.fn_calling.verifier_api import (
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.utils import get_environment_jobs, resolve_environment_key
 
+logger = logging.getLogger(__name__)
+
+_reward_config_logged = False
+
 
 class FnCallingMetrics(BaseMetrics):
-    """Metrics for function calling rollouts."""
     penalty: float
+
+
+def _format_tools_for_prompt(tools: List[Dict[str, Any]]) -> str:
+    import json
+
+    tool_descriptions = []
+    for tool in tools:
+        # Handle both OpenAI tool format and raw function format
+        if "function" in tool:
+            func = tool["function"]
+        else:
+            func = tool
+        tool_descriptions.append(json.dumps(func, indent=2))
+
+    tools_text = "\n".join(tool_descriptions)
+
+    return f"""You are provided with function signatures within <available_tools></available_tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about the arguments. Here are the available tools:
+<available_tools>
+{tools_text}
+</available_tools>
+
+Return ALL required function calls as a JSON list within <tool_calls></tool_calls> XML tags. If multiple function calls are needed, include ALL of them in a single list:
+<tool_calls>[{{"name": "function1", "arguments": {{"arg1": "val1"}}}}, {{"name": "function2", "arguments": {{"arg2": "val2"}}}}]</tool_calls>
+
+Example - calling add twice: <tool_calls>[{{"name": "add", "arguments": {{"a": 1, "b": 2}}}}, {{"name": "add", "arguments": {{"a": 3, "b": 4}}}}]</tool_calls>"""
 
 
 def _build_prompt(cfg: DictConfig, problem: Dict[str, Any]) -> Prompt:
@@ -33,26 +62,35 @@ def _build_prompt(cfg: DictConfig, problem: Dict[str, Any]) -> Prompt:
         problem: Problem dictionary with 'task' and 'extra_info'.
 
     Returns:
-        Prompt with system message and tools.
+        Prompt with system message and tools embedded in text.
     """
     messages: List[Dict[str, Any]] = []
-
-    # Add system prompt if configured
-    system_prompt = cfg.actor.get("system_prompt", "")
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-
-    # Add user message with the task
-    task = problem.get("task", "")
-    task_template = cfg.actor.get("task_template", "{task}")
-    user_content = task_template.format(task=task)
-    messages.append({"role": "user", "content": user_content})
 
     # Get tools from extra_info
     extra_info = problem.get("extra_info", {})
     oai_tools = extra_info.get("oai_tools", [])
 
-    return Prompt(messages=messages, tools=oai_tools if oai_tools else None)
+    # Build system prompt with tools embedded
+    base_system_prompt = cfg.actor.get("system_prompt", "")
+    if oai_tools:
+        tools_text = _format_tools_for_prompt(oai_tools)
+        if base_system_prompt:
+            system_content = f"{base_system_prompt}\n\n{tools_text}"
+        else:
+            system_content = tools_text
+        messages.append({"role": "system", "content": system_content})
+    elif base_system_prompt:
+        messages.append({"role": "system", "content": base_system_prompt})
+
+    task = problem.get("task", "")
+    task_template = cfg.actor.get("task_template", "{task}")
+    user_content = task_template.format(task=task)
+    messages.append({"role": "user", "content": user_content})
+
+    # Don't pass tools to Prompt
+    # we've embed them in the system message
+    # This avoids vLLM requiring --enable-auto-tool-choice --tool-call-parser
+    return Prompt(messages=messages, tools=None)
 
 
 async def _run_verification(
@@ -63,19 +101,6 @@ async def _run_verification(
     tool_calls: Optional[List[Dict[str, Any]]],
     model_name: str,
 ) -> str:
-    """Run verification either locally or via RPC.
-
-    Args:
-        cfg: Configuration object.
-        session: aiohttp session for RPC calls.
-        generation: Model's text generation.
-        reward_context: Verification context.
-        tool_calls: Structured tool calls from model output.
-        model_name: Model name for verification.
-
-    Returns:
-        Answer status string.
-    """
     use_local = cfg.actor.get("use_local_bfcl_verifier", False)
 
     if use_local:
@@ -86,7 +111,6 @@ async def _run_verification(
             model_name=model_name,
         )
 
-    # Use RPC verification
     env_key = resolve_environment_key(cfg, default="fn_calling")
     env_jobs = get_environment_jobs(cfg, env_key)
     if not env_jobs:
@@ -112,21 +136,8 @@ async def generate_fn_calling_rollout(
     problem: Dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> RolloutResult:
-    """Generate a rollout for a BFCL function calling problem.
-
-    Args:
-        cfg: Configuration object.
-        llm: Language model to generate with.
-        problem: Problem dictionary containing task, reward_context, extra_info.
-        session: aiohttp session for RPC calls.
-
-    Returns:
-        RolloutResult with training texts and metrics.
-    """
-    # Build prompt with tools
     prompt = _build_prompt(cfg, problem)
 
-    # Generate response
     start_time = time.time()
     llm_call = await llm_async_generate(llm, prompt, session)
     latency = time.time() - start_time
@@ -146,15 +157,12 @@ async def generate_fn_calling_rollout(
             for tc in llm_call.output.tool_calls
         ]
 
-    # Get reward context
     reward_context = problem.get("reward_context", {})
 
-    # Get model name for verification
     model_name = getattr(llm, "model_name", "model")
     if hasattr(llm, "model"):
         model_name = llm.model
 
-    # Run verification
     answer_status = await _run_verification(
         cfg=cfg,
         session=session,
@@ -164,9 +172,13 @@ async def generate_fn_calling_rollout(
         model_name=model_name,
     )
 
-    # Calculate reward
     rewards = RewardTable(**dict(cfg.rewards))
     trace = make_training_text(llm, llm_call)
+
+    global _reward_config_logged
+    if not _reward_config_logged:
+        rewards.log_config("fn_calling")
+        _reward_config_logged = True
 
     match (answer_status, trace.finished):
         case ("wrong", False):
@@ -188,10 +200,8 @@ async def generate_fn_calling_rollout(
         case _:
             raise ValueError(f"Unexpected fn_calling answer status '{answer_status}'")
 
-    # Apply discount factor
     reward *= cfg.actor.discount_factor ** llm_call.output_length_tokens
 
-    # Apply length penalty if configured
     overlong_penalty = 0.0
     try:
         max_tokens = llm.parameters["max_tokens"]
@@ -201,6 +211,14 @@ async def generate_fn_calling_rollout(
     if rewards.buffer_tokens > 0 and max_tokens is not None:
         overlong_penalty = length_penalty(max_tokens, llm_call.output_length_tokens, rewards.buffer_tokens)
         reward += overlong_penalty
+
+    # Warn if reward is negative (shouldn't happen with standard configs)
+    if reward < 0:
+        logger.warning(
+            f"Negative reward {reward:.4f} for fn_calling: "
+            f"status={answer_status}, finished={trace.finished}, "
+            f"penalty={overlong_penalty:.4f}, tokens={llm_call.output_length_tokens}"
+        )
 
     trace.reward = reward
     trace.metadata.setdefault("fn_calling", {}).update({"answer_status": answer_status})
