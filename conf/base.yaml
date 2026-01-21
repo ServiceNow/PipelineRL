@@ -62,9 +62,6 @@ vllm_config:
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
-    num-scheduler-steps: 1
-    disable-log-requests: ""
-    disable-frontend-multiprocessing: ""
     max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 1024
     enable-chunked-prefill: ""
@@ -73,6 +70,12 @@ vllm_config:
     pipeline-parallel-size: 1
     generation-config: vllm
     max_model_len: 10000
+    # V1 specific settings
+    # logprobs-mode: processed_logprobs
+    # V0 specific settings
+    num-scheduler-steps: 1
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
 
 world:
   replicas: 1

@@ -179,7 +179,7 @@ def load_model(args, model_class, current_dir):
         is_ds_zero_3 = get_accelerator().state.deepspeed_plugin.zero_stage == 3  # type: ignore
 
     if args.load_as_bf16:
-        loading_args["torch_dtype"] = torch.bfloat16
+        loading_args["dtype"] = torch.bfloat16
     if args.auto_device_map:
         loading_args["device_map"] = "auto"
     model_cls = get_auto_model_class(model_class)

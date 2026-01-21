@@ -27,8 +27,9 @@ from transformers import PreTrainedTokenizerFast, get_scheduler, set_seed
 from ring_flash_attn import substitute_hf_flash_attn, update_ring_flash_attn_params
 
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead
-import pipelinerl.torch_utils
+from pipelinerl import torch_utils
 from pipelinerl.finetune.types import PipelineBatchEncoding
+
 from pipelinerl.finetune.checkpoints import (
     load_model,
     load_tokenizer,
@@ -212,7 +213,8 @@ class WeightUpdateManager:
             for name, parameter in named_parameters.items():
                 with deepspeed.zero.GatheredParameters([parameter]):
                     if get_accelerator().is_main_process:
-                        dist.broadcast(parameter.data, src=0, group=self.actor_update_group)
+                        # Use PyNcclCommunicator's broadcast method as torch.distributed does not work since vLLM disabled that transfer path
+                        self.actor_update_group.broadcast(parameter.data, src=0, stream=torch.cuda.current_stream())
             if get_accelerator().is_main_process:
                 logger.info("Wait for HTTP requests")
                 for future in futures:  # type: ignore
@@ -254,8 +256,8 @@ class WeightUpdateManager:
                 futures = self.request_weight_updates(messages)
                 logger.info(f"Published weight update request for version {version}")
                 for _, parameter in named_parameters.items():
-                    dist.broadcast(parameter.data, src=0, group=self.actor_update_group)
-                dist.barrier(self.actor_update_group)
+                    # Use PyNcclCommunicator's broadcast method as torch.distributed does not work since vLLM disabled that transfer path
+                    self.actor_update_group.broadcast(parameter.data, src=0, stream=torch.cuda.current_stream())
                 for future in futures:
                     future.result()
                 logger.info("Finished broadcasting weights")
@@ -408,13 +410,15 @@ def run_finetuning_loop(
     get_accelerator().wait_for_everyone()
 
     if get_accelerator().is_main_process and args.send_weight_updates:
-        logger.info("Initializing actor process group")
-        actor_update_group = pipelinerl.torch_utils.init_extra_process_group(
-            group_name="actor",
-            backend="nccl",
+        current_device = get_accelerator().device
+        torch.cuda.set_device(current_device)
+        logger.info("Initializing actor process group using StatelessProcessGroup")
+        logger.info(f"Set CUDA device to {current_device} for actor process group (rank 0)")
+        actor_update_group = torch_utils.stateless_init_process_group(
             init_method=cfg.me.weight_update_group_init_method,
             rank=0,
             world_size=cfg.me.weight_update_group_world_size,
+            device=current_device,
         )
         logger.info("Actor process group initialized")
     else:
@@ -493,8 +497,7 @@ def run_finetuning_loop(
     finally:
         if weight_update_manager is not None:
             weight_update_manager.shutdown()
-        if actor_update_group:
-            dist.destroy_process_group(actor_update_group)
+        # PyNcclCommunicator doesn't need explicit destroy like torch.distributed process groups
 
 
 def rl_finetuning_worker(

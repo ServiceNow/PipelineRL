@@ -195,9 +195,17 @@ cd PipelineRL
 
 Create the environments with dependencies.
 ```bash
-conda create -n pipeline-rl -y python=3.11
-conda run --no-capture-output -n pipeline-rl pip install torch==2.6.0 
-conda run --no-capture-output -n pipeline-rl pip install -e . --no-build-isolation
+conda create -n pipeline-rl -y python=3.12
+conda run --no-capture-output -n pipeline-rl pip install -e .
+conda run --no-capture-output -n pipeline-rl pip install flash-attn==2.8.3 --no-build-isolation
+```
+
+Alternatively for `flash-attn`, you can install it via prebuilt packages (on Linux):
+```bash
+# Check your PyTorch's C++ ABI setting first:
+# python -c "import torch; print(torch._C._GLIBCXX_USE_CXX11_ABI)"
+# Use cxx11abiTRUE or cxx11abiFALSE in the URL accordingly
+conda run --no-capture-output -n pipeline-rl pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 ```
 
 By default Pipeline-RL will use the file system as the medium for streaming the generated data to the trainer processes. This works on one node, but the files can get quite large. To use Redis instead you will need to install the Redis server in the same conda environment:
