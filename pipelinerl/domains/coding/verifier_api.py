@@ -20,14 +20,12 @@ logger = logging.getLogger(__name__)
 
 _CODE_FENCE_RE = re.compile(r"```(?:python|py)?\n([\s\S]*?)```", re.IGNORECASE)
 
-# Sandbox instance (lazily initialized)
+# lazy init Sandbox instance
 _SANDBOX_INSTANCE = None
 _SANDBOX_LOCK = asyncio.Lock()
 
 
 class CodingVerificationRequest(BaseModel):
-    """Payload accepted by the coding verifier environment."""
-
     prediction: str | None = None
     reward_context: dict[str, Any] | str | None = Field(default_factory=dict)
     extra_info: dict[str, Any] | str | None = None
@@ -86,7 +84,6 @@ class CodingVerificationSummary:
 
 
 def _extract_code(prediction: str | None) -> str:
-    """Extract Python code from markdown code fences or raw text."""
     if not prediction:
         return ""
     match = _CODE_FENCE_RE.findall(prediction)
@@ -96,7 +93,6 @@ def _extract_code(prediction: str | None) -> str:
 
 
 def _ensure_dict(data: dict[str, Any] | str | None) -> dict[str, Any]:
-    """Parse JSON string to dict if needed."""
     if data is None:
         return {}
     if isinstance(data, dict):
@@ -108,19 +104,21 @@ def _ensure_dict(data: dict[str, Any] | str | None) -> dict[str, Any]:
 
 
 def _normalize_output(text: str | None) -> str:
-    """Normalize output for comparison."""
     if text is None:
         return ""
     return text.strip()
 
 
 def _build_stdin_test_script(user_code: str, stdin_input: str) -> str:
-    """Build script that simulates stdin input for stdout-style problems."""
+    """script that simulates stdin input for stdout-style problems."""
     # Escape the input for embedding in the script
     escaped_input = json.dumps(stdin_input)
     return f'''
 import sys
 from io import StringIO, BytesIO
+
+# Ensure __name__ == "__main__" so guarded code blocks execute
+__name__ = "__main__"
 
 # Create a stdin wrapper that supports both .read() and .buffer.read()
 class _StdinWrapper:
@@ -202,7 +200,21 @@ async def _get_sandbox():
             raise
 
 
-async def _run_in_sandbox(code: str, timeout: float = 10.0) -> dict[str, Any]:
+async def _reset_sandbox():
+    """Reset the sandbox instance after a failure."""
+    global _SANDBOX_INSTANCE
+
+    async with _SANDBOX_LOCK:
+        if _SANDBOX_INSTANCE is not None:
+            sandbox, sandbox_cm = _SANDBOX_INSTANCE
+            try:
+                await sandbox_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning("Error cleaning up sandbox during reset: %s", e)
+            _SANDBOX_INSTANCE = None
+
+
+async def _run_in_sandbox(code: str, timeout: float = 10.0, retry_on_error: bool = True) -> dict[str, Any]:
     """Execute code in the mcp-run-python sandbox."""
     try:
         sandbox_tuple = await asyncio.wait_for(_get_sandbox(), timeout=30.0)
@@ -212,10 +224,21 @@ async def _run_in_sandbox(code: str, timeout: float = 10.0) -> dict[str, Any]:
         result = await asyncio.wait_for(sandbox.eval(code), timeout=timeout)
         elapsed = time.perf_counter() - start
 
+        # mcp-run-python returns:
+        # - {"status": "success", "output": [...], "return_value": ...} on success
+        # - {"status": "run-error", "output": [...], "error": "..."} on error
+        status = result.get("status", "unknown")
+        # Normalize status: mcp-run-python uses "run-error", we use "error"
+        if status == "run-error":
+            status = "error"
+
+        # Capture error message from mcp-run-python's "error" field
+        stderr = result.get("error", "") or ""
+
         return {
-            "status": result.get("status", "unknown"),
+            "status": status,
             "stdout": "\n".join(result.get("output", [])),
-            "stderr": "",
+            "stderr": stderr,
             "return_value": result.get("return_value"),
             "elapsed": elapsed,
             "timeout": False,
@@ -230,10 +253,22 @@ async def _run_in_sandbox(code: str, timeout: float = 10.0) -> dict[str, Any]:
             "timeout": True,
         }
     except Exception as e:
+        error_msg = str(e) or f"Sandbox error: {type(e).__name__}"
+        logger.warning("Sandbox execution error: %s (%s)", error_msg, type(e).__name__)
+
+        # Try to reset and retry once if this looks like a sandbox crash
+        if retry_on_error:
+            logger.info("Attempting sandbox reset and retry...")
+            try:
+                await _reset_sandbox()
+                return await _run_in_sandbox(code, timeout=timeout, retry_on_error=False)
+            except Exception as retry_e:
+                error_msg = f"Retry failed: {retry_e}" if str(retry_e) else f"Retry failed: {type(retry_e).__name__}"
+
         return {
             "status": "error",
             "stdout": "",
-            "stderr": str(e),
+            "stderr": error_msg,
             "return_value": None,
             "elapsed": 0,
             "timeout": False,
