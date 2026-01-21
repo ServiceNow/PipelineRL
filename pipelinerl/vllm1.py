@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import signal
 import torch
@@ -191,9 +190,9 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     @app.post("/receive_weight_update")
     async def _receive_weight_update(request: WeightUpdateRequest):
-        # Fire-and-forget: return immediately, weight update happens in background
-        logger.info("Received weight update request (fire-and-forget)")
-        asyncio.create_task(weight_update_manager.receive_weight_update(request))
+        # Blocking: wait for weight update to complete before returning
+        logger.info("Received weight update request")
+        await weight_update_manager.receive_weight_update(request)
         return {"status": "ok"}
 
     await init_app_state(engine, app.state, args)
