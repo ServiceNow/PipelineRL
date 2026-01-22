@@ -1,5 +1,3 @@
-"""Rollout generation for the coding domain using mcp-run-python sandbox."""
-
 from __future__ import annotations
 
 import json
@@ -113,6 +111,7 @@ async def _run_verification(
             extra_info=extra_info,
             timeout_per_test=getattr(cfg.actor, "sandbox_timeout", 5.0),
             max_tests=getattr(cfg.actor, "max_tests_per_problem", 15),
+            pool_size=getattr(cfg.actor, "sandbox_pool_size", 4),
         )
         return summary.to_payload()
 
@@ -146,7 +145,6 @@ def _coerce_dict(data: dict[str, Any] | str | None) -> dict[str, Any]:
 
 
 def _get_system_prompt(cfg: DictConfig) -> str:
-    """Get the system prompt, preferring domain-specific prompt if global is empty."""
     if cfg.actor.system_prompt:
         return cfg.actor.system_prompt
     # Fall back to domain-specific system prompt
