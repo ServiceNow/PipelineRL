@@ -1,5 +1,3 @@
-"""Dataset loader for the coding domain using PrimeIntellect INTELLECT-3-RL."""
-
 from __future__ import annotations
 
 import json
@@ -40,6 +38,8 @@ class DatasetOptions:
     difficulty_column: str = DEFAULT_DIFFICULTY_COLUMN
     huggingface_token: str | None = None
     seed: int | None = None
+    # Source filtering: None means all sources, or specify e.g. ["primeintellect"]
+    sources: list[str] | None = None
 
 
 def _to_native(value: Any) -> Any:
@@ -81,6 +81,13 @@ def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
     if "seed" in loader_kwargs:
         val = loader_kwargs["seed"]
         options.seed = int(val) if val is not None else None
+    if "sources" in loader_kwargs:
+        val = loader_kwargs["sources"]
+        if val is not None:
+            if isinstance(val, str):
+                options.sources = [val]
+            else:
+                options.sources = list(val)
 
     return options
 
@@ -197,11 +204,6 @@ def _split_dataset(
     dataset: Dataset,
     options: DatasetOptions,
 ) -> Dataset:
-    """Split dataset into train/test subsets.
-
-    INTELLECT-3-RL only has a 'train' split, so we create our own train/test
-    split using a deterministic shuffle.
-    """
     if options.subset not in ("train", "test", "all"):
         logger.warning("Invalid subset '%s', defaulting to 'train'", options.subset)
         options.subset = "train"
@@ -211,16 +213,13 @@ def _split_dataset(
         logger.info("Using all data: %d samples", len(dataset))
         return dataset
 
-    # Use seed 42 for consistent splits across runs
     split_seed = 42
     total = len(dataset)
     indices = list(range(total))
 
-    # Deterministic shuffle
     rng = random.Random(split_seed)
     rng.shuffle(indices)
 
-    # Split indices
     train_end = int(total * options.train_ratio)
 
     if options.subset == "train":
@@ -282,6 +281,34 @@ def _filter_by_difficulty(
     return filtered
 
 
+def _filter_by_source(
+    dataset: Dataset,
+    options: DatasetOptions,
+) -> Dataset:
+    """Filter dataset by source (e.g., primeintellect, lcbv5)."""
+    if options.sources is None:
+        return dataset
+
+    allowed_sources = set(options.sources)
+
+    def matches_source(sample: dict) -> bool:
+        try:
+            info = json.loads(sample.get("info", "{}"))
+            source = info.get("source", "unknown")
+            return source in allowed_sources
+        except json.JSONDecodeError:
+            return False
+
+    filtered = dataset.filter(matches_source)
+    logger.info(
+        "Source filter (sources=%s): %d -> %d samples",
+        options.sources,
+        len(dataset),
+        len(filtered),
+    )
+    return filtered
+
+
 def load_datasets(
     dataset_names: List[str] | str | None = None,
     seed: int | None = None,
@@ -297,6 +324,9 @@ def load_datasets(
     split_dataset = _split_dataset(raw_dataset, options)
 
     filtered_dataset = _filter_by_difficulty(split_dataset, options)
+
+    # Filter by source if specified
+    filtered_dataset = _filter_by_source(filtered_dataset, options)
 
     # Convert to our format
     samples: list[dict] = []
