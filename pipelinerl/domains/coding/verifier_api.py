@@ -1,5 +1,3 @@
-"""Python code verification using mcp-run-python sandbox."""
-
 from __future__ import annotations
 
 import asyncio
@@ -20,9 +18,9 @@ logger = logging.getLogger(__name__)
 
 _CODE_FENCE_RE = re.compile(r"```(?:python|py)?\n([\s\S]*?)```", re.IGNORECASE)
 
-# lazy init Sandbox instance
-_SANDBOX_INSTANCE = None
-_SANDBOX_LOCK = asyncio.Lock()
+# Sandbox pool (lazily initialized)
+_SANDBOX_POOL: "SandboxPool | None" = None
+_SANDBOX_POOL_LOCK = asyncio.Lock()
 
 
 class CodingVerificationRequest(BaseModel):
@@ -115,10 +113,25 @@ def _build_stdin_test_script(user_code: str, stdin_input: str) -> str:
     escaped_input = json.dumps(stdin_input)
     return f'''
 import sys
+import os
 from io import StringIO, BytesIO
 
 # Ensure __name__ == "__main__" so guarded code blocks execute
 __name__ = "__main__"
+
+# Override exit functions to prevent them from killing the sandbox
+class _GracefulExit(Exception):
+    pass
+
+def _safe_exit(code=0):
+    raise _GracefulExit(code)
+
+sys.exit = _safe_exit
+os._exit = _safe_exit
+# Override builtins quit/exit which also raise SystemExit
+import builtins
+builtins.quit = _safe_exit
+builtins.exit = _safe_exit
 
 # Create a stdin wrapper that supports both .read() and .buffer.read()
 class _StdinWrapper:
@@ -145,6 +158,8 @@ sys.stdin = _StdinWrapper({escaped_input})
 
 try:
 {_indent_code(user_code, 4)}
+except (_GracefulExit, SystemExit, KeyboardInterrupt):
+    pass  # Gracefully handle exit calls and interrupts
 finally:
     sys.stdin = _original_stdin
 '''
@@ -154,12 +169,31 @@ def _build_fn_test_script(user_code: str, fn_name: str, args: list) -> str:
     """script that calls a function with given arguments."""
     args_repr = json.dumps(args)
     return f'''
-{user_code}
+import sys
+import os
 
-# Test the function
-_test_args = {args_repr}
-_result = {fn_name}(*_test_args)
-print(_result)
+# Override exit functions to prevent them from killing the sandbox
+class _GracefulExit(Exception):
+    pass
+
+def _safe_exit(code=0):
+    raise _GracefulExit(code)
+
+sys.exit = _safe_exit
+os._exit = _safe_exit
+import builtins
+builtins.quit = _safe_exit
+builtins.exit = _safe_exit
+
+try:
+{_indent_code(user_code, 4)}
+
+    # Test the function
+    _test_args = {args_repr}
+    _result = {fn_name}(*_test_args)
+    print(_result)
+except (_GracefulExit, SystemExit, KeyboardInterrupt):
+    pass  # Gracefully handle exit calls and interrupts
 '''
 
 
@@ -169,98 +203,196 @@ def _indent_code(code: str, spaces: int) -> str:
     return "\n".join(indent + line if line.strip() else line for line in lines)
 
 
-async def _get_sandbox():
-    global _SANDBOX_INSTANCE
-
-    async with _SANDBOX_LOCK:
-        if _SANDBOX_INSTANCE is not None:
-            return _SANDBOX_INSTANCE
-
-        try:
-            from mcp_run_python import code_sandbox
-
-            # Create sandbox context manager and enter it
-            sandbox_cm = code_sandbox()
-            sandbox = await sandbox_cm.__aenter__()
-            _SANDBOX_INSTANCE = (sandbox, sandbox_cm)
-
-            # Warmup execution
-            logger.info("Warming up mcp-run-python sandbox...")
-            await sandbox.eval("print('sandbox ready')")
-            logger.info("Sandbox ready")
-
-            return _SANDBOX_INSTANCE
-        except ImportError:
-            logger.error("mcp-run-python not installed. Install with: pip install mcp-run-python")
-            raise
-        except Exception as e:
-            logger.error("Failed to initialize sandbox: %s", e)
-            raise
+@dataclass
+class _SandboxInstance:
+    sandbox: Any
+    sandbox_cm: Any
+    healthy: bool = True
+    use_count: int = 0
+    last_error: str | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-async def _reset_sandbox():
-    global _SANDBOX_INSTANCE
+class SandboxPool:
+    def __init__(self, size: int = 4):
+        self.size = size
+        self.instances: list[_SandboxInstance | None] = [None] * size
+        self.init_locks: list[asyncio.Lock] = [asyncio.Lock() for _ in range(size)]
+        self._next_idx = 0
+        self._idx_lock = asyncio.Lock()
+        self._respawn_tasks: set[asyncio.Task] = set()
 
-    async with _SANDBOX_LOCK:
-        if _SANDBOX_INSTANCE is not None:
-            sandbox, sandbox_cm = _SANDBOX_INSTANCE
+    async def _create_sandbox(self) -> tuple[Any, Any]:
+        """Create a new sandbox instance."""
+        from mcp_run_python import code_sandbox
+        sandbox_cm = code_sandbox()
+        sandbox = await sandbox_cm.__aenter__()
+        await sandbox.eval("print('sandbox ready')")
+        return sandbox, sandbox_cm
+
+    async def _init_instance(self, idx: int) -> _SandboxInstance:
+        """Initialize or reinitialize a sandbox instance."""
+        async with self.init_locks[idx]:
+            # Check if already initialized
+            if self.instances[idx] is not None and self.instances[idx].healthy:
+                return self.instances[idx]
+
+            # Cleanup old
+            if self.instances[idx] is not None:
+                try:
+                    await self.instances[idx].sandbox_cm.__aexit__(None, None, None)
+                except Exception as e:
+                    logger.debug("Cleanup error for sandbox %d: %s", idx, e)
+
             try:
-                await sandbox_cm.__aexit__(None, None, None)
+                sandbox, sandbox_cm = await self._create_sandbox()
+                self.instances[idx] = _SandboxInstance(
+                    sandbox=sandbox,
+                    sandbox_cm=sandbox_cm,
+                    healthy=True,
+                    use_count=0,
+                )
+                logger.info("Sandbox %d initialized", idx)
+                return self.instances[idx]
             except Exception as e:
-                logger.warning("Error cleaning up sandbox during reset: %s", e)
-            _SANDBOX_INSTANCE = None
+                logger.error("Failed to initialize sandbox %d: %s", idx, e)
+                raise
 
+    async def _get_next_idx(self) -> int:
+        """Get next sandbox index (round-robin)."""
+        async with self._idx_lock:
+            idx = self._next_idx
+            self._next_idx = (self._next_idx + 1) % self.size
+            return idx
 
-async def _run_in_sandbox(code: str, timeout: float = 10.0, retry_on_error: bool = True) -> dict[str, Any]:
-    try:
-        sandbox_tuple = await asyncio.wait_for(_get_sandbox(), timeout=30.0)
-        sandbox = sandbox_tuple[0]
+    async def _respawn_in_background(self, idx: int):
+        """Respawn a failed sandbox in the background."""
+        try:
+            await self._init_instance(idx)
+        except Exception as e:
+            logger.warning("Background respawn of sandbox %d failed: %s", idx, e)
 
-        start = time.perf_counter()
-        result = await asyncio.wait_for(sandbox.eval(code), timeout=timeout)
-        elapsed = time.perf_counter() - start
+    def _schedule_respawn(self, idx: int):
+        """Schedule a background respawn task."""
+        task = asyncio.create_task(self._respawn_in_background(idx))
+        self._respawn_tasks.add(task)
+        task.add_done_callback(self._respawn_tasks.discard)
 
-        # mcp-run-python returns:
-        # - {"status": "success", "output": [...], "return_value": ...} on success
-        # - {"status": "run-error", "output": [...], "error": "..."} on error
-        status = result.get("status", "unknown")
-        # Normalize status: mcp-run-python uses "run-error", we use "error"
-        if status == "run-error":
-            status = "error"
+    async def execute(self, code: str, timeout: float = 10.0) -> dict[str, Any]:
+        """Execute code in an available sandbox."""
+        # sandbox in round-robin order with fallback
+        start_idx = await self._get_next_idx()
 
-        # Capture error message from mcp-run-python's "error" field
-        stderr = result.get("error", "") or ""
+        for attempt in range(self.size):
+            idx = (start_idx + attempt) % self.size
 
+            if self.instances[idx] is None or not self.instances[idx].healthy:
+                try:
+                    await asyncio.wait_for(self._init_instance(idx), timeout=30.0)
+                except Exception:
+                    continue  # next sandbox
+
+            instance = self.instances[idx]
+            if instance is None or not instance.healthy:
+                continue
+
+            # Try to acquire this sandbox
+            try:
+                async with asyncio.timeout(0.1):
+                    await instance.lock.acquire()
+            except asyncio.TimeoutError:
+                continue  # Sandbox busy, try next
+
+            try:
+                start = time.perf_counter()
+                result = await asyncio.wait_for(
+                    instance.sandbox.eval(code),
+                    timeout=timeout
+                )
+                elapsed = time.perf_counter() - start
+                instance.use_count += 1
+
+                status = result.get("status", "unknown")
+                if status == "run-error":
+                    status = "error"
+
+                return {
+                    "status": status,
+                    "stdout": "\n".join(result.get("output", [])),
+                    "stderr": result.get("error", "") or "",
+                    "return_value": result.get("return_value"),
+                    "elapsed": elapsed,
+                    "timeout": False,
+                }
+
+            except asyncio.TimeoutError:
+                return {
+                    "status": "timeout",
+                    "stdout": "",
+                    "stderr": "Execution timed out",
+                    "return_value": None,
+                    "elapsed": timeout,
+                    "timeout": True,
+                }
+
+            except Exception as e:
+                error_msg = str(e) or f"Sandbox error: {type(e).__name__}"
+                logger.warning("Sandbox %d error: %s", idx, error_msg)
+
+                # mark as unhealthy and respawn
+                instance.healthy = False
+                instance.last_error = error_msg
+                self._schedule_respawn(idx)
+
+                # don't fail immediately
+                continue
+
+            finally:
+                instance.lock.release()
+
+        # All sandboxes failed
         return {
-            "status": status,
-            "stdout": "\n".join(result.get("output", [])),
-            "stderr": stderr,
-            "return_value": result.get("return_value"),
-            "elapsed": elapsed,
+            "status": "error",
+            "stdout": "",
+            "stderr": "All sandboxes unavailable",
+            "return_value": None,
+            "elapsed": 0,
             "timeout": False,
         }
-    except asyncio.TimeoutError:
-        return {
-            "status": "timeout",
-            "stdout": "",
-            "stderr": "Execution timed out",
-            "return_value": None,
-            "elapsed": timeout,
-            "timeout": True,
-        }
+
+    async def shutdown(self):
+        # Cancel pending respawn tasks
+        for task in self._respawn_tasks:
+            task.cancel()
+
+        for idx, instance in enumerate(self.instances):
+            if instance is not None:
+                try:
+                    await instance.sandbox_cm.__aexit__(None, None, None)
+                except Exception as e:
+                    logger.debug("Shutdown cleanup error for sandbox %d: %s", idx, e)
+                self.instances[idx] = None
+
+
+async def _get_sandbox_pool(pool_size: int = 4) -> SandboxPool:
+    global _SANDBOX_POOL
+
+    async with _SANDBOX_POOL_LOCK:
+        if _SANDBOX_POOL is not None:
+            return _SANDBOX_POOL
+
+        _SANDBOX_POOL = SandboxPool(size=pool_size)
+        logger.info("Created sandbox pool with %d instances", pool_size)
+        return _SANDBOX_POOL
+
+
+async def _run_in_sandbox(code: str, timeout: float = 10.0, pool_size: int = 4) -> dict[str, Any]:
+    try:
+        pool = await asyncio.wait_for(_get_sandbox_pool(pool_size), timeout=5.0)
+        return await pool.execute(code, timeout=timeout)
     except Exception as e:
-        error_msg = str(e) or f"Sandbox error: {type(e).__name__}"
-        logger.warning("Sandbox execution error: %s (%s)", error_msg, type(e).__name__)
-
-        # Try to reset and retry once if this looks like a sandbox crash
-        if retry_on_error:
-            logger.info("Attempting sandbox reset and retry...")
-            try:
-                await _reset_sandbox()
-                return await _run_in_sandbox(code, timeout=timeout, retry_on_error=False)
-            except Exception as retry_e:
-                error_msg = f"Retry failed: {retry_e}" if str(retry_e) else f"Retry failed: {type(retry_e).__name__}"
-
+        error_msg = str(e) or f"Pool error: {type(e).__name__}"
+        logger.error("Sandbox pool error: %s", error_msg)
         return {
             "status": "error",
             "stdout": "",
@@ -278,6 +410,7 @@ async def evaluate_coding_prediction_async(
     extra_info: dict[str, Any] | str | None = None,
     timeout_per_test: float = 5.0,
     max_tests: int = 15,
+    pool_size: int = 4,
 ) -> CodingVerificationSummary:
     context = _ensure_dict(reward_context)
     summary = CodingVerificationSummary(
@@ -319,7 +452,7 @@ async def evaluate_coding_prediction_async(
             script = _build_stdin_test_script(candidate_code, str(test_input))
             expected_str = _normalize_output(str(expected_output))
 
-        result = await _run_in_sandbox(script, timeout=timeout_per_test)
+        result = await _run_in_sandbox(script, timeout=timeout_per_test, pool_size=pool_size)
 
         if result["timeout"]:
             status = "timeout"
@@ -369,6 +502,7 @@ def evaluate_coding_prediction(
     extra_info: dict[str, Any] | str | None = None,
     timeout_per_test: float = 5.0,
     max_tests: int = 15,
+    pool_size: int = 4,
 ) -> CodingVerificationSummary:
     return asyncio.run(
         evaluate_coding_prediction_async(
@@ -377,6 +511,7 @@ def evaluate_coding_prediction(
             extra_info=extra_info,
             timeout_per_test=timeout_per_test,
             max_tests=max_tests,
+            pool_size=pool_size,
         )
     )
 
@@ -464,13 +599,12 @@ class CodingSandboxEnvironment:
 
 
 async def cleanup_sandbox():
-    global _SANDBOX_INSTANCE
+    global _SANDBOX_POOL
 
-    async with _SANDBOX_LOCK:
-        if _SANDBOX_INSTANCE is not None:
-            sandbox, sandbox_cm = _SANDBOX_INSTANCE
+    async with _SANDBOX_POOL_LOCK:
+        if _SANDBOX_POOL is not None:
             try:
-                await sandbox_cm.__aexit__(None, None, None)
+                await _SANDBOX_POOL.shutdown()
             except Exception as e:
-                logger.warning("Error cleaning up sandbox: %s", e)
-            _SANDBOX_INSTANCE = None
+                logger.warning("Error cleaning up sandbox pool: %s", e)
+            _SANDBOX_POOL = None
