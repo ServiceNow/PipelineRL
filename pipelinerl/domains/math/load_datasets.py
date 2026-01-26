@@ -53,7 +53,10 @@ def process_math(dataset, dataset_name):
         if "subject" in item and "type" not in item:
             item["type"] = item["subject"]
         if "answer" in item:
-            answer = "\\boxed{" + item["answer"] + "}"
+            answer = item["answer"]
+            # Only box if not already boxed
+            if not answer.startswith("\\boxed{"):
+                answer = "\\boxed{" + answer + "}"
         elif "solution" in item:
             answer = item["solution"]
         else:
@@ -286,6 +289,49 @@ def _load_custom_dataset(dataset_name: str) -> list[dict]:
     return samples
 
 
+def _is_hf_dataset_path(name: str) -> bool:
+    """
+    Check if a name looks like a HuggingFace dataset path (format: "org/dataset-name").
+
+    Returns False for local file paths (multiple slashes, file extensions like .jsonl).
+    """
+    if "/" not in name:
+        return False
+    # Local paths typically have multiple slashes or file extensions
+    if name.count("/") > 1:
+        return False
+    if name.endswith(".jsonl") or name.endswith(".json"):
+        return False
+    # Check both parts are non-empty
+    parts = name.split("/")
+    return len(parts) == 2 and all(parts)
+
+
+# HuggingFace datasets that have custom loaders in load_datasets()
+_PREDEFINED_HF_DATASETS = {
+    "PRIME-RL/Eurus-2-RL-Data",
+    "agentica-org/DeepScaleR-Preview-Dataset",
+    "reliable-agents/Omni-MATH-500",
+    "HuggingFaceH4/MATH-500",
+    "open-r1/OpenR1-Math-220k",
+    "hendrydong/gpqa_main",
+    "hendrydong/gpqa_diamond",
+    "GAIR/LIMO",
+}
+
+
+def _load_hf_dataset(dataset_name: str) -> list[dict]:
+    """
+    Load a HuggingFace dataset by its path (format: "org/dataset-name").
+
+    Uses process_math to extract samples from the dataset.
+    """
+    dataset = load_dataset(dataset_name, split="train", trust_remote_code=True)
+    samples = [s for s in process_math(dataset, dataset_name) if s is not None]
+    logger.info(f"Loading {dataset_name} dataset: {len(samples)} samples")
+    return add_ids(samples)
+
+
 def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None) -> List[Tuple[str, Dict]]:
     if dataset_names is None:
         return []
@@ -476,14 +522,6 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
         datasets += _load_amc_dataset(2023)
         remaining.discard("amc_2023_original")
 
-    if "sometimes_success_data" in dataset_names:
-        PATH = "data/sometimes_success_data/data.jsonl"
-        with open(PATH, "r") as f:
-            samples = [json.loads(line) for line in f]
-        logger.info(f"Loading easy data dataset: {len(samples)} samples")
-        datasets += add_ids(samples)
-        remaining.discard("sometimes_success_data")
-
     if "open_reasoner_zero_57k" in dataset_names:
         dataset = load_dataset(
             "json",
@@ -520,57 +558,11 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
         datasets += add_ids(samples)
         remaining.discard("open_reasoner_zero_hard_13k")
 
-    for dataset_name in dataset_names:
-        test_matched = re.match(r"multiplication_(\d+)_by_(\d+)_(\d+)_test", dataset_name)
-        train_matched = re.match(r"multiplication(_upto)?_(\d+)_by_(\d+)_(\d+)_train", dataset_name)
-        if test_matched:
-            num_digits_1 = int(test_matched.group(1))
-            num_digits_2 = int(test_matched.group(2))
-            num_samples = int(test_matched.group(3))
-            dataset = load_dataset(
-                "json",
-                data_files=f"data/ehsan_kamalloo/multiplication/multiplication_{num_digits_1}_by_{num_digits_2}_{num_samples}_test.jsonl",
-                split="train",
-            )
-            samples = [
-                s
-                for s in process_math(dataset, f"multiplication_{num_digits_1}_by_{num_digits_2}_{num_samples}_test")
-                if s is not None
-            ]
-            logger.info(f"Loading multiplication {num_digits_1}_by_{num_digits_2} dataset: {len(samples)} samples")
-            datasets += add_ids(samples)
+    # Load any HuggingFace dataset (format: "org/dataset-name") not already handled above
+    for dataset_name in list(remaining):
+        if _is_hf_dataset_path(dataset_name) and dataset_name not in _PREDEFINED_HF_DATASETS:
+            datasets += _load_hf_dataset(dataset_name)
             remaining.discard(dataset_name)
-        elif train_matched:
-            upto_prefix = train_matched.group(1) or ""
-            num_digits_1 = int(train_matched.group(2))
-            num_digits_2 = int(train_matched.group(3))
-            num_samples = int(train_matched.group(4))
-            dataset = load_dataset(
-                "json",
-                data_files=f"data/ehsan_kamalloo/multiplication/multiplication{upto_prefix}_{num_digits_1}_by_{num_digits_2}_{num_samples}_train.jsonl",
-                split="train",
-            )
-            samples = [
-                s
-                for s in process_math(
-                    dataset, f"multiplication{upto_prefix}_{num_digits_1}_by_{num_digits_2}_{num_samples}_train"
-                )
-                if s is not None
-            ]
-            logger.info(
-                f"Loading multiplication {upto_prefix}_{num_digits_1}_by_{num_digits_2} dataset: {len(samples)} samples"
-            )
-            datasets += add_ids(samples)
-            remaining.discard(dataset_name)
-
-    if "countdown" in dataset_names:
-        dataset = load_dataset(
-            "parquet", data_files="data/xiaoyin/train.parquet", trust_remote_code=True, split="train"
-        )
-        samples = [s for s in process_countdown(dataset) if s is not None]
-        logger.info(f"Loading countdown dataset: {len(samples)} samples")
-        datasets += samples
-        remaining.discard("countdown")
 
     # resolve any remaining names as local custom datasets.
     unresolved: List[str] = []
