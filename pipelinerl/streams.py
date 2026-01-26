@@ -110,7 +110,7 @@ def connect_to_redis(config: RedisConfig):
             logger.debug(f"Trying to connect to Redis server at {config.host}:{config.port}")
             client = redis.Redis(host=config.host, port=config.port)
             client.ping()
-            logger.info(f"Connected to Redis server")
+            logger.debug("Connected to Redis server")
             return client
         except (redis.exceptions.TimeoutError, redis.ConnectionError) as e:
             logger.warning(f"Waiting for Redis server ({type(e)}). Retrying in 5 seconds.")
@@ -118,8 +118,15 @@ def connect_to_redis(config: RedisConfig):
 
 
 class RedisStreamWriter(StreamWriter):
-    def __init__(self, stream: SingleStreamSpec, mode: Literal["w", "a"] = "a"):
+    def __init__(self, stream: SingleStreamSpec, mode: Literal["w", "a"] = "a", max_stream_size: int = 1000000):
+        """
+        Args:
+            stream: The stream specification
+            mode: Write mode - 'w' for write (new stream) or 'a' for append
+            max_stream_size: Maximum number of entries to retain in the stream (Redis only)
+        """
         self.stream = stream
+        self.max_stream_size = max_stream_size
         assert isinstance(_backend, RedisConfig)
         self._stream_name = str(self.stream)
         self._redis = connect_to_redis(_backend)
@@ -155,7 +162,7 @@ class RedisStreamWriter(StreamWriter):
         if isinstance(data, BaseModel):
             data = data.model_dump()
         data = pickle.dumps(data)
-        self._redis.xadd(self._stream_name, {"index": self._index, "data": data}, maxlen=1000000, approximate=True)
+        self._redis.xadd(self._stream_name, {"index": self._index, "data": data}, maxlen=self.max_stream_size, approximate=True)
         self._index += 1
 
 
@@ -195,7 +202,13 @@ class RedisStreamReader(StreamReader):
 class RoundRobinRedisStreamWriter(StreamWriter):
     # TODO: share the connection across writers
 
-    def __init__(self, streams: StreamRangeSpec, mode: Literal["w", "a"] = "a"):
+    def __init__(self, streams: StreamRangeSpec, mode: Literal["w", "a"] = "a", max_stream_size: int = 1000000):
+        """
+        Args:
+            streams: The stream range specification
+            mode: Write mode - 'w' for write (new stream) or 'a' for append
+            max_stream_size: Maximum number of entries to retain in the stream (Redis only)
+        """
         self.streams = streams
         self._next_stream = 0
         self._writers = [
@@ -207,6 +220,7 @@ class RoundRobinRedisStreamWriter(StreamWriter):
                     partition=i,
                 ),
                 mode=mode,
+                max_stream_size=max_stream_size,
             )
             for i in range(*self.streams.partition_range)
         ]
@@ -400,16 +414,23 @@ def read_stream(stream: SingleStreamSpec) -> StreamReader:
         assert False
 
 
-def write_to_streams(streams: StreamSpec, mode: Literal["w", "a"] = "a") -> StreamWriter:
-    """Append to the end of the stream."""
+def write_to_streams(streams: StreamSpec, mode: Literal["w", "a"] = "a", max_stream_size: int = 1000000) -> StreamWriter:
+    """
+    Append to the end of the stream.
+
+    Args:
+        streams: The stream specification
+        mode: Write mode - 'w' for write (new stream) or 'a' for append
+        max_stream_size: Maximum number of entries to retain in the stream (Redis only)
+    """
     raise_if_backend_not_set()
     if not isinstance(streams, (SingleStreamSpec, StreamRangeSpec)):
         raise ValueError(f"Invalid stream spec: {streams}")
     if isinstance(_backend, RedisConfig):
         if isinstance(streams, SingleStreamSpec):
-            return RedisStreamWriter(streams, mode)
+            return RedisStreamWriter(streams, mode, max_stream_size)
         elif isinstance(streams, StreamRangeSpec):
-            return RoundRobinRedisStreamWriter(streams, mode)
+            return RoundRobinRedisStreamWriter(streams, mode, max_stream_size)
         else:
             assert False
     elif _backend == "files":

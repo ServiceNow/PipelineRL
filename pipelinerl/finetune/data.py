@@ -15,6 +15,7 @@ import os
 
 from pipelinerl.finetune.utils import create_sentinel_example
 from pipelinerl.rollouts import TrainingText
+from pipelinerl.vision_processor_utils import collate_visual_features
 
 from .context import get_accelerator, logger
 from .rl import RL_DATA_COLUMNS, prepare_rl_fields
@@ -172,17 +173,13 @@ def collate(
     if seq_length % pad_to_multiple_of:
         seq_length += pad_to_multiple_of - (seq_length % pad_to_multiple_of)
     result = {}
-    
-    # Visual feature fields that should be stacked, not padded
-    if "visual_features" in example_dict and isinstance(example_dict["visual_features"][0], dict):
-        for k, seq_list in example_dict["visual_features"][0].items():
-            if k == "image_grid_thw":
-                # image_grid_thw should remain as a list
-                result[k] = seq_list
-            else:
-                # Other visual fields like pixel_values can be stacked as tensors
-                valid_tensors = [torch.tensor(seq) for seq in seq_list]
-                result[k] = torch.stack(valid_tensors)
+
+    # Handle visual features with dynamic batching
+    if "visual_features" in example_dict:
+        visual_features_list = example_dict["visual_features"]
+        batched_visual_features = collate_visual_features(visual_features_list)
+        if batched_visual_features:
+            result["visual_features"] = batched_visual_features
     
     for k, seq_list in example_dict.items():
         if k == "model_version":

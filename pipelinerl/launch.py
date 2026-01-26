@@ -56,12 +56,8 @@ def validate_config(cfg: DictConfig):
     
     # Check for vision language model constraints
     if cfg.finetune.model_class == "vision2seq-language-modeling":
-        if "Qwen2.5-VL" not in cfg.model_path:
-            raise ValueError("Only Qwen2.5-VL models are supported for vision language modeling")
         if cfg.finetune.seq_packing:
             raise ValueError("Vision language models cannot use sequence packing (seq_packing must be false)")
-        if cfg.finetune.train_batch_size > 1:
-            raise ValueError("Vision language models cannot use batch size > 1 (train_batch_size must be 1)")
     
     if cfg.finetune.seq_parallel > 1:
         if not cfg.finetune.seq_packing:
@@ -132,7 +128,7 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     os.makedirs(log_dir, exist_ok=True)
 
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "vllm.entrypoints.openai.api_server",
         "--model",
@@ -187,7 +183,7 @@ def run_actor_llm(
         "pipelinerl.entrypoints.run_vllm0"
     )
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         entrypoint,
         "--model",
@@ -240,7 +236,7 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 actor yet")
     llm_urls = "+".join(world_map.get_actor_urls())
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_actor",
         "--config-dir",
@@ -265,7 +261,7 @@ def run_environment(cfg: DictConfig, job: Job):
     # run in a subprocess like in the rest of the code
     run_dir = Path(cfg.output_dir) / f"environment_{job.replica_idx}"
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_environment",
         "--config-dir",
@@ -296,7 +292,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     if cfg.use_fsdp and cfg.use_deepspeed:
         raise ValueError("Cannot use both FSDP and DeepSpeed")
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "accelerate.commands.launch",
     ]
@@ -393,7 +389,7 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 preprocessor yet")
     llm_urls = "+".join(world_map.get_preprocessor_urls())
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_preprocess",
         "--config-dir",
@@ -544,6 +540,7 @@ def debug_link_streams(cfg: DictConfig, topics: list[str]):
     if not cfg.debug.streams_from:
         raise ValueError("Need to specify streams_from for debug mode")
     stream_dir = Path(cfg.output_dir) / "streams"
+    stream_dir.mkdir(parents=True, exist_ok=True)
     for topic in topics:
         source_topic_dir = Path(cfg.debug.streams_from) / "streams" / topic
         target_topic_dir = stream_dir / topic

@@ -419,6 +419,7 @@ def run_preprocessing_loop(
             model_name=cfg.finetune.config_name,
             tokenizer_name=cfg.finetune.config_name,
             parameters=cfg.llm.parameters,
+            mm_processor_kwargs=cfg.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]
@@ -462,7 +463,8 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
-    with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    max_stream_size = cfg.preprocess.max_stream_size
+    with write_to_streams(output_stream, max_stream_size=max_stream_size) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
