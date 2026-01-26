@@ -15,6 +15,7 @@ import os
 
 from pipelinerl.finetune.utils import create_sentinel_example
 from pipelinerl.rollouts import TrainingText
+from pipelinerl.vision_processor_utils import collate_visual_features
 
 from .context import get_accelerator, logger
 from .rl import RL_DATA_COLUMNS, prepare_rl_fields
@@ -176,37 +177,9 @@ def collate(
     # Handle visual features with dynamic batching
     if "visual_features" in example_dict:
         visual_features_list = example_dict["visual_features"]
-
-        if visual_features_list and visual_features_list[0] is not None:
-            first_vf = visual_features_list[0]
-
-            for key in first_vf.keys():
-                if key == "image_grid_thw":
-                    # Concatenate all image_grid_thw arrays into a single tensor
-                    # Each sample has shape (num_images, 3), concatenate along image dimension
-                    all_grids = [torch.as_tensor(vf[key]) for vf in visual_features_list]
-                    result[key] = torch.cat(all_grids, dim=0)
-                else:
-                    # Convert to torch tensors (zero-copy for numpy arrays)
-                    all_tensors = [torch.as_tensor(vf[key]) for vf in visual_features_list]
-
-                    # Find max number of images in this batch
-                    max_num_images = max(t.shape[0] for t in all_tensors)
-
-                    # Get shape of single image: (C, H, W)
-                    single_shape = all_tensors[0].shape[1:]
-                    dtype = all_tensors[0].dtype
-
-                    # Pre-allocate batch tensor: (batch_size, max_num_images, C, H, W)
-                    batch_shape = (len(all_tensors), max_num_images) + single_shape
-                    batched = torch.zeros(batch_shape, dtype=dtype)
-
-                    # Fill in actual data (padding is already zeros)
-                    for i, tensor in enumerate(all_tensors):
-                        num_images = tensor.shape[0]
-                        batched[i, :num_images] = tensor
-
-                    result[key] = batched
+        batched_visual_features = collate_visual_features(visual_features_list)
+        if batched_visual_features:
+            result["visual_features"] = batched_visual_features
     
     for k, seq_list in example_dict.items():
         if k == "model_version":

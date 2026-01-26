@@ -403,6 +403,7 @@ class TrainableLLM(LLM):
     max_parallel_requests: int = 32
     max_retries: int = 5
     base_delay: float = 0.5
+    mm_processor_kwargs: dict = Field(default_factory=dict)
     _semaphore: asyncio.Semaphore
 
     def model_post_init(self, __context):

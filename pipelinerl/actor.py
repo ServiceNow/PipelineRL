@@ -622,6 +622,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
+            mm_processor_kwargs=cfg.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]
@@ -632,6 +633,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
+            mm_processor_kwargs=cfg.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]

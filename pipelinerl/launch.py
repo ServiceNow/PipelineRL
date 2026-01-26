@@ -56,8 +56,6 @@ def validate_config(cfg: DictConfig):
     
     # Check for vision language model constraints
     if cfg.finetune.model_class == "vision2seq-language-modeling":
-        if "Qwen2.5-VL" not in cfg.model_path:
-            raise ValueError("Only Qwen2.5-VL models are supported for vision language modeling")
         if cfg.finetune.seq_packing:
             raise ValueError("Vision language models cannot use sequence packing (seq_packing must be false)")
     

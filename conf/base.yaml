@@ -91,6 +91,9 @@ eval_every_n_versions: 78000
 # changed
 model_path: Qwen/Qwen2.5-7B
 
+# Processor configuration for vision-language models (multimodal)
+mm_processor_kwargs: {}
+
 # will use default based on the chosen backend
 accelerate_config: null
 use_deepspeed: true

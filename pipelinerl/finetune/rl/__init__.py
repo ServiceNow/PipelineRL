@@ -190,13 +190,12 @@ def rl_step(
     }
     if batch.is_packed:
         model_inputs["position_ids"] = batch.position_ids
-    
+
     # Add visual features if present (for multimodal models)
-    if hasattr(batch, 'pixel_values') and batch.pixel_values is not None:
-        model_inputs["pixel_values"] = batch.pixel_values
-    if hasattr(batch, 'image_grid_thw') and batch.image_grid_thw is not None:
-        model_inputs["image_grid_thw"] = batch.image_grid_thw #torch.tensor(.reshape((1, 3))
-    
+    # Unpack all visual features from the dict (e.g., pixel_values, image_grid_thw, image_sizes)
+    if hasattr(batch, 'visual_features') and batch.visual_features is not None:
+        model_inputs.update(batch.visual_features)
+
     outputs = model(**model_inputs)
 
     # compute log probs and entropy

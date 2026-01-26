@@ -8,8 +8,9 @@ finetune:
   seq_length: 8000
   gradient_accumulation_passes: 512
   seq_packing: false
-  epsilon_high: 4.0
-  epsilon_low: 0.0
+  rl:
+    epsilon_high: 4.0
+    epsilon_low: 0.0
 
 llm:
   parameters:
@@ -48,6 +49,14 @@ test_dataset_names:
 
 # Use vision-language model for multimodal support
 model_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+eval_every_n_versions: 12500
+
+# Processor configuration for vision-language models (shared between training and inference)
+mm_processor_kwargs:
+  min_pixels: 784  # 28*28
+  max_pixels: 1003520  # 1280*28*28
+  use_fast: true
 
 # Override vLLM config for multimodal support
 vllm_config:
