@@ -160,17 +160,16 @@ def preprocess_dataset(
     try:
         dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
     except Exception as e:
-        logger.exception(
-            "Error in populate_rl_data: {}".format({
-                "Data": data,
-                "Dataset": dataset,
-                "Tokenizer eos_token_id": tokenizer.eos_token_id,
-                "RL config": rl_config,
-                "LLM": llm,
-                "Seq length": seq_length,
-            }), 
-        )
-        raise e
+        logger.error(f"Error in populate_rl_data: {e}", extra={
+            "data": data,
+            "dataset": dataset,
+            "tokenizer": tokenizer,
+            "eos_token_id": tokenizer.eos_token_id,
+            "rl_config": rl_config,
+            "llm": llm,
+            "seq_length": seq_length,
+        })
+        raise
     return dataset
 
 

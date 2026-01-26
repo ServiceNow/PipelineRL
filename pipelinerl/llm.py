@@ -21,44 +21,11 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field, TypeAdapter
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from pipelinerl.rollouts import TrainingText
+
 logger = logging.getLogger(__name__)
 
 PIPELINERL_LLM_TOKEN = "PIPELINERL_LLM_TOKEN"
-
-class TrainingText(BaseModel):
-    """
-    Training text instance used to finetune a language model.
-
-    Attributes:
-        text (str): The full text of the training instance.
-        n_predicted (int): The number of predicted characters in the text.
-        reward (float): The reward associated with the training instance. Defaults to 0.0.
-        logprobs (List[float]): A list of log probabilities of the completion tokens from the assistant model.
-        ref_logprobs (List[float]): A list of reference log probabilities of the completion tokens from the reference model.
-        input_ids (List[int]): The tokenized input ids of the text.
-        labels (List[int]): The tokenized labels of the text (i.e., masked token ids for the prompt and regular token ids for the prediction).
-        group_id (str, optional): ID of the group. It is used by the RL finetuning script to normalize rewards.
-        prompt_text (str): Portion of the text that serves as the prompt (i.e., the text excluding the predicted characters).
-        output_text (str): Portion of the text that represents the predicted output (i.e., the last n_predicted characters).
-    """
-
-    text: str
-    n_predicted: int
-    reward: float = 0.0
-    logprobs: list[float] = Field(default_factory=list)
-    ref_logprobs: list[float] = Field(default_factory=list)
-    input_ids: list[int] = Field(default_factory=list)
-    labels: list[int] = Field(default_factory=list)
-    group_id: str | None = None
-    metadata: dict = Field(default_factory=dict)
-
-    @property
-    def prompt_text(self) -> str:
-        return self.text[: -self.n_predicted]
-
-    @property
-    def output_text(self) -> str:
-        return self.text[-self.n_predicted :]
 
 
 class Prompt(BaseModel):

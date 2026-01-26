@@ -1,0 +1,16 @@
+defaults:
+  - miniwob
+  - _self_
+
+train_dataset_names:
+  - uic_train
+test_dataset_names:
+  - uic_train_train_heldout_goals
+  - uic_test
+
+reward_computation: uic
+
+finetune:
+  gradient_accumulation_passes: 512
+
+eval_every_n_versions: 5120  # 512 effective bs * 10 "optim steps"
