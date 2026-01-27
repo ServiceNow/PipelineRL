@@ -156,29 +156,12 @@ def load_math(split):
     return datasets.Dataset.from_list(data)
 
 
-def _load_aime_2025_opencompass_dataset(upsample_factor: int = 0) -> list[dict]:
-    configs = ["AIME2025-I", "AIME2025-II"]
-    dataset_name = "aime_2025" + ("" if upsample_factor > 0 else "_original")
-
-    samples: list[dict] = []
-    for config_name in configs:
-        ds = load_dataset("opencompass/AIME2025", config_name, split="test")
-        samples.extend([s for s in process_math(ds, dataset_name) if s is not None])
-
-    original_size = len(samples)
-    if upsample_factor > 0:
-        samples *= upsample_factor
-
-    logger.info(
-        f"Loading aime 2025 (OpenCompass) dataset: {len(samples)} samples"
-        + (f" (upsampled from {original_size})" if upsample_factor > 0 else "")
-    )
-    return add_ids(samples)
-
-
 def _load_aime_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
-    aime_dataset = load_dataset("AI-MO/aimo-validation-aime", split="train", trust_remote_code=True)
-    aime_dataset = aime_dataset.filter(lambda x: str(year) in x["url"])
+    if year == 2025:
+        aime_dataset = load_dataset("MathArena/aime_2025", split="train", trust_remote_code=True)
+    else:
+        aime_dataset = load_dataset("AI-MO/aimo-validation-aime", split="train", trust_remote_code=True)
+        aime_dataset = aime_dataset.filter(lambda x: str(year) in x["url"])
 
     dataset_name = f"aime_{year}" + ("" if upsample_factor > 0 else "_original")
     samples = [s for s in process_aime_and_amc(aime_dataset, dataset_name) if s is not None]
@@ -498,11 +481,11 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
         remaining.discard("aime_2024_original")
 
     if "aime_2025" in dataset_names:
-        datasets += _load_aime_2025_opencompass_dataset(upsample_factor=16)
+        datasets += _load_aime_dataset(2025, upsample_factor=16)
         remaining.discard("aime_2025")
 
     if "aime_2025_original" in dataset_names:
-        datasets += _load_aime_2025_opencompass_dataset()
+        datasets += _load_aime_dataset(2025)
         remaining.discard("aime_2025_original")
 
     if "amc_2022" in dataset_names:
