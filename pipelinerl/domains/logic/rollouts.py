@@ -1,9 +1,6 @@
-"""Rollout generation for the logic domain.
+"""Rollout generation for the logic domain."""
 
-Supports both local (in-process) verification using i3-logic verifiers
-and RPC-based verification via a remote LogicEnvironment server.
-"""
-
+import logging
 import random
 import time
 
@@ -14,47 +11,16 @@ from pipelinerl.async_llm import llm_async_generate, make_training_text
 from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.utils import get_environment_jobs, resolve_environment_key
-from pipelinerl.domains.math.rollouts import RewardTable
+from pipelinerl.domains.math.rollouts import RewardTable, length_penalty
 
-from .verifier_api import verify_logic_answer, verify_logic_answer_rpc, VerificationResult
+from .verifier_api import verify_answer_rpc
+
+logger = logging.getLogger(__name__)
 
 
 class Metrics(BaseMetrics):
     """Metrics for logic domain rollouts."""
     pass
-
-
-async def _run_verification(
-    cfg: DictConfig,
-    session: aiohttp.ClientSession,
-    prediction: str,
-    reward_context: dict,
-) -> VerificationResult:
-    """Run verification either locally (in-process) or via RPC.
-
-    If cfg.actor.use_local_logic_verifier is True (default), uses i3-logic directly.
-    Otherwise, sends verification request to a remote LogicEnvironment server.
-    """
-    use_local = getattr(cfg.actor, "use_local_logic_verifier", True)
-
-    if use_local:
-        return verify_logic_answer(prediction, reward_context)
-
-    # Fall back to RPC-based verification
-    env_key = resolve_environment_key(cfg, default="logic")
-    env_jobs = get_environment_jobs(cfg, env_key)
-    if not env_jobs:
-        raise RuntimeError("No logic environment servers registered and use_local_logic_verifier=False")
-    env_job = random.choice(env_jobs)
-    if env_job.hostname is None or env_job.port is None:
-        raise RuntimeError("Logic environment job is missing host/port information")
-    return await verify_logic_answer_rpc(
-        session,
-        host=env_job.hostname,
-        port=env_job.port,
-        prediction=prediction,
-        reward_context=reward_context,
-    )
 
 
 async def generate_logic_rollout(
@@ -63,24 +29,11 @@ async def generate_logic_rollout(
     problem: dict,
     session: aiohttp.ClientSession,
 ) -> RolloutResult:
-    """Generate a rollout for a logic problem.
-
-    Supports both local verification (default) and RPC-based verification.
-    Set cfg.actor.use_local_logic_verifier=False to use remote LogicEnvironment.
-    """
+    """Generate a rollout for a logic problem."""
     # Build prompt
     messages = []
-
-    # Use domain-specific system prompt if available
-    system_prompt = cfg.actor.system_prompt
-    if not system_prompt:
-        domain_prompts = getattr(cfg.actor, "domain_system_prompts", None)
-        if domain_prompts:
-            system_prompt = getattr(domain_prompts, "logic", "")
-
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-
+    if cfg.actor.system_prompt:
+        messages.append({"role": "system", "content": cfg.actor.system_prompt})
     messages.append({
         "role": "user",
         "content": cfg.actor.task_template.format(task=problem["task"])
@@ -95,13 +48,21 @@ async def generate_logic_rollout(
     assert llm_call.output.content is not None
 
     # Get reward configuration
-    rewards = RewardTable(**dict(cfg.get("rewards", {})))
-    discount_factor = getattr(cfg.actor, "discount_factor", 1.0)
+    rewards = RewardTable(**dict(cfg.rewards))
+    discount_factor = cfg.actor.discount_factor
 
-    # Verify answer (local or RPC based on config)
-    verification = await _run_verification(
-        cfg,
-        session,
+    # Verify answer via RPC
+    env_key = resolve_environment_key(cfg, default="logic")
+    env_jobs = get_environment_jobs(cfg, env_key)
+    if not env_jobs:
+        raise RuntimeError("No environment servers available for logic domain")
+    env_job = random.choice(env_jobs)
+    assert env_job.port is not None
+
+    answer_status = await verify_answer_rpc(
+        session=session,
+        host=env_job.hostname,
+        port=env_job.port,
         prediction=llm_call.output.content,
         reward_context=problem.get("reward_context", {}),
     )
@@ -109,8 +70,6 @@ async def generate_logic_rollout(
     trace = make_training_text(llm, llm_call)
 
     # Determine reward based on answer status and finished state
-    # Note: "error" status maps to "unparsable" in the shared RewardTable
-    answer_status = verification.status
     match (answer_status, trace.finished):
         case ("wrong", False):
             reward = rewards.wrong_answer_not_finished
@@ -120,25 +79,31 @@ async def generate_logic_rollout(
             reward = rewards.no_answer_not_finished
         case ("no_answer", True):
             reward = rewards.no_answer_finished
-        case ("error", False):
+        case ("unparsable", False):
             reward = rewards.unparsable_not_finished
-        case ("error", True):
+        case ("unparsable", True):
             reward = rewards.unparsable_finished
         case ("correct", False):
             reward = rewards.correct_answer_not_finished
         case ("correct", True):
             reward = rewards.correct_answer_finished
         case _:
-            reward = rewards.unparsable_finished if trace.finished else rewards.unparsable_not_finished
+            raise ValueError(f"Invalid answer_status/finished combination: {answer_status}/{trace.finished}")
 
     # Apply discount factor based on output length
     reward *= discount_factor ** llm_call.output_length_tokens
+    if rewards.buffer_tokens and llm.parameters.get("max_tokens") is not None:
+        reward += length_penalty(
+            llm.parameters["max_tokens"],
+            llm_call.output_length_tokens,
+            rewards.buffer_tokens,
+        )
     trace.reward = reward
 
     metrics = Metrics(
         reward=reward,
         success=answer_status == "correct",
-        no_error=answer_status not in ("error",),
+        no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
     )
 
