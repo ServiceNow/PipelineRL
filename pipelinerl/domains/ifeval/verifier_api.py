@@ -1,190 +1,182 @@
 """IFEval instruction following verification.
 
-Uses the instruction_following_eval package for verification.
-Install with: pip install git+https://github.com/josejg/instruction_following_eval.git
+Uses AllenAI's IFEvalG module which supports 67 constraint types.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Any
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+
+import aiohttp
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
 # Lazy import to avoid dependency issues
 _IFEVAL_LOADED = False
-_test_instruction_following = None
-_InputExample = None
+_INSTRUCTION_DICT = None
 
 
 def _lazy_import_ifeval():
-    """Lazily import instruction_following_eval to avoid import overhead."""
-    global _IFEVAL_LOADED, _test_instruction_following, _InputExample
+    global _IFEVAL_LOADED, _INSTRUCTION_DICT
 
     if _IFEVAL_LOADED:
         return True
 
     try:
-        from instruction_following_eval.evaluation import test_instruction_following
-        from instruction_following_eval.evaluation import InputExample
+        from pipelinerl.domains.ifeval.ifevalg.instructions_registry import INSTRUCTION_DICT
 
-        _test_instruction_following = test_instruction_following
-        _InputExample = InputExample
+        _INSTRUCTION_DICT = INSTRUCTION_DICT
         _IFEVAL_LOADED = True
-        logger.info("instruction_following_eval loaded successfully")
+        logger.info("IFEvalG loaded successfully (%d constraint types)", len(INSTRUCTION_DICT))
         return True
     except ImportError as e:
-        logger.error(
-            "Failed to import instruction_following_eval: %s. "
-            "Install with: pip install git+https://github.com/josejg/instruction_following_eval.git",
-            e,
-        )
+        logger.error("Failed to import IFEvalG: %s", e)
         return False
 
 
-@dataclass
-class IFEvalVerificationResult:
-    """Result of IFEval instruction verification."""
+def _check_single_instruction(instruction_id: str, kwargs: dict, response: str) -> bool:
+    if instruction_id not in _INSTRUCTION_DICT:
+        logger.warning("Unknown instruction ID: %s", instruction_id)
+        return False
 
-    followed_all: bool
-    followed_count: int
-    total_count: int
-    instruction_results: list[bool]
-    error: str | None = None
+    try:
+        instruction_class = _INSTRUCTION_DICT[instruction_id]
+        instruction = instruction_class(instruction_id)
 
-    @property
-    def score(self) -> float:
-        """Return fraction of instructions followed."""
-        if self.total_count == 0:
-            return 0.0
-        return self.followed_count / self.total_count
+        if kwargs:
+            instruction.build_description(**kwargs)
+        else:
+            instruction.build_description()
 
-    def to_dict(self) -> dict[str, Any]:
+        result = instruction.check_following(response)
+        return bool(result) if result is not None else False
+
+    except Exception as e:
+        logger.debug("Error checking instruction %s: %s", instruction_id, e)
+        return False
+
+
+def verify_answer(prediction: str, reward_context: dict) -> dict:
+    instruction_id_list = reward_context.get("instruction_id_list", [])
+    kwargs_list = reward_context.get("kwargs", [])
+
+    if not instruction_id_list:
         return {
-            "followed_all": self.followed_all,
-            "followed_count": self.followed_count,
-            "total_count": self.total_count,
-            "instruction_results": self.instruction_results,
-            "score": self.score,
-            "error": self.error,
+            "answer_status": "correct",
+            "followed_count": 0,
+            "total_count": 0,
+            "score": 1.0,
         }
 
-
-def verify_ifeval_response(
-    response: str,
-    instruction_id_list: list[str],
-    kwargs_list: list[dict | None],
-    strict: bool = False,
-) -> IFEvalVerificationResult:
-    """Verify if a response follows the given instructions.
-
-    Args:
-        response: The model's response to verify.
-        instruction_id_list: List of instruction IDs to check.
-        kwargs_list: List of kwargs for each instruction (or None).
-        strict: If True, use strict matching. If False, try response variants.
-
-    Returns:
-        IFEvalVerificationResult with verification details.
-    """
-    if not instruction_id_list:
-        return IFEvalVerificationResult(
-            followed_all=True,
-            followed_count=0,
-            total_count=0,
-            instruction_results=[],
-        )
-
     if not _lazy_import_ifeval():
-        return IFEvalVerificationResult(
-            followed_all=False,
-            followed_count=0,
-            total_count=len(instruction_id_list),
-            instruction_results=[False] * len(instruction_id_list),
-            error="instruction_following_eval not installed",
-        )
+        return {
+            "answer_status": "unparsable",
+            "followed_count": 0,
+            "total_count": len(instruction_id_list),
+            "score": 0.0,
+        }
 
-    if not response or not response.strip():
-        return IFEvalVerificationResult(
-            followed_all=False,
-            followed_count=0,
-            total_count=len(instruction_id_list),
-            instruction_results=[False] * len(instruction_id_list),
-            error="empty_response",
-        )
+    if not prediction or not prediction.strip():
+        return {
+            "answer_status": "no_answer",
+            "followed_count": 0,
+            "total_count": len(instruction_id_list),
+            "score": 0.0,
+        }
 
     # Ensure kwargs_list matches instruction_id_list length
     if len(kwargs_list) < len(instruction_id_list):
         kwargs_list = list(kwargs_list) + [{}] * (len(instruction_id_list) - len(kwargs_list))
 
-    # Normalize kwargs - replace None with empty dict
+    # Normalize kwargs
     kwargs_list = [kw if kw is not None else {} for kw in kwargs_list]
 
-    try:
-        # Create InputExample for the verifier
-        example = _InputExample(
-            key=0,
-            instruction_id_list=instruction_id_list,
-            prompt="",  # Not needed for verification
-            kwargs=kwargs_list,
-        )
+    # Check each instruction
+    instruction_results = []
+    for instr_id, kwargs in zip(instruction_id_list, kwargs_list):
+        try:
+            result = _check_single_instruction(instr_id, kwargs, prediction)
+            instruction_results.append(result)
+        except Exception as e:
+            logger.warning("IFEval verification error for %s: %s", instr_id, e)
+            instruction_results.append(False)
 
-        # Run verification
-        result = _test_instruction_following(example, response, strict=strict)
+    followed_count = sum(instruction_results)
+    total_count = len(instruction_id_list)
+    score = followed_count / total_count if total_count > 0 else 0.0
 
-        # Extract individual instruction results
-        instruction_results = []
-        for instr_id in instruction_id_list:
-            # The result has follow_instruction_list which is a list of bools
-            # corresponding to each instruction
-            idx = instruction_id_list.index(instr_id)
-            if idx < len(result.follow_instruction_list):
-                instruction_results.append(result.follow_instruction_list[idx])
-            else:
-                instruction_results.append(False)
+    # Determine answer status
+    if all(instruction_results):
+        answer_status = "correct"
+    elif followed_count > 0:
+        answer_status = "partial"  # Some but not all instructions followed
+    else:
+        answer_status = "wrong"
 
-        followed_count = sum(instruction_results)
-
-        return IFEvalVerificationResult(
-            followed_all=result.follow_all_instructions,
-            followed_count=followed_count,
-            total_count=len(instruction_id_list),
-            instruction_results=instruction_results,
-        )
-
-    except Exception as e:
-        logger.warning("IFEval verification error: %s", e)
-        return IFEvalVerificationResult(
-            followed_all=False,
-            followed_count=0,
-            total_count=len(instruction_id_list),
-            instruction_results=[False] * len(instruction_id_list),
-            error=str(e),
-        )
+    return {
+        "answer_status": answer_status,
+        "followed_count": followed_count,
+        "total_count": total_count,
+        "score": score,
+    }
 
 
-def verify_ifeval_from_context(
-    response: str,
-    reward_context: dict[str, Any],
-    strict: bool = False,
-) -> IFEvalVerificationResult:
-    """Verify response using reward_context from dataset.
-
-    Args:
-        response: The model's response to verify.
-        reward_context: Dict with instruction_id_list and kwargs.
-        strict: If True, use strict matching.
+async def verify_answer_rpc(
+    session: aiohttp.ClientSession,
+    host: str,
+    port: int,
+    prediction: str,
+    reward_context: dict,
+) -> dict:
+    """Verify answer via RPC call to an IFEvalEnvironment server.
 
     Returns:
-        IFEvalVerificationResult with verification details.
+        Dict with: answer_status, followed_count, total_count, score
     """
-    instruction_id_list = reward_context.get("instruction_id_list", [])
-    kwargs_list = reward_context.get("kwargs", [])
+    json_payload = {
+        "prediction": prediction,
+        "reward_context": reward_context,
+    }
+    async with session.post(
+        f"http://{host}:{port}/verify_answer",
+        json=json_payload,
+    ) as response:
+        if response.status == 200:
+            return await response.json()
+        else:
+            logger.error("Error verifying answer: %s", response.status)
+            logger.error("Response: %s", await response.text())
+            raise ValueError("Error verifying answer")
 
-    return verify_ifeval_response(
-        response=response,
-        instruction_id_list=instruction_id_list,
-        kwargs_list=kwargs_list,
-        strict=strict,
-    )
+
+class IFEvalEnvironment:
+    """FastAPI-based IFEval verification server."""
+
+    def launch(self, port: int):
+        app = FastAPI()
+
+        with ProcessPoolExecutor(max_workers=4) as process_pool:
+
+            @app.post("/verify_answer")
+            async def verify(request: dict):
+                prediction = request["prediction"]
+                reward_context = request["reward_context"]
+
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    process_pool,
+                    partial(verify_answer, prediction, reward_context),
+                )
+                return JSONResponse(content=result)
+
+            @app.get("/health")
+            async def health():
+                return JSONResponse(content={"status": "ok"})
+
+            uvicorn.run(app, host="0.0.0.0", port=port, timeout_keep_alive=60)
