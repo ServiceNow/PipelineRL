@@ -1,45 +1,54 @@
+"""Combined dataset loader for BAAI/TACO + codeparrot/apps."""
+
 from __future__ import annotations
 
 import json
 import logging
 import random
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
-DOMAIN_NAME = "coding"
-DEFAULT_DATASET_ID = "PrimeIntellect/INTELLECT-3-RL"
-DEFAULT_DATASET_CONFIG = "code"
-DEFAULT_SPLIT = "train"
-# Column used for difficulty filtering
-DEFAULT_DIFFICULTY_COLUMN = "avg@8_qwen3_4b_instruct_2507"
-# Default difficulty range: problems with 10-90% solve rate
-DEFAULT_MIN_DIFFICULTY = 0.1
-DEFAULT_MAX_DIFFICULTY = 0.9
-DEFAULT_TRAIN_RATIO = 0.9
+# Patterns to extract function names from prompts (e.g., GeeksForGeeks style)
+_FN_NAME_PATTERNS = [
+    re.compile(r"Complete the function\s+(\w+)\s*\(", re.IGNORECASE),
+    re.compile(r"function\s+named\s+['\"]?(\w+)['\"]?", re.IGNORECASE),
+    re.compile(r"implement\s+(?:the\s+)?function\s+['\"]?(\w+)['\"]?", re.IGNORECASE),
+    re.compile(r"write\s+(?:a\s+)?function\s+['\"]?(\w+)['\"]?\s*\(", re.IGNORECASE),
+]
 
-_DATASET_CACHE: dict[str, Dataset] = {}
+
+def _extract_fn_name_from_prompt(prompt: str) -> str | None:
+    """Try to extract function name from prompt text."""
+    for pattern in _FN_NAME_PATTERNS:
+        match = pattern.search(prompt)
+        if match:
+            return match.group(1)
+    return None
+
+DOMAIN_NAME = "coding"
+
+# TACO difficulties to exclude by default
+TACO_EXCLUDED_DIFFICULTIES = {"HARD", "VERY_HARD"}
 
 
 @dataclass
-class DatasetOptions:
-    dataset_id: str = DEFAULT_DATASET_ID
-    dataset_config: str = DEFAULT_DATASET_CONFIG
-    split: str = DEFAULT_SPLIT
-    subset: str = "train"
-    train_ratio: float = DEFAULT_TRAIN_RATIO
+class CombinedDatasetOptions:
+    taco_split: str = "train"
+    apps_split: str = "train"
+    subset: str = "train"  # "train", "test", or "all"
+    train_ratio: float = 0.9
     max_examples: int | None = None
-    min_difficulty: float | None = DEFAULT_MIN_DIFFICULTY
-    max_difficulty: float | None = DEFAULT_MAX_DIFFICULTY
-    difficulty_column: str = DEFAULT_DIFFICULTY_COLUMN
+    max_tests_per_problem: int = 50  # Limit test cases to avoid memory issues
+    taco_excluded_difficulties: set[str] = field(default_factory=lambda: TACO_EXCLUDED_DIFFICULTIES.copy())
     huggingface_token: str | None = None
     seed: int | None = None
-    # Source filtering: None means all sources, or specify e.g. ["primeintellect"]
-    sources: list[str] | None = None
+    skip_apps: bool = False  # Skip loading APPS dataset (has inconsistent I/O formats)
 
 
 def _to_native(value: Any) -> Any:
@@ -48,173 +57,168 @@ def _to_native(value: Any) -> Any:
     return value
 
 
-def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
-    options = DatasetOptions()
+def _normalize_options(loader_kwargs: Dict[str, Any]) -> CombinedDatasetOptions:
+    options = CombinedDatasetOptions()
     if not loader_kwargs:
         return options
 
-    if "dataset_id" in loader_kwargs:
-        options.dataset_id = str(loader_kwargs["dataset_id"])
-    if "dataset_config" in loader_kwargs:
-        options.dataset_config = str(loader_kwargs["dataset_config"])
-    if "split" in loader_kwargs:
-        options.split = str(loader_kwargs["split"])
+    if "taco_split" in loader_kwargs:
+        options.taco_split = str(loader_kwargs["taco_split"])
+    if "apps_split" in loader_kwargs:
+        options.apps_split = str(loader_kwargs["apps_split"])
     if "subset" in loader_kwargs:
         options.subset = str(loader_kwargs["subset"])
     if "train_ratio" in loader_kwargs:
         val = loader_kwargs["train_ratio"]
-        options.train_ratio = float(val) if val is not None else DEFAULT_TRAIN_RATIO
+        options.train_ratio = float(val) if val is not None else 0.9
     if "max_examples" in loader_kwargs:
         val = loader_kwargs["max_examples"]
         options.max_examples = int(val) if val is not None else None
-    if "min_difficulty" in loader_kwargs:
-        val = loader_kwargs["min_difficulty"]
-        options.min_difficulty = float(val) if val is not None else None
-    if "max_difficulty" in loader_kwargs:
-        val = loader_kwargs["max_difficulty"]
-        options.max_difficulty = float(val) if val is not None else None
-    if "difficulty_column" in loader_kwargs:
-        options.difficulty_column = str(loader_kwargs["difficulty_column"])
+    if "max_tests_per_problem" in loader_kwargs:
+        val = loader_kwargs["max_tests_per_problem"]
+        options.max_tests_per_problem = int(val) if val is not None else 50
+    if "taco_excluded_difficulties" in loader_kwargs:
+        val = _to_native(loader_kwargs["taco_excluded_difficulties"])
+        if val is not None:
+            if isinstance(val, (list, tuple)):
+                options.taco_excluded_difficulties = set(val)
+            elif isinstance(val, set):
+                options.taco_excluded_difficulties = val
+            else:
+                options.taco_excluded_difficulties = set()
+        else:
+            options.taco_excluded_difficulties = set()
     if "huggingface_token" in loader_kwargs or "hf_token" in loader_kwargs:
         token = loader_kwargs.get("huggingface_token") or loader_kwargs.get("hf_token")
         options.huggingface_token = str(token) if token else None
     if "seed" in loader_kwargs:
         val = loader_kwargs["seed"]
         options.seed = int(val) if val is not None else None
-    if "sources" in loader_kwargs:
-        val = loader_kwargs["sources"]
-        if val is not None:
-            if isinstance(val, str):
-                options.sources = [val]
-            else:
-                options.sources = list(val)
+    if "skip_apps" in loader_kwargs:
+        options.skip_apps = bool(loader_kwargs["skip_apps"])
 
     return options
 
 
-def _load_raw_dataset(options: DatasetOptions) -> Dataset:
-    cache_key = f"{options.dataset_id}:{options.dataset_config}:{options.split}"
-    if cache_key in _DATASET_CACHE:
-        logger.debug("Using cached dataset for %s", cache_key)
-        return _DATASET_CACHE[cache_key]
-
-    logger.info(
-        "Loading dataset %s (config=%s, split=%s)...",
-        options.dataset_id,
-        options.dataset_config,
-        options.split,
-    )
-    ds = load_dataset(
-        options.dataset_id,
-        options.dataset_config,
-        split=options.split,
-        token=options.huggingface_token,
-    )
-    _DATASET_CACHE[cache_key] = ds
-    logger.info("Loaded %d samples from %s/%s", len(ds), options.dataset_id, options.dataset_config)
-    return ds
-
-
-def _parse_tests(info_str: str | None) -> dict[str, Any] | None:
-    if info_str is None:
+def _parse_input_output(io_data: str | dict | None) -> dict | None:
+    """Parse input_output field (can be JSON string or dict)."""
+    if io_data is None:
         return None
 
-    try:
-        info = json.loads(info_str)
-    except json.JSONDecodeError:
-        return None
+    if isinstance(io_data, dict):
+        return io_data
 
-    if not isinstance(info, dict):
-        return None
-
-    tests_raw = info.get("tests")
-    if tests_raw is None:
-        return None
-
-    # Parse inner tests JSON if string
-    if isinstance(tests_raw, str):
+    if isinstance(io_data, str):
         try:
-            tests = json.loads(tests_raw)
-        except json.JSONDecodeError:
+            return json.loads(io_data)
+        except (json.JSONDecodeError, ValueError):
+            # ValueError can occur for extremely large integers exceeding Python limits
             return None
-    else:
-        tests = tests_raw
 
-    if not isinstance(tests, dict):
-        return None
-
-    return tests
+    return None
 
 
-def _build_record(sample: dict, idx: int) -> dict | None:
+def _build_taco_record(sample: dict, idx: int, max_tests: int = 50) -> dict | None:
+    """Convert TACO sample to internal format."""
     prompt = sample.get("question")
     if not prompt:
         return None
 
-    tests = _parse_tests(sample.get("info"))
-    if tests is None:
+    io_data = _parse_input_output(sample.get("input_output"))
+    if io_data is None:
         return None
 
-    inputs = tests.get("inputs", [])
-    outputs = tests.get("outputs", [])
+    inputs = io_data.get("inputs", [])
+    outputs = io_data.get("outputs", [])
+    fn_name = io_data.get("fn_name")
+
+    # If fn_name not in data, try to extract from prompt (e.g., GeeksForGeeks style)
+    if not fn_name:
+        fn_name = _extract_fn_name_from_prompt(prompt)
+
     if not inputs or not outputs:
         return None
 
-    fn_name = tests.get("fn_name")
+    # Limit test cases to avoid memory issues
+    if max_tests and len(inputs) > max_tests:
+        inputs = inputs[:max_tests]
+        outputs = outputs[:max_tests]
 
-    # Determine call type based on whether fn_name is present
-    # and whether inputs are strings (stdin) or lists (function args)
-    if fn_name:
-        call_type = "fn"
-    elif inputs and isinstance(inputs[0], str) and "\n" in str(inputs[0]):
-        # Multi-line string input suggests stdin/stdout style
-        call_type = "std"
-    else:
-        # Single-line stdin problems (no fn_name, no newlines in input)
-        call_type = "std"
-
-    # Build reward_context in the format expected by verifier
-    reward_context = {
-        "inputs": inputs,
-        "outputs": outputs,
-        "call_type": call_type,
-    }
+    call_type = "fn" if fn_name else "std"
+    reward_context = {"inputs": inputs, "outputs": outputs, "call_type": call_type}
     if fn_name:
         reward_context["fn_name"] = fn_name
 
-    # Extract source info
-    try:
-        info = json.loads(sample.get("info", "{}"))
-        source = info.get("source", "unknown")
-    except json.JSONDecodeError:
-        source = "unknown"
+    return {
+        "id": idx,
+        "problem_id": f"taco_{idx}",
+        "task": prompt,
+        "reward_context": reward_context,
+        "dataset": f"taco@{sample.get('source', 'unknown')}",
+        "domain": DOMAIN_NAME,
+        "source": sample.get("source", "unknown"),
+        "difficulty": sample.get("difficulty", "unknown"),
+    }
+
+
+def _build_apps_record(sample: dict, idx: int, max_tests: int = 50) -> dict | None:
+    """Convert APPS sample to internal format."""
+    prompt = sample.get("question")
+    if not prompt:
+        return None
+
+    io_data = _parse_input_output(sample.get("input_output"))
+    if io_data is None:
+        return None
+
+    inputs = io_data.get("inputs", [])
+    outputs = io_data.get("outputs", [])
+    fn_name = io_data.get("fn_name")
+
+    # If fn_name not in data, try to extract from prompt
+    if not fn_name:
+        fn_name = _extract_fn_name_from_prompt(prompt)
+
+    if not inputs or not outputs:
+        return None
+
+    # Limit test cases to avoid memory issues
+    if max_tests and len(inputs) > max_tests:
+        inputs = inputs[:max_tests]
+        outputs = outputs[:max_tests]
+
+    call_type = "fn" if fn_name else "std"
+    reward_context = {"inputs": inputs, "outputs": outputs, "call_type": call_type}
+    if fn_name:
+        reward_context["fn_name"] = fn_name
 
     return {
         "id": idx,
-        "problem_id": f"intellect3_{idx}",
+        "problem_id": f"apps_{sample.get('problem_id', idx)}",
         "task": prompt,
         "reward_context": reward_context,
-        "dataset": f"intellect3-rl-code@{source}",
+        "dataset": "apps",
         "domain": DOMAIN_NAME,
-        "source": source,
+        "source": "apps",
+        "difficulty": sample.get("difficulty", "unknown"),
     }
 
 
 def _split_dataset(
-    dataset: Dataset,
-    options: DatasetOptions,
-) -> Dataset:
+    samples: List[Dict],
+    options: CombinedDatasetOptions,
+) -> List[Dict]:
+    """Split samples into train/test subsets."""
     if options.subset not in ("train", "test", "all"):
         logger.warning("Invalid subset '%s', defaulting to 'train'", options.subset)
         options.subset = "train"
 
-    # Return full dataset for "all" subset
     if options.subset == "all":
-        logger.info("Using all data: %d samples", len(dataset))
-        return dataset
+        logger.info("Using all data: %d samples", len(samples))
+        return samples
 
     split_seed = 42
-    total = len(dataset)
+    total = len(samples)
     indices = list(range(total))
 
     rng = random.Random(split_seed)
@@ -239,74 +243,7 @@ def _split_dataset(
             total,
         )
 
-    return dataset.select(selected_indices)
-
-
-def _filter_by_difficulty(
-    dataset: Dataset,
-    options: DatasetOptions,
-) -> Dataset:
-    if options.min_difficulty is None and options.max_difficulty is None:
-        return dataset
-
-    col = options.difficulty_column
-    if col not in dataset.column_names:
-        logger.warning(
-            "Difficulty column '%s' not found in dataset. Skipping difficulty filter. "
-            "Available columns: %s",
-            col,
-            dataset.column_names,
-        )
-        return dataset
-
-    def in_range(sample: dict) -> bool:
-        val = sample.get(col)
-        if val is None:
-            return True  # Keep samples without difficulty info
-        if options.min_difficulty is not None and val < options.min_difficulty:
-            return False
-        if options.max_difficulty is not None and val > options.max_difficulty:
-            return False
-        return True
-
-    filtered = dataset.filter(in_range)
-    logger.info(
-        "Difficulty filter (%s in [%s, %s]): %d -> %d samples",
-        col,
-        options.min_difficulty,
-        options.max_difficulty,
-        len(dataset),
-        len(filtered),
-    )
-    return filtered
-
-
-def _filter_by_source(
-    dataset: Dataset,
-    options: DatasetOptions,
-) -> Dataset:
-    """Filter dataset by source (e.g., primeintellect, lcbv5)."""
-    if options.sources is None:
-        return dataset
-
-    allowed_sources = set(options.sources)
-
-    def matches_source(sample: dict) -> bool:
-        try:
-            info = json.loads(sample.get("info", "{}"))
-            source = info.get("source", "unknown")
-            return source in allowed_sources
-        except json.JSONDecodeError:
-            return False
-
-    filtered = dataset.filter(matches_source)
-    logger.info(
-        "Source filter (sources=%s): %d -> %d samples",
-        options.sources,
-        len(dataset),
-        len(filtered),
-    )
-    return filtered
+    return [samples[i] for i in selected_indices]
 
 
 def load_datasets(
@@ -314,33 +251,82 @@ def load_datasets(
     seed: int | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
+    """Load combined TACO + APPS dataset.
+
+    Args:
+        dataset_names: Ignored (for API compatibility).
+        seed: Random seed for shuffling.
+        **loader_kwargs: Additional options (taco_split, apps_split, etc.).
+
+    Returns:
+        List of problem records with task, reward_context, etc.
+    """
     if loader_kwargs.get("seed") is None and seed is not None:
         loader_kwargs["seed"] = seed
 
     options = _normalize_options(loader_kwargs)
 
-    raw_dataset = _load_raw_dataset(options)
+    samples: List[Dict] = []
 
-    split_dataset = _split_dataset(raw_dataset, options)
-
-    filtered_dataset = _filter_by_difficulty(split_dataset, options)
-
-    # Filter by source if specified
-    filtered_dataset = _filter_by_source(filtered_dataset, options)
-
-    # Convert to our format
-    samples: list[dict] = []
-    for idx, sample in enumerate(filtered_dataset):
-        record = _build_record(sample, idx)
-        if record is not None:
+    # Load TACO from parquet files via hf:// URLs (dataset script no longer supported)
+    logger.info("Loading TACO dataset (split=%s)...", options.taco_split)
+    taco_data_url = f"hf://datasets/BAAI/TACO/ALL/{options.taco_split}-*.parquet"
+    taco = load_dataset(
+        "parquet",
+        data_files=taco_data_url,
+        split="train",  # data_files creates a "train" split by default
+        token=options.huggingface_token,
+    )
+    taco_filtered = 0
+    taco_invalid = 0
+    for sample in taco:
+        difficulty = sample.get("difficulty", "")
+        if options.taco_excluded_difficulties and difficulty in options.taco_excluded_difficulties:
+            taco_filtered += 1
+            continue
+        record = _build_taco_record(sample, len(samples), max_tests=options.max_tests_per_problem)
+        if record:
             samples.append(record)
+        else:
+            taco_invalid += 1
+    logger.info(
+        "TACO: loaded %d samples (filtered %d by difficulty, %d invalid)",
+        len(samples),
+        taco_filtered,
+        taco_invalid,
+    )
 
-    logger.info("Built %d valid coding samples", len(samples))
+    # Load APPS from jsonl files via hf:// URLs (dataset script no longer supported)
+    if not options.skip_apps:
+        taco_count = len(samples)
+        logger.info("Loading APPS dataset (split=%s)...", options.apps_split)
+        apps_data_url = f"hf://datasets/codeparrot/apps/{options.apps_split}.jsonl"
+        apps = load_dataset(
+            "json",
+            data_files=apps_data_url,
+            split="train",  # data_files creates a "train" split by default
+            token=options.huggingface_token,
+        )
+        apps_invalid = 0
+        for sample in apps:
+            record = _build_apps_record(sample, len(samples), max_tests=options.max_tests_per_problem)
+            if record:
+                samples.append(record)
+            else:
+                apps_invalid += 1
+        logger.info("APPS: loaded %d samples (%d invalid)", len(samples) - taco_count, apps_invalid)
+    else:
+        logger.info("Skipping APPS dataset (skip_apps=True)")
 
+    # Split into train/test
+    samples = _split_dataset(samples, options)
+
+    # Shuffle if seed provided
     if options.seed is not None:
         rng = random.Random(options.seed)
         rng.shuffle(samples)
 
+    # Limit examples if specified
     if options.max_examples is not None and len(samples) > options.max_examples:
         samples = samples[: options.max_examples]
         logger.info("Limited to %d samples", len(samples))
@@ -349,6 +335,7 @@ def load_datasets(
     for idx, sample in enumerate(samples):
         sample["id"] = idx
 
+    logger.info("Final combined dataset: %d samples", len(samples))
     return samples
 
 
@@ -356,5 +343,39 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
+    """Hydra entrypoint for loading problems.
+
+    Dispatches to appropriate loader based on dataset_names:
+    - "livecodebench*": Load LiveCodeBench evaluation benchmark
+    - "taco", "taco@train", "taco@test", "taco@all": Load TACO only (skip APPS)
+    - "coding", "coding@all", etc.: Load TACO + APPS training data
+    """
     seed = loader_kwargs.pop("seed", None)
-    return load_datasets(dataset_names, seed=seed, **loader_kwargs)
+
+    # Normalize dataset_names to list
+    if dataset_names is None:
+        names = []
+    elif isinstance(dataset_names, str):
+        names = [dataset_names]
+    else:
+        names = list(dataset_names)
+
+    # Dispatch to LiveCodeBench if any livecodebench variant is requested
+    livecodebench_names = [n for n in names if n.startswith("livecodebench")]
+    if livecodebench_names:
+        from . import livecodebench
+        return livecodebench.load_datasets(dataset_names, seed=seed, **loader_kwargs)
+
+    # Check if "taco" is requested (skip APPS, use TACO only)
+    # Handles: "taco", "taco@train", "taco@test", "taco@all"
+    taco_only = any(n.startswith("taco") for n in names)
+    if taco_only:
+        loader_kwargs["skip_apps"] = True
+        # Map taco subset to standard subset names
+        for i, n in enumerate(names):
+            if n == "taco":
+                names[i] = "coding@all"
+            elif n.startswith("taco@"):
+                names[i] = "coding@" + n.split("@", 1)[1]
+
+    return load_datasets(names, seed=seed, **loader_kwargs)
