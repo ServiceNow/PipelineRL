@@ -1,5 +1,3 @@
-"""Dataset loader for the logic domain using PrimeIntellect INTELLECT-3-RL."""
-
 from __future__ import annotations
 
 import json
@@ -35,6 +33,7 @@ class DatasetOptions:
     split: str = DEFAULT_SPLIT
     subset: str = "train"
     train_ratio: float = DEFAULT_TRAIN_RATIO
+    test_size: int | None = None  # Fixed test size (overrides train_ratio if set)
     max_examples: int | None = None
     min_difficulty: float | None = DEFAULT_MIN_DIFFICULTY
     max_difficulty: float | None = DEFAULT_MAX_DIFFICULTY
@@ -44,15 +43,7 @@ class DatasetOptions:
     seed: int | None = None
 
 
-def _to_native(value: Any) -> Any:
-    """Convert OmegaConf containers to Python types."""
-    if isinstance(value, DictConfig):
-        return OmegaConf.to_container(value, resolve=True)
-    return value
-
-
 def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
-    """Parse loader kwargs into DatasetOptions."""
     options = DatasetOptions()
     if not loader_kwargs:
         return options
@@ -68,6 +59,9 @@ def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
     if "train_ratio" in loader_kwargs:
         val = loader_kwargs["train_ratio"]
         options.train_ratio = float(val) if val is not None else DEFAULT_TRAIN_RATIO
+    if "test_size" in loader_kwargs:
+        val = loader_kwargs["test_size"]
+        options.test_size = int(val) if val is not None else None
     if "max_examples" in loader_kwargs:
         val = loader_kwargs["max_examples"]
         options.max_examples = int(val) if val is not None else None
@@ -93,7 +87,6 @@ def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
 
 
 def _load_raw_dataset(options: DatasetOptions) -> Dataset:
-    """Load the raw dataset from HuggingFace with caching."""
     cache_key = f"{options.dataset_id}:{options.dataset_config}:{options.split}"
     if cache_key in _DATASET_CACHE:
         logger.debug("Using cached dataset for %s", cache_key)
@@ -117,7 +110,6 @@ def _load_raw_dataset(options: DatasetOptions) -> Dataset:
 
 
 def _parse_info(info_str: str | None) -> dict[str, Any] | None:
-    """Parse the info field JSON."""
     if info_str is None:
         return None
     try:
@@ -127,7 +119,6 @@ def _parse_info(info_str: str | None) -> dict[str, Any] | None:
 
 
 def _build_record(sample: dict, idx: int, tasks_to_skip: set[str]) -> dict | None:
-    """Convert an INTELLECT-3-RL logic sample to our internal format."""
     prompt = sample.get("question")
     if not prompt:
         return None
@@ -170,7 +161,6 @@ def _split_dataset(
     dataset: Dataset,
     options: DatasetOptions,
 ) -> Dataset:
-    """Split dataset into train/test subsets."""
     if options.subset not in ("train", "test"):
         logger.warning("Invalid subset '%s', defaulting to 'train'", options.subset)
         options.subset = "train"
@@ -182,14 +172,21 @@ def _split_dataset(
     rng = random.Random(split_seed)
     rng.shuffle(indices)
 
-    train_end = int(total * options.train_ratio)
+    # Determine split point
+    if options.test_size is not None and options.test_size > 0:
+        # Use fixed test size
+        test_count = min(options.test_size, total)
+        train_end = total - test_count
+    else:
+        # Use ratio
+        train_end = int(total * options.train_ratio)
 
     if options.subset == "train":
         selected_indices = indices[:train_end]
         logger.info(
             "Using train subset: %d samples (%.1f%% of %d)",
             len(selected_indices),
-            options.train_ratio * 100,
+            len(selected_indices) / total * 100,
             total,
         )
     else:
@@ -197,7 +194,7 @@ def _split_dataset(
         logger.info(
             "Using test subset: %d samples (%.1f%% of %d)",
             len(selected_indices),
-            (1 - options.train_ratio) * 100,
+            len(selected_indices) / total * 100,
             total,
         )
 
@@ -208,7 +205,6 @@ def _filter_by_difficulty(
     dataset: Dataset,
     options: DatasetOptions,
 ) -> Dataset:
-    """Filter dataset by difficulty using solve rate column."""
     if options.min_difficulty is None and options.max_difficulty is None:
         return dataset
 
@@ -249,23 +245,6 @@ def load_datasets(
     seed: int | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Load logic problems from INTELLECT-3-RL dataset.
-
-    Args:
-        dataset_names: Ignored for compatibility. Always uses INTELLECT-3-RL.
-        seed: Random seed for shuffling.
-        **loader_kwargs: Additional options (max_examples, min_difficulty, etc.)
-
-    Returns:
-        List of problem dictionaries with keys:
-        - id: int
-        - problem_id: str
-        - task: str (the problem prompt)
-        - reward_context: dict with task type and game_data
-        - dataset: str
-        - domain: str
-        - logic_task: str (the specific logic task type)
-    """
     if loader_kwargs.get("seed") is None and seed is not None:
         loader_kwargs["seed"] = seed
 
@@ -313,6 +292,21 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Hydra entrypoint that mirrors the math domain loader style."""
     seed = loader_kwargs.pop("seed", None)
+
+    # Normalize dataset_names to list
+    if dataset_names is None:
+        names = []
+    elif isinstance(dataset_names, str):
+        names = [dataset_names]
+    else:
+        names = list(dataset_names)
+
+    # Dispatch based on dataset name
+    if "logic_test" in names:
+        loader_kwargs["subset"] = "test"
+    elif "logic" in names or "logic_train" in names:
+        if "subset" not in loader_kwargs:
+            loader_kwargs["subset"] = "train"
+
     return load_datasets(dataset_names, seed=seed, **loader_kwargs)
