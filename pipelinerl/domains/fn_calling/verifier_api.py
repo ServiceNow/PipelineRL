@@ -141,6 +141,7 @@ def verify_fn_calling_answer(
     ground_truth = reward_context.get("ground_truth")
 
     oai_tool_calls = _extract_tool_calls(generation, tool_calls)
+    bfcl = _lazy_import_bfcl()
 
     if is_relevance:
         has_tool_calls = len(oai_tool_calls) > 0
@@ -154,6 +155,9 @@ def verify_fn_calling_answer(
     if not oai_tool_calls:
         return "no_answer"
 
+    # Note: Java name normalization is handled by BFCL when using a -FC model
+    # (BFCL converts ground truth dots→underscores to match model output)
+
     try:
         gorilla_tool_calls = _convert_to_gorilla(oai_tool_calls)
     except Exception as e:
@@ -161,7 +165,6 @@ def verify_fn_calling_answer(
         return "unparsable"
 
     try:
-        bfcl = _lazy_import_bfcl()
         is_valid_format = bfcl["is_function_calling_format_output"](gorilla_tool_calls)
         if not is_valid_format:
             logger.debug("Invalid tool call format")
@@ -169,6 +172,11 @@ def verify_fn_calling_answer(
     except Exception as e:
         logger.debug(f"Format validation failed: {e}")
         return "unparsable"
+
+    # Always use a known -FC model for BFCL's AST checker.
+    # The -FC suffix means underscore_to_dot=True, which normalizes ground truth dots→underscores
+    # to match model output (OpenAI API doesn't allow dots in function names).
+    model_name_for_bfcl = "gpt-4o-2024-11-20-FC"
 
     if ground_truth is None:
         logger.warning(f"No ground truth for category '{category}'")
@@ -192,7 +200,7 @@ def verify_fn_calling_answer(
             ground_truth,
             language,
             category,
-            model_name,
+            model_name_for_bfcl,
         )
     except Exception as e:
         logger.debug(f"AST checker failed: {e}")
