@@ -29,15 +29,14 @@ dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
 dataset_loader_params:
   per_domain_params:
     coding:
-      # PrimeIntellect INTELLECT-3-RL code domain (8.5k curated samples)
-      dataset_id: PrimeIntellect/INTELLECT-3-RL
-      dataset_config: code
-      split: train
+      # TACO + APPS coding datasets
+      taco_split: train
+      apps_split: train
       subset: train
       train_ratio: 0.9
-      min_difficulty: 0.1
-      max_difficulty: 0.9
-      difficulty_column: avg@8_qwen3_4b_instruct_2507
+      max_tests_per_problem: 50
+      taco_excluded_difficulties: [HARD, VERY_HARD]
+      skip_apps: false
       max_examples: null
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
