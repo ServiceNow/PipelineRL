@@ -1,5 +1,3 @@
-"""Combined dataset loader for BAAI/TACO + codeparrot/apps."""
-
 from __future__ import annotations
 
 import json
@@ -14,7 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
-# Patterns to extract function names from prompts (e.g., GeeksForGeeks style)
+# extract function name from prompt
 _FN_NAME_PATTERNS = [
     re.compile(r"Complete the function\s+(\w+)\s*\(", re.IGNORECASE),
     re.compile(r"function\s+named\s+['\"]?(\w+)['\"]?", re.IGNORECASE),
@@ -33,7 +31,6 @@ def _extract_fn_name_from_prompt(prompt: str) -> str | None:
 
 DOMAIN_NAME = "coding"
 
-# TACO difficulties to exclude by default
 TACO_EXCLUDED_DIFFICULTIES = {"HARD", "VERY_HARD"}
 
 
@@ -48,7 +45,7 @@ class CombinedDatasetOptions:
     taco_excluded_difficulties: set[str] = field(default_factory=lambda: TACO_EXCLUDED_DIFFICULTIES.copy())
     huggingface_token: str | None = None
     seed: int | None = None
-    skip_apps: bool = False  # Skip loading APPS dataset (has inconsistent I/O formats)
+    skip_apps: bool = False
 
 
 def _to_native(value: Any) -> Any:
@@ -101,7 +98,6 @@ def _normalize_options(loader_kwargs: Dict[str, Any]) -> CombinedDatasetOptions:
 
 
 def _parse_input_output(io_data: str | dict | None) -> dict | None:
-    """Parse input_output field (can be JSON string or dict)."""
     if io_data is None:
         return None
 
@@ -119,7 +115,6 @@ def _parse_input_output(io_data: str | dict | None) -> dict | None:
 
 
 def _build_taco_record(sample: dict, idx: int, max_tests: int = 50) -> dict | None:
-    """Convert TACO sample to internal format."""
     prompt = sample.get("question")
     if not prompt:
         return None
@@ -132,7 +127,6 @@ def _build_taco_record(sample: dict, idx: int, max_tests: int = 50) -> dict | No
     outputs = io_data.get("outputs", [])
     fn_name = io_data.get("fn_name")
 
-    # If fn_name not in data, try to extract from prompt (e.g., GeeksForGeeks style)
     if not fn_name:
         fn_name = _extract_fn_name_from_prompt(prompt)
 
@@ -162,7 +156,6 @@ def _build_taco_record(sample: dict, idx: int, max_tests: int = 50) -> dict | No
 
 
 def _build_apps_record(sample: dict, idx: int, max_tests: int = 50) -> dict | None:
-    """Convert APPS sample to internal format."""
     prompt = sample.get("question")
     if not prompt:
         return None
@@ -175,7 +168,6 @@ def _build_apps_record(sample: dict, idx: int, max_tests: int = 50) -> dict | No
     outputs = io_data.get("outputs", [])
     fn_name = io_data.get("fn_name")
 
-    # If fn_name not in data, try to extract from prompt
     if not fn_name:
         fn_name = _extract_fn_name_from_prompt(prompt)
 
@@ -208,7 +200,6 @@ def _split_dataset(
     samples: List[Dict],
     options: CombinedDatasetOptions,
 ) -> List[Dict]:
-    """Split samples into train/test subsets."""
     if options.subset not in ("train", "test", "all"):
         logger.warning("Invalid subset '%s', defaulting to 'train'", options.subset)
         options.subset = "train"
@@ -251,16 +242,6 @@ def load_datasets(
     seed: int | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Load combined TACO + APPS dataset.
-
-    Args:
-        dataset_names: Ignored (for API compatibility).
-        seed: Random seed for shuffling.
-        **loader_kwargs: Additional options (taco_split, apps_split, etc.).
-
-    Returns:
-        List of problem records with task, reward_context, etc.
-    """
     if loader_kwargs.get("seed") is None and seed is not None:
         loader_kwargs["seed"] = seed
 
@@ -268,7 +249,7 @@ def load_datasets(
 
     samples: List[Dict] = []
 
-    # Load TACO from parquet files via hf:// URLs (dataset script no longer supported)
+    # load from parquet files via hf:// URLs (dataset script no longer supported)
     logger.info("Loading TACO dataset (split=%s)...", options.taco_split)
     taco_data_url = f"hf://datasets/BAAI/TACO/ALL/{options.taco_split}-*.parquet"
     taco = load_dataset(
@@ -296,7 +277,6 @@ def load_datasets(
         taco_invalid,
     )
 
-    # Load APPS from jsonl files via hf:// URLs (dataset script no longer supported)
     if not options.skip_apps:
         taco_count = len(samples)
         logger.info("Loading APPS dataset (split=%s)...", options.apps_split)
@@ -304,7 +284,7 @@ def load_datasets(
         apps = load_dataset(
             "json",
             data_files=apps_data_url,
-            split="train",  # data_files creates a "train" split by default
+            split="train",
             token=options.huggingface_token,
         )
         apps_invalid = 0
@@ -318,20 +298,17 @@ def load_datasets(
     else:
         logger.info("Skipping APPS dataset (skip_apps=True)")
 
-    # Split into train/test
     samples = _split_dataset(samples, options)
 
-    # Shuffle if seed provided
     if options.seed is not None:
         rng = random.Random(options.seed)
         rng.shuffle(samples)
 
-    # Limit examples if specified
     if options.max_examples is not None and len(samples) > options.max_examples:
         samples = samples[: options.max_examples]
         logger.info("Limited to %d samples", len(samples))
 
-    # Re-assign IDs after filtering/shuffling
+    # re-assign IDs after filtering/shuffling
     for idx, sample in enumerate(samples):
         sample["id"] = idx
 
@@ -343,16 +320,9 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Hydra entrypoint for loading problems.
-
-    Dispatches to appropriate loader based on dataset_names:
-    - "livecodebench*": Load LiveCodeBench evaluation benchmark
-    - "taco", "taco@train", "taco@test", "taco@all": Load TACO only (skip APPS)
-    - "coding", "coding@all", etc.: Load TACO + APPS training data
-    """
     seed = loader_kwargs.pop("seed", None)
 
-    # Normalize dataset_names to list
+    # normalize dataset_names
     if dataset_names is None:
         names = []
     elif isinstance(dataset_names, str):
@@ -360,14 +330,11 @@ def load_problems(
     else:
         names = list(dataset_names)
 
-    # Dispatch to LiveCodeBench if any livecodebench variant is requested
     livecodebench_names = [n for n in names if n.startswith("livecodebench")]
     if livecodebench_names:
         from . import livecodebench
         return livecodebench.load_datasets(dataset_names, seed=seed, **loader_kwargs)
 
-    # Check if "taco" is requested (skip APPS, use TACO only)
-    # Handles: "taco", "taco@train", "taco@test", "taco@all"
     taco_only = any(n.startswith("taco") for n in names)
     if taco_only:
         loader_kwargs["skip_apps"] = True

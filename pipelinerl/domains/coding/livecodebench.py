@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 DOMAIN_NAME = "coding"
 DEFAULT_DATASET_ID = "livecodebench/code_generation_lite"
-DEFAULT_VERSION = "release_v5"  # Aug 2024 - Jan 2025 (880 problems)
+DEFAULT_VERSION = "release_latest"
 
 
 @dataclass
