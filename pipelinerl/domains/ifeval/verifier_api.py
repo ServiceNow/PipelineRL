@@ -90,14 +90,12 @@ def verify_answer(prediction: str, reward_context: dict) -> dict:
             "score": 0.0,
         }
 
-    # Ensure kwargs_list matches instruction_id_list length
     if len(kwargs_list) < len(instruction_id_list):
         kwargs_list = list(kwargs_list) + [{}] * (len(instruction_id_list) - len(kwargs_list))
 
     # Normalize kwargs
     kwargs_list = [kw if kw is not None else {} for kw in kwargs_list]
 
-    # Check each instruction
     instruction_results = []
     for instr_id, kwargs in zip(instruction_id_list, kwargs_list):
         try:
@@ -111,11 +109,10 @@ def verify_answer(prediction: str, reward_context: dict) -> dict:
     total_count = len(instruction_id_list)
     score = followed_count / total_count if total_count > 0 else 0.0
 
-    # Determine answer status
     if all(instruction_results):
         answer_status = "correct"
     elif followed_count > 0:
-        answer_status = "partial"  # Some but not all instructions followed
+        answer_status = "partial"
     else:
         answer_status = "wrong"
 
@@ -134,11 +131,6 @@ async def verify_answer_rpc(
     prediction: str,
     reward_context: dict,
 ) -> dict:
-    """Verify answer via RPC call to an IFEvalEnvironment server.
-
-    Returns:
-        Dict with: answer_status, followed_count, total_count, score
-    """
     json_payload = {
         "prediction": prediction,
         "reward_context": reward_context,
@@ -156,8 +148,6 @@ async def verify_answer_rpc(
 
 
 class IFEvalEnvironment:
-    """FastAPI-based IFEval verification server."""
-
     def launch(self, port: int):
         app = FastAPI()
 
