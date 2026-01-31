@@ -223,4 +223,21 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    return load_datasets(dataset_names, **loader_kwargs)
+    seed = loader_kwargs.pop("seed", 42)
+
+    # Normalize dataset_names to list
+    if dataset_names is None:
+        names = []
+    elif isinstance(dataset_names, str):
+        names = [dataset_names]
+    else:
+        names = list(dataset_names)
+
+    # Dispatch based on dataset name
+    if "fn_calling_test" in names:
+        loader_kwargs["subset"] = "test"
+    elif "fn_calling" in names or "fn_calling_train" in names:
+        if "subset" not in loader_kwargs:
+            loader_kwargs["subset"] = "train"
+
+    return load_datasets(dataset_names, seed=seed, **loader_kwargs)
