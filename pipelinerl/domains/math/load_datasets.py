@@ -53,7 +53,10 @@ def process_math(dataset, dataset_name):
         if "subject" in item and "type" not in item:
             item["type"] = item["subject"]
         if "answer" in item:
-            answer = "\\boxed{" + item["answer"] + "}"
+            answer = item["answer"]
+            # Only box if not already boxed
+            if not answer.startswith("\\boxed{"):
+                answer = "\\boxed{" + answer + "}"
         elif "solution" in item:
             answer = item["solution"]
         else:
@@ -153,29 +156,12 @@ def load_math(split):
     return datasets.Dataset.from_list(data)
 
 
-def _load_aime_2025_opencompass_dataset(upsample_factor: int = 0) -> list[dict]:
-    configs = ["AIME2025-I", "AIME2025-II"]
-    dataset_name = "aime_2025" + ("" if upsample_factor > 0 else "_original")
-
-    samples: list[dict] = []
-    for config_name in configs:
-        ds = load_dataset("opencompass/AIME2025", config_name, split="test")
-        samples.extend([s for s in process_math(ds, dataset_name) if s is not None])
-
-    original_size = len(samples)
-    if upsample_factor > 0:
-        samples *= upsample_factor
-
-    logger.info(
-        f"Loading aime 2025 (OpenCompass) dataset: {len(samples)} samples"
-        + (f" (upsampled from {original_size})" if upsample_factor > 0 else "")
-    )
-    return add_ids(samples)
-
-
 def _load_aime_dataset(year: int, upsample_factor: int = 0) -> list[dict]:
-    aime_dataset = load_dataset("AI-MO/aimo-validation-aime", split="train", trust_remote_code=True)
-    aime_dataset = aime_dataset.filter(lambda x: str(year) in x["url"])
+    if year == 2025:
+        aime_dataset = load_dataset("MathArena/aime_2025", split="train", trust_remote_code=True)
+    else:
+        aime_dataset = load_dataset("AI-MO/aimo-validation-aime", split="train", trust_remote_code=True)
+        aime_dataset = aime_dataset.filter(lambda x: str(year) in x["url"])
 
     dataset_name = f"aime_{year}" + ("" if upsample_factor > 0 else "_original")
     samples = [s for s in process_aime_and_amc(aime_dataset, dataset_name) if s is not None]
@@ -284,6 +270,49 @@ def _load_custom_dataset(dataset_name: str) -> list[dict]:
 
     logger.info(f"Loading custom dataset {dataset_name}: {len(samples)} samples from {dataset_path}")
     return samples
+
+
+def _is_hf_dataset_path(name: str) -> bool:
+    """
+    Check if a name looks like a HuggingFace dataset path (format: "org/dataset-name").
+
+    Returns False for local file paths (multiple slashes, file extensions like .jsonl).
+    """
+    if "/" not in name:
+        return False
+    # Local paths typically have multiple slashes or file extensions
+    if name.count("/") > 1:
+        return False
+    if name.endswith(".jsonl") or name.endswith(".json"):
+        return False
+    # Check both parts are non-empty
+    parts = name.split("/")
+    return len(parts) == 2 and all(parts)
+
+
+# HuggingFace datasets that have custom loaders in load_datasets()
+_PREDEFINED_HF_DATASETS = {
+    "PRIME-RL/Eurus-2-RL-Data",
+    "agentica-org/DeepScaleR-Preview-Dataset",
+    "reliable-agents/Omni-MATH-500",
+    "HuggingFaceH4/MATH-500",
+    "open-r1/OpenR1-Math-220k",
+    "hendrydong/gpqa_main",
+    "hendrydong/gpqa_diamond",
+    "GAIR/LIMO",
+}
+
+
+def _load_hf_dataset(dataset_name: str) -> list[dict]:
+    """
+    Load a HuggingFace dataset by its path (format: "org/dataset-name").
+
+    Uses process_math to extract samples from the dataset.
+    """
+    dataset = load_dataset(dataset_name, split="train", trust_remote_code=True)
+    samples = [s for s in process_math(dataset, dataset_name) if s is not None]
+    logger.info(f"Loading {dataset_name} dataset: {len(samples)} samples")
+    return add_ids(samples)
 
 
 def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None) -> List[Tuple[str, Dict]]:
@@ -452,11 +481,11 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
         remaining.discard("aime_2024_original")
 
     if "aime_2025" in dataset_names:
-        datasets += _load_aime_2025_opencompass_dataset(upsample_factor=16)
+        datasets += _load_aime_dataset(2025, upsample_factor=16)
         remaining.discard("aime_2025")
 
     if "aime_2025_original" in dataset_names:
-        datasets += _load_aime_2025_opencompass_dataset()
+        datasets += _load_aime_dataset(2025)
         remaining.discard("aime_2025_original")
 
     if "amc_2022" in dataset_names:
@@ -475,14 +504,6 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
     if "amc_2023_original" in dataset_names:
         datasets += _load_amc_dataset(2023)
         remaining.discard("amc_2023_original")
-
-    if "sometimes_success_data" in dataset_names:
-        PATH = "data/sometimes_success_data/data.jsonl"
-        with open(PATH, "r") as f:
-            samples = [json.loads(line) for line in f]
-        logger.info(f"Loading easy data dataset: {len(samples)} samples")
-        datasets += add_ids(samples)
-        remaining.discard("sometimes_success_data")
 
     if "open_reasoner_zero_57k" in dataset_names:
         dataset = load_dataset(
@@ -520,57 +541,11 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
         datasets += add_ids(samples)
         remaining.discard("open_reasoner_zero_hard_13k")
 
-    for dataset_name in dataset_names:
-        test_matched = re.match(r"multiplication_(\d+)_by_(\d+)_(\d+)_test", dataset_name)
-        train_matched = re.match(r"multiplication(_upto)?_(\d+)_by_(\d+)_(\d+)_train", dataset_name)
-        if test_matched:
-            num_digits_1 = int(test_matched.group(1))
-            num_digits_2 = int(test_matched.group(2))
-            num_samples = int(test_matched.group(3))
-            dataset = load_dataset(
-                "json",
-                data_files=f"data/ehsan_kamalloo/multiplication/multiplication_{num_digits_1}_by_{num_digits_2}_{num_samples}_test.jsonl",
-                split="train",
-            )
-            samples = [
-                s
-                for s in process_math(dataset, f"multiplication_{num_digits_1}_by_{num_digits_2}_{num_samples}_test")
-                if s is not None
-            ]
-            logger.info(f"Loading multiplication {num_digits_1}_by_{num_digits_2} dataset: {len(samples)} samples")
-            datasets += add_ids(samples)
+    # Load any HuggingFace dataset (format: "org/dataset-name") not already handled above
+    for dataset_name in list(remaining):
+        if _is_hf_dataset_path(dataset_name) and dataset_name not in _PREDEFINED_HF_DATASETS:
+            datasets += _load_hf_dataset(dataset_name)
             remaining.discard(dataset_name)
-        elif train_matched:
-            upto_prefix = train_matched.group(1) or ""
-            num_digits_1 = int(train_matched.group(2))
-            num_digits_2 = int(train_matched.group(3))
-            num_samples = int(train_matched.group(4))
-            dataset = load_dataset(
-                "json",
-                data_files=f"data/ehsan_kamalloo/multiplication/multiplication{upto_prefix}_{num_digits_1}_by_{num_digits_2}_{num_samples}_train.jsonl",
-                split="train",
-            )
-            samples = [
-                s
-                for s in process_math(
-                    dataset, f"multiplication{upto_prefix}_{num_digits_1}_by_{num_digits_2}_{num_samples}_train"
-                )
-                if s is not None
-            ]
-            logger.info(
-                f"Loading multiplication {upto_prefix}_{num_digits_1}_by_{num_digits_2} dataset: {len(samples)} samples"
-            )
-            datasets += add_ids(samples)
-            remaining.discard(dataset_name)
-
-    if "countdown" in dataset_names:
-        dataset = load_dataset(
-            "parquet", data_files="data/xiaoyin/train.parquet", trust_remote_code=True, split="train"
-        )
-        samples = [s for s in process_countdown(dataset) if s is not None]
-        logger.info(f"Loading countdown dataset: {len(samples)} samples")
-        datasets += samples
-        remaining.discard("countdown")
 
     # resolve any remaining names as local custom datasets.
     unresolved: List[str] = []
