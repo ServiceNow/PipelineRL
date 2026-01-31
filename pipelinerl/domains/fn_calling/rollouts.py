@@ -13,10 +13,7 @@ from omegaconf import DictConfig
 from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from pipelinerl.domains.math.rollouts import RewardTable, length_penalty
-from pipelinerl.domains.fn_calling.verifier_api import (
-    verify_fn_calling_answer,
-    verify_fn_calling_answer_rpc,
-)
+from pipelinerl.domains.fn_calling.verifier_api import verify_fn_calling_answer_rpc
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.utils import get_environment_jobs, resolve_environment_key
 
@@ -99,25 +96,14 @@ async def _run_verification(
     generation: str,
     reward_context: Dict[str, Any],
     tool_calls: Optional[List[Dict[str, Any]]],
-    model_name: str,
 ) -> str:
-    use_local = cfg.actor.get("use_local_bfcl_verifier", False)
-
-    if use_local:
-        return verify_fn_calling_answer(
-            generation=generation,
-            reward_context=reward_context,
-            tool_calls=tool_calls,
-            model_name=model_name,
-        )
-
+    """Run verification via RPC to BFCLEnvironment server."""
     env_key = resolve_environment_key(cfg, default="fn_calling")
     env_jobs = get_environment_jobs(cfg, env_key)
     if not env_jobs:
         raise RuntimeError("No environment servers available for fn_calling domain")
     env_job = random.choice(env_jobs)
-    if env_job.hostname is None or env_job.port is None:
-        raise RuntimeError("fn_calling environment job is missing host/port information")
+    assert env_job.port is not None
 
     return await verify_fn_calling_answer_rpc(
         session=session,
@@ -126,7 +112,6 @@ async def _run_verification(
         generation=generation,
         reward_context=reward_context,
         tool_calls=tool_calls,
-        model_name=model_name,
     )
 
 
@@ -159,17 +144,12 @@ async def generate_fn_calling_rollout(
 
     reward_context = problem.get("reward_context", {})
 
-    model_name = getattr(llm, "model_name", "model")
-    if hasattr(llm, "model"):
-        model_name = llm.model
-
     answer_status = await _run_verification(
         cfg=cfg,
         session=session,
         generation=llm_call.output.content,
         reward_context=reward_context,
         tool_calls=tool_calls,
-        model_name=model_name,
     )
 
     rewards = RewardTable(**dict(cfg.rewards))
