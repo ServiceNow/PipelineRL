@@ -222,7 +222,6 @@ async def _run_code_sandboxfusion(
     timeout: float,
     sandbox_endpoint: str,
 ) -> _SandboxResult:
-    """Run code using SandboxFusion."""
     global _ENDPOINT_CONFIGURED
 
     if not _ENDPOINT_CONFIGURED:
