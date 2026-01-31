@@ -5,25 +5,14 @@ defaults:
 
 actor:
   rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
+  # No system prompt - model's chat template provides guidance
   system_prompt: ""
+  # Minimal task template - each problem contains its own instructions
   task_template: |-
     {task}
   task_prompt: ""
   ensure_boxed_answers: false
   domain_mix: null
-  # Domain-specific system prompts (used when actor.system_prompt is empty)
-  domain_system_prompts:
-    coding: |-
-      You are an expert Python programmer. When providing code solutions, format your final code inside markdown code blocks using triple backticks with the python language identifier, like this:
-      ```python
-      # your code here
-      ```
-      Provide complete, working implementations that pass all test cases.
-    fn_calling: |-
-      You are a helpful assistant with access to functions. When the user's request requires using a function, call the appropriate function with the correct arguments. Make function calls in JSON format.
-    math: ""
-    logic: |-
-      You are an expert at solving logic puzzles and reasoning problems. Think through each problem step by step, then provide your final answer inside <answer></answer> tags.
   domain_rollouts:
     math: ${domain_rollouts.math}
     guessing: ${domain_rollouts.guessing}
@@ -31,15 +20,10 @@ actor:
     chartqa: ${domain_rollouts.chartqa}
     miniwob: ${domain_rollouts.miniwob}
     coding: ${domain_rollouts.coding}
+    livecodebench: ${domain_rollouts.livecodebench}
     fn_calling: ${domain_rollouts.fn_calling}
     logic: ${domain_rollouts.logic}
-
-  # Use local mcp-run-python sandbox (no separate K8s job needed)
-  use_local_sandbox: true
-  sandbox_timeout: 5.0
-  max_tests_per_problem: 15
-  # Use local BFCL verifier for fn_calling (no separate K8s job needed)
-  use_local_bfcl_verifier: true
+    ifeval: ${domain_rollouts.ifeval}
 
 dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
 dataset_loader_params:
@@ -80,9 +64,23 @@ dataset_loader_params:
         - parallel_multiple
       max_examples_per_category: null
       max_examples: null
-      subset: train  # "train" or "test" (90/10 split)
+      subset: train  # "train", "test" (90/10 split), or "all" (no split, all categories)
       train_ratio: 0.9
       seed: 42
+    livecodebench:
+      # LiveCodeBench evaluation benchmark (held-out coding problems)
+      version: release_latest
+      max_examples: null
+      max_tests_per_problem: 15
+      seed: 42
+      huggingface_token: ${oc.env:HF_TOKEN, null}
+    ifeval:
+      # IFEval instruction following (AllenAI IF_multi_constraints for train, Google IFEval for test)
+      subset: train  # "train" (AllenAI 95k), "test" (Google 541), or "all"
+      max_examples: null
+      max_constraints: null  # Optionally limit max constraints per sample
+      seed: 42
+      huggingface_token: ${oc.env:HF_TOKEN, null}
 
 train_dataset_names: []
 test_dataset_names: []
@@ -92,19 +90,18 @@ environments:
     mode: remote
     replicas_per_actor: ${world.env_replicas_per_actor}
     _target_: pipelinerl.domains.math.MathEnvironment
-  # Coding uses local sandbox, no remote environment needed
-  # Logic uses local i3-logic verifier by default, but can use remote:
-  # - key: logic
-  #   mode: remote
-  #   replicas_per_actor: ${world.env_replicas_per_actor}
-  #   _target_: pipelinerl.domains.logic.LogicEnvironment
-  #   max_workers: 4
-  # fn_calling uses local BFCL verifier by default, but can use remote:
-  # - key: fn_calling
-  #   mode: remote
-  #   replicas_per_actor: ${world.env_replicas_per_actor}
-  #   _target_: pipelinerl.domains.fn_calling.BFCLEnvironment
-  #   max_workers: 4
+  - key: logic
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.logic.LogicEnvironment
+  - key: ifeval
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.ifeval.IFEvalEnvironment
+  - key: fn_calling
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.fn_calling.BFCLEnvironment
 
 environment_key: null
 

@@ -15,8 +15,8 @@ actor:
     math: ${domain_rollouts.math}
     coding: ${domain_rollouts.coding}
 
-  # Use local mcp-run-python sandbox (no separate K8s job needed)
-  use_local_sandbox: true
+  # SandboxFusion verification
+  sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
   sandbox_timeout: 5.0
   max_tests_per_problem: 15
 
@@ -53,7 +53,7 @@ environments:
     mode: remote
     replicas_per_actor: ${world.env_replicas_per_actor}
     _target_: pipelinerl.domains.math.MathEnvironment
-  # Coding uses local sandbox, no remote environment needed
+  # Coding uses SandboxFusion, no remote environment needed
 
 environment_key: null
 

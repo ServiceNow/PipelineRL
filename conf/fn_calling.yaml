@@ -4,24 +4,31 @@ defaults:
 
 actor:
   rollout_policy: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
-  system_prompt: |-
-    You are a helpful assistant with access to functions. When the user's request requires using a function, call the appropriate function with the correct arguments. Make function calls in JSON format.
+  # System prompt is intentionally empty - the chat template will inject
+  # tool instructions when tools are present in the request
+  system_prompt: ""
   task_template: |-
     {task}
   task_prompt: ""
   ensure_boxed_answers: false
-  # Use local BFCL verifier (no separate K8s job needed)
-  # Set to false to use remote BFCLEnvironment server
-  use_local_bfcl_verifier: true
 
 dataset_loader: pipelinerl.domains.fn_calling.dataset.load_problems
 dataset_loader_params:
-  # BFCL v3 test categories (single-turn)
+  # BFCL v4 test categories (single-turn) - ~2500 samples total
   categories:
-    - simple
-    - multiple
-    - parallel
-    - parallel_multiple
+    # Simple (single function call)
+    - simple_python      # 400
+    - simple_java        # 100
+    - simple_javascript  # 50
+    # Complex (multiple calls)
+    - multiple           # 200
+    - parallel           # 200
+    - parallel_multiple  # 200
+    # Live (real-world APIs)
+    - live_simple        # 258
+    - live_multiple      # 1053
+    - live_parallel      # 16
+    - live_parallel_multiple  # 24
   max_examples_per_category: null
   max_examples: null
   subset: train  # "train" or "test" (90/10 split by default)
@@ -32,7 +39,15 @@ train_dataset_names:
   - fn_calling
 
 test_dataset_names:
-  - fn_calling
+  - fn_calling_test
 
-# fn_calling can use local verifier, but remote is also supported
+environments:
+  - key: fn_calling
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.fn_calling.BFCLEnvironment
+
 environment_key: fn_calling
+
+world:
+  env_replicas_per_actor: 1

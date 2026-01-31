@@ -4,44 +4,44 @@ defaults:
 
 actor:
   rollout_policy: pipelinerl.domains.coding.generate_coding_rollout
-  system_prompt: |-
-    You are an expert Python programmer. When providing code solutions, format your final code inside markdown code blocks using triple backticks with the python language identifier, like this:
-    ```python
-    # your code here
-    ```
-    Provide complete, working implementations that pass all test cases.
+  # Empty system prompt - the problems already include instructions like:
+  # "Read the inputs from stdin...Enclose your code within ```python delimiters."
+  # Adding extra instructions can conflict with the model's native prompt format.
+  system_prompt: ""
   task_template: |-
     {task}
+
+    Write your solution in Python. Be concise. Output only the code in a single ```python``` block.
   task_prompt: ""
   ensure_boxed_answers: false
 
-  # Use local mcp-run-python sandbox (no separate K8s job needed)
-  use_local_sandbox: true
-  sandbox_timeout: 5.0
-  max_tests_per_problem: 15
+  # SandboxFusion verification endpoint
+  sandbox_endpoint: http://dns-4943305a-c17f-44b1-b767-9536529eb8bc-sandbox:8080
+  sandbox_timeout: 10.0
+  max_tests_per_problem: 5
 
+# Use combined TACO + APPS dataset
 dataset_loader: pipelinerl.domains.coding.dataset.load_problems
 dataset_loader_params:
-  # PrimeIntellect INTELLECT-3-RL dataset (open source, curated)
-  # Available configs: code, math, logic, science
-  dataset_id: PrimeIntellect/INTELLECT-3-RL
-  dataset_config: code
-  split: train
-  subset: train  # "train" or "test" (90/10 split)
+  taco_split: train
+  apps_split: train
+  subset: train  # "train", "test", or "all"
   train_ratio: 0.9
-  # Difficulty filtering: keep problems with 10-90% solve rate
-  min_difficulty: 0.1
-  max_difficulty: 0.9
-  difficulty_column: avg@8_qwen3_4b_instruct_2507
+  # Filter out HARD and VERY_HARD from TACO (APPS kept as-is)
+  taco_excluded_difficulties:
+    - HARD
+    - VERY_HARD
+  # Limit test cases per problem (aligned with median test counts)
+  max_tests_per_problem: 5
   max_examples: null
   seed: 42
   huggingface_token: ${oc.env:HF_TOKEN, null}
 
 train_dataset_names:
-  - coding
+  - taco
+  - apps
 
 test_dataset_names:
-  - coding
+  - livecodebench_v5
 
-# No remote environment needed when use_local_sandbox=true
 environment_key: coding

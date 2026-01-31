@@ -4,15 +4,12 @@ defaults:
 
 actor:
   rollout_policy: pipelinerl.domains.logic.generate_logic_rollout
-  system_prompt: |-
-    You are an expert at solving logic puzzles and reasoning problems. Think through each problem step by step, then provide your final answer inside <answer></answer> tags.
+  system_prompt: ""
   task_template: |-
     {task}
+
   task_prompt: ""
   ensure_boxed_answers: false
-  # Use local i3-logic verifier (no separate K8s job needed)
-  # Set to false to use remote LogicEnvironment server
-  use_local_logic_verifier: true
 
 dataset_loader: pipelinerl.domains.logic.dataset.load_problems
 dataset_loader_params:
@@ -20,8 +17,9 @@ dataset_loader_params:
   dataset_id: PrimeIntellect/INTELLECT-3-RL
   dataset_config: logic
   split: train
-  subset: train  # "train" or "test" (90/10 split)
-  train_ratio: 0.9
+  subset: train  # "train" or "test"
+  # Fixed test size similar to IFEval (~550 held-out samples)
+  test_size: 550
   # Difficulty filtering using model solve rates
   min_difficulty: 0.0
   max_difficulty: 1.0
@@ -36,7 +34,16 @@ train_dataset_names:
   - logic
 
 test_dataset_names:
-  - logic
+  - logic_test
 
-# Logic uses local i3-logic verifiers, no remote environment needed
+environments:
+  - key: logic
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.logic.LogicEnvironment
+
+world:
+  env_replicas_per_actor: 1
+
+# Logic verification via RPC to LogicEnvironment server
 environment_key: logic
