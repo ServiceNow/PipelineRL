@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import time
 from typing import Any, Literal
 
@@ -12,10 +11,9 @@ from omegaconf import DictConfig
 from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.async_llm import llm_async_generate, make_training_text
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
-from pipelinerl.utils import get_environment_jobs, resolve_environment_key
 from pipelinerl.domains.math.rollouts import RewardTable, length_penalty
 
-from .verifier_api import evaluate_coding_prediction_async, verify_coding_solution_rpc
+from .verifier_api import evaluate_coding_prediction_async
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +28,28 @@ class CodingMetrics(BaseMetrics):
 
 def _format_task(problem: dict[str, Any]) -> str:
     if "task" in problem and problem["task"]:
-        return str(problem["task"])
-    if "question" in problem and problem["question"]:
-        return str(problem["question"])
-    extra_info = problem.get("extra_info") or {}
-    if isinstance(extra_info, dict) and extra_info.get("question"):
-        return str(extra_info["question"])
-    return str(problem)
+        task = str(problem["task"])
+    elif "question" in problem and problem["question"]:
+        task = str(problem["question"])
+    else:
+        extra_info = problem.get("extra_info") or {}
+        if isinstance(extra_info, dict) and extra_info.get("question"):
+            task = str(extra_info["question"])
+        else:
+            task = str(problem)
+
+    # append function name if needed
+    reward_context = problem.get("reward_context") or {}
+    if isinstance(reward_context, str):
+        try:
+            reward_context = json.loads(reward_context)
+        except (json.JSONDecodeError, ValueError):
+            reward_context = {}
+    fn_name = reward_context.get("fn_name")
+    if fn_name and fn_name not in task:
+        task = f"{task}\n\nYour function should be named `{fn_name}`."
+
+    return task
 
 
 def _determine_answer_status(verification: dict[str, Any]) -> Literal["correct", "wrong", "no_answer", "unparsable"]:
@@ -91,46 +104,20 @@ def _compute_reward(
 async def _run_verification(
     cfg: DictConfig,
     *,
-    session: aiohttp.ClientSession,
     prediction: str | None,
     reward_context: dict[str, Any] | str | None,
     extra_info: dict[str, Any] | str | None,
 ) -> dict[str, Any]:
-    """Run verification either locally (in-process) or via RPC.
-
-    If cfg.actor.use_local_sandbox is True, uses mcp-run-python directly.
-    Otherwise, sends verification request to a remote environment server.
-    """
-    use_local = getattr(cfg.actor, "use_local_sandbox", True)
-
-    if use_local:
-        # Run verification in-process using mcp-run-python
-        summary = await evaluate_coding_prediction_async(
-            prediction=prediction,
-            reward_context=reward_context,
-            extra_info=extra_info,
-            timeout_per_test=getattr(cfg.actor, "sandbox_timeout", 5.0),
-            max_tests=getattr(cfg.actor, "max_tests_per_problem", 15),
-            pool_size=getattr(cfg.actor, "sandbox_pool_size", 4),
-        )
-        return summary.to_payload()
-
-    # Fall back to RPC-based verification
-    env_key = resolve_environment_key(cfg, default="coding")
-    env_jobs = get_environment_jobs(cfg, env_key)
-    if not env_jobs:
-        raise RuntimeError("No coding environment servers registered and use_local_sandbox=False")
-    env_job = random.choice(env_jobs)
-    if env_job.hostname is None or env_job.port is None:
-        raise RuntimeError("Coding environment job is missing host/port information")
-    return await verify_coding_solution_rpc(
-        session,
-        host=env_job.hostname,
-        port=env_job.port,
+    """Run verification through SandboxFusion."""
+    summary = await evaluate_coding_prediction_async(
         prediction=prediction,
         reward_context=reward_context,
         extra_info=extra_info,
+        timeout_per_test=getattr(cfg.actor, "sandbox_timeout", 5.0),
+        max_tests=getattr(cfg.actor, "max_tests_per_problem", 15),
+        sandbox_endpoint=getattr(cfg.actor, "sandbox_endpoint", "http://127.0.0.1:8080"),
     )
+    return summary.to_payload()
 
 
 def _coerce_dict(data: dict[str, Any] | str | None) -> dict[str, Any]:
@@ -178,7 +165,6 @@ async def generate_coding_rollout(
     extra_info = _coerce_dict(problem.get("extra_info"))
     verification = await _run_verification(
         cfg,
-        session=session,
         prediction=llm_call.output.content,
         reward_context=reward_context,
         extra_info=extra_info,
