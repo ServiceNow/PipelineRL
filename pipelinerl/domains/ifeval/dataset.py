@@ -1,7 +1,7 @@
 """Dataset loader for IFEval instruction following domain.
 
 Training data: allenai/IF_multi_constraints_upto5 (95k samples with up to 5 constraints)
-This loader is for TRAINING only. For eval, use google_ifeval domain.
+Supports train/test splitting similar to coding domain.
 """
 
 from __future__ import annotations
@@ -19,6 +19,27 @@ logger = logging.getLogger(__name__)
 DOMAIN_NAME = "ifeval"
 DATASET_ID = "allenai/IF_multi_constraints_upto5"
 
+# Default test size similar to Google IFEval benchmark (541 samples)
+DEFAULT_TEST_SIZE = 550
+DEFAULT_TRAIN_RATIO = 0.994  # ~95k train, ~550 test
+
+# Lazy-loaded tokenizer for prompt length filtering
+_tokenizer = None
+
+
+def _get_tokenizer():
+    """Get tiktoken tokenizer for token counting."""
+    global _tokenizer
+    if _tokenizer is None:
+        import tiktoken
+        _tokenizer = tiktoken.get_encoding("cl100k_base")
+    return _tokenizer
+
+
+def _count_tokens(text: str) -> int:
+    """Count tokens in text using tiktoken."""
+    return len(_get_tokenizer().encode(text))
+
 
 @dataclass
 class DatasetOptions:
@@ -27,6 +48,12 @@ class DatasetOptions:
     huggingface_token: str | None = None
     # Limit number of constraints per sample
     max_constraints: int | None = None
+    # Train/test split options
+    subset: str = "train"  # "train", "test", or "all"
+    train_ratio: float = DEFAULT_TRAIN_RATIO
+    test_size: int | None = DEFAULT_TEST_SIZE  # Fixed test size (overrides train_ratio if set)
+    # Filter out prompts exceeding this token count (to avoid context length errors)
+    max_prompt_tokens: int | None = None
 
 
 def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
@@ -47,6 +74,17 @@ def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
     if "max_constraints" in loader_kwargs:
         val = loader_kwargs["max_constraints"]
         options.max_constraints = int(val) if val is not None else None
+    if "subset" in loader_kwargs:
+        options.subset = str(loader_kwargs["subset"])
+    if "train_ratio" in loader_kwargs:
+        val = loader_kwargs["train_ratio"]
+        options.train_ratio = float(val) if val is not None else DEFAULT_TRAIN_RATIO
+    if "test_size" in loader_kwargs:
+        val = loader_kwargs["test_size"]
+        options.test_size = int(val) if val is not None else None
+    if "max_prompt_tokens" in loader_kwargs:
+        val = loader_kwargs["max_prompt_tokens"]
+        options.max_prompt_tokens = int(val) if val is not None else None
 
     return options
 
@@ -119,6 +157,56 @@ def _build_record(sample: dict, idx: int, options: DatasetOptions) -> dict | Non
     }
 
 
+def _split_dataset(
+    samples: List[Dict],
+    options: DatasetOptions,
+) -> List[Dict]:
+    """Split samples into train/test subsets."""
+    if options.subset not in ("train", "test", "all"):
+        logger.warning("Invalid subset '%s', defaulting to 'train'", options.subset)
+        options.subset = "train"
+
+    if options.subset == "all":
+        logger.info("Using all data: %d samples", len(samples))
+        return samples
+
+    # Use fixed seed for reproducible splits
+    split_seed = 42
+    total = len(samples)
+    indices = list(range(total))
+
+    rng = random.Random(split_seed)
+    rng.shuffle(indices)
+
+    # Determine split point
+    if options.test_size is not None and options.test_size > 0:
+        # Use fixed test size
+        test_count = min(options.test_size, total)
+        train_end = total - test_count
+    else:
+        # Use ratio
+        train_end = int(total * options.train_ratio)
+
+    if options.subset == "train":
+        selected_indices = indices[:train_end]
+        logger.info(
+            "Using train subset: %d samples (%.1f%% of %d)",
+            len(selected_indices),
+            len(selected_indices) / total * 100,
+            total,
+        )
+    else:  # test
+        selected_indices = indices[train_end:]
+        logger.info(
+            "Using test subset: %d samples (%.1f%% of %d)",
+            len(selected_indices),
+            len(selected_indices) / total * 100,
+            total,
+        )
+
+    return [samples[i] for i in selected_indices]
+
+
 def load_datasets(
     dataset_names: List[str] | str | None = None,
     seed: int | None = None,
@@ -158,14 +246,26 @@ def load_datasets(
         return []
 
     samples: list[dict] = []
+    filtered_long = 0
     for idx, sample in enumerate(ds):
         record = _build_record(sample, idx, options)
         if record is not None:
+            # Filter out prompts that are too long
+            if options.max_prompt_tokens is not None:
+                token_count = _count_tokens(record["task"])
+                if token_count > options.max_prompt_tokens:
+                    filtered_long += 1
+                    continue
             samples.append(record)
 
     logger.info("Built %d valid samples", len(samples))
+    if filtered_long > 0:
+        logger.info("Filtered out %d samples exceeding %d tokens", filtered_long, options.max_prompt_tokens)
 
-    # Shuffle if seed provided
+    # Split into train/test subsets
+    samples = _split_dataset(samples, options)
+
+    # Shuffle if seed provided (after split to maintain split consistency)
     if options.seed is not None:
         rng = random.Random(options.seed)
         rng.shuffle(samples)
@@ -186,6 +286,34 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Hydra entrypoint that mirrors other domain loader style."""
+    """Hydra entrypoint that mirrors other domain loader style.
+
+    Dispatches based on dataset_names:
+    - "ifeval_test": Load test subset from AllenAI data (~550 samples)
+    - "ifeval" or "ifeval_train": Load train subset from AllenAI data (~94k samples)
+    - "google_ifeval": Load Google IFEval benchmark (541 held-out eval samples)
+    """
     seed = loader_kwargs.pop("seed", None)
+
+    # Normalize dataset_names to list
+    if dataset_names is None:
+        names = []
+    elif isinstance(dataset_names, str):
+        names = [dataset_names]
+    else:
+        names = list(dataset_names)
+
+    # Dispatch based on dataset name
+    if "google_ifeval" in names:
+        from . import google_ifeval
+        return google_ifeval.load_datasets(dataset_names, seed=seed, **loader_kwargs)
+
+    # Check for test subset request
+    if "ifeval_test" in names:
+        loader_kwargs["subset"] = "test"
+    elif "ifeval" in names or "ifeval_train" in names:
+        # Default to train subset
+        if "subset" not in loader_kwargs:
+            loader_kwargs["subset"] = "train"
+
     return load_datasets(dataset_names, seed=seed, **loader_kwargs)
