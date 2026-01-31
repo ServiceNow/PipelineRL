@@ -1,8 +1,3 @@
-"""IFEval instruction following verification.
-
-Uses AllenAI's IFEvalG module which supports 67 constraint types.
-"""
-
 from __future__ import annotations
 
 import asyncio

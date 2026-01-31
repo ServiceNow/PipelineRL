@@ -1,5 +1,3 @@
-"""Rollout generation for the IFEval instruction following domain."""
-
 import logging
 import random
 import time

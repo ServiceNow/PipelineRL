@@ -1,9 +1,3 @@
-"""Dataset loader for Google IFEval evaluation benchmark.
-
-This is the original IFEval benchmark (541 samples) - completely held out from training.
-Use this for EVALUATION only. For training, use the ifeval domain.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -27,7 +21,6 @@ class DatasetOptions:
 
 
 def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
-    """Parse loader kwargs into DatasetOptions."""
     options = DatasetOptions()
     if not loader_kwargs:
         return options
@@ -46,7 +39,6 @@ def _normalize_options(loader_kwargs: Dict[str, Any]) -> DatasetOptions:
 
 
 def _build_record(sample: dict, idx: int) -> dict | None:
-    """Convert a Google IFEval sample to our internal format."""
     prompt = sample.get("prompt", "")
     if not prompt:
         return None
@@ -57,7 +49,6 @@ def _build_record(sample: dict, idx: int) -> dict | None:
     if not instruction_ids:
         return None
 
-    # Build reward_context for verifier
     reward_context = {
         "instruction_id_list": instruction_ids,
         "kwargs": kwargs_list,
@@ -79,16 +70,6 @@ def load_datasets(
     seed: int | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Load Google IFEval benchmark (541 held-out evaluation samples).
-
-    Args:
-        dataset_names: Ignored for compatibility.
-        seed: Random seed for shuffling.
-        **loader_kwargs: Additional options (max_examples, etc.)
-
-    Returns:
-        List of problem dictionaries.
-    """
     if loader_kwargs.get("seed") is None and seed is not None:
         loader_kwargs["seed"] = seed
 
@@ -114,17 +95,14 @@ def load_datasets(
 
     logger.info("Built %d valid samples", len(samples))
 
-    # Shuffle if seed provided
     if options.seed is not None:
         rng = random.Random(options.seed)
         rng.shuffle(samples)
 
-    # Limit samples if requested
     if options.max_examples is not None and len(samples) > options.max_examples:
         samples = samples[: options.max_examples]
         logger.info("Limited to %d samples", len(samples))
 
-    # Re-assign IDs after filtering/shuffling
     for idx, sample in enumerate(samples):
         sample["id"] = idx
 
@@ -135,6 +113,5 @@ def load_problems(
     dataset_names: List[str] | str | None = None,
     **loader_kwargs: Any,
 ) -> List[Dict]:
-    """Hydra entrypoint."""
     seed = loader_kwargs.pop("seed", None)
     return load_datasets(dataset_names, seed=seed, **loader_kwargs)

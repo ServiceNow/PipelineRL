@@ -1,9 +1,3 @@
-"""Dataset loader for IFEval instruction following domain.
-
-Training data: allenai/IF_multi_constraints_upto5 (95k samples with up to 5 constraints)
-Supports train/test splitting similar to coding domain.
-"""
-
 from __future__ import annotations
 
 import json
