@@ -10,8 +10,8 @@ This directory contains domain-specific implementations for multi-domain RL trai
 | Domain | Description | Dataset | Verifier |
 |--------|-------------|---------|----------|
 | `math` | Mathematical reasoning | OpenReasonerZero, AIME, etc. | math-verify |
-| `coding` | Code generation | PrimeIntellect INTELLECT-3-RL (code) | mcp-run-python sandbox |
-| `livecodebench` | Code generation (eval only) | LiveCodeBench v5 | mcp-run-python sandbox |
+| `coding` | Code generation | TACO + APPS | SandboxFusion |
+| `livecodebench` | Code generation (eval only) | LiveCodeBench v5 | SandboxFusion |
 | `logic` | Logic puzzles | PrimeIntellect INTELLECT-3-RL (logic) | i3-logic |
 | `fn_calling` | Function calling | BFCL v3 | bfcl-eval |
 | `ifeval` | Instruction following (train) | AllenAI IF_multi_constraints_upto5 | instruction_following_eval |
@@ -28,7 +28,7 @@ pip install pipelinerl[domains]
 ### Per-Domain Installation
 
 ```bash
-# Coding domain (mcp-run-python sandbox)
+# Coding domain (SandboxFusion SDK)
 pip install pipelinerl[coding]
 
 # Function calling domain (BFCL verifier)
@@ -62,15 +62,23 @@ prime env install primeintellect/i3-logic
 
 ### Coding Domain Setup
 
-The coding domain uses `mcp-run-python` for sandboxed code execution. It also requires `deno` runtime:
+The coding domain uses [SandboxFusion](https://github.com/bytedance/SandboxFusion) for sandboxed Python execution. SandboxFusion is a Docker-based code execution service that must be deployed separately.
 
 ```bash
-# Install deno (if not already installed)
-curl -fsSL https://deno.land/install.sh | sh
-export PATH="$HOME/.deno/bin:$PATH"
+# Install SandboxFusion Python SDK
+pip install sandbox-fusion
 
-# Verify installation
-deno --version
+# Deploy SandboxFusion server (Docker required)
+# See https://bytedance.github.io/SandboxFusion for deployment options
+docker run -d -p 8080:8080 bytedance/sandbox-fusion:latest
+```
+
+Configuration in `conf/coding.yaml`:
+```yaml
+actor:
+  sandbox_endpoint: http://127.0.0.1:8080
+  sandbox_timeout: 10.0
+  max_tests_per_problem: 5
 ```
 
 ## Usage in Config
@@ -101,9 +109,9 @@ test_dataset_names:
 - **Reward**: Binary (correct/incorrect)
 
 ### Coding
-- **Training data**: PrimeIntellect INTELLECT-3-RL code domain (8.5k curated samples)
+- **Training data**: TACO + APPS datasets (combined, filtered by difficulty)
 - **Eval data**: LiveCodeBench v5 (880 problems, Aug 2024 - Jan 2025)
-- **Verifier**: Sandboxed Python execution via `mcp-run-python`
+- **Verifier**: Sandboxed Python execution via SandboxFusion (concurrent)
 - **Reward**: Fraction of test cases passed
 
 ### Logic
