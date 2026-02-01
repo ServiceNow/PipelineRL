@@ -50,7 +50,7 @@ dataset_loader_params:
       min_difficulty: 0.0
       max_difficulty: 1.0
       difficulty_column: avg@16_qwen3_4b_instruct_2507
-      tasks_to_skip: [arc_agi, arc_agi_2, buggy_tables]
+      tasks_to_skip: [arc_agi, arc_agi_2, buggy_tables, dyck_language, dyck_language_errors, dyck_language_reasoning_errors]
       max_examples: null
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
