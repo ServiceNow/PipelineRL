@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -11,23 +10,6 @@ from datasets import load_dataset
 from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
-
-# extract function name from prompt
-_FN_NAME_PATTERNS = [
-    re.compile(r"Complete the function\s+(\w+)\s*\(", re.IGNORECASE),
-    re.compile(r"function\s+named\s+['\"]?(\w+)['\"]?", re.IGNORECASE),
-    re.compile(r"implement\s+(?:the\s+)?function\s+['\"]?(\w+)['\"]?", re.IGNORECASE),
-    re.compile(r"write\s+(?:a\s+)?function\s+['\"]?(\w+)['\"]?\s*\(", re.IGNORECASE),
-]
-
-
-def _extract_fn_name_from_prompt(prompt: str) -> str | None:
-    """Try to extract function name from prompt text."""
-    for pattern in _FN_NAME_PATTERNS:
-        match = pattern.search(prompt)
-        if match:
-            return match.group(1)
-    return None
 
 DOMAIN_NAME = "coding"
 
@@ -125,10 +107,10 @@ def _build_taco_record(sample: dict, idx: int, max_tests: int = 50) -> dict | No
 
     inputs = io_data.get("inputs", [])
     outputs = io_data.get("outputs", [])
+    # Only use fn_name if explicitly provided in io_data.
+    # Do NOT extract from prompts - geeksforgeeks inputs are pseudo-code strings
+    # meant for stdin simulation, not actual function arguments.
     fn_name = io_data.get("fn_name")
-
-    if not fn_name:
-        fn_name = _extract_fn_name_from_prompt(prompt)
 
     if not inputs or not outputs:
         return None
@@ -166,10 +148,8 @@ def _build_apps_record(sample: dict, idx: int, max_tests: int = 50) -> dict | No
 
     inputs = io_data.get("inputs", [])
     outputs = io_data.get("outputs", [])
+    # Only use fn_name if explicitly provided in io_data.
     fn_name = io_data.get("fn_name")
-
-    if not fn_name:
-        fn_name = _extract_fn_name_from_prompt(prompt)
 
     if not inputs or not outputs:
         return None
