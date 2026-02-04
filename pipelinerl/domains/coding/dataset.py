@@ -23,7 +23,7 @@ class CombinedDatasetOptions:
     subset: str = "train"  # "train", "test", or "all"
     train_ratio: float = 0.9
     max_examples: int | None = None
-    max_tests_per_problem: int = 50  # Limit test cases to avoid memory issues
+    max_tests_per_problem: int = 50  # Limit test cases to avoid context/mem issues
     taco_excluded_difficulties: set[str] = field(default_factory=lambda: TACO_EXCLUDED_DIFFICULTIES.copy())
     huggingface_token: str | None = None
     seed: int | None = None
@@ -31,7 +31,7 @@ class CombinedDatasetOptions:
 
 
 def _to_native(value: Any) -> Any:
-    if isinstance(value, DictConfig):
+    if OmegaConf.is_config(value):
         return OmegaConf.to_container(value, resolve=True)
     return value
 
@@ -107,8 +107,6 @@ def _build_taco_record(sample: dict, idx: int, max_tests: int = 50) -> dict | No
 
     inputs = io_data.get("inputs", [])
     outputs = io_data.get("outputs", [])
-    # Only use fn_name if explicitly provided in io_data.
-    # Do NOT extract from prompts - geeksforgeeks inputs are pseudo-code strings
     # meant for stdin simulation, not actual function arguments.
     fn_name = io_data.get("fn_name")
 
