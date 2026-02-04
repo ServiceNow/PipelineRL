@@ -216,4 +216,5 @@ async def generate_fn_calling_rollout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem.get("dataset"),
+        domain="fn_calling",
     )
