@@ -56,6 +56,27 @@ tapeagents = [
 lora = [
     "peft==0.18.0",
 ]
+# Domain-specific dependencies
+coding = [
+    "sandbox-fusion>=0.3.7",
+]
+fn_calling = [
+    "bfcl-eval>=2025.6.8",
+]
+logic = [
+    # i3-logic is installed via: prime env install primeintellect/i3-logic
+    # It requires the verifiers package which is on PyPI
+    "verifiers>=0.1.7",
+]
+ifeval = [
+    # IFEvalG bundled module dependencies
+    "langdetect",
+    "absl-py",
+]
+# Install all domain dependencies
+domains = [
+    "pipelinerl[coding,fn_calling,logic,ifeval]",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

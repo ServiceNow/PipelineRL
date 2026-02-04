@@ -11,6 +11,9 @@ from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 
 
+DOMAIN = "counting"
+
+
 async def generate_counting_rollout(
     cfg: DictConfig,
     llm: TrainableLLM,
@@ -63,6 +66,7 @@ async def generate_counting_rollout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
+        domain="counting",
     )
     
 
@@ -81,6 +85,7 @@ def load_problems(dataset_names: list[str]):
                 if not isinstance(problem, dict) or "letter" not in problem or "word" not in problem or "count" not in problem:
                     raise ValueError(f"Problem {problem} in dataset {name} is invalid.")
                 problem["dataset"] = name
+                problem.setdefault("domain", DOMAIN)
                 problems.append(problem)
     return problems
     

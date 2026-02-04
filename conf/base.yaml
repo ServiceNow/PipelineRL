@@ -145,4 +145,3 @@ wandb:
   wandb_dir: null
   # Comma-separated list of keywords to tag the run.
   tags: []
-

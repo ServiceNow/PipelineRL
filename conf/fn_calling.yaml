@@ -1,0 +1,53 @@
+defaults:
+  - base
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
+  # System prompt is intentionally empty - the chat template will inject
+  # tool instructions when tools are present in the request
+  system_prompt: ""
+  task_template: |-
+    {task}
+  task_prompt: ""
+  ensure_boxed_answers: false
+
+dataset_loader: pipelinerl.domains.fn_calling.dataset.load_problems
+dataset_loader_params:
+  # BFCL v4 test categories (single-turn) - ~2500 samples total
+  categories:
+    # Simple (single function call)
+    - simple_python      # 400
+    - simple_java        # 100
+    - simple_javascript  # 50
+    # Complex (multiple calls)
+    - multiple           # 200
+    - parallel           # 200
+    - parallel_multiple  # 200
+    # Live (real-world APIs)
+    - live_simple        # 258
+    - live_multiple      # 1053
+    - live_parallel      # 16
+    - live_parallel_multiple  # 24
+  max_examples_per_category: null
+  max_examples: null
+  subset: train  # "train" or "test" (90/10 split by default)
+  train_ratio: 0.9
+  seed: 42
+
+train_dataset_names:
+  - fn_calling
+
+test_dataset_names:
+  - fn_calling_test
+
+environments:
+  - key: fn_calling
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.fn_calling.BFCLEnvironment
+
+environment_key: fn_calling
+
+world:
+  env_replicas_per_actor: 1
