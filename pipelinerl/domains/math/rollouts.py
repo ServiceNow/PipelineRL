@@ -139,6 +139,7 @@ async def generate_math_rollout(
     return RolloutResult(
         training_texts=[trace],
         metrics=metrics,
-        latency=latency, 
+        latency=latency,
         dataset_name=problem.get("dataset"),
+        domain="math",
     )
