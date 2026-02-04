@@ -113,9 +113,9 @@ async def _run_verification(
         prediction=prediction,
         reward_context=reward_context,
         extra_info=extra_info,
-        timeout_per_test=getattr(cfg.actor, "sandbox_timeout", 5.0),
-        max_tests=getattr(cfg.actor, "max_tests_per_problem", 15),
-        sandbox_endpoint=cfg.actor.sandbox_endpoint,
+        timeout_per_test=getattr(cfg, "sandbox_timeout", 5.0),
+        max_tests=getattr(cfg, "max_tests_per_problem", 15),
+        sandbox_endpoint=cfg.sandbox_endpoint,
     )
     return summary.to_payload()
 
