@@ -84,6 +84,7 @@ async def generate_guessing_rollout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
+        domain="guessing",
     )
     
 
