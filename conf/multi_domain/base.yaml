@@ -29,19 +29,18 @@ dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
 dataset_loader_params:
   per_domain_params:
     coding:
-      # TACO + APPS coding datasets
+      # TACO + APPS
       taco_split: train
       apps_split: train
       subset: train
       train_ratio: 0.9
-      max_tests_per_problem: 50
-      taco_excluded_difficulties: [HARD, VERY_HARD]
+      max_tests_per_problem: 5
+      taco_excluded_difficulties: [VERY_HARD]
       skip_apps: false
       max_examples: null
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
     logic:
-      # PrimeIntellect INTELLECT-3-RL logic domain (11.6k samples, 87 task types)
       dataset_id: PrimeIntellect/INTELLECT-3-RL
       dataset_config: logic
       split: train
@@ -55,29 +54,39 @@ dataset_loader_params:
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
     fn_calling:
-      # BFCL v3 function calling (Berkeley Function Calling Leaderboard)
+      # BFCL v4 function calling (Berkeley Function Calling Leaderboard)
       categories:
-        - simple
+        # Simple (single function call)
+        - simple_python
+        - simple_java
+        - simple_javascript
+        # Complex (multiple calls)
         - multiple
         - parallel
         - parallel_multiple
+        # Live (real-world APIs)
+        - live_simple
+        - live_multiple
+        - live_parallel
+        - live_parallel_multiple
       max_examples_per_category: null
       max_examples: null
       subset: train  # "train", "test" (90/10 split), or "all" (no split, all categories)
       train_ratio: 0.9
       seed: 42
     livecodebench:
-      # LiveCodeBench evaluation benchmark (held-out coding problems)
       version: release_latest
       max_examples: null
       max_tests_per_problem: 15
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
     ifeval:
-      # IFEval instruction following (AllenAI IF_multi_constraints for train, Google IFEval for test)
-      subset: train  # "train" (AllenAI 95k), "test" (Google 541), or "all"
+      # AllenAI IF_multi_constraints for train, Google IFEval for test
+      subset: train  # "train" (AllenAI 95k), "test" (Google 541)
       max_examples: null
-      max_constraints: null  # Optionally limit max constraints per sample
+      max_constraints: null
+      # Filter out prompts exceeding this token count (max_model_len - max_tokens - buffer)
+      max_prompt_tokens: 42000
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
 
