@@ -221,4 +221,5 @@ async def generate_coding_rollout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem.get("dataset"),
+        domain="coding",
     )
