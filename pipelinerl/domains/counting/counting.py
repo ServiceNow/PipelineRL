@@ -66,6 +66,7 @@ async def generate_counting_rollout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
+        domain="counting",
     )
     
 
