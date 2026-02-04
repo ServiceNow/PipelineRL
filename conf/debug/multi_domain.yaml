@@ -9,17 +9,16 @@ actor:
   llm_max_rollouts: 2
   rollout_workers: 1
   domain_rollouts:
-    math: ${domain_rollouts.math}
     guessing: ${domain_rollouts.guessing}
     coding: ${domain_rollouts.coding}
 
 dataset_loader: pipelinerl.domains.multidomain.load_problems
+# Note: math_debug removed because math rollouts require a remote verifier
 train_dataset_names:
-  - math_debug
   - guessing_debug
   - coding_debug
 test_dataset_names:
-  - math_debug
+  - guessing_debug
   - coding_debug
 
 environment: null
