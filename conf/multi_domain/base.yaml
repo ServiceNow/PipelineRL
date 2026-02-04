@@ -12,7 +12,6 @@ actor:
     {task}
   task_prompt: ""
   ensure_boxed_answers: false
-  domain_mix: null
   domain_rollouts:
     math: ${domain_rollouts.math}
     guessing: ${domain_rollouts.guessing}
