@@ -1,7 +1,8 @@
+# @package _global_
 defaults:
-  - base
-  - domain_rollouts: base
-  - override rewards: success_and_format
+  - /base
+  - /domain_rollouts@domain_rollouts: base
+  - override /rewards: success_and_format
   - _self_
 
 actor:
