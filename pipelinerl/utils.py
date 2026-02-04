@@ -164,7 +164,7 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
                 {
                     "key": str(key) if key is not None else "default",
                     "mode": default_mode,
-                    "replicas_per_actor": default_replicas,
+                    "replicas_per_actor": None,  # Let _place_environments fall back to env_replicas
                     "index": 0,
                 }
             )
