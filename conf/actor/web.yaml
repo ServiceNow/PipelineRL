@@ -10,6 +10,11 @@ environments:
     config_path: conf/mcp/web.json
 environment_key: mcp
 
+# Legacy key for tapeagents compatibility (expects cfg.environment)
+environment:
+  _target_: tapeagents.mcp.MCPEnvironment
+  config_path: conf/mcp/web.json
+
 llm:
   _target_: tapeagents.llms.LiteLLM
   model_name: o4-mini-2025-04-16
