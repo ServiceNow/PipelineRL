@@ -15,10 +15,10 @@ actor:
   task_prompt: ""
   ensure_boxed_answers: false
 
-  # SandboxFusion verification endpoint (override via SANDBOX_ENDPOINT env var)
-  sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
-  sandbox_timeout: 10.0
-  max_tests_per_problem: 5
+# SandboxFusion verification settings
+sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
+sandbox_timeout: 10.0
+max_tests_per_problem: 5
 
 # Use combined TACO + APPS dataset
 dataset_loader: pipelinerl.domains.coding.dataset.load_problems
