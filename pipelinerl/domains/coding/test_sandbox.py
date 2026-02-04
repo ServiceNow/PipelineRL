@@ -1,5 +1,7 @@
-import requests
 import json
+import os
+
+import requests
 
 fn_name = "add_one"
 generation = """
@@ -129,7 +131,7 @@ request_timeout = 10
 code = current_generation_code
 stdin = "15"
 memory_limit_mb=1024
-sandbox_fusion_url="http://dns-4943305a-c17f-44b1-b767-9536529eb8bc-sandbox:8080/run_code"
+sandbox_fusion_url = os.environ.get("SANDBOX_ENDPOINT", "http://127.0.0.1:8080") + "/run_code"
 language="python"
 
 

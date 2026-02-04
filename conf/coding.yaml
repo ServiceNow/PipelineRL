@@ -15,8 +15,8 @@ actor:
   task_prompt: ""
   ensure_boxed_answers: false
 
-  # SandboxFusion verification endpoint
-  sandbox_endpoint: http://dns-4943305a-c17f-44b1-b767-9536529eb8bc-sandbox:8080
+  # SandboxFusion verification endpoint (override via SANDBOX_ENDPOINT env var)
+  sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
   sandbox_timeout: 10.0
   max_tests_per_problem: 5
 
