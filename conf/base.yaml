@@ -2,7 +2,6 @@ defaults:
   - finetune: base
   - rewards: pure_success
   - streams: files
-  - domain_mix: null
   - _self_
 
 seed: 42
