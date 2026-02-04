@@ -37,7 +37,6 @@ from pipelinerl.streams import (
 from .utils import (
     always_or_never_success_stats,
     calculate_stats,
-    resolve_environment_key,
     setup_logging,
     wait_for_environments,
     wait_for_inference_servers,
@@ -175,23 +174,7 @@ async def schedule_rollouts(
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
-            domain_value: str | None = None
-            if isinstance(problem, dict):
-                raw_domain = problem.get("domain")
-                if raw_domain:
-                    domain_value = str(raw_domain)
-            elif isinstance(problem, tuple) and len(problem) >= 2 and isinstance(problem[1], dict):
-                raw_domain = problem[1].get("domain")
-                if raw_domain:
-                    domain_value = str(raw_domain)
-
-            if not domain_value:
-                resolved = resolve_environment_key(cfg)
-                domain_value = str(resolved) if resolved else None
-
             rollout_result = await rollout_policy(cfg, llm, problem, session)
-            if domain_value and not rollout_result.domain:
-                rollout_result.domain = domain_value
             rollout_result.model_version = model_version
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
