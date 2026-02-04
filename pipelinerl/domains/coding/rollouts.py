@@ -115,7 +115,7 @@ async def _run_verification(
         extra_info=extra_info,
         timeout_per_test=getattr(cfg.actor, "sandbox_timeout", 5.0),
         max_tests=getattr(cfg.actor, "max_tests_per_problem", 15),
-        sandbox_endpoint=getattr(cfg.actor, "sandbox_endpoint", "http://127.0.0.1:8080"),
+        sandbox_endpoint=cfg.actor.sandbox_endpoint,
     )
     return summary.to_payload()
 
