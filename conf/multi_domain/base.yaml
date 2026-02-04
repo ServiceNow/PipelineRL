@@ -1,7 +1,8 @@
 # @package _global_
 defaults:
   - /domain_rollouts@domain_rollouts: base
-  - domain_mix: null
+  - /domain_mix: null
+  - _self_
 
 actor:
   rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
