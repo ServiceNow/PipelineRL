@@ -17,9 +17,9 @@ actor:
     math: ${domain_rollouts.math}
     coding: ${domain_rollouts.coding}
 
-  domain_mix:
-    math: 0.5
-    coding: 0.5
+  # domain_mix:
+  #   math: 0.5
+  #   coding: 0.5
 
 # SandboxFusion verification settings
 sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
