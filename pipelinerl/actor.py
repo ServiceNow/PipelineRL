@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 import wandb
 from pipelinerl.domain_sampling import DomainWeightedSampler
+from pipelinerl.domains.math.rollouts import length_penalty
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.llm import TrainableLLM
@@ -359,6 +360,19 @@ class ActorLoop:
         metrics['num_turns'] = len(result.training_texts)
         metrics['prompt_tokens'] = [training_text.prompt_tokens for training_text in result.training_texts]
         metrics['output_tokens'] = [training_text.output_tokens for training_text in result.training_texts]
+        metrics['penalty_delta'] = getattr(result, '_penalty_delta', 0.0)
+        if self.is_training:
+            max_tokens = self.cfg.llm.parameters.get("max_tokens", None)
+        else:
+            test_llm_cfg = getattr(self.cfg, "test_llm", None)
+            if test_llm_cfg and getattr(test_llm_cfg, "parameters", None) is not None:
+                max_tokens = test_llm_cfg.parameters.get("max_tokens", None)
+            else:
+                max_tokens = self.cfg.llm.parameters.get("max_tokens", None)
+        if max_tokens is not None:
+            is_overlong = any(training_text.output_tokens >= max_tokens for training_text in result.training_texts)
+            metrics['overlong'] = is_overlong
+            metrics['overlong_success'] = is_overlong and result.metrics.success
         
         return metrics
 
@@ -428,6 +442,15 @@ class ActorLoop:
         else:
             problem_iter = sequential_iter(dataset)
         assert self.trainer_state.propagated_weight_version is not None
+        dap_cfg = getattr(self.cfg.actor, "difficulty_aware_penalty", None)
+        if dap_cfg and dap_cfg.enabled:
+            assert dap_cfg.gamma >= 0, (
+                f"difficulty_aware_penalty.gamma must be >= 0, got {dap_cfg.gamma}"
+            )
+            failure_scale = getattr(dap_cfg, "failure_scale", 0.0)
+            assert 0 <= failure_scale <= 1, (
+                f"difficulty_aware_penalty.failure_scale must be in [0, 1], got {failure_scale}"
+            )
 
         last_trainer_version = self.trainer_state.propagated_weight_version
         max_lag = self.cfg.finetune.max_lag if self.is_training else None
@@ -523,6 +546,37 @@ class ActorLoop:
                         if r.domain:
                             domain_sampler.record_completion(r.domain)
 
+                # --- Difficulty-aware length penalty adjustment ---
+                dap_cfg = getattr(self.cfg.actor, "difficulty_aware_penalty", None)
+                max_tokens = self.cfg.llm.parameters.get("max_tokens", None)
+                if (
+                    self.is_training
+                    and dap_cfg
+                    and dap_cfg.enabled
+                    and self.cfg.rewards.buffer_tokens > 0
+                    and max_tokens is not None
+                ):
+                    group_solve_rate = sum(r.metrics.success for r in rollout_results) / len(rollout_results)
+                    gamma = dap_cfg.gamma
+                    failure_scale = getattr(dap_cfg, "failure_scale", 0.0)
+                    success_scale = group_solve_rate ** gamma
+                    buffer_tokens = self.cfg.rewards.buffer_tokens
+
+                    for r in rollout_results:
+                        scale = success_scale if r.metrics.success else failure_scale
+                        metrics_delta = 0.0
+                        for text in r.training_texts:
+                            original_penalty = length_penalty(max_tokens, text.output_tokens, buffer_tokens)
+                            adjusted_penalty = original_penalty * scale
+                            penalty_delta = adjusted_penalty - original_penalty
+                            text.reward += penalty_delta
+                            metrics_delta += penalty_delta
+                        r.metrics.reward += metrics_delta
+                        r._penalty_delta = metrics_delta
+                else:
+                    for r in rollout_results:
+                        r._penalty_delta = 0.0
+
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
                 all_text_dumps = []
@@ -584,6 +638,13 @@ class ActorLoop:
             for dataset_name, list_of_stats_per_metric_and_dataset in self.stats[metric_name].items():
                 for agg, sub_stats in calculate_stats(list_of_stats_per_metric_and_dataset).items():
                     stats[f"{dataset_name}/{metric_name}_{agg}"] = sub_stats
+
+        overlong_dataset_names = [ds for ds in self.stats.get("overlong", {}).keys() if ds is not None]
+        for prefix in [split_name, *[f"{ds}/" for ds in overlong_dataset_names]]:
+            overlong_key = f"{prefix}overlong_mean"
+            overlong_success_key = f"{prefix}overlong_success_mean"
+            if overlong_key in stats and overlong_success_key in stats and stats[overlong_key] > 0:
+                stats[f"{prefix}success_given_overlong"] = stats[overlong_success_key] / stats[overlong_key]
 
         stats |= (
             {
