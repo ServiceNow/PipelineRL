@@ -1,0 +1,110 @@
+defaults:
+    - base
+    - /domain_rollouts@domain_rollouts: base
+    - _self_
+
+actor:
+  shared_memory_entry_size: 2000000000
+  rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
+  # No system prompt - model's chat template provides guidance
+  system_prompt: ""
+  # Minimal task template - each problem contains its own instructions
+  task_template: |-
+    {task}
+  task_prompt: ""
+
+  domain_rollouts:
+    math: ${domain_rollouts.math}
+    coding: ${domain_rollouts.coding}
+
+  domain_mix:
+    math: 0.5
+    coding: 0.5
+
+# SandboxFusion verification settings
+sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
+sandbox_timeout: 10.0
+max_tests_per_problem: 5
+
+preprocess:
+  shared_memory_entry_size: 2000000000
+
+finetune:
+  seq_length: 32000
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 32000
+
+llm:
+  parameters: 
+    max_tokens: 16000
+
+test_llm:
+  parameters: 
+    max_tokens: 16000
+
+# Bandit-based curriculum learning configuration
+curriculum:
+  # Enable curriculum learning
+  enabled: true
+  # How difficulty is determined: "field" (from difficulty_field) or "estimated" (from success rates)
+  difficulty_source: "field"
+  # Field name for difficulty/level (used when difficulty_source="field")
+  difficulty_field: null
+  # Additional field(s) for categorization beyond difficulty (optional)
+  # Can be a single string: "dataset" or a list: ["dataset", "type"]
+  category_fields: ["domain"]
+  # Softmax temperature (higher = more exploration, lower = more exploitation)
+  temperature: 0.4
+  # Q-value update learning rate
+  learning_rate: 0.5
+  # Initial Q-value for new categories
+  initial_q_value: 0.0
+  # Signal for Q-update: "advantage", "reward", or "success"
+  update_signal: "advantage"
+  # Number of difficulty buckets (only used when difficulty_source="estimated")
+  # Problems are grouped by success rate into buckets:
+  # e.g., 5 buckets: [0-0.2), [0.2-0.4), [0.4-0.6), [0.6-0.8), [0.8-1.0]
+  num_difficulty_buckets: 5
+  # How often to reassign problems to buckets (only used when difficulty_source="estimated")
+  # Counted in preprocessor batches - each batch updates success rates and may trigger reindex
+  # Lower = more responsive to changing success rates, higher = more stable bucket assignments
+  reindex_interval: 5
+
+dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
+dataset_loader_params:
+  per_domain_params:
+    coding:
+      # TACO + APPS
+      taco_split: train
+      apps_split: train
+      subset: train
+      train_ratio: 0.9
+      max_tests_per_problem: 5
+      taco_excluded_difficulties: [VERY_HARD]
+      skip_apps: false
+      max_examples: null
+      seed: 42
+      huggingface_token: ${oc.env:HF_TOKEN, null}
+
+environments:
+  - key: math
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.math.MathEnvironment
+
+environment_key: null
+
+world:
+  env_replicas_per_actor: 1
+
+train_dataset_names:
+  - coding::taco
+  - coding::apps
+  - math::open_reasoner_zero_57k
+  - math::open_reasoner_zero_extended_72k
+
+test_dataset_names:
+  - math::aime_2025
+  - coding::livecodebench_v5
