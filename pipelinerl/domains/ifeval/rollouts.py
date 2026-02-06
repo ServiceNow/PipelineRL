@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class Metrics(BaseMetrics):
+    penalty: float = 0.0
     instructions_followed: int = 0
     instructions_total: int = 0
     partial_score: float = 0.0
@@ -106,16 +107,19 @@ async def generate_ifeval_rollout(
         success = False
 
     reward *= discount_factor ** llm_call.output_length_tokens
+    overlong_penalty = 0.0
     if rewards.buffer_tokens and llm.parameters.get("max_tokens") is not None:
-        reward += length_penalty(
+        overlong_penalty = length_penalty(
             llm.parameters["max_tokens"],
             llm_call.output_length_tokens,
             rewards.buffer_tokens,
         )
+        reward += overlong_penalty
     trace.reward = reward
 
     metrics = Metrics(
         reward=reward,
+        penalty=overlong_penalty,
         success=success,
         no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
