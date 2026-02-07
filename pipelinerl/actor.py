@@ -640,9 +640,19 @@ class ActorLoop:
             for agg, group_stats in calculate_stats(dict_of_stats_per_metric).items():
                 stats[f"{split_name}{metric_name}_{agg}"] = group_stats
 
+            domain_groups: Dict[str, Dict] = defaultdict(dict)
             for dataset_name, list_of_stats_per_metric_and_dataset in self.stats[metric_name].items():
                 for agg, sub_stats in calculate_stats(list_of_stats_per_metric_and_dataset).items():
                     stats[f"{dataset_name}/{metric_name}_{agg}"] = sub_stats
+                # Group datasets by domain prefix (e.g. "math::dataset_name" -> "math")
+                if isinstance(dataset_name, str) and "::" in dataset_name:
+                    domain = dataset_name.split("::", 1)[0]
+                    domain_groups[domain].update(
+                        {(dataset_name, gid): vals for gid, vals in list_of_stats_per_metric_and_dataset.items()}
+                    )
+            for domain, grouped in domain_groups.items():
+                for agg, agg_val in calculate_stats(grouped).items():
+                    stats[f"{domain}/{metric_name}_{agg}"] = agg_val
 
         # compute success_given_overlong from raw stats
         overlong_stats = self.stats.get("overlong", {})
