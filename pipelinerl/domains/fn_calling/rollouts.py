@@ -98,10 +98,6 @@ async def _run_verification(
     reward_context: Dict[str, Any],
     tool_calls: Optional[List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
-    """Run verification via RPC to BFCLEnvironment server.
-
-    Returns dict with 'answer_status' and 'partial_score'.
-    """
     env_key = resolve_environment_key(cfg, default="fn_calling")
     env_jobs = get_environment_jobs(cfg, env_key)
     if not env_jobs:
