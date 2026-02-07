@@ -630,8 +630,13 @@ class ActorLoop:
     def publish_stats(self, stats_writer: StreamWriter, loop_stats: Dict):
         split_name = "test_" if not self.is_training else ""
 
+        # skip intermediate metrics that are not meaningful on their own and keep the dashboard clean  
+        _hidden_metrics = {"overlong_success"}
+
         stats = defaultdict(float)
         for metric_name, dict_of_stats_per_metric in self.stats.items():
+            if metric_name in _hidden_metrics:
+                continue
             for agg, group_stats in calculate_stats(dict_of_stats_per_metric).items():
                 stats[f"{split_name}{metric_name}_{agg}"] = group_stats
 
@@ -639,12 +644,22 @@ class ActorLoop:
                 for agg, sub_stats in calculate_stats(list_of_stats_per_metric_and_dataset).items():
                     stats[f"{dataset_name}/{metric_name}_{agg}"] = sub_stats
 
-        overlong_dataset_names = [ds for ds in self.stats.get("overlong", {}).keys() if ds is not None]
-        for prefix in [split_name, *[f"{ds}/" for ds in overlong_dataset_names]]:
-            overlong_key = f"{prefix}overlong_mean"
-            overlong_success_key = f"{prefix}overlong_success_mean"
-            if overlong_key in stats and overlong_success_key in stats and stats[overlong_key] > 0:
-                stats[f"{prefix}success_given_overlong"] = stats[overlong_success_key] / stats[overlong_key]
+        # compute success_given_overlong from raw stats
+        overlong_stats = self.stats.get("overlong", {})
+        overlong_success_stats = self.stats.get("overlong_success", {})
+        # global
+        overlong_list = calculate_stats(overlong_stats).get("mean")
+        overlong_success_list = calculate_stats(overlong_success_stats).get("mean")
+        if overlong_list and overlong_success_list and overlong_list > 0:
+            stats[f"{split_name}success_given_overlong"] = overlong_success_list / overlong_list
+        # per-dataset
+        for ds in overlong_stats:
+            if ds is None:
+                continue
+            ds_overlong = calculate_stats(overlong_stats[ds]).get("mean")
+            ds_overlong_success = calculate_stats(overlong_success_stats.get(ds, {})).get("mean")
+            if ds_overlong and ds_overlong_success and ds_overlong > 0:
+                stats[f"{ds}/success_given_overlong"] = ds_overlong_success / ds_overlong
 
         stats |= (
             {
