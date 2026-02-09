@@ -2,7 +2,8 @@ import logging
 import signal
 import torch
 import uvloop
-from vllm.utils import FlexibleArgumentParser, set_ulimit
+from vllm.utils.system_utils import set_ulimit
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.entrypoints.openai.cli_args import (
     make_arg_parser,
     validate_parsed_serve_args,
@@ -15,7 +16,7 @@ from vllm.entrypoints.openai.api_server import (
     init_app_state,
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+from vllm.tool_parsers import ToolParserManager
 from vllm._version import version
 from vllm.usage.usage_lib import UsageContext
 from vllm.config import ModelConfig
