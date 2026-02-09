@@ -301,14 +301,19 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     # Get absolute path to config file
     config_path = Path(__file__).parent.parent / "qwen25_05B-instruct.yaml"
 
-    cmd = [
-        "conda",
-        "run",
-        "-n",
-        "fast-llm",
-        "--cwd",
-        str(config_path.parent),  # Set working directory for fast-llm
-    ]
+    # TODO: make config or make everywhere without conda
+    use_conda = False
+    if use_conda:
+        cmd = [
+            "conda",
+            "run",
+            "-n",
+            "fast-llm",
+            "--cwd",
+            str(config_path.parent),  # Set working directory for fast-llm
+        ]
+    else:
+        cmd = []
 
     cmd += [
         "fast-llm",
