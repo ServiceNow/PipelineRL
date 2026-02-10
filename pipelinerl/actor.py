@@ -311,40 +311,51 @@ class ActorLoop:
 
         # Determine the number of processes to use
         num_processes = min(self.cfg.actor.rollout_workers, len(self.llms))
-        attempts = self.cfg.attempts if is_training else 1
+        self._attempts = self.cfg.attempts if is_training else 1
 
         # Divide LLMs approximately equally across processes
-        llm_groups = [[] for _ in range(num_processes)]
+        self._llm_groups = [[] for _ in range(num_processes)]
         for i, llm in enumerate(self.llms):
-            llm_groups[i % num_processes].append((i, llm))
+            self._llm_groups[i % num_processes].append((i, llm))
 
         self.smm = SharedMemoryManager()
         self.smm.start()
 
-        
         # Use SharedMemoryQueue instead of separate problem_queue, result_queue, and io_buffer
         self.problem_queue = SharedMemoryQueue(self.smm, self.cfg.actor.problem_queue_size, cfg.actor.shared_memory_entry_size)
         self.result_queue = SharedMemoryQueue(self.smm, self.cfg.actor.result_queue_size, cfg.actor.shared_memory_entry_size)
-        
+
         logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
         logger.info(f"Problem queue size: {self.problem_queue.max_size}, result queue size: {self.result_queue.max_size}")
         logger.info(f"Result queue buffer size: {self.result_queue.get_memory_size() / 2**30} Gb")
 
-        # Create and start multiple rollout processes
         self.rollout_processes = []
-        for llm_group in llm_groups:
+        if is_training:
+            self._start_rollout_processes()
+
+    def _start_rollout_processes(self):
+        for llm_group in self._llm_groups:
             assert llm_group
             llm_idxs = [llm[0] for llm in llm_group]
             llms = [llm[1] for llm in llm_group]
             scheduler_name = (
-                f"{'train' if is_training else 'test'} scheduler for llms {','.join([str(i) for i in llm_idxs])}"
+                f"{'train' if self.is_training else 'test'} scheduler for llms {','.join([str(i) for i in llm_idxs])}"
             )
             process = mp.Process(
                 target=rollout_maker_entrypoint,
-                args=(self.cfg, attempts, self.problem_queue, self.result_queue, llms, scheduler_name),
+                args=(self.cfg, self._attempts, self.problem_queue, self.result_queue, llms, scheduler_name),
             )
             process.start()
             self.rollout_processes.append(process)
+        logger.info(f"Started {len(self.rollout_processes)} rollout processes")
+
+    def _stop_rollout_processes(self):
+        for p in self.rollout_processes:
+            p.terminate()
+        for p in self.rollout_processes:
+            p.join(timeout=10)
+        logger.info(f"Stopped {len(self.rollout_processes)} rollout processes")
+        self.rollout_processes = []
 
     def init_stats(self):
         self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -415,6 +426,15 @@ class ActorLoop:
 
 
     def run(self, dataset: list[tuple[str, dict]]):
+        if not self.rollout_processes:
+            self._start_rollout_processes()
+        try:
+            yield from self._run(dataset)
+        finally:
+            if not self.is_training:
+                self._stop_rollout_processes()
+
+    def _run(self, dataset: list[tuple[str, dict]]):
         loop_start_time = time.time()
         self.init_stats()
 
