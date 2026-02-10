@@ -1,5 +1,6 @@
 import logging
 import random
+import re
 import time
 
 import aiohttp
@@ -14,6 +15,18 @@ from pipelinerl.domains.math.rollouts import RewardTable, length_penalty
 from .verifier_api import verify_answer_rpc
 
 logger = logging.getLogger(__name__)
+
+_FINAL_RESPONSE_RE = re.compile(
+    r"\[BEGIN FINAL RESPONSE\]\s*(.*?)\s*\[END FINAL RESPONSE\]",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _extract_final_response(text: str) -> str:
+    match = _FINAL_RESPONSE_RE.search(text)
+    if match:
+        return match.group(1)
+    return text
 
 
 class Metrics(BaseMetrics):
@@ -56,11 +69,13 @@ async def generate_ifeval_rollout(
     env_job = random.choice(env_jobs)
     assert env_job.port is not None
 
+    prediction = _extract_final_response(llm_call.output.content)
+
     verification = await verify_answer_rpc(
         session=session,
         host=env_job.hostname,
         port=env_job.port,
-        prediction=llm_call.output.content,
+        prediction=prediction,
         reward_context=problem.get("reward_context", {}),
     )
 
