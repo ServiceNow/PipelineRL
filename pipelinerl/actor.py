@@ -363,6 +363,7 @@ class ActorLoop:
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
         self.domain_counts = defaultdict(int)
+        self.dataset_to_domain: Dict[str, str] = {}
     
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
@@ -399,12 +400,14 @@ class ActorLoop:
             if getattr(result, "domain", None):
                 domain_key = str(result.domain)
             elif isinstance(dataset_name, str):
-                domain_key = dataset_name.split("::", 1)[0]
+                domain_key = dataset_name.split("@", 1)[0]
             elif dataset_name is not None:
                 domain_key = str(dataset_name)
 
             if domain_key:
                 self.domain_counts[domain_key] += len(result.training_texts)
+                if dataset_name is not None:
+                    self.dataset_to_domain[str(dataset_name)] = domain_key
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
             all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
             for k, v in all_metrics.items():
@@ -664,9 +667,9 @@ class ActorLoop:
             for dataset_name, list_of_stats_per_metric_and_dataset in self.stats[metric_name].items():
                 for agg, sub_stats in calculate_stats(list_of_stats_per_metric_and_dataset).items():
                     stats[f"{dataset_name}/{metric_name}_{agg}"] = sub_stats
-                # Group datasets by domain prefix (e.g. "math::dataset_name" -> "math")
-                if isinstance(dataset_name, str) and "::" in dataset_name:
-                    domain = dataset_name.split("::", 1)[0]
+                # Group datasets by domain (using mapping built in update_stats)
+                domain = self.dataset_to_domain.get(str(dataset_name)) if dataset_name is not None else None
+                if domain:
                     domain_groups[domain].update(
                         {(dataset_name, gid): vals for gid, vals in list_of_stats_per_metric_and_dataset.items()}
                     )
