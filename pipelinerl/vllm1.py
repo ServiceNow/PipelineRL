@@ -25,21 +25,31 @@ from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
-from pipelinerl.finetune_loop import WeightUpdateRequest
+from pipelinerl.finetune_loop import WeightUpdateRequest, ParameterInfo
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable, Dict, Optional
 import pipelinerl.torch_utils
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
+from vllm.distributed import cleanup_dist_env_and_memory
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
-# configure this logger individually, in order to avoid messign
+# configure this logger individually, in order to avoid messing
 # with the default vllm logger configuration
-logger.setLevel(logging.INFO)
+# Check environment variable to enable DEBUG logging (for tests)
+import os
+
+log_level = logging.DEBUG if os.getenv("PIPELINERL_DEBUG") else logging.INFO
+logger.setLevel(log_level)
 handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+handler.setLevel(log_level)
+formatter = logging.Formatter(
+    "[%(asctime)s] [VLLM-%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+)
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+# Prevent propagation to vLLM's loggers to avoid double logging
+logger.propagate = False
 
 
 @runtime_checkable
@@ -47,13 +57,22 @@ class LikeWorker(Protocol):
     rank: int
     local_rank: int
     device: torch.device
-    model_runner: GPUModelRunner 
+    model_runner: GPUModelRunner
     pg_rank: int
     process_group: Any
     model_config: ModelConfig
 
 
 class WorkerExtension:
+    def is_extension_loaded(self: LikeWorker) -> int:
+        """Simple method to verify the extension is loaded on workers.
+
+        Returns:
+            PID of the worker process
+        """
+        import os
+
+        return os.getpid()
 
     def init_actor_update_group(
         self: LikeWorker,
@@ -81,30 +100,81 @@ class WorkerExtension:
             world_size=weight_update_group_world_size,
         )
 
+    def destroy_actor_update_group(self: LikeWorker):
+        torch.distributed.destroy_process_group(self.process_group)
+
     def receive_weight_update(self: LikeWorker, request: WeightUpdateRequest):
         torch.cuda.synchronize(self.device)
-        logger.info("Start receiving weight update")
+        logger.info(
+            f"Start receiving weight update: {len(request.parameters_info)} parameters"
+        )
         expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
-        for info in request.parameters_info:
+
+        for i, info in enumerate(request.parameters_info):
+            logger.debug(
+                f"[{i+1}/{len(request.parameters_info)}] Preparing to receive: {info.name}"
+            )
+            logger.debug(f"  - shape: {info.shape}, dtype: {info.dtype}")
+
             target_dtype = string_to_dtype(info.dtype)
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
-            buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
+
+            logger.debug(f"  - Creating buffer for {info.name}")
+            buffer = torch.empty(
+                tuple(info.shape), dtype=target_dtype, device=self.device
+            )
+            logger.debug(
+                f"  - Buffer created: shape={buffer.shape}, dtype={buffer.dtype}, device={buffer.device}"
+            )
+
+            logger.debug(f"  - Calling broadcast for {info.name}...")
             torch.distributed.broadcast(buffer, src=0, group=self.process_group)
-            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
-            if len(loaded_params) != 1:
-                raise ValueError(f"model {info.name} not found in model state dict")
+            logger.debug(f"  - Broadcast received for {info.name}")
+
+            logger.debug(f"  - Loading weights for {info.name}...")
+            try:
+                loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])  # type: ignore
+                if len(loaded_params) == 0:
+                    # Parameter doesn't exist in vLLM model - this is an error
+                    logger.error(f"  - ERROR: {info.name} not found in vLLM model")
+                    raise ValueError(
+                        f"Parameter {info.name} not found in vLLM model state dict"
+                    )
+                elif len(loaded_params) == 1:
+                    logger.debug(f"  - Weights loaded for {info.name}")
+                else:
+                    logger.error(
+                        f"  - ERROR: load_weights returned {len(loaded_params)} params for {info.name}"
+                    )
+                    raise ValueError(
+                        f"Unexpected number of parameters loaded for {info.name}"
+                    )
+            except Exception as e:
+                logger.error(f"  - ERROR loading weights for {info.name}: {e}")
+                raise
+
+            if (i + 1) % 10 == 0:
+                logger.info(f"Received {i+1}/{len(request.parameters_info)} parameters")
+
         pipelinerl.vllm_quantization.invalidate_fp32_cache()
-        logger.info("Weight update received")
+        logger.info("Weight update received - all parameters processed")
 
 
-class WeightUpdateManager:
-    def __init__(self, args, engine_client: AsyncMPClient):
+class EngineManager:
+    def __init__(self, args, engine: AsyncLLM, engine_config: Any):
         self.args = args
-        self.engine_client = engine_client
+        self.engine = engine
+        self.engine_config = engine_config
 
-    async def input_process_groups(self):
-        await self.engine_client.collective_rpc_async(
+    async def is_extension_loaded(self):
+        return await self.engine.engine_core.collective_rpc_async(
+            "is_extension_loaded",
+            args=(),
+        )
+
+    async def init_actor_update_group(self):
+        await self.engine.engine_core.collective_rpc_async(
             "init_actor_update_group",
             args=(
                 self.args.actor_llm_idx,
@@ -114,11 +184,97 @@ class WeightUpdateManager:
             ),
         )
 
+    async def destroy_actor_update_group(self):
+        await self.engine.engine_core.collective_rpc_async(
+            "destroy_actor_update_group",
+            args=(),
+        )
+
     async def receive_weight_update(self, request: WeightUpdateRequest):
-        await self.engine_client.collective_rpc_async(
+        await self.engine.engine_core.collective_rpc_async(
             "receive_weight_update", args=(request,)
         )
         logger.info("Weight update processed")
+
+    @asynccontextmanager
+    @staticmethod
+    async def create_engine(
+        args: Any,
+        cleanup: bool = True,
+    ):
+        """Create vLLM AsyncLLM engine with automatic cleanup.
+
+        This is an async context manager that ensures proper engine lifecycle
+        management with automatic cleanup on exit.
+
+        Usage:
+            # Simple usage (tests)
+            async with create_engine(args) as (engine, engine_config):
+                # Use engine for generation
+                async for output in engine.generate(...):
+                    ...
+            # Automatic cleanup happens here
+
+            # Or unpack only what you need
+            async with create_engine(args) as (engine, _):
+                # Use engine, ignore config
+                ...
+
+            # Server usage (no cleanup)
+            async with create_engine(args, cleanup=False) as (engine, engine_config):
+                # Use both engine and config
+                await init_app_state(engine, engine_config, ...)
+                ...
+
+        Args:
+            args: Arguments object with vLLM engine configuration.
+                Must be compatible with AsyncEngineArgs.from_cli_args().
+                Required attributes: model
+                Optional attributes: tensor_parallel_size, disable_log_stats,
+                                    disable_log_requests, etc.
+            cleanup: Whether to cleanup engine on exit (default: True).
+                    Set to False for server usage where engine runs indefinitely.
+
+        Yields:
+            Tuple of (engine, engine_config):
+                - engine: AsyncLLM engine instance
+                - engine_config: VllmConfig for init_app_state
+        """
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        engine_args.worker_extension_cls = "pipelinerl.vllm1.WorkerExtension"
+        engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
+
+        logger.info(f"Creating vLLM engine with model={args.model}")
+        engine = AsyncLLM.from_vllm_config(
+            vllm_config=engine_config,
+            usage_context=UsageContext.OPENAI_API_SERVER,
+            disable_log_stats=engine_args.disable_log_stats,
+            enable_log_requests=engine_args.enable_log_requests,
+        )
+
+        logger.info("vLLM engine created successfully")
+
+        try:
+            assert isinstance(engine.engine_core, AsyncMPClient)
+            manager = EngineManager(args, engine, engine_config)
+            if not args.disable_weight_updates:
+                await manager.init_actor_update_group()
+            yield manager
+        finally:
+            if not args.disable_weight_updates:
+                await manager.destroy_actor_update_group()
+            if cleanup:
+                logger.info("Cleaning up vLLM engine")
+                # Clear manager reference to engine first
+                manager.engine = None
+                manager.engine_config = None
+                # Delete engine and force immediate garbage collection
+                del engine
+                del manager
+                import gc
+
+                gc.collect()
+                cleanup_dist_env_and_memory()
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
@@ -151,61 +307,52 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
-    engine_args = AsyncEngineArgs.from_cli_args(args)
-    engine_args.worker_extension_cls = "pipelinerl.vllm1.WorkerExtension"
-    engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
-    engine = AsyncLLM.from_vllm_config(
-        vllm_config=engine_config,
-        usage_context=UsageContext.OPENAI_API_SERVER,
-        disable_log_stats=engine_args.disable_log_stats,
-        disable_log_requests=engine_args.disable_log_requests,
-    )
-    assert isinstance(engine.engine_core, AsyncMPClient)
+    # Create engine (cleanup=False since server runs indefinitely)
+    async with EngineManager.create_engine(args, cleanup=False) as manager:
+        # Run HTTP server
+        sock_addr = (args.host or "", args.port)
+        sock = create_server_socket(sock_addr)
+        app = build_app(args)
 
-    weight_update_manager = WeightUpdateManager(args, engine.engine_core)
-    if not args.disable_weight_updates:
-        await weight_update_manager.input_process_groups()
+        @app.post("/receive_weight_update")
+        async def _receive_weight_update(request: WeightUpdateRequest):
+            await manager.receive_weight_update(request)
+            return {"status": "ok"}
 
-    # Run HTTP server
-    sock_addr = (args.host or "", args.port)
-    sock = create_server_socket(sock_addr)
-    app = build_app(args)
+        await init_app_state(manager.engine, app.state, args)
+        shutdown_task = await serve_http(
+            app,
+            sock,
+            host=args.host,
+            port=args.port,
+            log_level=args.uvicorn_log_level,
+            # increase timeout
+            timeout_keep_alive=60,
+            ssl_keyfile=args.ssl_keyfile,
+            ssl_certfile=args.ssl_certfile,
+            ssl_ca_certs=args.ssl_ca_certs,
+            ssl_cert_reqs=args.ssl_cert_reqs,
+            **uvicorn_kwargs,
+        )
 
-    @app.post("/receive_weight_update")
-    async def _receive_weight_update(request: WeightUpdateRequest):
-        await weight_update_manager.receive_weight_update(request)
-        return {"status": "ok"}
+        # NB: Await server shutdown only after the backend context is exited
+        await shutdown_task
 
-    await init_app_state(engine, engine_config, app.state, args)
-    shutdown_task = await serve_http(
-        app,
-        sock,
-        host=args.host,
-        port=args.port,
-        log_level=args.uvicorn_log_level,
-        # increase timeout
-        timeout_keep_alive=60,
-        ssl_keyfile=args.ssl_keyfile,
-        ssl_certfile=args.ssl_certfile,
-        ssl_ca_certs=args.ssl_ca_certs,
-        ssl_cert_reqs=args.ssl_cert_reqs,
-        **uvicorn_kwargs,
-    )
+        sock.close()
 
-    # NB: Await server shutdown only after the backend context is exited
-    await shutdown_task
-
-    sock.close()
-
-    # TODO: proper cleanup
-    # dist.destroy_process_group(actor_update_group)
+        # TODO: proper cleanup
+        # dist.destroy_process_group(actor_update_group)
 
 
 def run_llm():
-    parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
+    parser = FlexibleArgumentParser(
+        description="vLLM OpenAI-Compatible RESTful API server."
+    )
     parser = make_arg_parser(parser)
     parser.add_argument(
-        "--disable-weight-updates", action="store_true", help="Whether to receive weight updates from the trainer"
+        "--disable-weight-updates",
+        action="store_true",
+        help="Whether to receive weight updates from the trainer",
     )
     parser.add_argument(
         "--actor-llm-idx",
