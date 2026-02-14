@@ -142,6 +142,10 @@ async def schedule_rollouts(
 
     final_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
+    retryable_rollout_exceptions = (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError)
+    max_rollout_retries = int(getattr(cfg.actor, "max_rollout_retries", -1))  # -1 means infinite retries
+    retry_initial_delay_s = float(getattr(cfg.actor, "rollout_retry_initial_delay_s", 1.0))
+    retry_max_delay_s = float(getattr(cfg.actor, "rollout_retry_max_delay_s", 30.0))
 
     def is_trainer_finished() -> bool:
         return (
@@ -150,7 +154,7 @@ async def schedule_rollouts(
         )
 
     def handle_rollout_exception(exc: Exception):
-        if isinstance(exc, aiohttp.ClientError) and is_trainer_finished():
+        if isinstance(exc, retryable_rollout_exceptions) and is_trainer_finished():
             logger.info(
                 f"{scheduler_name}: rollout task encountered {exc.__class__.__name__} after trainer completion; ignoring"
             )
@@ -175,7 +179,28 @@ async def schedule_rollouts(
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
-            rollout_result = await rollout_policy(cfg, llm, problem, session)
+            retry_count = 0
+            while True:
+                try:
+                    rollout_result = await rollout_policy(cfg, llm, problem, session)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    is_retryable = isinstance(exc, retryable_rollout_exceptions)
+                    can_retry = max_rollout_retries < 0 or retry_count < max_rollout_retries
+                    if is_retryable and can_retry and not is_trainer_finished():
+                        retry_count += 1
+                        backoff_s = min(retry_max_delay_s, retry_initial_delay_s * (2 ** (retry_count - 1)))
+                        if retry_count == 1 or retry_count % 10 == 0:
+                            logger.warning(
+                                f"{scheduler_name}: rollout {group_id}/{rollout_index} failed with "
+                                f"{exc.__class__.__name__}, retry {retry_count}"
+                            )
+                        await asyncio.sleep(backoff_s)
+                        continue
+                    handle_rollout_exception(exc)
+                    return
             rollout_result.model_version = model_version
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
@@ -470,7 +495,7 @@ class ActorLoop:
             assert dap_cfg.gamma >= 0, (
                 f"difficulty_aware_penalty.gamma must be >= 0, got {dap_cfg.gamma}"
             )
-            failure_scale = getattr(dap_cfg, "failure_scale", 0.0)
+            failure_scale = getattr(dap_cfg, "failure_scale", 1.0)
             assert 0 <= failure_scale <= 1, (
                 f"difficulty_aware_penalty.failure_scale must be in [0, 1], got {failure_scale}"
             )
@@ -570,6 +595,12 @@ class ActorLoop:
                             domain_sampler.record_completion(r.domain)
 
                 # --- Difficulty-aware length penalty adjustment ---
+                # Reduces the overlong penalty for SUCCESSFUL rollouts on hard problems,
+                # so the model can reason longer when it actually leads to solving the problem.
+                # Failed overlong rollouts keep the full penalty (failure_scale=1.0)
+                # to discourage degenerate long generation that doesn't lead to solutions.
+                # Hard cap guard: sequences that hit max_tokens without finishing always
+                # get full penalty, even if the rollout is marked successful.
                 dap_cfg = getattr(self.cfg.actor, "difficulty_aware_penalty", None)
                 max_tokens = self.cfg.llm.parameters.get("max_tokens", None)
                 if (
@@ -581,14 +612,20 @@ class ActorLoop:
                 ):
                     group_solve_rate = sum(r.metrics.success for r in rollout_results) / len(rollout_results)
                     gamma = dap_cfg.gamma
-                    failure_scale = getattr(dap_cfg, "failure_scale", 0.0)
+                    failure_scale = getattr(dap_cfg, "failure_scale", 1.0)
                     success_scale = group_solve_rate ** gamma
                     buffer_tokens = self.cfg.rewards.buffer_tokens
 
                     for r in rollout_results:
-                        scale = success_scale if r.metrics.success else failure_scale
+                        rollout_scale = success_scale if r.metrics.success else failure_scale
                         metrics_delta = 0.0
                         for text in r.training_texts:
+                            # Hard cap guard: if the sequence hit max_tokens without
+                            # finishing, always apply full penalty regardless of success
+                            if text.output_tokens >= max_tokens and not text.finished:
+                                scale = 1.0
+                            else:
+                                scale = rollout_scale
                             original_penalty = length_penalty(max_tokens, text.output_tokens, buffer_tokens)
                             adjusted_penalty = original_penalty * scale
                             penalty_delta = adjusted_penalty - original_penalty
