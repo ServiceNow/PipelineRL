@@ -14,6 +14,15 @@ import signal
 # torch is needed at top level for pytest.mark.skipif decorators
 import torch
 
+# Import shared utilities
+from .server_weight_update_utils import (
+    wait_for_server_ready,
+    run_generation_loop,
+    analyze_and_verify_pattern,
+    start_vllm_server,
+    start_trainer_process,
+)
+
 try:
     import psutil
     HAS_PSUTIL = True
@@ -839,261 +848,57 @@ class TestWeightUpdateDistributed:
         - Trainer: wait 15s → broadcast perturbed → wait 5s → broadcast original → wait 5s → broadcast perturbed
         - Verify generation pattern: original → perturbed → original → perturbed
         """
-        import requests
-        import time
-
         print("\n" + "="*60)
         print("Starting server weight update pattern test")
         print("="*60)
 
-        # Start vLLM HTTP server
         server_port = 8000
-        vllm_env = os.environ.copy()
-        vllm_env["CUDA_VISIBLE_DEVICES"] = "0"
-        vllm_env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+        server_url = f"http://127.0.0.1:{server_port}"
 
-        print(f"[Main] Starting vLLM HTTP server on port {server_port} (GPU 0)")
-        vllm_entry_point = Path(__file__).parent.parent / "pipelinerl" / "entrypoints" / "run_vllm1.py"
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                str(vllm_entry_point),
-                "--model", model_name,
-                "--port", str(server_port),
-                "--host", "127.0.0.1",
-                "--actor-llm-idx", "0",
-                "--weight-update-group-init-method", distributed_init_method,
-                "--weight-update-group-world-size", "2",
-            ],
-            env=vllm_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        # Start vLLM server (HTTP mode - default, no extra args)
+        server_proc, _, _ = start_vllm_server(
+            model_name=model_name,
+            server_port=server_port,
+            distributed_init_method=distributed_init_method,
+            stream_process_output_fn=stream_process_output,
+            extra_args=None,  # HTTP mode is default
         )
 
-        # Start streaming server output in background threads
-        print("[Main] Starting server output streaming...")
-        server_stdout_thread, server_stderr_thread = stream_process_output(server_proc, "vLLM Server")
-
-        # Give server a moment to start, then immediately start trainer
-        # (they need to rendezvous for process group initialization)
+        # Give server a moment to start
         await asyncio.sleep(1)
 
-        # Start trainer process immediately (needed for process group rendezvous)
-        trainer_env = os.environ.copy()
-        trainer_env["CUDA_VISIBLE_DEVICES"] = "1"
-
-        print("[Main] Starting trainer process (GPU 1) for process group rendezvous")
-        trainer_proc = subprocess.Popen(
-            [
-                sys.executable,
-                str(distributed_trainer_helper),
-                "timed_broadcast_server_test",
-                "--init-method", distributed_init_method,
-                "--model-name", model_name,
-                "--server-url", f"http://127.0.0.1:{server_port}",
-            ],
-            env=trainer_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        # Start trainer process
+        trainer_proc, _, _ = start_trainer_process(
+            trainer_helper_path=distributed_trainer_helper,
+            distributed_init_method=distributed_init_method,
+            model_name=model_name,
+            server_url=server_url,
+            stream_process_output_fn=stream_process_output,
+            extra_args=None,  # No extra args for HTTP mode
         )
-
-        # Start streaming trainer output in background threads
-        print("[Main] Starting trainer output streaming...")
-        trainer_stdout_thread, trainer_stderr_thread = stream_process_output(trainer_proc, "Trainer")
 
         try:
             # Wait for server to be ready
-            print("[Main] Waiting for server to be ready...")
-            server_ready = False
-            for i in range(300):  # Wait up to 5 minutes
-                # Check if server process crashed
-                if server_proc.poll() is not None:
-                    print(f"[Main] Server process terminated with code {server_proc.returncode}")
-                    raise RuntimeError(f"Server process terminated with code {server_proc.returncode}")
+            await wait_for_server_ready(server_url, server_proc, trainer_proc)
 
-                # Check if trainer process crashed
-                if trainer_proc.poll() is not None:
-                    print(f"[Main] Trainer process terminated with code {trainer_proc.returncode}")
-                    raise RuntimeError(f"Trainer process terminated with code {trainer_proc.returncode}")
+            # Run generation loop
+            generations = await run_generation_loop(
+                server_url=server_url,
+                model_name=model_name,
+                simple_prompt=simple_prompt,
+                generation_config=generation_config,
+                trainer_proc=trainer_proc,
+            )
 
-                try:
-                    resp = requests.get(f"http://127.0.0.1:{server_port}/health", timeout=1)
-                    if resp.status_code == 200:
-                        server_ready = True
-                        print("[Main] Server is ready!")
-                        break
-                except requests.exceptions.RequestException:
-                    pass
-
-                if i % 10 == 0:
-                    print(f"[Main] Still waiting for server... ({i} seconds)")
-                await asyncio.sleep(1)
-
-            if not server_ready:
-                raise TimeoutError("Server did not become ready within 5 minutes")
-
-            # Continuously generate completions
-            print("[Main] Starting continuous generation loop...")
-            generations = []
-            start_time = time.time()
-            generation_interval = 0.5  # Generate every 0.5 seconds (more frequent)
-            max_duration = 120  # Run for 120 seconds max (covers 15s + 3 broadcasts with 5s delays)
-
-            def check_pattern_detected(generations):
-                """Check if we have detected the full pattern (4 phases)."""
-                if len(generations) < 4:
-                    return False
-
-                # Track when the text changes to identify phase boundaries
-                phases = []
-                current_text = None
-                current_phase = []
-
-                for ts, text in generations:
-                    if text != current_text:
-                        if current_phase:
-                            phases.append((current_text, current_phase))
-                        current_text = text
-                        current_phase = [(ts, text)]
-                    else:
-                        current_phase.append((ts, text))
-
-                # Add the last phase
-                if current_phase:
-                    phases.append((current_text, current_phase))
-
-                # Check if we have at least 4 phases
-                if len(phases) < 4:
-                    return False
-
-                # Verify the pattern: phase1 != phase2, phase3 == phase1, phase4 == phase2
-                phase1_text = phases[0][0]
-                phase2_text = phases[1][0]
-                phase3_text = phases[2][0]
-                phase4_text = phases[3][0]
-
-                if phase1_text == phase2_text:
-                    return False  # Phase 1 and 2 should be different
-                if phase3_text != phase1_text:
-                    return False  # Phase 3 should match Phase 1
-                if phase4_text != phase2_text:
-                    return False  # Phase 4 should match Phase 2
-
-                return True
-
-            while time.time() - start_time < max_duration:
-                # Check if trainer is still running
-                trainer_poll = trainer_proc.poll()
-                if trainer_poll is not None:
-                    print(f"[Main] Trainer exited with code {trainer_poll}")
-                    break
-
-                try:
-                    # Generate via HTTP API
-                    payload = {
-                        "model": model_name,
-                        "prompt": simple_prompt,
-                        "max_tokens": generation_config["max_tokens"],
-                        "temperature": 0.0,  # Deterministic
-                        "top_p": 1.0,  # Must match engine params
-                        "seed": 42,
-                    }
-
-                    resp = requests.post(
-                        f"http://127.0.0.1:{server_port}/v1/completions",
-                        json=payload,
-                        timeout=30,
-                    )
-
-                    if resp.status_code == 200:
-                        result = resp.json()
-                        generated_text = result["choices"][0]["text"]
-                        timestamp = time.time() - start_time
-                        generations.append((timestamp, generated_text))
-                        print(f"[Main] [{timestamp:.1f}s] Generated: '{generated_text}'")
-
-                        # Check if pattern is detected - stop early if confirmed
-                        if check_pattern_detected(generations):
-                            print(f"[Main] Pattern detected! Stopping generation early at {timestamp:.1f}s")
-                            break
-                    else:
-                        print(f"[Main] Generation failed with status {resp.status_code}")
-
-                except requests.exceptions.RequestException as e:
-                    print(f"[Main] Request failed: {e}")
-
-                await asyncio.sleep(generation_interval)
-
-            # Wait a bit more for trainer to finish
+            # Wait for trainer to finish
             print("[Main] Waiting for trainer to finish...")
             for _ in range(30):
                 if trainer_proc.poll() is not None:
                     break
                 await asyncio.sleep(1)
 
-            # Analyze generation sequence
-            print("\n" + "="*60)
-            print("GENERATION SEQUENCE ANALYSIS")
-            print("="*60)
-            print(f"Total generations: {len(generations)}")
-
-            # Print all generations
-            for i, (ts, text) in enumerate(generations):
-                print(f"[{ts:5.1f}s] Gen {i+1}: '{text[:80]}...'")
-
-            # Identify unique generation texts and their phases
-            # Expected pattern: original → perturbed → original → perturbed
-            if len(generations) < 4:
-                raise AssertionError(f"Not enough generations to verify pattern (need at least 4, got {len(generations)})")
-
-            # Track when the text changes to identify phase boundaries
-            phases = []
-            current_text = None
-            current_phase = []
-
-            for ts, text in generations:
-                if text != current_text:
-                    if current_phase:
-                        phases.append((current_text, current_phase))
-                    current_text = text
-                    current_phase = [(ts, text)]
-                else:
-                    current_phase.append((ts, text))
-
-            # Add the last phase
-            if current_phase:
-                phases.append((current_text, current_phase))
-
-            print("\n" + "="*60)
-            print(f"Detected {len(phases)} phases:")
-            for i, (text, items) in enumerate(phases):
-                print(f"Phase {i+1}: {len(items)} generations - '{text[:60]}...'")
-            print("="*60)
-
-            # Verify the pattern
-            assert len(phases) >= 4, f"Expected at least 4 phases (original → perturbed → original → perturbed), got {len(phases)}"
-
-            phase1_text, phase1_items = phases[0]
-            phase2_text, phase2_items = phases[1]
-            phase3_text, phase3_items = phases[2]
-            phase4_text, phase4_items = phases[3]
-
-            # Verify phase 1 (original) != phase 2 (perturbed)
-            assert phase1_text != phase2_text, "Phase 1 (original) and Phase 2 (perturbed) should be different"
-
-            # Verify phase 3 (original) == phase 1 (original)
-            assert phase3_text == phase1_text, f"Phase 3 should match Phase 1 (original weights restored)"
-
-            # Verify phase 4 (perturbed) == phase 2 (perturbed)
-            assert phase4_text == phase2_text, f"Phase 4 should match Phase 2 (perturbed weights reapplied)"
-
-            print("\n✓ Pattern verified:")
-            print(f"  Phase 1 (original):   {len(phase1_items)} generations")
-            print(f"  Phase 2 (perturbed):  {len(phase2_items)} generations")
-            print(f"  Phase 3 (original):   {len(phase3_items)} generations (matches Phase 1 ✓)")
-            print(f"  Phase 4 (perturbed):  {len(phase4_items)} generations (matches Phase 2 ✓)")
+            # Analyze and verify pattern
+            analyze_and_verify_pattern(generations)
             print("\n✓ Server weight update pattern test PASSED")
 
         finally:
