@@ -23,9 +23,19 @@ import asyncio
 import logging
 import signal
 import torch
+import torch.distributed as dist
 import uvloop
+from pydantic import TypeAdapter
 from vllm import AsyncLLMEngine
-from vllm.utils import FlexibleArgumentParser, set_ulimit
+from vllm._version import version
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.launcher import serve_http
+from vllm.entrypoints.openai.api_server import (
+    build_app,
+    create_server_socket,
+    init_app_state,
+    run_server,
+)
 from vllm.entrypoints.openai.cli_args import (
     make_arg_parser,
     validate_parsed_serve_args,
@@ -42,11 +52,15 @@ from vllm._version import version
 from vllm.worker.worker import Worker
 from vllm.executor.multiproc_worker_utils import ProcessWorkerWrapper
 from vllm.executor.mp_distributed_executor import MultiprocessingDistributedExecutor
+from vllm.executor.multiproc_worker_utils import ProcessWorkerWrapper
+from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
 from vllm.usage.usage_lib import UsageContext
-from vllm.worker.multi_step_worker import MultiStepWorker
+from vllm.utils import FlexibleArgumentParser, set_ulimit
 from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+from vllm.worker.multi_step_worker import MultiStepWorker
+from vllm.worker.worker import Worker
 
 
 from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest

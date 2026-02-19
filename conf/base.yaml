@@ -5,6 +5,7 @@ defaults:
   - _self_
 
 seed: 42
+use_ray: false
 
 # use FP32 for lm_head computation in both training and inference.
 fp32_lm_head: false
@@ -22,12 +23,16 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  async_batch_size: 1 # if ==1, rollout function will be called as synchronous
+  task_submission_delay_sec: 0.5
+  collect_logprobs: true
+
 environment: null
 preprocess:
   input: actor
   output: training_data
   n_workers: 8
-  chunk_n_groups: 2
+  chunk_n_groups: 8
   # queue for loaded raw groups
   raw_queue_size: 8
   # queue for processed chunks of multiple groups
@@ -89,6 +94,8 @@ world:
 
   actor_group_port: 9000
   environment_start_port: 7777
+# Remote vs embedded environment execution strategy
+  environment_mode: embedded
 # this will be autocreated based on the config
 jobs: []
 
