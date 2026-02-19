@@ -3,6 +3,10 @@ defaults:
   - override finetune: grpo
   - _self_
 
+debug:
+  mode: actor
+save_tapes: False
+
 model_path: ServiceNow-AI/Apriel-1.6-15b-Thinker
 
 actor:
