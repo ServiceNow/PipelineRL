@@ -34,7 +34,7 @@ def task_id(problem: dict) -> str:
 class MiniwobMetrics(BaseMetrics):
     reward: float = -1.0
     success: bool = False
-    has_error: bool = False
+    no_error: bool = True
     no_answer: bool = True
     overflow: bool = False
     n_llm_calls: int = 0
@@ -156,7 +156,7 @@ def _compute_metrics(
     metrics = MiniwobMetrics(
         reward=reward,
         success=reward > 0.5,
-        has_error=has_error,
+        no_error=not has_error,
         no_answer=reward < 0,
         overflow=has_overflow,
         n_llm_calls=n_llm_calls,
@@ -464,4 +464,32 @@ async def _execute_rollout_with_timeout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
+        domain="miniwob"
+    )
+
+
+def _create_failed_rollout_result(problem: dict, start_time: float, error_type: str) -> RolloutResult:
+    """Create a failed rollout result for timeout or other errors."""
+    latency = time.time() - start_time
+    
+    # Create empty training texts and metrics for failed rollout
+    metrics = MiniwobMetrics(
+        reward=-1.0,
+        success=False,
+        no_error=False,
+        no_answer=True,
+        overflow=False,
+        n_llm_calls=0,
+        n_step_errors=0,
+        n_observations=0,
+        n_steps=0,
+        total_execution_time=latency
+    )
+    
+    return RolloutResult(
+        training_texts=[],
+        metrics=metrics,
+        latency=latency,
+        dataset_name=problem["dataset"],
+        domain="miniwob"
     )

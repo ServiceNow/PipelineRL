@@ -22,8 +22,9 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 
 import wandb
-from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
+from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.finetune_loop import calculate_train_steps
+from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 from pipelinerl.shared_memory_array import SharedMemoryQueue
@@ -375,7 +376,8 @@ class ActorLoop:
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
-
+        self.domain_counts = defaultdict(int)
+    
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
 
@@ -394,7 +396,17 @@ class ActorLoop:
             group_id = result.group_id
             self.latency_list.append(result.latency)
             self.model_versions_list.append(result.model_version)
-            domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result)
+            domain_key: str | None = None
+            if getattr(result, "domain", None):
+                domain_key = str(result.domain)
+            elif isinstance(dataset_name, str):
+                domain_key = dataset_name.split("::", 1)[0]
+            elif dataset_name is not None:
+                domain_key = str(dataset_name)
+
+            if domain_key:
+                self.domain_counts[domain_key] += len(result.training_texts)
+            domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
             all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
             all_metrics["used_python"] = int(all_metrics.get("used_python", False))
             all_metrics["used_math_answer"] = int(all_metrics.get("used_math_answer", False))
@@ -434,8 +446,15 @@ class ActorLoop:
         # If training, we expect to sample infinitely
         # for train sample, sample random batches infinitely
         # for test samples, loop through the dataset once
+        domain_sampler = None
         if self.is_training:
             problem_iter = random_iter(dataset)
+            domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
+            if domain_mix_cfg:
+                mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+                if not isinstance(mix_weights, dict):
+                    raise ValueError("actor.domain_mix must be a mapping from domain to weight")
+                domain_sampler = DomainWeightedSampler(dataset, mix_weights)
         else:
             problem_iter = sequential_iter(dataset)
         assert self.trainer_state.propagated_weight_version is not None
@@ -503,7 +522,10 @@ class ActorLoop:
                         if not blocked_by_lag and self.have_capacity():
                             try:
                                 try:
-                                    problem = next(problem_iter)
+                                    if domain_sampler is not None:
+                                        problem = domain_sampler.sample()
+                                    else:
+                                        problem = next(problem_iter)
                                     self.submit_problem(problem)
                                     submitted_groups += 1
                                 except queue.Full:
@@ -529,6 +551,12 @@ class ActorLoop:
                 assert isinstance(rollout_results[0], RolloutResult)
                 assert len(rollout_results) == attempts, f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
+
+                # Track completions per domain for adaptive sampling
+                if domain_sampler is not None:
+                    for r in rollout_results:
+                        if r.domain:
+                            domain_sampler.record_completion(r.domain)
 
                 published_samples += group_samples
                 samples_in_queue = self.results_ready_to_publish()
@@ -606,6 +634,25 @@ class ActorLoop:
         )
 
         stats |= loop_stats
+
+        total_domain_samples = sum(self.domain_counts.values())
+        if total_domain_samples:
+            for domain, count in sorted(self.domain_counts.items()):
+                stats[f"{split_name}domain_mix_count/{domain}"] = count
+                stats[f"{split_name}domain_mix_actual/{domain}"] = count / total_domain_samples
+
+        domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
+        if domain_mix_cfg:
+            mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+            if isinstance(mix_weights, dict):
+                target_total = sum(float(v) for v in mix_weights.values() if float(v) > 0)
+                if target_total > 0:
+                    for domain, weight in mix_weights.items():
+                        stats[f"{split_name}domain_mix_target/{domain}"] = float(weight) / target_total
+                else:
+                    for domain in mix_weights:
+                        stats[f"{split_name}domain_mix_target/{domain}"] = 0.0
+
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
 

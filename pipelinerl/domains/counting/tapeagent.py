@@ -101,6 +101,7 @@ async def generate_counting_rollout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
-        prompt_tokens= [llm_call.prompt_length_tokens],
+        domain="counting",
+        prompt_tokens=[llm_call.prompt_length_tokens],
         output_tokens=[llm_call.output_length_tokens],
     )

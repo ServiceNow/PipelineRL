@@ -21,12 +21,17 @@ from vllm.entrypoints.openai.cli_args import (
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser, set_ulimit
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.system_utils import set_ulimit
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import pipelinerl.torch_utils
+import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 from pipelinerl.finetune_loop import WeightUpdateRequest
+from pipelinerl.torch_utils import stateless_init_process_group
+from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign
@@ -44,7 +49,7 @@ class LikeWorker(Protocol):
     rank: int
     local_rank: int
     device: torch.device
-    model_runner: GPUModelRunner 
+    model_runner: GPUModelRunner
     pg_rank: int
     process_group: Any
     model_config: ModelConfig
@@ -70,33 +75,47 @@ class WorkerExtension:
             prefix
             + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
         )
-        self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-            group_name="actor",
-            backend="nccl",
+
+        # Use vLLM's StatelessProcessGroup instead of torch.distributed
+        self.model_update_group = stateless_init_process_group(
             init_method=weight_update_group_init_method,
             rank=self.pg_rank,
             world_size=weight_update_group_world_size,
+            device=self.device,
         )
+        logger.info(prefix + "Actor update process group initialized")
 
-    def receive_weight_update(self: LikeWorker, request: WeightUpdateRequest):
+    def receive_weight_update(self: LikeWorker, request_json: str):
+        request = WeightUpdateRequest.model_validate_json(request_json)
         torch.cuda.synchronize(self.device)
         logger.info("Start receiving weight update")
+        expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
+
         for info in request.parameters_info:
-            model_dtype = self.model_config.dtype
-            assert info.dtype == str(model_dtype), (
-                f"mismatch dtype: src {info.dtype}, dst {self.model_config.dtype}"
-            )
-            buffer = torch.empty(tuple(info.shape), dtype=model_dtype, device=self.device)
-            torch.distributed.broadcast(buffer, src=0, group=self.process_group)
-            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)]) # type: ignore
+            target_dtype = string_to_dtype(info.dtype)
+            if target_dtype not in expected_dtypes:
+                logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
+            buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
+            self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
+            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])  # type: ignore
             if len(loaded_params) != 1:
                 raise ValueError(f"model {info.name} not found in model state dict")
+
+        pipelinerl.vllm_quantization.invalidate_fp32_cache()
         logger.info("Weight update received")
+
+    def close_communicator(self):
+        """Closes the communicator when weight synchronization is no longer needed."""
+        if hasattr(self, "model_update_group") and self.model_update_group is not None:
+            del self.model_update_group
+            self.model_update_group = None
+            logger.info("Weight update communicator closed")
 
 
 class WeightUpdateManager:
-    def __init__(self, args, engine_client: AsyncMPClient):
+    def __init__(self, args, engine: AsyncLLM, engine_client: AsyncMPClient):
         self.args = args
+        self.engine = engine
         self.engine_client = engine_client
 
     async def input_process_groups(self):
@@ -111,16 +130,21 @@ class WeightUpdateManager:
         )
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
+        logger.info("Starting weight update...")
         await self.engine_client.collective_rpc_async(
-            "receive_weight_update", args=(request,)
+            "receive_weight_update", args=(request.model_dump_json(),)
         )
         logger.info("Weight update processed")
+
+    async def close_communicator(self):
+        """Closes the communicator when weight synchronization is no longer needed."""
+        await self.engine_client.collective_rpc_async("close_communicator")
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
     # COPIED FROM vllm/entrypoints/openai/api_server.py, vllm version 0.6.6.post1
-    logger.info("vLLM API server version %s", version)
-    logger.info("args: %s", args)
+    logger.info(f"vLLM API server version {version}")
+    logger.info(f"args: {args}")
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
@@ -154,11 +178,11 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         vllm_config=engine_config,
         usage_context=UsageContext.OPENAI_API_SERVER,
         disable_log_stats=engine_args.disable_log_stats,
-        disable_log_requests=engine_args.disable_log_requests,
+        enable_log_requests=engine_args.enable_log_requests,
     )
     assert isinstance(engine.engine_core, AsyncMPClient)
 
-    weight_update_manager = WeightUpdateManager(args, engine.engine_core)
+    weight_update_manager = WeightUpdateManager(args, engine, engine.engine_core)
     if not args.disable_weight_updates:
         await weight_update_manager.input_process_groups()
 
@@ -169,10 +193,12 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     @app.post("/receive_weight_update")
     async def _receive_weight_update(request: WeightUpdateRequest):
+        # Blocking: wait for weight update to complete before returning
+        logger.info("Received weight update request")
         await weight_update_manager.receive_weight_update(request)
         return {"status": "ok"}
 
-    await init_app_state(engine, engine_config, app.state, args)
+    await init_app_state(engine, app.state, args)
     shutdown_task = await serve_http(
         app,
         sock,
@@ -191,10 +217,10 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     # NB: Await server shutdown only after the backend context is exited
     await shutdown_task
 
+    # Cleanup
+    if not args.disable_weight_updates:
+        await weight_update_manager.close_communicator()
     sock.close()
-
-    # TODO: proper cleanup
-    # dist.destroy_process_group(actor_update_group)
 
 
 def run_llm():

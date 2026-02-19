@@ -97,6 +97,31 @@ def validate_config(cfg: DictConfig):
             )
 
 
+def _get_quantization_args(cfg: DictConfig) -> list[str]:
+    """Build quantization CLI args for vLLM."""
+    if cfg.get("fp32_lm_head", False):
+        explicit_quant = cfg.vllm_config.get("quantization")
+        if explicit_quant and explicit_quant != "bf16_last_layer_fp32":
+            logger.warning(
+                f"fp32_lm_head=true overrides explicit vllm_config.quantization='{explicit_quant}' "
+                f"with 'bf16_last_layer_fp32'"
+            )
+        return ["--quantization", "bf16_last_layer_fp32"]
+    elif cfg.vllm_config.get("quantization"):
+        return ["--quantization", cfg.vllm_config.quantization]
+    return []
+
+
+def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
+    """Get environment variables for quantization config."""
+    env = {}
+    if cfg.get("fp32_lm_head", False):
+        # Pass the layer prefix to the quantization config via environment variable
+        prefix = cfg.get("fp32_layer_prefix", "lm_head")
+        env["PIPELINERL_FP32_LAYER_PREFIX"] = prefix
+    return env
+
+
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
     kwargs = cfg.vllm_config.vllm_kwargs
     if kwargs["num-scheduler-steps"] > 1:
@@ -119,7 +144,9 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
         str(cfg.seed + preprocessor_llm_idx),
     ]
 
-    # Add vLLM kwargs as separate arguments
+    cmd.extend(_get_quantization_args(cfg))
+
+    # add vLLM kwargs as separate arguments
     for k, v in kwargs.items():
         cmd.append(f"--{k}")
         if v not in [None, ""]:
@@ -129,10 +156,11 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
+            env=env,
             stdout=log_file,
             stderr=err_file,
         )
@@ -177,30 +205,9 @@ def run_actor_llm(
         str(world_map.weight_update_group_size),
     ]
 
-    # Provide deterministic rendezvous port defaults when env vars are absent.
-    # vLLM spins up a torch.distributed TCPStore using VLLM_PORT. On the remote
-    # scheduler we observed replica crashes (store collisions, connection
-    # refused) because every start script inherited the same default port. By
-    # exporting VLLM_PORT_BASE/VLLM_PORT_STRIDE we carve out a rendezvous range
-    # per actor_idx while keeping the public HTTP listener at 8080+local_idx.
-    env = dict(os.environ)
-    if "VLLM_PORT_BASE" not in env:
-        # Each rank gets 1000 ports; 43000 leaves room below.
-        env["VLLM_PORT_BASE"] = str(43000 + 1000 * world_map.my_rank)
-        logger.debug(
-            "Setting default VLLM_PORT_BASE=%s for rank %s",
-            env["VLLM_PORT_BASE"], world_map.my_rank,
-        )
-    if "VLLM_PORT_STRIDE" not in env:
-        env["VLLM_PORT_STRIDE"] = "20"
+    cmd.extend(_get_quantization_args(cfg))
 
-    env_overrides = {
-        key: str(env[key])
-        for key in ("VLLM_PORT_BASE", "VLLM_PORT_STRIDE")
-        if key in env
-    }
-
-    # Add vLLM kwargs as separate arguments
+    # add vLLM kwargs as separate arguments
     if cfg.vllm_config.vllm_kwargs:
         for k, v in cfg.vllm_config.vllm_kwargs.items():
             cmd.append(f"--{k}")
@@ -212,13 +219,14 @@ def run_actor_llm(
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
-    save_command(log_dir, cmd, env_overrides or None)
+    save_command(log_dir, cmd)
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
-            env={**env, "CUDA_VISIBLE_DEVICES": gpu_str},
+            env=env,
             stdout=log_file,
             stderr=err_file,
         )
@@ -250,7 +258,6 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     )
     if proc is not None:
         yield LaunchedProcess(kind="actor", handle=proc)
-
 
 def run_environment(cfg: DictConfig, job: Job):
     # run in a subprocess like in the rest of the code

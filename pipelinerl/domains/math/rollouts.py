@@ -1,16 +1,21 @@
-import time
+import logging
 import random
+import time
 
 import aiohttp
 from omegaconf import DictConfig
 from pydantic import BaseModel
-from pipelinerl.rollouts import RolloutResult, BaseMetrics
-from pipelinerl.world import Job
 from tapeagents.core import Prompt
 from tapeagents.llms.trainable import TrainableLLM
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
+from pipelinerl.rollouts import BaseMetrics, RolloutResult
+from pipelinerl.utils import get_environment_jobs, resolve_environment_key
+
 from .verifier_api import verify_answer_rpc
+
+logger = logging.getLogger(__name__)
+
 
 class Metrics(BaseMetrics):
     penalty: float
@@ -25,6 +30,29 @@ class RewardTable(BaseModel):
     correct_answer_not_finished: float
     correct_answer_finished: float
     buffer_tokens: int = 0 # 0 means no overlong reward shaping
+
+    def get_reward_range(self) -> tuple[float, float]:
+        values = [
+            self.wrong_answer_not_finished,
+            self.wrong_answer_finished,
+            self.no_answer_not_finished,
+            self.no_answer_finished,
+            self.unparsable_not_finished,
+            self.unparsable_finished,
+            self.correct_answer_not_finished,
+            self.correct_answer_finished,
+        ]
+        return min(values), max(values)
+
+    def log_config(self, domain: str = "unknown") -> None:
+        """Log the reward configuration for debugging."""
+        min_r, max_r = self.get_reward_range()
+        logger.info(
+            f"RewardTable for {domain}: range=[{min_r}, {max_r}], "
+            f"correct_finished={self.correct_answer_finished}, "
+            f"wrong_finished={self.wrong_answer_finished}, "
+            f"buffer_tokens={self.buffer_tokens}"
+        )
 
 def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
     """
@@ -54,9 +82,10 @@ async def generate_math_rollout(
     rewards = RewardTable(**dict(cfg.rewards))
     discount_factor = cfg.actor.discount_factor
 
-    # math_verify is a fast environment, no support for environment replicas for now
-    env_jobs = [Job(**job) for job in cfg.jobs if job["kind"] == "environment"]
-    # choose the job randomly
+    env_key = resolve_environment_key(cfg, default="math")
+    env_jobs = get_environment_jobs(cfg, env_key)
+    if not env_jobs:
+        raise RuntimeError("No environment servers available for math domain")
     env_job = random.choice(env_jobs)
     assert env_job.port is not None
     answer_status = await verify_answer_rpc(
@@ -109,6 +138,7 @@ async def generate_math_rollout(
     return RolloutResult(
         training_texts=[trace],
         metrics=metrics,
-        latency=latency, 
+        latency=latency,
         dataset_name=problem.get("dataset"),
+        domain="math",
     )

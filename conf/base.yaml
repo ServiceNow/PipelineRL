@@ -7,6 +7,10 @@ defaults:
 seed: 42
 use_ray: false
 
+# use FP32 for lm_head computation in both training and inference.
+fp32_lm_head: false
+fp32_layer_prefix: "lm_head"  # "lm_head" | "output" | "embed_out" | "head"
+
 finetune:
   seed: ${..seed}
 
@@ -30,8 +34,8 @@ preprocess:
   n_workers: 8
   chunk_n_groups: 8
   # queue for loaded raw groups
-  raw_queue_size: 128
-  # queue for processed chunks of multiple groups  
+  raw_queue_size: 8
+  # queue for processed chunks of multiple groups
   input_queue_size: 32
   # queue for ready chunks for multiple groups
   output_queue_size: 32
@@ -41,9 +45,10 @@ preprocess:
   ring_buffer_size: 128
   # "virtual" sample queue per lead trainer
   max_ready_samples_per_lead: 64
-  pop_old_data: ${..pop_old_data} 
+  pop_old_data: ${..pop_old_data}
   shared_memory_entry_size: 100000000
   log_every_n_samples: 128
+
 llm:
   parameters:
     # changed
@@ -59,12 +64,10 @@ test_llm:
 
 vllm_config:
   use_v1: false
+  quantization: null  # or bf16_last_layer_fp32
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
-    num-scheduler-steps: 1
-    disable-log-requests: ""
-    disable-frontend-multiprocessing: ""
     max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 1024
     enable-chunked-prefill: ""
@@ -72,7 +75,13 @@ vllm_config:
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
-    max_model_len: 16000
+    max_model_len: 10000
+    # V1 specific settings
+    # logprobs-mode: processed_logprobs
+    # V0 specific settings
+    num-scheduler-steps: 1
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
 
 world:
   replicas: 1
@@ -81,8 +90,7 @@ world:
   preprocessor_fraction: 0
   finetune_fraction: 4
 
-  # Number of environment servers per actor VLLM server
-  env_replicas_per_actor: 1
+  env_replicas: 1
 
   actor_group_port: 9000
   environment_start_port: 7777
@@ -144,4 +152,3 @@ wandb:
   wandb_dir: null
   # Comma-separated list of keywords to tag the run.
   tags: []
-
