@@ -18,13 +18,65 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def init_process_group(init_method: str, rank: int, world_size: int):
-    """Initialize a distributed process group and wait."""
-    import torch.distributed as dist
-    import time
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_model_path(model_name: str):
+    """Resolve model name to a local Path, downloading from HuggingFace if needed."""
+    from pathlib import Path
+    from huggingface_hub import snapshot_download
+
+    model_path = Path(model_name)
+    if not model_path.exists():
+        print(f"[Trainer] Downloading model from HuggingFace Hub: {model_name}")
+        model_path = Path(snapshot_download(model_name))
+    return model_path
+
+
+def _load_state_dict(model_name: str, device: str = "cuda:0") -> tuple:
+    """Load model state dict from safetensors files.
+
+    Returns:
+        (state_dict, model_path)
+    """
+    import json
+    from safetensors.torch import load_file
+
+    model_path = _resolve_model_path(model_name)
+    index_file = model_path / "model.safetensors.index.json"
+
+    if index_file.exists():
+        print(f"[Trainer] Found index file, loading sharded model")
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+
+        file_to_params = {}
+        for param_name, filename in weight_map.items():
+            file_to_params.setdefault(filename, []).append(param_name)
+
+        state_dict = {}
+        for filename, param_names in file_to_params.items():
+            file_path = model_path / filename
+            print(f"[Trainer] Loading {len(param_names)} parameters from {filename}")
+            tensors = load_file(str(file_path), device=device)
+            for param_name in param_names:
+                state_dict[param_name] = tensors[param_name]
+    else:
+        safetensors_file = model_path / "model.safetensors"
+        print(f"[Trainer] Loading from single file: {safetensors_file}")
+        state_dict = load_file(str(safetensors_file), device=device)
+
+    print(f"[Trainer] Loaded {len(state_dict)} parameters from safetensors")
+    return state_dict, model_path
+
+
+def _init_actor_process_group(init_method: str, rank: int = 0, world_size: int = 2):
+    """Initialize the actor NCCL process group and return it."""
     import pipelinerl.torch_utils
 
-    print(f"[Trainer rank={rank}] Initializing process group")
+    print(f"[Trainer] Initializing process group as rank {rank}")
     process_group = pipelinerl.torch_utils.init_extra_process_group(
         group_name="actor",
         backend="nccl",
@@ -32,6 +84,107 @@ def init_process_group(init_method: str, rank: int, world_size: int):
         rank=rank,
         world_size=world_size,
     )
+    print("[Trainer] Process group initialized")
+    return process_group
+
+
+def _create_perturbed_state_dict(
+    state_dict: dict, seed: int = 42, noise_scale: float = 0.001
+) -> dict:
+    """Return a new state dict with Gaussian noise added to all tensors."""
+    import torch
+
+    print(f"[Trainer] Creating perturbed weights (all tensors) with seed={seed}...")
+    torch.manual_seed(seed)
+    perturbed = {}
+    for name, tensor in state_dict.items():
+        perturbed_tensor = tensor.clone()
+        perturbed_tensor.add_(torch.randn_like(perturbed_tensor) * noise_scale)
+        perturbed[name] = perturbed_tensor
+    print(
+        f"[Trainer] Perturbed all {len(perturbed)} tensors with noise={noise_scale}, seed={seed}"
+    )
+    return perturbed
+
+
+def _broadcast_tensors(state_dict: dict, process_group, log_interval: int = 50):
+    """Broadcast every tensor in state_dict via NCCL (src=0)."""
+    import torch.distributed as dist
+
+    total = len(state_dict)
+    for i, (name, tensor) in enumerate(state_dict.items()):
+        if tensor.device.type != "cuda":
+            tensor = tensor.cuda(0)
+        dist.broadcast(tensor, src=0, group=process_group)
+        if (i + 1) % log_interval == 0:
+            print(f"[Trainer] Broadcasted {i+1}/{total} parameters")
+    print(f"[Trainer] All {total} parameters broadcasted")
+
+
+def _broadcast_via_server(
+    state_dict: dict,
+    server_url: str,
+    version: int,
+    process_group,
+    label: str = "",
+):
+    """Broadcast weights to a running vLLM server via HTTP POST + NCCL.
+
+    The POST blocks on the server side until NCCL broadcast completes, so we
+    run it in a background thread while we drive the broadcast ourselves.
+    """
+    import threading
+    import time
+    import requests
+    from weight_update_utils import create_weight_update_request_from_state_dict
+
+    label_str = f" {label}" if label else ""
+    print(f"[Trainer] Broadcasting {len(state_dict)}{label_str} parameters")
+
+    request = create_weight_update_request_from_state_dict(state_dict, version=version)
+
+    post_result = {"error": None}
+
+    def _post():
+        try:
+            print("[Trainer] POSTing weight update request to server...")
+            resp = requests.post(
+                f"{server_url}/receive_weight_update",
+                json=request.model_dump(),
+                timeout=600,
+            )
+            if resp.status_code != 200:
+                post_result["error"] = (
+                    f"POST failed with status {resp.status_code}: {resp.text}"
+                )
+            else:
+                print("[Trainer] Server acknowledged weight update")
+        except Exception as e:
+            post_result["error"] = f"POST failed: {e}"
+
+    post_thread = threading.Thread(target=_post, daemon=False)
+    post_thread.start()
+    time.sleep(0.5)  # Give server a moment to start receiving
+
+    _broadcast_tensors(state_dict, process_group)
+
+    post_thread.join(timeout=60)
+    if post_result["error"]:
+        raise RuntimeError(f"Weight update POST failed: {post_result['error']}")
+
+    print(f"[Trainer] Broadcast{label_str} complete")
+
+
+# ---------------------------------------------------------------------------
+# Public command functions
+# ---------------------------------------------------------------------------
+
+def init_process_group(init_method: str, rank: int, world_size: int):
+    """Initialize a distributed process group and wait."""
+    import torch.distributed as dist
+    import time
+
+    process_group = _init_actor_process_group(init_method, rank, world_size)
     print(f"[Trainer rank={rank}] Process group initialized successfully")
 
     # Wait for coordination
@@ -53,7 +206,6 @@ def save_model_to_dir(state_dict: dict, output_dir: str, model_name: str):
     from pathlib import Path
     from safetensors.torch import save_file
     import shutil
-    import json
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -64,12 +216,7 @@ def save_model_to_dir(state_dict: dict, output_dir: str, model_name: str):
     print(f"[Trainer] Saved model weights to {safetensors_path}")
 
     # Copy config.json from original model
-    original_path = Path(model_name)
-    if not original_path.exists():
-        # Download if needed
-        from huggingface_hub import snapshot_download
-
-        original_path = Path(snapshot_download(model_name))
+    original_path = _resolve_model_path(model_name)
 
     config_src = original_path / "config.json"
     config_dst = output_path / "config.json"
@@ -100,9 +247,7 @@ def broadcast_weights(
     """Load model and broadcast weights to vLLM worker."""
     import torch
     import torch.distributed as dist
-    from transformers import AutoModelForCausalLM
     from pathlib import Path
-    import pipelinerl.torch_utils
 
     # Setup sync points if provided
     if sync_dir:
@@ -117,16 +262,7 @@ def broadcast_weights(
         broadcast_done = SyncPoint(sync_path, "broadcast_done")
 
     # IMPORTANT: Initialize process group FIRST (before any waiting)
-    # Use the same init_extra_process_group as vLLM to create the SAME process group
-    print("[Trainer] Initializing process group as rank 0")
-    process_group = pipelinerl.torch_utils.init_extra_process_group(
-        group_name="actor",
-        backend="nccl",
-        init_method=init_method,
-        rank=0,
-        world_size=2,
-    )
-    print("[Trainer] Process group initialized")
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=2)
 
     # Now wait for vLLM to finish baseline and be ready to receive
     if sync_dir:
@@ -138,56 +274,9 @@ def broadcast_weights(
         ready_to_receive.wait(timeout=60)
         print("[Trainer] vLLM ready, starting weight broadcast")
 
-    # Load tensors directly from safetensors files (not the full model)
     print(f"[Trainer] Loading tensors from safetensors for {model_name}")
-    from pathlib import Path
-    import json
-    from safetensors.torch import load_file
-    from huggingface_hub import snapshot_download
+    state_dict, _ = _load_state_dict(model_name)
 
-    # Handle both local paths and HuggingFace model IDs
-    model_path = Path(model_name)
-    if not model_path.exists():
-        # Download from HuggingFace Hub
-        print(f"[Trainer] Downloading model from HuggingFace Hub: {model_name}")
-        model_path = Path(snapshot_download(model_name))
-
-    index_file = model_path / "model.safetensors.index.json"
-
-    # Load state_dict from safetensors files
-    if index_file.exists():
-        # Sharded model - use index to load from multiple files
-        print(f"[Trainer] Found index file, loading sharded model")
-        with open(index_file) as f:
-            index = json.load(f)
-
-        weight_map = index["weight_map"]  # {param_name: filename}
-
-        # Group parameters by file to load each file only once
-        file_to_params = {}
-        for param_name, filename in weight_map.items():
-            if filename not in file_to_params:
-                file_to_params[filename] = []
-            file_to_params[filename].append(param_name)
-
-        # Load all tensors
-        state_dict = {}
-        for filename, param_names in file_to_params.items():
-            file_path = model_path / filename
-            print(f"[Trainer] Loading {len(param_names)} parameters from {filename}")
-            tensors = load_file(str(file_path), device="cuda:0")
-            for param_name in param_names:
-                state_dict[param_name] = tensors[param_name]
-    else:
-        # Single file model
-        safetensors_file = model_path / "model.safetensors"
-        print(f"[Trainer] Loading from single file: {safetensors_file}")
-        state_dict = load_file(str(safetensors_file), device="cuda:0")
-
-    print(f"[Trainer] Loaded {len(state_dict)} parameters from safetensors")
-
-    # Fast-LLM broadcasts weights as they are in safetensors files
-    # No filtering - vLLM handles its own implementation details
     params_to_broadcast = state_dict
     print(f"[Trainer] Will broadcast {len(params_to_broadcast)} parameters")
 
@@ -214,14 +303,7 @@ def broadcast_weights(
 
     # Optionally perturb weights - add noise to ALL tensors
     if perturb:
-        logger.info("Perturbing ALL weights with seed=42")
-        torch.manual_seed(42)
-        for name, tensor in params_to_broadcast.items():
-            if tensor.device.type != "cuda":
-                tensor = tensor.cuda(0)
-            noise = torch.randn_like(tensor) * 0.001  # Smaller noise to avoid breaking model
-            tensor.add_(noise)
-        print(f"[Trainer] Perturbed all {len(params_to_broadcast)} tensors with noise=0.001, seed=42")
+        params_to_broadcast = _create_perturbed_state_dict(params_to_broadcast)
 
     # Broadcast each weight with detailed logging
     logger.info(f"Starting broadcast of {len(params_to_broadcast)} parameters")
@@ -230,24 +312,19 @@ def broadcast_weights(
         logger.debug(
             f"  - shape: {tensor.shape}, dtype: {tensor.dtype}, device: {tensor.device}"
         )
-
-        # Move to GPU if needed
         if tensor.device.type != "cuda":
             logger.debug(f"  - Moving {name} to CUDA")
             tensor = tensor.cuda(0)
             logger.debug(f"  - {name} now on device: {tensor.device}")
-
         logger.debug(f"  - Calling dist.broadcast for {name}...")
         dist.broadcast(tensor, src=0, group=process_group)
         logger.debug(f"  - Broadcast complete for {name}")
-
         if (i + 1) % 10 == 0:
             logger.info(f"Broadcasted {i+1}/{len(params_to_broadcast)} parameters")
 
     print(f"[Trainer] All {len(params_to_broadcast)} parameters broadcasted")
 
     # Signal broadcast complete BEFORE destroying process group
-    # This ensures vLLM sees the signal before trainer exits
     if sync_dir:
         broadcast_done.signal()
         print("[Trainer] Signaled broadcast complete")
@@ -263,16 +340,12 @@ def broadcast_cross_validation(
 
     Also saves perturbed model to disk for vLLM to load.
     """
-    import torch
     import torch.distributed as dist
     from pathlib import Path
-    import json
-    import pipelinerl.torch_utils
-    from safetensors.torch import load_file
-    from huggingface_hub import snapshot_download
 
     sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint, write_weight_update_request
+    from weight_update_utils import create_weight_update_request_from_state_dict
 
     sync_path = Path(sync_dir)
     baseline_done = SyncPoint(sync_path, "baseline_done")
@@ -285,63 +358,15 @@ def broadcast_cross_validation(
     ready_to_receive_original = SyncPoint(sync_path, "ready_to_receive_original")
     original_broadcast_done = SyncPoint(sync_path, "original_broadcast_done")
 
-    # Initialize process group
-    print("[Trainer] Initializing process group as rank 0")
-    process_group = pipelinerl.torch_utils.init_extra_process_group(
-        group_name="actor",
-        backend="nccl",
-        init_method=init_method,
-        rank=0,
-        world_size=2,
-    )
-    print("[Trainer] Process group initialized")
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=2)
 
-    # Wait for baseline
     print("[Trainer] Waiting for vLLM baseline generation...")
     baseline_done.wait(timeout=120)
 
-    # Load original model
     print(f"[Trainer] Loading original model {model_name}")
-    model_path = Path(model_name)
-    if not model_path.exists():
-        print(f"[Trainer] Downloading model from HuggingFace Hub: {model_name}")
-        model_path = Path(snapshot_download(model_name))
+    original_state_dict, model_path = _load_state_dict(model_name)
 
-    index_file = model_path / "model.safetensors.index.json"
-    if index_file.exists():
-        print(f"[Trainer] Loading sharded model")
-        with open(index_file) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
-        file_to_params = {}
-        for param_name, filename in weight_map.items():
-            if filename not in file_to_params:
-                file_to_params[filename] = []
-            file_to_params[filename].append(param_name)
-
-        original_state_dict = {}
-        for filename, param_names in file_to_params.items():
-            file_path = model_path / filename
-            tensors = load_file(str(file_path), device="cuda:0")
-            for param_name in param_names:
-                original_state_dict[param_name] = tensors[param_name]
-    else:
-        safetensors_file = model_path / "model.safetensors"
-        original_state_dict = load_file(str(safetensors_file), device="cuda:0")
-
-    print(f"[Trainer] Loaded {len(original_state_dict)} original parameters")
-
-    # Create perturbed version - add noise to ALL tensors
-    print("[Trainer] Creating perturbed weights (all tensors) with seed=42...")
-    torch.manual_seed(42)
-    perturbed_state_dict = {}
-    for name, tensor in original_state_dict.items():
-        perturbed_tensor = tensor.clone()
-        # Add smaller noise to avoid completely breaking the model
-        noise = torch.randn_like(perturbed_tensor) * 0.001  # Reduced from 0.01
-        perturbed_tensor.add_(noise)
-        perturbed_state_dict[name] = perturbed_tensor
-    print(f"[Trainer] Perturbed all {len(perturbed_state_dict)} tensors with noise=0.001, seed=42")
+    perturbed_state_dict = _create_perturbed_state_dict(original_state_dict)
 
     # Save perturbed model to disk
     perturbed_model_dir = Path(temp_dir) / "perturbed_model"
@@ -350,93 +375,52 @@ def broadcast_cross_validation(
         perturbed_state_dict, str(perturbed_model_dir), str(model_path)
     )
 
-    # Write perturbed model path to sync file
     path_file = sync_path / "perturbed_model_path.txt"
     path_file.write_text(saved_path)
     perturbed_model_saved.signal()
     print(f"[Trainer] Signaled perturbed model saved at: {saved_path}")
 
-    # Wait for vLLM to be ready to receive perturbed weights
+    # Broadcast perturbed weights
     print("[Trainer] Waiting for vLLM to be ready for perturbed broadcast...")
     ready_to_receive_perturbed.wait(timeout=120)
 
-    # Broadcast perturbed weights
     print(f"[Trainer] Broadcasting {len(perturbed_state_dict)} perturbed parameters")
-    from weight_update_utils import create_weight_update_request_from_state_dict
-
-    request = create_weight_update_request_from_state_dict(
-        perturbed_state_dict, version=1
-    )
+    request = create_weight_update_request_from_state_dict(perturbed_state_dict, version=1)
     write_weight_update_request(sync_path, request)
-
-    for i, (name, tensor) in enumerate(perturbed_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(
-                f"[Trainer] Broadcasted {i+1}/{len(perturbed_state_dict)} perturbed parameters"
-            )
+    _broadcast_tensors(perturbed_state_dict, process_group)
 
     perturbed_broadcast_done.signal()
     print("[Trainer] Perturbed weights broadcast complete")
 
-    # Wait for vLLM to finish generating res_mod_1
     print("[Trainer] Waiting for vLLM to finish res_mod_1...")
     mod1_done.wait(timeout=120)
 
-    # Destroy our process group immediately after we're done using it
-    # No need to wait for vLLM - destroy_process_group() is a local operation
     print("[Trainer] Destroying process group for first broadcast")
     dist.destroy_process_group(process_group)
 
-    # Wait for vLLM to destroy its first engine before creating new groups
     print("[Trainer] Waiting for vLLM to destroy first engine...")
     first_engine_destroyed.wait(timeout=120)
 
-    # Recreate our process group BEFORE vLLM creates its engine
-    # (vLLM will rendezvous with us when it creates engine 2)
     print("[Trainer] Recreating process group for second broadcast")
-    process_group = pipelinerl.torch_utils.init_extra_process_group(
-        group_name="actor",
-        backend="nccl",
-        init_method=init_method,
-        rank=0,
-        world_size=2,
-    )
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=2)
     print("[Trainer] Process group recreated, waiting at rendezvous...")
 
-    # Wait for vLLM to recreate engine (confirms rendezvous completed)
     print("[Trainer] Waiting for vLLM to recreate engine...")
     engine_recreated.wait(timeout=300)  # 5 minutes - engine creation can be slow
     print("[Trainer] vLLM engine recreated, both in new process group")
 
-    # Wait for vLLM to be ready for original weights
+    # Broadcast original weights
     print("[Trainer] Waiting for vLLM to be ready for original broadcast...")
     ready_to_receive_original.wait(timeout=120)
 
-    # Broadcast original weights
     print(f"[Trainer] Broadcasting {len(original_state_dict)} original parameters")
-    from weight_update_utils import create_weight_update_request_from_state_dict
-
-    request = create_weight_update_request_from_state_dict(
-        original_state_dict, version=2
-    )
+    request = create_weight_update_request_from_state_dict(original_state_dict, version=2)
     write_weight_update_request(sync_path, request)
-
-    for i, (name, tensor) in enumerate(original_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(
-                f"[Trainer] Broadcasted {i+1}/{len(original_state_dict)} original parameters"
-            )
+    _broadcast_tensors(original_state_dict, process_group)
 
     original_broadcast_done.signal()
     print("[Trainer] Original weights broadcast complete")
 
-    # Cleanup
     dist.destroy_process_group(process_group)
     print("[Trainer] Process group destroyed")
 
@@ -446,16 +430,12 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
 
     Tests that we can switch between weight sets multiple times.
     """
-    import torch
     import torch.distributed as dist
     from pathlib import Path
-    import json
-    import pipelinerl.torch_utils
-    from safetensors.torch import load_file
-    from huggingface_hub import snapshot_download
 
     sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint, write_weight_update_request
+    from weight_update_utils import create_weight_update_request_from_state_dict
 
     sync_path = Path(sync_dir)
     baseline_done = SyncPoint(sync_path, "baseline_done")
@@ -466,62 +446,15 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     ready_for_perturbed2 = SyncPoint(sync_path, "ready_for_perturbed2")
     perturbed2_done = SyncPoint(sync_path, "perturbed2_done")
 
-    # Initialize process group
-    print("[Trainer] Initializing process group as rank 0")
-    process_group = pipelinerl.torch_utils.init_extra_process_group(
-        group_name="actor",
-        backend="nccl",
-        init_method=init_method,
-        rank=0,
-        world_size=2,
-    )
-    print("[Trainer] Process group initialized")
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=2)
 
-    # Wait for baseline
     print("[Trainer] Waiting for vLLM baseline generation...")
     baseline_done.wait(timeout=120)
 
-    # Load original model
     print(f"[Trainer] Loading model {model_name}")
-    model_path = Path(model_name)
-    if not model_path.exists():
-        print(f"[Trainer] Downloading model from HuggingFace Hub: {model_name}")
-        model_path = Path(snapshot_download(model_name))
+    original_state_dict, model_path = _load_state_dict(model_name)
 
-    index_file = model_path / "model.safetensors.index.json"
-    if index_file.exists():
-        print(f"[Trainer] Loading sharded model")
-        with open(index_file) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
-        file_to_params = {}
-        for param_name, filename in weight_map.items():
-            if filename not in file_to_params:
-                file_to_params[filename] = []
-            file_to_params[filename].append(param_name)
-
-        original_state_dict = {}
-        for filename, param_names in file_to_params.items():
-            file_path = model_path / filename
-            tensors = load_file(str(file_path), device="cuda:0")
-            for param_name in param_names:
-                original_state_dict[param_name] = tensors[param_name]
-    else:
-        safetensors_file = model_path / "model.safetensors"
-        original_state_dict = load_file(str(safetensors_file), device="cuda:0")
-
-    print(f"[Trainer] Loaded {len(original_state_dict)} original parameters")
-
-    # Create perturbed version
-    print("[Trainer] Creating perturbed weights with seed=42...")
-    torch.manual_seed(42)
-    perturbed_state_dict = {}
-    for name, tensor in original_state_dict.items():
-        perturbed_tensor = tensor.clone()
-        noise = torch.randn_like(perturbed_tensor) * 0.001
-        perturbed_tensor.add_(noise)
-        perturbed_state_dict[name] = perturbed_tensor
-    print(f"[Trainer] Perturbed all {len(perturbed_state_dict)} tensors with noise=0.001, seed=42")
+    perturbed_state_dict = _create_perturbed_state_dict(original_state_dict)
 
     # Save perturbed weights for reuse in server tests
     perturbed_weights_dir = Path(sync_dir) / "perturbed_weights"
@@ -536,16 +469,9 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     ready_for_perturbed1.wait(timeout=120)
 
     print(f"[Trainer] Broadcasting perturbed weights (1st time)")
-    from weight_update_utils import create_weight_update_request_from_state_dict
     request = create_weight_update_request_from_state_dict(perturbed_state_dict, version=1)
     write_weight_update_request(sync_path, request)
-
-    for i, (name, tensor) in enumerate(perturbed_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(f"[Trainer] Broadcasted {i+1}/{len(perturbed_state_dict)} parameters")
+    _broadcast_tensors(perturbed_state_dict, process_group)
 
     perturbed1_done.signal()
     print("[Trainer] First perturbed broadcast complete")
@@ -555,17 +481,9 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     ready_for_original.wait(timeout=120)
 
     print(f"[Trainer] Broadcasting original weights")
-    from weight_update_utils import create_weight_update_request_from_state_dict
-
     request = create_weight_update_request_from_state_dict(original_state_dict, version=2)
     write_weight_update_request(sync_path, request)
-
-    for i, (name, tensor) in enumerate(original_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(f"[Trainer] Broadcasted {i+1}/{len(original_state_dict)} parameters")
+    _broadcast_tensors(original_state_dict, process_group)
 
     original_done.signal()
     print("[Trainer] Original broadcast complete")
@@ -575,22 +493,13 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     ready_for_perturbed2.wait(timeout=120)
 
     print(f"[Trainer] Broadcasting perturbed weights (2nd time)")
-    from weight_update_utils import create_weight_update_request_from_state_dict
-
     request = create_weight_update_request_from_state_dict(perturbed_state_dict, version=3)
     write_weight_update_request(sync_path, request)
-
-    for i, (name, tensor) in enumerate(perturbed_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(f"[Trainer] Broadcasted {i+1}/{len(perturbed_state_dict)} parameters")
+    _broadcast_tensors(perturbed_state_dict, process_group)
 
     perturbed2_done.signal()
     print("[Trainer] Second perturbed broadcast complete")
 
-    # Cleanup
     dist.destroy_process_group(process_group)
     print("[Trainer] Process group destroyed")
 
@@ -610,30 +519,14 @@ def timed_broadcast_server_test(
         model_name: Model name to load
         server_url: Base URL of vLLM server (e.g., "http://127.0.0.1:8000")
     """
-    import torch
     import torch.distributed as dist
     from pathlib import Path
-    import json
-    import pipelinerl.torch_utils
-    from safetensors.torch import load_file
-    from huggingface_hub import snapshot_download
     import time
     import requests
-    import threading
 
     sys.path.insert(0, str(Path(__file__).parent))
-    from weight_update_utils import create_weight_update_request_from_state_dict
 
-    # Initialize process group
-    print("[Trainer] Initializing process group as rank 0")
-    process_group = pipelinerl.torch_utils.init_extra_process_group(
-        group_name="actor",
-        backend="nccl",
-        init_method=init_method,
-        rank=0,
-        world_size=2,
-    )
-    print("[Trainer] Process group initialized")
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=2)
 
     # Wait for server to be ready by polling health endpoint
     print("[Trainer] Waiting for server to be ready...")
@@ -656,188 +549,26 @@ def timed_broadcast_server_test(
     print("[Trainer] Waiting additional 10 seconds for server to fully initialize...")
     time.sleep(10)
 
-    # Load original weights
     print(f"[Trainer] Loading original weights from {model_name}")
-    model_path = Path(model_name)
-    if not model_path.exists():
-        print(f"[Trainer] Downloading model from HuggingFace Hub: {model_name}")
-        model_path = Path(snapshot_download(model_name))
+    original_state_dict, _ = _load_state_dict(model_name)
 
-    index_file = model_path / "model.safetensors.index.json"
-    if index_file.exists():
-        print(f"[Trainer] Loading sharded original model")
-        with open(index_file) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
-        file_to_params = {}
-        for param_name, filename in weight_map.items():
-            if filename not in file_to_params:
-                file_to_params[filename] = []
-            file_to_params[filename].append(param_name)
-
-        original_state_dict = {}
-        for filename, param_names in file_to_params.items():
-            file_path = model_path / filename
-            tensors = load_file(str(file_path), device="cuda:0")
-            for param_name in param_names:
-                original_state_dict[param_name] = tensors[param_name]
-    else:
-        safetensors_file = model_path / "model.safetensors"
-        original_state_dict = load_file(str(safetensors_file), device="cuda:0")
-
-    print(f"[Trainer] Loaded {len(original_state_dict)} original parameters")
-
-    # Create perturbed weights
-    print("[Trainer] Creating perturbed weights with seed=42...")
-    torch.manual_seed(42)
-    perturbed_state_dict = {}
-    for name, tensor in original_state_dict.items():
-        perturbed_tensor = tensor.clone()
-        noise = torch.randn_like(perturbed_tensor) * 0.001
-        perturbed_tensor.add_(noise)
-        perturbed_state_dict[name] = perturbed_tensor
-    print(f"[Trainer] Perturbed all {len(perturbed_state_dict)} tensors with noise=0.001, seed=42")
+    perturbed_state_dict = _create_perturbed_state_dict(original_state_dict)
 
     # Broadcast 1: Perturbed weights
-    print(f"[Trainer] Broadcasting {len(perturbed_state_dict)} perturbed parameters")
+    _broadcast_via_server(perturbed_state_dict, server_url, version=1, process_group=process_group, label="perturbed")
 
-    request = create_weight_update_request_from_state_dict(
-        perturbed_state_dict, version=1
-    )
-
-    # POST request to server in background thread (it will block until broadcast completes)
-    post_result = {"error": None}
-    def post_weight_update():
-        try:
-            print("[Trainer] POSTing weight update request to server...")
-            resp = requests.post(
-                f"{server_url}/receive_weight_update",
-                json=request.model_dump(),
-                timeout=600,  # 10 minutes
-            )
-            if resp.status_code != 200:
-                post_result["error"] = f"POST failed with status {resp.status_code}: {resp.text}"
-            else:
-                print("[Trainer] Server acknowledged weight update")
-        except Exception as e:
-            post_result["error"] = f"POST failed: {e}"
-
-    post_thread = threading.Thread(target=post_weight_update, daemon=False)
-    post_thread.start()
-
-    # Give server a moment to start receiving
-    time.sleep(0.5)
-
-    # Now broadcast via NCCL
-    for i, (name, tensor) in enumerate(perturbed_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(
-                f"[Trainer] Broadcasted {i+1}/{len(perturbed_state_dict)} perturbed parameters"
-            )
-
-    # Wait for POST to complete
-    post_thread.join(timeout=60)
-    if post_result["error"]:
-        raise RuntimeError(f"Weight update POST failed: {post_result['error']}")
-
-    print("[Trainer] Perturbed weights broadcast complete")
-
-    # Wait 5 seconds
     print("[Trainer] Waiting 5 seconds before broadcasting original weights...")
     time.sleep(5)
 
     # Broadcast 2: Original weights
-    print(f"[Trainer] Broadcasting {len(original_state_dict)} original parameters")
-    request = create_weight_update_request_from_state_dict(
-        original_state_dict, version=2
-    )
+    _broadcast_via_server(original_state_dict, server_url, version=2, process_group=process_group, label="original")
 
-    # POST request to server in background thread
-    post_result = {"error": None}
-    def post_weight_update():
-        try:
-            print("[Trainer] POSTing weight update request to server...")
-            resp = requests.post(
-                f"{server_url}/receive_weight_update",
-                json=request.model_dump(),
-                timeout=600,
-            )
-            if resp.status_code != 200:
-                post_result["error"] = f"POST failed with status {resp.status_code}: {resp.text}"
-            else:
-                print("[Trainer] Server acknowledged weight update")
-        except Exception as e:
-            post_result["error"] = f"POST failed: {e}"
-
-    post_thread = threading.Thread(target=post_weight_update, daemon=False)
-    post_thread.start()
-    time.sleep(0.5)
-
-    for i, (name, tensor) in enumerate(original_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(
-                f"[Trainer] Broadcasted {i+1}/{len(original_state_dict)} original parameters"
-            )
-
-    post_thread.join(timeout=60)
-    if post_result["error"]:
-        raise RuntimeError(f"Weight update POST failed: {post_result['error']}")
-
-    print("[Trainer] Original weights broadcast complete")
-
-    # Wait 5 seconds
     print("[Trainer] Waiting 5 seconds before broadcasting perturbed weights again...")
     time.sleep(5)
 
     # Broadcast 3: Perturbed weights again (same as first)
-    print(f"[Trainer] Broadcasting {len(perturbed_state_dict)} perturbed parameters (2nd time)")
-    request = create_weight_update_request_from_state_dict(
-        perturbed_state_dict, version=3
-    )
+    _broadcast_via_server(perturbed_state_dict, server_url, version=3, process_group=process_group, label="perturbed (2nd time)")
 
-    # POST request to server in background thread
-    post_result = {"error": None}
-    def post_weight_update():
-        try:
-            print("[Trainer] POSTing weight update request to server...")
-            resp = requests.post(
-                f"{server_url}/receive_weight_update",
-                json=request.model_dump(),
-                timeout=600,
-            )
-            if resp.status_code != 200:
-                post_result["error"] = f"POST failed with status {resp.status_code}: {resp.text}"
-            else:
-                print("[Trainer] Server acknowledged weight update")
-        except Exception as e:
-            post_result["error"] = f"POST failed: {e}"
-
-    post_thread = threading.Thread(target=post_weight_update, daemon=False)
-    post_thread.start()
-    time.sleep(0.5)
-
-    for i, (name, tensor) in enumerate(perturbed_state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % 50 == 0:
-            print(
-                f"[Trainer] Broadcasted {i+1}/{len(perturbed_state_dict)} perturbed parameters"
-            )
-
-    post_thread.join(timeout=60)
-    if post_result["error"]:
-        raise RuntimeError(f"Weight update POST failed: {post_result['error']}")
-
-    print("[Trainer] Perturbed weights broadcast complete (2nd time)")
-
-    # Cleanup
     dist.destroy_process_group(process_group)
     print("[Trainer] Process group destroyed, exiting")
 
