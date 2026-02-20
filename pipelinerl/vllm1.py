@@ -28,6 +28,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from pipelinerl.finetune_loop import WeightUpdateRequest, ParameterInfo
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from typing import Any, Protocol, runtime_checkable, Dict, Optional
+from fastapi import BackgroundTasks
 import pipelinerl.torch_utils
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -99,9 +100,14 @@ class WorkerExtension:
             rank=self.pg_rank,
             world_size=weight_update_group_world_size,
         )
+        self._process_group_destroyed = False
 
     def destroy_actor_update_group(self: LikeWorker):
+        self._process_group_destroyed = True
         torch.distributed.destroy_process_group(self.process_group)
+
+    def is_actor_update_group_destroyed(self: LikeWorker) -> bool:
+        return getattr(self, "_process_group_destroyed", False)
 
     def receive_weight_update(self: LikeWorker, request: WeightUpdateRequest):
         torch.cuda.synchronize(self.device)
@@ -246,8 +252,13 @@ class WorkerExtension:
                                     )
                             elif event_type == "training_finished":
                                 logger.info(
-                                    f"[Worker rank={self.rank}] Received training_finished event"
+                                    f"[Worker rank={self.rank}] Received training_finished event, destroying process group"
                                 )
+                                try:
+                                    self.destroy_actor_update_group()
+                                except Exception as e:
+                                    logger.error(f"[Worker rank={self.rank}] Error destroying process group: {e}")
+                                self.fast_llm_stop_event.set()  # stop monitoring loop
 
                 except Exception as e:
                     logger.error(f"[Worker rank={self.rank}] Error in Redis monitor: {e}")
@@ -268,12 +279,17 @@ class WorkerExtension:
 
     def stop_fast_llm_monitoring(self: LikeWorker):
         """Stop the Fast-LLM monitoring thread."""
-        if hasattr(self, "fast_llm_stop_event"):
-            logger.info(f"[Worker rank={self.rank}] Stopping Fast-LLM monitoring")
+        if not hasattr(self, "fast_llm_stop_event"):
+            return
+        if not self.fast_llm_stop_event.is_set():
+            logger.warning(
+                f"[Worker rank={self.rank}] training_finished was not received; "
+                "forcing monitoring thread stop"
+            )
             self.fast_llm_stop_event.set()
-            if hasattr(self, "fast_llm_monitor_thread"):
-                self.fast_llm_monitor_thread.join(timeout=5)
-                logger.info(f"[Worker rank={self.rank}] Fast-LLM monitoring stopped")
+        if hasattr(self, "fast_llm_monitor_thread"):
+            self.fast_llm_monitor_thread.join(timeout=5)
+            logger.info(f"[Worker rank={self.rank}] Fast-LLM monitoring stopped")
 
     def receive_weight_update_fast_llm(self: LikeWorker):
         """Receive weight update via Fast-LLM broadcast protocol.
@@ -391,6 +407,13 @@ class EngineManager:
             args=(),
         )
 
+    async def is_actor_update_group_destroyed(self) -> bool:
+        results = await self.engine.engine_core.collective_rpc_async(
+            "is_actor_update_group_destroyed",
+            args=(),
+        )
+        return all(results)
+
     async def receive_weight_update(self, request: WeightUpdateRequest):
         await self.engine.engine_core.collective_rpc_async(
             "receive_weight_update", args=(request,)
@@ -498,7 +521,11 @@ class EngineManager:
                 if hasattr(args, 'weight_update_mode') and args.weight_update_mode == "fast-llm":
                     await manager.stop_fast_llm_monitoring()
 
-                await manager.destroy_actor_update_group()
+                if not await manager.is_actor_update_group_destroyed():
+                    logger.warning(
+                        "training_finished was not called before shutdown; "
+                        "NCCL process group was not destroyed — potential resource leak"
+                    )
             if cleanup:
                 logger.info("Cleaning up vLLM engine")
                 # Clear manager reference to engine first
@@ -556,6 +583,13 @@ async def run_server(args, **uvicorn_kwargs) -> None:
             async def _receive_weight_update(request: WeightUpdateRequest):
                 await manager.receive_weight_update(request)
                 return {"status": "ok"}
+
+            @app.post("/training_finished")
+            async def _training_finished(background_tasks: BackgroundTasks):
+                logger.info("Received /training_finished, scheduling NCCL process group teardown")
+                background_tasks.add_task(manager.destroy_actor_update_group)
+                return {"status": "ok"}
+
             logger.info("HTTP weight update endpoint registered")
         else:
             logger.info("Fast-LLM mode: using Redis stream (no HTTP endpoint registered)")
