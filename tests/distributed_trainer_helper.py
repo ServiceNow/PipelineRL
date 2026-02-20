@@ -8,6 +8,17 @@ allowing proper GPU isolation for distributed tests.
 import sys
 import argparse
 import logging
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from trainer_test_utils import (
+    _resolve_model_path,
+    _load_state_dict,
+    _create_perturbed_state_dict,
+    _init_actor_process_group,
+    _broadcast_tensors,
+    _wait_for_servers_ready,
+)
 
 # Setup debug logging
 logging.basicConfig(
@@ -18,120 +29,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+def _wait_all_actors(sync_path, name: str, num_actors: int, timeout: float = 120):
+    """Wait for all actors to signal a named sync point.
 
-def _resolve_model_path(model_name: str):
-    """Resolve model name to a local Path, downloading from HuggingFace if needed."""
-    from pathlib import Path
-    from huggingface_hub import snapshot_download
-
-    model_path = Path(model_name)
-    if not model_path.exists():
-        print(f"[Trainer] Downloading model from HuggingFace Hub: {model_name}")
-        model_path = Path(snapshot_download(model_name))
-    return model_path
-
-
-def _load_state_dict(model_name: str, device: str = "cuda:0") -> tuple:
-    """Load model state dict from safetensors files.
-
-    Returns:
-        (state_dict, model_path)
+    Each actor signals ``{name}_actor_{i}`` for i in range(num_actors).
     """
-    import json
-    from safetensors.torch import load_file
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from sync_helper import SyncPoint
 
-    model_path = _resolve_model_path(model_name)
-    index_file = model_path / "model.safetensors.index.json"
-
-    if index_file.exists():
-        print(f"[Trainer] Found index file, loading sharded model")
-        with open(index_file) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
-
-        file_to_params = {}
-        for param_name, filename in weight_map.items():
-            file_to_params.setdefault(filename, []).append(param_name)
-
-        state_dict = {}
-        for filename, param_names in file_to_params.items():
-            file_path = model_path / filename
-            print(f"[Trainer] Loading {len(param_names)} parameters from {filename}")
-            tensors = load_file(str(file_path), device=device)
-            for param_name in param_names:
-                state_dict[param_name] = tensors[param_name]
-    else:
-        safetensors_file = model_path / "model.safetensors"
-        print(f"[Trainer] Loading from single file: {safetensors_file}")
-        state_dict = load_file(str(safetensors_file), device=device)
-
-    print(f"[Trainer] Loaded {len(state_dict)} parameters from safetensors")
-    return state_dict, model_path
-
-
-def _init_actor_process_group(init_method: str, rank: int = 0, world_size: int = 2):
-    """Initialize the actor NCCL process group and return it."""
-    import pipelinerl.torch_utils
-
-    print(f"[Trainer] Initializing process group as rank {rank}")
-    process_group = pipelinerl.torch_utils.init_extra_process_group(
-        group_name="actor",
-        backend="nccl",
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size,
-    )
-    print("[Trainer] Process group initialized")
-    return process_group
-
-
-def _create_perturbed_state_dict(
-    state_dict: dict, seed: int = 42, noise_scale: float = 0.001
-) -> dict:
-    """Return a new state dict with Gaussian noise added to all tensors."""
-    import torch
-
-    print(f"[Trainer] Creating perturbed weights (all tensors) with seed={seed}...")
-    torch.manual_seed(seed)
-    perturbed = {}
-    for name, tensor in state_dict.items():
-        perturbed_tensor = tensor.clone()
-        perturbed_tensor.add_(torch.randn_like(perturbed_tensor) * noise_scale)
-        perturbed[name] = perturbed_tensor
-    print(
-        f"[Trainer] Perturbed all {len(perturbed)} tensors with noise={noise_scale}, seed={seed}"
-    )
-    return perturbed
-
-
-def _broadcast_tensors(state_dict: dict, process_group, log_interval: int = 50):
-    """Broadcast every tensor in state_dict via NCCL (src=0)."""
-    import torch.distributed as dist
-
-    total = len(state_dict)
-    for i, (name, tensor) in enumerate(state_dict.items()):
-        if tensor.device.type != "cuda":
-            tensor = tensor.cuda(0)
-        dist.broadcast(tensor, src=0, group=process_group)
-        if (i + 1) % log_interval == 0:
-            print(f"[Trainer] Broadcasted {i+1}/{total} parameters")
-    print(f"[Trainer] All {total} parameters broadcasted")
+    for i in range(num_actors):
+        SyncPoint(sync_path, f"{name}_actor_{i}").wait(timeout=timeout)
 
 
 def _broadcast_via_server(
     state_dict: dict,
-    server_url: str,
+    server_urls: list,
     version: int,
     process_group,
     label: str = "",
 ):
-    """Broadcast weights to a running vLLM server via HTTP POST + NCCL.
+    """Broadcast weights to one or more running vLLM servers via HTTP POST + NCCL.
 
-    The POST blocks on the server side until NCCL broadcast completes, so we
-    run it in a background thread while we drive the broadcast ourselves.
+    One POST thread is started per server URL (all in parallel) before the
+    NCCL broadcast so that all servers are ready to receive simultaneously.
     """
     import threading
     import time
@@ -139,38 +60,48 @@ def _broadcast_via_server(
     from weight_update_utils import create_weight_update_request_from_state_dict
 
     label_str = f" {label}" if label else ""
-    print(f"[Trainer] Broadcasting {len(state_dict)}{label_str} parameters")
+    print(f"[Trainer] Broadcasting {len(state_dict)}{label_str} parameters to {len(server_urls)} server(s)")
 
     request = create_weight_update_request_from_state_dict(state_dict, version=version)
 
-    post_result = {"error": None}
+    errors = []
+    threads = []
 
-    def _post():
-        try:
-            print("[Trainer] POSTing weight update request to server...")
-            resp = requests.post(
-                f"{server_url}/receive_weight_update",
-                json=request.model_dump(),
-                timeout=600,
-            )
-            if resp.status_code != 200:
-                post_result["error"] = (
-                    f"POST failed with status {resp.status_code}: {resp.text}"
+    for url in server_urls:
+        err = {"error": None}
+        errors.append(err)
+
+        def _post(server_url=url, post_result=err):
+            try:
+                print(f"[Trainer] POSTing weight update request to {server_url}...")
+                resp = requests.post(
+                    f"{server_url}/receive_weight_update",
+                    json=request.model_dump(),
+                    timeout=600,
                 )
-            else:
-                print("[Trainer] Server acknowledged weight update")
-        except Exception as e:
-            post_result["error"] = f"POST failed: {e}"
+                if resp.status_code != 200:
+                    post_result["error"] = (
+                        f"POST to {server_url} failed with status {resp.status_code}: {resp.text}"
+                    )
+                else:
+                    print(f"[Trainer] Server {server_url} acknowledged weight update")
+            except Exception as e:
+                post_result["error"] = f"POST to {server_url} failed: {e}"
 
-    post_thread = threading.Thread(target=_post, daemon=False)
-    post_thread.start()
-    time.sleep(0.5)  # Give server a moment to start receiving
+        t = threading.Thread(target=_post, daemon=False)
+        threads.append(t)
+        t.start()
+
+    time.sleep(0.5)  # Give all servers a moment to start receiving
 
     _broadcast_tensors(state_dict, process_group)
 
-    post_thread.join(timeout=60)
-    if post_result["error"]:
-        raise RuntimeError(f"Weight update POST failed: {post_result['error']}")
+    for t in threads:
+        t.join(timeout=60)
+
+    failed = [e["error"] for e in errors if e["error"]]
+    if failed:
+        raise RuntimeError(f"Weight update POST(s) failed: {failed}")
 
     print(f"[Trainer] Broadcast{label_str} complete")
 
@@ -425,10 +356,18 @@ def broadcast_cross_validation(
     print("[Trainer] Process group destroyed")
 
 
-def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
+def broadcast_back_and_forth(
+    init_method: str,
+    model_name: str,
+    sync_dir: str,
+    num_actors: int = 1,
+    world_size: int = 2,
+):
     """Back-and-forth test: broadcast perturbed → original → perturbed again.
 
     Tests that we can switch between weight sets multiple times.
+    Supports multiple actors: waits for all actors to signal readiness before
+    each broadcast, then sends a single shared completion signal.
     """
     import torch.distributed as dist
     from pathlib import Path
@@ -438,18 +377,14 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     from weight_update_utils import create_weight_update_request_from_state_dict
 
     sync_path = Path(sync_dir)
-    baseline_done = SyncPoint(sync_path, "baseline_done")
-    ready_for_perturbed1 = SyncPoint(sync_path, "ready_for_perturbed1")
     perturbed1_done = SyncPoint(sync_path, "perturbed1_done")
-    ready_for_original = SyncPoint(sync_path, "ready_for_original")
     original_done = SyncPoint(sync_path, "original_done")
-    ready_for_perturbed2 = SyncPoint(sync_path, "ready_for_perturbed2")
     perturbed2_done = SyncPoint(sync_path, "perturbed2_done")
 
-    process_group = _init_actor_process_group(init_method, rank=0, world_size=2)
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=world_size)
 
-    print("[Trainer] Waiting for vLLM baseline generation...")
-    baseline_done.wait(timeout=120)
+    print(f"[Trainer] Waiting for {num_actors} actor(s) to finish baseline generation...")
+    _wait_all_actors(sync_path, "baseline_done", num_actors, timeout=120)
 
     print(f"[Trainer] Loading model {model_name}")
     original_state_dict, model_path = _load_state_dict(model_name)
@@ -465,10 +400,10 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     print(f"[Trainer] Perturbed weights saved to {saved_path}")
 
     # Broadcast 1: Perturbed weights
-    print("[Trainer] Waiting for vLLM to be ready for first perturbed broadcast...")
-    ready_for_perturbed1.wait(timeout=120)
+    print(f"[Trainer] Waiting for {num_actors} actor(s) to be ready for first perturbed broadcast...")
+    _wait_all_actors(sync_path, "ready_for_perturbed1", num_actors, timeout=120)
 
-    print(f"[Trainer] Broadcasting perturbed weights (1st time)")
+    print(f"[Trainer] Broadcasting perturbed weights (1st time) to {num_actors} actor(s)")
     request = create_weight_update_request_from_state_dict(perturbed_state_dict, version=1)
     write_weight_update_request(sync_path, request)
     _broadcast_tensors(perturbed_state_dict, process_group)
@@ -477,10 +412,10 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     print("[Trainer] First perturbed broadcast complete")
 
     # Broadcast 2: Original weights
-    print("[Trainer] Waiting for vLLM to be ready for original broadcast...")
-    ready_for_original.wait(timeout=120)
+    print(f"[Trainer] Waiting for {num_actors} actor(s) to be ready for original broadcast...")
+    _wait_all_actors(sync_path, "ready_for_original", num_actors, timeout=120)
 
-    print(f"[Trainer] Broadcasting original weights")
+    print(f"[Trainer] Broadcasting original weights to {num_actors} actor(s)")
     request = create_weight_update_request_from_state_dict(original_state_dict, version=2)
     write_weight_update_request(sync_path, request)
     _broadcast_tensors(original_state_dict, process_group)
@@ -489,10 +424,10 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
     print("[Trainer] Original broadcast complete")
 
     # Broadcast 3: Perturbed weights again (same as first)
-    print("[Trainer] Waiting for vLLM to be ready for second perturbed broadcast...")
-    ready_for_perturbed2.wait(timeout=120)
+    print(f"[Trainer] Waiting for {num_actors} actor(s) to be ready for second perturbed broadcast...")
+    _wait_all_actors(sync_path, "ready_for_perturbed2", num_actors, timeout=120)
 
-    print(f"[Trainer] Broadcasting perturbed weights (2nd time)")
+    print(f"[Trainer] Broadcasting perturbed weights (2nd time) to {num_actors} actor(s)")
     request = create_weight_update_request_from_state_dict(perturbed_state_dict, version=3)
     write_weight_update_request(sync_path, request)
     _broadcast_tensors(perturbed_state_dict, process_group)
@@ -505,7 +440,10 @@ def broadcast_back_and_forth(init_method: str, model_name: str, sync_dir: str):
 
 
 def timed_broadcast_server_test(
-    init_method: str, model_name: str, server_url: str
+    init_method: str,
+    model_name: str,
+    server_urls: list,
+    world_size: int = 2,
 ):
     """Timed broadcast for server tests: perturbed → original → perturbed with delays.
 
@@ -517,37 +455,16 @@ def timed_broadcast_server_test(
     Args:
         init_method: Distributed init method
         model_name: Model name to load
-        server_url: Base URL of vLLM server (e.g., "http://127.0.0.1:8000")
+        server_urls: List of base URLs of vLLM servers (e.g., ["http://127.0.0.1:8000"])
+        world_size: Total world size (trainer rank 0 + all vLLM workers)
     """
     import torch.distributed as dist
-    from pathlib import Path
     import time
     import requests
 
-    sys.path.insert(0, str(Path(__file__).parent))
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=world_size)
 
-    process_group = _init_actor_process_group(init_method, rank=0, world_size=2)
-
-    # Wait for server to be ready by polling health endpoint
-    print("[Trainer] Waiting for server to be ready...")
-    server_ready = False
-    for i in range(120):  # Try for up to 2 minutes
-        try:
-            resp = requests.get(f"{server_url}/health", timeout=1)
-            if resp.status_code == 200:
-                server_ready = True
-                print(f"[Trainer] Server is ready (took {i} seconds)")
-                break
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(1)
-
-    if not server_ready:
-        raise TimeoutError("Server did not become ready within 2 minutes")
-
-    # Wait additional 10 seconds for server to fully initialize
-    print("[Trainer] Waiting additional 10 seconds for server to fully initialize...")
-    time.sleep(10)
+    _wait_for_servers_ready(server_urls, extra_wait_secs=10)
 
     print(f"[Trainer] Loading original weights from {model_name}")
     original_state_dict, _ = _load_state_dict(model_name)
@@ -555,20 +472,30 @@ def timed_broadcast_server_test(
     perturbed_state_dict = _create_perturbed_state_dict(original_state_dict)
 
     # Broadcast 1: Perturbed weights
-    _broadcast_via_server(perturbed_state_dict, server_url, version=1, process_group=process_group, label="perturbed")
+    _broadcast_via_server(perturbed_state_dict, server_urls, version=1, process_group=process_group, label="perturbed")
 
     print("[Trainer] Waiting 5 seconds before broadcasting original weights...")
     time.sleep(5)
 
     # Broadcast 2: Original weights
-    _broadcast_via_server(original_state_dict, server_url, version=2, process_group=process_group, label="original")
+    _broadcast_via_server(original_state_dict, server_urls, version=2, process_group=process_group, label="original")
 
     print("[Trainer] Waiting 5 seconds before broadcasting perturbed weights again...")
     time.sleep(5)
 
     # Broadcast 3: Perturbed weights again (same as first)
-    _broadcast_via_server(perturbed_state_dict, server_url, version=3, process_group=process_group, label="perturbed (2nd time)")
+    _broadcast_via_server(perturbed_state_dict, server_urls, version=3, process_group=process_group, label="perturbed (2nd time)")
 
+    # Wait to allow generation with the last broadcast before tearing down
+    print("[Trainer] Waiting 5 seconds for generation with final weights...")
+    time.sleep(5)
+
+    # Signal training is finished so vLLM servers destroy their side of the process group
+    for url in server_urls:
+        print(f"[Trainer] Sending training_finished signal to {url}...")
+        requests.post(f"{url}/training_finished", timeout=10)
+
+    # Cleanup — destroy_process_group now resolves because vLLM servers respond to /training_finished
     dist.destroy_process_group(process_group)
     print("[Trainer] Process group destroyed, exiting")
 
@@ -586,8 +513,9 @@ if __name__ == "__main__":
         "--temp-dir", type=str, help="Temporary directory for saving models"
     )
     parser.add_argument(
-        "--server-url", type=str, help="Base URL of vLLM server (e.g., http://127.0.0.1:8000)"
+        "--server-urls", nargs="+", help="Base URL(s) of vLLM server(s) (e.g., http://127.0.0.1:8000)"
     )
+    parser.add_argument("--num-actors", type=int, default=1, help="Number of vLLM actor processes")
 
     args = parser.parse_args()
 
@@ -614,13 +542,22 @@ if __name__ == "__main__":
             if not args.model_name or not args.sync_dir:
                 print("Error: --model-name and --sync-dir required for back_and_forth")
                 sys.exit(1)
-            broadcast_back_and_forth(args.init_method, args.model_name, args.sync_dir)
+            broadcast_back_and_forth(
+                args.init_method,
+                args.model_name,
+                args.sync_dir,
+                num_actors=args.num_actors,
+                world_size=args.world_size,
+            )
         elif args.command == "timed_broadcast_server_test":
-            if not args.model_name or not args.server_url:
-                print("Error: --model-name and --server-url required for timed_broadcast_server_test")
+            if not args.model_name or not args.server_urls:
+                print("Error: --model-name and --server-urls required for timed_broadcast_server_test")
                 sys.exit(1)
             timed_broadcast_server_test(
-                args.init_method, args.model_name, args.server_url
+                args.init_method,
+                args.model_name,
+                args.server_urls,
+                world_size=args.world_size,
             )
     except Exception as e:
         print(f"[Trainer] Error: {e}")

@@ -17,7 +17,9 @@ import torch
 # Import shared utilities
 from .server_weight_update_utils import (
     wait_for_server_ready,
+    wait_for_all_servers_ready,
     run_generation_loop,
+    run_generation_loop_multi,
     analyze_and_verify_pattern,
     start_vllm_server,
     start_trainer_process,
@@ -263,6 +265,217 @@ async def wait_for_processes(processes_with_names, check_interval=0.5, timeout=6
                 task.cancel()
         # Wait for cancellation
         await asyncio.gather(*reader_tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers shared by all test variants
+# ---------------------------------------------------------------------------
+
+def _compare_actor_results(sync_dir: Path, num_actors: int):
+    """Assert that all actors produced identical generation results.
+
+    Each actor writes ``sync_dir/results_actor_{i}.json`` with keys
+    res_or_1, res_mod_1, res_or_2, res_mod_2.
+    """
+    import json
+
+    results = [
+        json.loads((sync_dir / f"results_actor_{i}.json").read_text())
+        for i in range(num_actors)
+    ]
+    for key in results[0]:
+        texts = [r[key] for r in results]
+        assert len(set(texts)) == 1, (
+            f"Actors disagree on '{key}': {texts}"
+        )
+
+
+async def _run_back_and_forth_engine_test(
+    model_name,
+    simple_prompt,
+    generation_config,
+    init_method,
+    distributed_trainer_helper,
+    vllm_engine_helper,
+    sync_dir,
+    vllm_configs,
+    trainer_gpu,
+    world_size,
+    timeout=1800,
+):
+    """Run back-and-forth engine test with one or more vLLM actor processes.
+
+    Args:
+        vllm_configs: List of dicts, each with keys:
+            - cuda_devices: str, e.g. "0" or "0,1"
+            - actor_llm_idx: int
+            - tensor_parallel_size: int
+        trainer_gpu: str, e.g. "1" or "2"
+        world_size: total NCCL world size (all vLLM workers + trainer)
+    """
+    from .sync_helper import create_sync_dir
+
+    num_actors = len(vllm_configs)
+    all_procs = []
+
+    # Start all vLLM actor subprocesses
+    for cfg in vllm_configs:
+        vllm_env = os.environ.copy()
+        vllm_env["CUDA_VISIBLE_DEVICES"] = cfg["cuda_devices"]
+        vllm_env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+        vllm_env["PIPELINERL_DEBUG"] = "1"
+
+        actor_idx = cfg["actor_llm_idx"]
+        tp = cfg.get("tensor_parallel_size", 1)
+        print(f"[Main] Starting vLLM actor {actor_idx} (GPU(s) {cfg['cuda_devices']}, TP={tp})")
+
+        vllm_proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(vllm_engine_helper),
+                "back_and_forth",
+                "--model-name", model_name,
+                "--init-method", init_method,
+                "--actor-llm-idx", str(actor_idx),
+                "--world-size", str(world_size),
+                "--tensor-parallel-size", str(tp),
+                "--prompt", simple_prompt,
+                "--max-tokens", str(generation_config["max_tokens"]),
+                "--sync-dir", str(sync_dir),
+            ],
+            env=vllm_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        all_procs.append((vllm_proc, f"vLLM Actor {actor_idx}"))
+
+    await asyncio.sleep(1)
+
+    # Start trainer subprocess
+    trainer_env = os.environ.copy()
+    trainer_env["CUDA_VISIBLE_DEVICES"] = trainer_gpu
+    trainer_env["PIPELINERL_DEBUG"] = "1"
+
+    print(f"[Main] Starting trainer (GPU {trainer_gpu}, {num_actors} actor(s), world_size={world_size})")
+    trainer_proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(distributed_trainer_helper),
+            "back_and_forth",
+            "--init-method", init_method,
+            "--model-name", model_name,
+            "--sync-dir", str(sync_dir),
+            "--num-actors", str(num_actors),
+            "--world-size", str(world_size),
+        ],
+        env=trainer_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    all_procs.append((trainer_proc, "Trainer"))
+
+    await wait_for_processes(all_procs, timeout=timeout)
+
+    # Verify all actors produced the same results
+    _compare_actor_results(sync_dir, num_actors)
+    print(f"\n✓ Back-and-forth test PASSED ({num_actors} actor(s), world_size={world_size})")
+
+
+async def _run_server_weight_update_test(
+    model_name,
+    simple_prompt,
+    generation_config,
+    init_method,
+    distributed_trainer_helper,
+    vllm_server_configs,
+    trainer_gpu,
+    world_size,
+    timeout=2400,
+):
+    """Run server weight-update pattern test with one or more vLLM servers.
+
+    Args:
+        vllm_server_configs: List of dicts, each with keys:
+            - port: int
+            - gpu_ids: str
+            - actor_llm_idx: int
+            - tensor_parallel_size: int
+        trainer_gpu: str, e.g. "1" or "2"
+        world_size: total NCCL world size
+    """
+    server_procs = []
+    server_urls = []
+
+    for cfg in vllm_server_configs:
+        port = cfg["port"]
+        url = f"http://127.0.0.1:{port}"
+        server_urls.append(url)
+
+        server_proc, _, _ = start_vllm_server(
+            model_name=model_name,
+            server_port=port,
+            distributed_init_method=init_method,
+            stream_process_output_fn=stream_process_output,
+            extra_args=None,
+            gpu_ids=cfg.get("gpu_ids", "0"),
+            actor_llm_idx=cfg.get("actor_llm_idx", 0),
+            world_size=world_size,
+            tensor_parallel_size=cfg.get("tensor_parallel_size", 1),
+        )
+        server_procs.append(server_proc)
+
+    await asyncio.sleep(1)
+
+    trainer_proc, _, _ = start_trainer_process(
+        trainer_helper_path=distributed_trainer_helper,
+        distributed_init_method=init_method,
+        model_name=model_name,
+        server_urls=server_urls,
+        stream_process_output_fn=stream_process_output,
+        extra_args=None,
+        gpu_id=trainer_gpu,
+        world_size=world_size,
+    )
+
+    try:
+        await wait_for_all_servers_ready(server_urls, server_procs, trainer_proc)
+
+        if len(server_urls) == 1:
+            generations = await run_generation_loop(
+                server_url=server_urls[0],
+                model_name=model_name,
+                simple_prompt=simple_prompt,
+                generation_config=generation_config,
+                trainer_proc=trainer_proc,
+            )
+        else:
+            generations = await run_generation_loop_multi(
+                server_urls=server_urls,
+                model_name=model_name,
+                simple_prompt=simple_prompt,
+                generation_config=generation_config,
+                trainer_proc=trainer_proc,
+            )
+
+        # Wait for trainer to finish
+        print("[Main] Waiting for trainer to finish...")
+        for _ in range(30):
+            if trainer_proc.poll() is not None:
+                break
+            await asyncio.sleep(1)
+
+        analyze_and_verify_pattern(generations)
+        print(f"\n✓ Server weight update pattern test PASSED ({len(server_urls)} server(s))")
+
+    finally:
+        print("[Main] Cleaning up processes...")
+        for proc in server_procs:
+            if proc:
+                kill_process_tree(proc.pid)
+        if trainer_proc:
+            kill_process_tree(trainer_proc.pid)
 
 
 class TestBasicGeneration:
@@ -738,90 +951,29 @@ class TestWeightUpdateDistributed:
     ):
         """Back-and-forth test: switch between original and perturbed weights.
 
-        This test validates that:
-        1. We can update weights multiple times
-        2. We can switch back and forth between weight sets
-        3. Updates are deterministic and reproducible
-
-        Flow:
-        - vLLM: Load original, generate res_or_1
-        - Trainer: Broadcast perturbed weights
-        - vLLM: Receive perturbed, generate res_mod_1
-        - Trainer: Broadcast original weights
-        - vLLM: Receive original, generate res_or_2
-        - Trainer: Broadcast perturbed weights again (same as first)
-        - vLLM: Receive perturbed, generate res_mod_2
-
-        Assertions:
-        - res_or_1 == res_or_2 (can restore original weights)
-        - res_mod_1 == res_mod_2 (perturbed weights are consistent)
+        Validates that we can update weights multiple times and the results
+        are deterministic and reproducible.
         """
         from .sync_helper import create_sync_dir
 
         print("\n" + "="*60)
-        print("Starting back-and-forth test")
+        print("Starting back-and-forth test (TP=1, 1 actor, 2 GPUs)")
         print("="*60)
 
-        # Create sync directory for coordination
         sync_dir = create_sync_dir(shared_test_dir)
-        print(f"[Main] Sync directory: {sync_dir}")
-
-        # Step 1: Start vLLM engine subprocess
-        vllm_env = os.environ.copy()
-        vllm_env["CUDA_VISIBLE_DEVICES"] = "0"
-        vllm_env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-        vllm_env["PIPELINERL_DEBUG"] = "1"
-
-        print("[Main] Starting vLLM engine process (GPU 0)")
-        vllm_proc = subprocess.Popen(
-            [
-                sys.executable,
-                str(vllm_engine_helper),
-                "back_and_forth",
-                "--model-name", model_name,
-                "--init-method", shared_distributed_init_method,
-                "--actor-llm-idx", "0",
-                "--world-size", "2",
-                "--prompt", simple_prompt,
-                "--max-tokens", str(generation_config["max_tokens"]),
-                "--sync-dir", str(sync_dir),
-            ],
-            env=vllm_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        await _run_back_and_forth_engine_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=shared_distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_engine_helper=vllm_engine_helper,
+            sync_dir=sync_dir,
+            vllm_configs=[{"cuda_devices": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1}],
+            trainer_gpu="1",
+            world_size=2,
+            timeout=1800,
         )
-
-        # Give vLLM engine a moment to start
-        await asyncio.sleep(1)
-
-        # Step 2: Start trainer subprocess
-        trainer_env = os.environ.copy()
-        trainer_env["CUDA_VISIBLE_DEVICES"] = "1"
-        trainer_env["PIPELINERL_DEBUG"] = "1"
-
-        print("[Main] Starting trainer process (GPU 1)")
-        trainer_proc = subprocess.Popen(
-            [
-                sys.executable,
-                str(distributed_trainer_helper),
-                "back_and_forth",
-                "--init-method", shared_distributed_init_method,
-                "--model-name", model_name,
-                "--sync-dir", str(sync_dir),
-            ],
-            env=trainer_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        # Step 3: Wait for both processes
-        # This test does 3 broadcasts, so use longer timeout
-        await wait_for_processes([
-            (vllm_proc, "vLLM Engine"),
-            (trainer_proc, "Trainer"),
-        ], timeout=1800)  # 30 minutes
 
     @pytest.mark.timeout(2400)  # 40 minutes for server test
     @pytest.mark.asyncio
@@ -837,80 +989,238 @@ class TestWeightUpdateDistributed:
     ):
         """Server integration test: verify weight update pattern with HTTP API.
 
-        This test validates the real-world scenario where:
-        1. vLLM server is running and serving HTTP requests
-        2. Trainer broadcasts weight updates while server is active
-        3. Server responses change based on weight updates
-
-        Flow:
-        - Start vLLM HTTP server (loads original model)
-        - Continuously generate via HTTP API (deterministic)
-        - Trainer: wait 15s → broadcast perturbed → wait 5s → broadcast original → wait 5s → broadcast perturbed
-        - Verify generation pattern: original → perturbed → original → perturbed
+        Validates the real-world scenario where a vLLM HTTP server receives
+        weight updates from a trainer while serving requests.
         """
         print("\n" + "="*60)
-        print("Starting server weight update pattern test")
+        print("Starting server weight update pattern test (TP=1, 1 actor, 2 GPUs)")
         print("="*60)
 
-        server_port = 8000
-        server_url = f"http://127.0.0.1:{server_port}"
-
-        # Start vLLM server (HTTP mode - default, no extra args)
-        server_proc, _, _ = start_vllm_server(
+        await _run_server_weight_update_test(
             model_name=model_name,
-            server_port=server_port,
-            distributed_init_method=distributed_init_method,
-            stream_process_output_fn=stream_process_output,
-            extra_args=None,  # HTTP mode is default
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_server_configs=[{"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1}],
+            trainer_gpu="1",
+            world_size=2,
+            timeout=2400,
         )
 
-        # Give server a moment to start
-        await asyncio.sleep(1)
 
-        # Start trainer process
-        trainer_proc, _, _ = start_trainer_process(
-            trainer_helper_path=distributed_trainer_helper,
-            distributed_init_method=distributed_init_method,
+class TestWeightUpdateTP2:
+    """Test weight updates with tensor-parallel (TP=2) vLLM — needs 3 GPUs."""
+
+    @pytest.mark.timeout(2000)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
+    async def test_weight_update_back_and_forth_tp2(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        distributed_trainer_helper,
+        vllm_engine_helper,
+        temp_dir,
+    ):
+        """Back-and-forth test with TP=2: one vLLM instance on GPUs 0+1, trainer on GPU 2."""
+        from .sync_helper import create_sync_dir
+
+        print("\n" + "="*60)
+        print("Starting back-and-forth test (TP=2, 1 actor, 3 GPUs)")
+        print("="*60)
+
+        sync_dir = create_sync_dir(temp_dir)
+        await _run_back_and_forth_engine_test(
             model_name=model_name,
-            server_url=server_url,
-            stream_process_output_fn=stream_process_output,
-            extra_args=None,  # No extra args for HTTP mode
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_engine_helper=vllm_engine_helper,
+            sync_dir=sync_dir,
+            vllm_configs=[{"cuda_devices": "0,1", "actor_llm_idx": 0, "tensor_parallel_size": 2}],
+            trainer_gpu="2",
+            world_size=3,
+            timeout=1800,
         )
 
-        try:
-            # Wait for server to be ready
-            await wait_for_server_ready(server_url, server_proc, trainer_proc)
+    @pytest.mark.timeout(2400)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
+    async def test_server_weight_update_pattern_tp2(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        distributed_trainer_helper,
+        temp_dir,
+    ):
+        """Server weight update test with TP=2: one server on GPUs 0+1, trainer on GPU 2."""
+        print("\n" + "="*60)
+        print("Starting server weight update pattern test (TP=2, 1 actor, 3 GPUs)")
+        print("="*60)
 
-            # Run generation loop
-            generations = await run_generation_loop(
-                server_url=server_url,
-                model_name=model_name,
-                simple_prompt=simple_prompt,
-                generation_config=generation_config,
-                trainer_proc=trainer_proc,
-            )
+        await _run_server_weight_update_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_server_configs=[{"port": 8001, "gpu_ids": "0,1", "actor_llm_idx": 0, "tensor_parallel_size": 2}],
+            trainer_gpu="2",
+            world_size=3,
+            timeout=2400,
+        )
 
-            # Wait for trainer to finish
-            print("[Main] Waiting for trainer to finish...")
-            for _ in range(30):
-                if trainer_proc.poll() is not None:
-                    break
-                await asyncio.sleep(1)
 
-            # Analyze and verify pattern
-            analyze_and_verify_pattern(generations)
-            print("\n✓ Server weight update pattern test PASSED")
+class TestWeightUpdateMultiActor:
+    """Test weight updates with multiple independent vLLM actors."""
 
-        finally:
-            # Cleanup - always kill process tree even if main process exited
-            # (child processes like vLLM workers might still be running)
-            print("[Main] Cleaning up processes...")
-            if server_proc:
-                print(f"[Main] Killing server process tree (PID {server_proc.pid})...")
-                kill_process_tree(server_proc.pid)
-            if trainer_proc:
-                print(f"[Main] Killing trainer process tree (PID {trainer_proc.pid})...")
-                kill_process_tree(trainer_proc.pid)
+    @pytest.mark.timeout(2000)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
+    async def test_weight_update_back_and_forth_2actors(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        distributed_trainer_helper,
+        vllm_engine_helper,
+        temp_dir,
+    ):
+        """Back-and-forth test with 2 actors: vLLM on GPU 0 and GPU 1, trainer on GPU 2."""
+        from .sync_helper import create_sync_dir
+
+        print("\n" + "="*60)
+        print("Starting back-and-forth test (TP=1, 2 actors, 3 GPUs)")
+        print("="*60)
+
+        sync_dir = create_sync_dir(temp_dir)
+        await _run_back_and_forth_engine_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_engine_helper=vllm_engine_helper,
+            sync_dir=sync_dir,
+            vllm_configs=[
+                {"cuda_devices": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
+                {"cuda_devices": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
+            ],
+            trainer_gpu="2",
+            world_size=3,
+            timeout=1800,
+        )
+
+    @pytest.mark.timeout(2000)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires at least 4 GPUs")
+    async def test_weight_update_back_and_forth_3actors(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        distributed_trainer_helper,
+        vllm_engine_helper,
+        temp_dir,
+    ):
+        """Back-and-forth test with 3 actors: vLLM on GPUs 0/1/2, trainer on GPU 3."""
+        from .sync_helper import create_sync_dir
+
+        print("\n" + "="*60)
+        print("Starting back-and-forth test (TP=1, 3 actors, 4 GPUs)")
+        print("="*60)
+
+        sync_dir = create_sync_dir(temp_dir)
+        await _run_back_and_forth_engine_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_engine_helper=vllm_engine_helper,
+            sync_dir=sync_dir,
+            vllm_configs=[
+                {"cuda_devices": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
+                {"cuda_devices": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
+                {"cuda_devices": "2", "actor_llm_idx": 2, "tensor_parallel_size": 1},
+            ],
+            trainer_gpu="3",
+            world_size=4,
+            timeout=1800,
+        )
+
+    @pytest.mark.timeout(2400)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
+    async def test_server_weight_update_pattern_2actors(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        distributed_trainer_helper,
+        temp_dir,
+    ):
+        """Server weight update test with 2 actors: servers on GPUs 0 and 1, trainer on GPU 2."""
+        print("\n" + "="*60)
+        print("Starting server weight update pattern test (TP=1, 2 actors, 3 GPUs)")
+        print("="*60)
+
+        await _run_server_weight_update_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_server_configs=[
+                {"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
+                {"port": 8001, "gpu_ids": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
+            ],
+            trainer_gpu="2",
+            world_size=3,
+            timeout=2400,
+        )
+
+    @pytest.mark.timeout(2400)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires at least 4 GPUs")
+    async def test_server_weight_update_pattern_3actors(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        distributed_trainer_helper,
+        temp_dir,
+    ):
+        """Server weight update test with 3 actors: servers on GPUs 0/1/2, trainer on GPU 3."""
+        print("\n" + "="*60)
+        print("Starting server weight update pattern test (TP=1, 3 actors, 4 GPUs)")
+        print("="*60)
+
+        await _run_server_weight_update_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            distributed_trainer_helper=distributed_trainer_helper,
+            vllm_server_configs=[
+                {"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
+                {"port": 8001, "gpu_ids": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
+                {"port": 8002, "gpu_ids": "2", "actor_llm_idx": 2, "tensor_parallel_size": 1},
+            ],
+            trainer_gpu="3",
+            world_size=4,
+            timeout=2400,
+        )
 
 
 # class TestConcurrentOperations:

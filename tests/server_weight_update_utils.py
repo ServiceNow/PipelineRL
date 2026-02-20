@@ -52,23 +52,11 @@ async def wait_for_server_ready(server_url: str, server_proc, trainer_proc, time
     raise TimeoutError(f"Server did not become ready within {timeout_seconds} seconds")
 
 
-def check_pattern_detected(generations):
-    """Check if we have detected the full pattern (4 phases).
-
-    Args:
-        generations: List of (timestamp, text) tuples
-
-    Returns:
-        True if pattern is detected (4 phases with correct relationships)
-    """
-    if len(generations) < 4:
-        return False
-
-    # Track when the text changes to identify phase boundaries
+def _build_phases(generations):
+    """Collapse a generation list into (text, items) phase tuples."""
     phases = []
     current_text = None
     current_phase = []
-
     for ts, text in generations:
         if text != current_text:
             if current_phase:
@@ -77,29 +65,73 @@ def check_pattern_detected(generations):
             current_phase = [(ts, text)]
         else:
             current_phase.append((ts, text))
-
-    # Add the last phase
     if current_phase:
         phases.append((current_text, current_phase))
+    return phases
 
-    # Check if we have at least 4 phases
+
+def _find_abab_pattern(phases):
+    """Search for the A→B→A→B pattern anchored to the first and last phases.
+
+    A is always ``phases[0]`` — the text the server starts with (original weights).
+    B2 is always ``phases[-1]`` — the current/final phase (perturbed weights after
+    the 3rd broadcast).
+
+    Any transition phases in between are skipped automatically because we only
+    require that some phase after the first B has the same text as phases[0] (A),
+    without caring what sits between the first B and that return-to-A.
+
+    Returns (phase_a, phase_b, phase_a2, phase_b2) or None.
+    """
     if len(phases) < 4:
+        return None
+
+    text_a = phases[0][0]
+    text_b2 = phases[-1][0]
+
+    if text_a == text_b2:
+        return None  # A and B must be distinct texts
+
+    texts = [t for t, _ in phases]
+
+    # Find the first B (same text as B2) strictly between phase 0 and last
+    for j in range(1, len(phases) - 1):
+        if texts[j] != text_b2:
+            continue
+        # Find the first return to A strictly between j and last
+        for k in range(j + 1, len(phases) - 1):
+            if texts[k] == text_a:
+                return phases[0], phases[j], phases[k], phases[-1]
+
+    return None
+
+
+def check_pattern_detected(generations):
+    """Check whether the full A→B→A→B pattern is present in the generation history.
+
+    This is a **post-hoc analysis helper** (e.g. for assertions after the
+    generation loop ends).  It is intentionally *not* used as an early-stop
+    signal inside the generation loops.
+
+    Why not early-stop? Any transition artifact text T that happens to appear
+    with several consecutive identical generations (possible when NCCL broadcasts
+    are slow) is indistinguishable from the real perturbed text B at generation
+    time.  False positives would cut the loop short before the final stable B
+    phase accumulates.  The generation loops instead rely on the trainer process
+    exiting (``trainer_proc.poll() is not None``) as their sole reliable
+    termination signal — the trainer exits within milliseconds of completing its
+    last broadcast, so no significant extra generation happens.
+
+    Args:
+        generations: List of (timestamp, text) tuples
+
+    Returns:
+        True if the A→B→A→B pattern is present
+    """
+    if len(generations) < 4:
         return False
-
-    # Verify the pattern: phase1 != phase2, phase3 == phase1, phase4 == phase2
-    phase1_text = phases[0][0]
-    phase2_text = phases[1][0]
-    phase3_text = phases[2][0]
-    phase4_text = phases[3][0]
-
-    if phase1_text == phase2_text:
-        return False  # Phase 1 and 2 should be different
-    if phase3_text != phase1_text:
-        return False  # Phase 3 should match Phase 1
-    if phase4_text != phase2_text:
-        return False  # Phase 4 should match Phase 2
-
-    return True
+    phases = _build_phases(generations)
+    return _find_abab_pattern(phases) is not None
 
 
 async def run_generation_loop(
@@ -159,11 +191,6 @@ async def run_generation_loop(
                 timestamp = time.time() - start_time
                 generations.append((timestamp, generated_text))
                 print(f"[Main] [{timestamp:.1f}s] Generated: '{generated_text}'")
-
-                # Check if pattern is detected - stop early if confirmed
-                if check_pattern_detected(generations):
-                    print(f"[Main] Pattern detected! Stopping generation early at {timestamp:.1f}s")
-                    break
             else:
                 print(f"[Main] Generation failed with status {resp.status_code}")
 
@@ -176,7 +203,11 @@ async def run_generation_loop(
 
 
 def analyze_and_verify_pattern(generations):
-    """Analyze generation sequence and verify the expected pattern.
+    """Analyze generation sequence and verify the expected A→B→A→B pattern.
+
+    Tolerates transition-artifact phases (e.g. a single generation produced
+    while an NCCL broadcast was in-flight) by searching for the pattern as
+    a subsequence rather than requiring it at exactly positions [0,1,2,3].
 
     Args:
         generations: List of (timestamp, text) tuples
@@ -189,70 +220,42 @@ def analyze_and_verify_pattern(generations):
     print("=" * 60)
     print(f"Total generations: {len(generations)}")
 
-    # Print all generations
     for i, (ts, text) in enumerate(generations):
         print(f"[{ts:5.1f}s] Gen {i+1}: '{text[:80]}...'")
 
-    # Identify unique generation texts and their phases
-    if len(generations) < 4:
-        raise AssertionError(
-            f"Not enough generations to verify pattern (need at least 4, got {len(generations)})"
-        )
+    assert len(generations) >= 4, (
+        f"Not enough generations to verify pattern (need at least 4, got {len(generations)})"
+    )
 
-    # Track when the text changes to identify phase boundaries
-    phases = []
-    current_text = None
-    current_phase = []
-
-    for ts, text in generations:
-        if text != current_text:
-            if current_phase:
-                phases.append((current_text, current_phase))
-            current_text = text
-            current_phase = [(ts, text)]
-        else:
-            current_phase.append((ts, text))
-
-    # Add the last phase
-    if current_phase:
-        phases.append((current_text, current_phase))
+    phases = _build_phases(generations)
 
     print("\n" + "=" * 60)
-    print(f"Detected {len(phases)} phases:")
+    print(f"Detected {len(phases)} phase(s):")
     for i, (text, items) in enumerate(phases):
-        print(f"Phase {i+1}: {len(items)} generations - '{text[:60]}...'")
+        print(f"Phase {i+1}: {len(items)} generation(s) - '{text[:60]}...'")
     print("=" * 60)
 
-    # Verify the pattern
-    assert (
-        len(phases) >= 4
-    ), f"Expected at least 4 phases (original → perturbed → original → perturbed), got {len(phases)}"
+    result = _find_abab_pattern(phases)
+    assert result is not None, (
+        f"Could not find A→B→A→B pattern in {len(phases)} phase(s). "
+        f"Phases: {[(text[:40], len(items)) for text, items in phases]}"
+    )
 
-    phase1_text, phase1_items = phases[0]
-    phase2_text, phase2_items = phases[1]
-    phase3_text, phase3_items = phases[2]
-    phase4_text, phase4_items = phases[3]
+    (phase_a_text, phase_a_items), (phase_b_text, phase_b_items), \
+    (phase_a2_text, phase_a2_items), (phase_b2_text, phase_b2_items) = result
 
-    # Verify phase 1 (original) != phase 2 (perturbed)
-    assert (
-        phase1_text != phase2_text
-    ), "Phase 1 (original) and Phase 2 (perturbed) should be different"
+    # These hold by construction from _find_abab_pattern, but assert for clarity
+    assert phase_a_text != phase_b_text, "Phase A and Phase B should be different"
+    assert phase_a2_text == phase_a_text, "Second A should match first A (original weights restored)"
+    assert phase_b2_text == phase_b_text, "Second B should match first B (perturbed weights reapplied)"
 
-    # Verify phase 3 (original) == phase 1 (original)
-    assert (
-        phase3_text == phase1_text
-    ), f"Phase 3 should match Phase 1 (original weights restored)"
-
-    # Verify phase 4 (perturbed) == phase 2 (perturbed)
-    assert (
-        phase4_text == phase2_text
-    ), f"Phase 4 should match Phase 2 (perturbed weights reapplied)"
-
-    print("\n✓ Pattern verified:")
-    print(f"  Phase 1 (original):   {len(phase1_items)} generations")
-    print(f"  Phase 2 (perturbed):  {len(phase2_items)} generations")
-    print(f"  Phase 3 (original):   {len(phase3_items)} generations (matches Phase 1 ✓)")
-    print(f"  Phase 4 (perturbed):  {len(phase4_items)} generations (matches Phase 2 ✓)")
+    skipped = len(phases) - 4
+    skip_note = f" ({skipped} transition phase(s) skipped)" if skipped else ""
+    print(f"\n✓ Pattern verified{skip_note}:")
+    print(f"  Phase A  (original):   {len(phase_a_items)} generation(s)")
+    print(f"  Phase B  (perturbed):  {len(phase_b_items)} generation(s)")
+    print(f"  Phase A2 (original):   {len(phase_a2_items)} generation(s)  ← matches A ✓")
+    print(f"  Phase B2 (perturbed):  {len(phase_b2_items)} generation(s)  ← matches B ✓")
 
 
 def start_vllm_server(
@@ -261,6 +264,10 @@ def start_vllm_server(
     distributed_init_method: str,
     stream_process_output_fn,
     extra_args: list = None,
+    gpu_ids: str = "0",
+    actor_llm_idx: int = 0,
+    world_size: int = 2,
+    tensor_parallel_size: int = 1,
 ):
     """Start vLLM HTTP server subprocess.
 
@@ -270,15 +277,19 @@ def start_vllm_server(
         distributed_init_method: Distributed initialization method
         stream_process_output_fn: Function to stream process output
         extra_args: Additional CLI arguments (e.g., ["--weight-update-mode", "fast-llm"])
+        gpu_ids: CUDA_VISIBLE_DEVICES value (e.g., "0" or "0,1")
+        actor_llm_idx: Actor index for this vLLM instance
+        world_size: Total distributed world size
+        tensor_parallel_size: Number of GPUs for tensor parallelism
 
     Returns:
         Tuple of (server_proc, stdout_thread, stderr_thread)
     """
     vllm_env = os.environ.copy()
-    vllm_env["CUDA_VISIBLE_DEVICES"] = "0"
+    vllm_env["CUDA_VISIBLE_DEVICES"] = gpu_ids
     vllm_env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    print(f"[Main] Starting vLLM HTTP server on port {server_port} (GPU 0)")
+    print(f"[Main] Starting vLLM HTTP server on port {server_port} (GPU(s) {gpu_ids}, actor_idx={actor_llm_idx}, TP={tensor_parallel_size})")
     vllm_entry_point = Path(__file__).parent.parent / "pipelinerl" / "entrypoints" / "run_vllm1.py"
 
     cmd = [
@@ -287,9 +298,10 @@ def start_vllm_server(
         "--model", model_name,
         "--port", str(server_port),
         "--host", "127.0.0.1",
-        "--actor-llm-idx", "0",
+        "--actor-llm-idx", str(actor_llm_idx),
         "--weight-update-group-init-method", distributed_init_method,
-        "--weight-update-group-world-size", "2",
+        "--weight-update-group-world-size", str(world_size),
+        "--tensor-parallel-size", str(tensor_parallel_size),
     ]
 
     if extra_args:
@@ -304,18 +316,126 @@ def start_vllm_server(
     )
 
     print("[Main] Starting server output streaming...")
-    stdout_thread, stderr_thread = stream_process_output_fn(server_proc, "vLLM Server")
+    stdout_thread, stderr_thread = stream_process_output_fn(server_proc, f"vLLM Server (actor {actor_llm_idx})")
 
     return server_proc, stdout_thread, stderr_thread
+
+
+async def wait_for_all_servers_ready(
+    server_urls: list,
+    server_procs: list,
+    trainer_proc,
+    timeout_seconds: int = 300,
+):
+    """Wait for all servers to be ready by polling their health endpoints.
+
+    Args:
+        server_urls: List of server base URLs
+        server_procs: List of server subprocesses (same order as server_urls)
+        trainer_proc: Trainer subprocess
+        timeout_seconds: Maximum time to wait per server
+
+    Returns:
+        True if all servers are ready
+
+    Raises:
+        RuntimeError: If any process terminates unexpectedly
+        TimeoutError: If any server doesn't become ready within timeout
+    """
+    for url, proc in zip(server_urls, server_procs):
+        await wait_for_server_ready(url, proc, trainer_proc, timeout_seconds)
+    return True
+
+
+async def run_generation_loop_multi(
+    server_urls: list,
+    model_name: str,
+    simple_prompt: str,
+    generation_config: dict,
+    trainer_proc,
+    max_duration: int = 120,
+    generation_interval: float = 0.5,
+):
+    """Run continuous generation loop querying all servers each round.
+
+    Each iteration queries ALL servers and asserts all responses are equal
+    (since they should have the same weights after a broadcast). Records one
+    (timestamp, text) entry per round.
+
+    Args:
+        server_urls: List of server base URLs
+        model_name: Model name for API request
+        simple_prompt: Prompt to generate from
+        generation_config: Config dict with max_tokens, etc.
+        trainer_proc: Trainer subprocess to monitor
+        max_duration: Maximum duration in seconds
+        generation_interval: Time between generation rounds
+
+    Returns:
+        List of (timestamp, generated_text) tuples
+    """
+    print(f"[Main] Starting continuous generation loop across {len(server_urls)} server(s)...")
+    generations = []
+    start_time = time.time()
+
+    payload = {
+        "model": model_name,
+        "prompt": simple_prompt,
+        "max_tokens": generation_config["max_tokens"],
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 42,
+    }
+
+    while time.time() - start_time < max_duration:
+        # Check if trainer is still running
+        trainer_poll = trainer_proc.poll()
+        if trainer_poll is not None:
+            print(f"[Main] Trainer exited with code {trainer_poll}")
+            break
+
+        try:
+            texts = []
+            for url in server_urls:
+                resp = requests.post(
+                    f"{url}/v1/completions",
+                    json=payload,
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    texts.append(resp.json()["choices"][0]["text"])
+                else:
+                    print(f"[Main] Generation from {url} failed with status {resp.status_code}")
+                    texts = []
+                    break
+
+            if texts:
+                # All servers should agree
+                assert len(set(texts)) == 1, (
+                    f"Servers disagree on generation: {texts}"
+                )
+                text = texts[0]
+                timestamp = time.time() - start_time
+                generations.append((timestamp, text))
+                print(f"[Main] [{timestamp:.1f}s] Generated: '{text}'")
+
+        except requests.exceptions.RequestException as e:
+            print(f"[Main] Request failed: {e}")
+
+        await asyncio.sleep(generation_interval)
+
+    return generations
 
 
 def start_trainer_process(
     trainer_helper_path: Path,
     distributed_init_method: str,
     model_name: str,
-    server_url: str,
+    server_urls: list,
     stream_process_output_fn,
     extra_args: list = None,
+    gpu_id: str = "1",
+    world_size: int = 2,
 ):
     """Start trainer subprocess.
 
@@ -323,17 +443,19 @@ def start_trainer_process(
         trainer_helper_path: Path to trainer helper script
         distributed_init_method: Distributed initialization method
         model_name: Model name
-        server_url: Server URL for health check
+        server_urls: List of server URLs (one per actor)
         stream_process_output_fn: Function to stream process output
         extra_args: Additional CLI arguments (e.g., ["--redis-host", "localhost"])
+        gpu_id: CUDA_VISIBLE_DEVICES value for the trainer GPU
+        world_size: Total distributed world size
 
     Returns:
         Tuple of (trainer_proc, stdout_thread, stderr_thread)
     """
     trainer_env = os.environ.copy()
-    trainer_env["CUDA_VISIBLE_DEVICES"] = "1"
+    trainer_env["CUDA_VISIBLE_DEVICES"] = gpu_id
 
-    print("[Main] Starting trainer process (GPU 1) for process group rendezvous")
+    print(f"[Main] Starting trainer process (GPU {gpu_id}) for process group rendezvous")
 
     cmd = [
         sys.executable,
@@ -346,16 +468,18 @@ def start_trainer_process(
         cmd.extend([
             "--init-method", distributed_init_method,
             "--model", model_name,
-            "--server-url", server_url,
-        ])
+            "--world-size", str(world_size),
+            "--server-urls",
+        ] + list(server_urls))
     else:
-        # distributed_trainer_helper.py uses positional args
+        # distributed_trainer_helper.py uses positional command + flags
         cmd.extend([
             "timed_broadcast_server_test",
             "--init-method", distributed_init_method,
             "--model-name", model_name,
-            "--server-url", server_url,
-        ])
+            "--world-size", str(world_size),
+            "--server-urls",
+        ] + list(server_urls))
 
     if extra_args:
         cmd.extend(extra_args)

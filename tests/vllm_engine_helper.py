@@ -394,6 +394,7 @@ async def test_back_and_forth(
     prompt: str,
     max_tokens: int,
     sync_dir: str,
+    tensor_parallel_size: int = 1,
 ):
     """Back-and-forth test: switch between original and perturbed weights.
 
@@ -413,14 +414,16 @@ async def test_back_and_forth(
 
     print("[vLLM Engine] Starting back-and-forth test")
 
-    # Create sync points
+    # Create sync points — actor-signaled names use per-actor suffix;
+    # completion signals (trainer→actors) stay unadorned and are shared.
     sync_path = Path(sync_dir)
-    baseline_done = SyncPoint(sync_path, "baseline_done")
-    ready_for_perturbed1 = SyncPoint(sync_path, "ready_for_perturbed1")
+    suffix = f"_actor_{actor_llm_idx}"
+    baseline_done = SyncPoint(sync_path, f"baseline_done{suffix}")
+    ready_for_perturbed1 = SyncPoint(sync_path, f"ready_for_perturbed1{suffix}")
     perturbed1_done = SyncPoint(sync_path, "perturbed1_done")
-    ready_for_original = SyncPoint(sync_path, "ready_for_original")
+    ready_for_original = SyncPoint(sync_path, f"ready_for_original{suffix}")
     original_done = SyncPoint(sync_path, "original_done")
-    ready_for_perturbed2 = SyncPoint(sync_path, "ready_for_perturbed2")
+    ready_for_perturbed2 = SyncPoint(sync_path, f"ready_for_perturbed2{suffix}")
     perturbed2_done = SyncPoint(sync_path, "perturbed2_done")
 
     sampling_params = SamplingParams(
@@ -433,7 +436,7 @@ async def test_back_and_forth(
     # Create engine args
     args = ap.Namespace(
         model=model_name,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tensor_parallel_size,
         disable_log_stats=True,
         enable_log_requests=False,
         disable_weight_updates=False,
@@ -499,18 +502,18 @@ async def test_back_and_forth(
             res_mod_2 = output.outputs[0].text
         print(f"[vLLM Engine] res_mod_2: '{res_mod_2}'")
 
-    # Step 5: Save results for server test
+    # Step 5: Save results to per-actor file for multi-actor comparison
     import json
-    results_file = sync_path / "expected_results.json"
-    expected_results = {
+    results_file = sync_path / f"results_actor_{actor_llm_idx}.json"
+    actor_results = {
         "res_or_1": res_or_1,
         "res_mod_1": res_mod_1,
         "res_or_2": res_or_2,
         "res_mod_2": res_mod_2,
     }
     with open(results_file, "w") as f:
-        json.dump(expected_results, f, indent=2)
-    print(f"[vLLM Engine] Saved expected results to {results_file}")
+        json.dump(actor_results, f, indent=2)
+    print(f"[vLLM Engine] Saved results for actor {actor_llm_idx} to {results_file}")
 
     # Step 6: Verify
     print("\n" + "="*60)
@@ -554,6 +557,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--sync-dir", type=str, help="Directory for sync files")
     parser.add_argument("--expect-different", action="store_true", help="Expect outputs to be different (for perturbed weights)")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Tensor parallel size for engine")
 
     args = parser.parse_args()
 
@@ -604,6 +608,7 @@ if __name__ == "__main__":
                 args.prompt,
                 args.max_tokens,
                 args.sync_dir,
+                tensor_parallel_size=args.tensor_parallel_size,
             ))
     except Exception as e:
         print(f"[vLLM Engine] Error: {e}")

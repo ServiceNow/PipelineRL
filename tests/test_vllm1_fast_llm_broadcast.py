@@ -17,7 +17,9 @@ import torch
 # Import shared utilities
 from .server_weight_update_utils import (
     wait_for_server_ready,
+    wait_for_all_servers_ready,
     run_generation_loop,
+    run_generation_loop_multi,
     analyze_and_verify_pattern,
     start_vllm_server,
     start_trainer_process,
@@ -191,8 +193,120 @@ def redis_server():
         print("[Redis] Redis server stopped")
 
 
+# ---------------------------------------------------------------------------
+# Module-level helper shared by all Fast-LLM test variants
+# ---------------------------------------------------------------------------
+
+async def _run_fast_llm_server_test(
+    model_name,
+    simple_prompt,
+    generation_config,
+    init_method,
+    fast_llm_trainer_helper,
+    redis_host,
+    redis_port,
+    vllm_server_configs,
+    trainer_gpu,
+    world_size,
+    timeout=2400,
+):
+    """Run Fast-LLM server weight-update pattern test with one or more vLLM servers.
+
+    Args:
+        vllm_server_configs: List of dicts, each with keys:
+            - port: int
+            - gpu_ids: str
+            - actor_llm_idx: int
+            - tensor_parallel_size: int
+        trainer_gpu: str, e.g. "1" or "2"
+        world_size: total NCCL world size (trainer + all vLLM workers)
+        redis_host: Redis host address
+        redis_port: Redis port number
+    """
+    server_procs = []
+    server_urls = []
+
+    fast_llm_server_args = [
+        "--weight-update-mode", "fast-llm",
+        "--redis-host", redis_host,
+        "--redis-port", str(redis_port),
+    ]
+
+    for cfg in vllm_server_configs:
+        port = cfg["port"]
+        url = f"http://127.0.0.1:{port}"
+        server_urls.append(url)
+
+        server_proc, _, _ = start_vllm_server(
+            model_name=model_name,
+            server_port=port,
+            distributed_init_method=init_method,
+            stream_process_output_fn=stream_process_output,
+            extra_args=fast_llm_server_args,
+            gpu_ids=cfg.get("gpu_ids", "0"),
+            actor_llm_idx=cfg.get("actor_llm_idx", 0),
+            world_size=world_size,
+            tensor_parallel_size=cfg.get("tensor_parallel_size", 1),
+        )
+        server_procs.append(server_proc)
+
+    await asyncio.sleep(1)
+
+    trainer_proc, _, _ = start_trainer_process(
+        trainer_helper_path=fast_llm_trainer_helper,
+        distributed_init_method=init_method,
+        model_name=model_name,
+        server_urls=server_urls,
+        stream_process_output_fn=stream_process_output,
+        extra_args=[
+            "--redis-host", redis_host,
+            "--redis-port", str(redis_port),
+        ],
+        gpu_id=trainer_gpu,
+        world_size=world_size,
+    )
+
+    try:
+        await wait_for_all_servers_ready(server_urls, server_procs, trainer_proc)
+
+        if len(server_urls) == 1:
+            generations = await run_generation_loop(
+                server_url=server_urls[0],
+                model_name=model_name,
+                simple_prompt=simple_prompt,
+                generation_config=generation_config,
+                trainer_proc=trainer_proc,
+            )
+        else:
+            generations = await run_generation_loop_multi(
+                server_urls=server_urls,
+                model_name=model_name,
+                simple_prompt=simple_prompt,
+                generation_config=generation_config,
+                trainer_proc=trainer_proc,
+            )
+
+        # Wait for trainer to finish
+        print("[Main] Waiting for trainer to finish...")
+        for _ in range(30):
+            if trainer_proc.poll() is not None:
+                break
+            await asyncio.sleep(1)
+
+        analyze_and_verify_pattern(generations)
+        print(f"\n✓ Fast-LLM server weight update pattern test PASSED ({len(server_urls)} server(s))")
+
+    finally:
+        print("[Main] Cleaning up processes...")
+        for proc in server_procs:
+            if proc:
+                kill_process_tree(proc.pid)
+        if trainer_proc:
+            kill_process_tree(trainer_proc.pid)
+
+
 class TestFastLLMServerIntegration:
-    """Test Fast-LLM weight broadcast with vLLM HTTP server."""
+    """Test Fast-LLM weight broadcast with vLLM HTTP server — 2 GPUs (baseline)."""
 
     @pytest.mark.timeout(2400)  # 40 minutes for server test
     @pytest.mark.asyncio
@@ -211,95 +325,164 @@ class TestFastLLMServerIntegration:
     ):
         """Server integration test: verify Fast-LLM weight broadcast pattern with HTTP API.
 
-        This test validates the Fast-LLM protocol where:
-        1. Redis server is automatically started
-        2. vLLM server is running and serving HTTP requests
-        3. Trainer broadcasts weight updates via Redis stream + broadcast_object_list
-        4. Server responses change based on weight updates
+        Validates the Fast-LLM protocol where:
+        - Redis server signals weight updates
+        - vLLM server receives weights via broadcast_object_list + broadcast
+        - Server responses change as expected (original → perturbed → original → perturbed)
 
-        Flow:
-        - Start Redis server (via fixture)
-        - Start vLLM HTTP server with --weight-update-mode=fast-llm
-        - Continuously generate via HTTP API (deterministic)
-        - Trainer: wait 15s → broadcast perturbed → wait 5s → broadcast original → wait 5s → broadcast perturbed
-        - Verify generation pattern: original → perturbed → original → perturbed
-        - Stop Redis server (via fixture cleanup)
+        Topology: 1 vLLM server on GPU 0, trainer on GPU 1 (world_size=2).
         """
         print("\n" + "=" * 60)
-        print("Starting Fast-LLM server weight update pattern test")
+        print("Starting Fast-LLM server weight update pattern test (TP=1, 1 actor, 2 GPUs)")
         print("=" * 60)
 
-        # Get Redis connection info from fixture
         redis_host, redis_port = redis_server
-        print(f"[Main] Using Redis server at {redis_host}:{redis_port}")
 
-        server_port = 8000
-        server_url = f"http://127.0.0.1:{server_port}"
-
-        # Start vLLM server with Fast-LLM mode
-        server_proc, _, _ = start_vllm_server(
+        await _run_fast_llm_server_test(
             model_name=model_name,
-            server_port=server_port,
-            distributed_init_method=distributed_init_method,
-            stream_process_output_fn=stream_process_output,
-            extra_args=[
-                "--weight-update-mode", "fast-llm",
-                "--redis-host", redis_host,
-                "--redis-port", str(redis_port),
-            ],
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            fast_llm_trainer_helper=fast_llm_trainer_helper,
+            redis_host=redis_host,
+            redis_port=redis_port,
+            vllm_server_configs=[{"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1}],
+            trainer_gpu="1",
+            world_size=2,
+            timeout=2400,
         )
 
-        # Give server a moment to start
-        await asyncio.sleep(1)
 
-        # Start trainer process
-        trainer_proc, _, _ = start_trainer_process(
-            trainer_helper_path=fast_llm_trainer_helper,
-            distributed_init_method=distributed_init_method,
+class TestFastLLMServerTP2:
+    """Test Fast-LLM weight broadcast with tensor-parallel (TP=2) — needs 3 GPUs."""
+
+    @pytest.mark.timeout(2400)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs"
+    )
+    async def test_server_fast_llm_broadcast_pattern_tp2(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        fast_llm_trainer_helper,
+        redis_server,
+        temp_dir,
+    ):
+        """Fast-LLM server test with TP=2: one server on GPUs 0+1, trainer on GPU 2.
+
+        Verifies that tensor-parallel vLLM correctly receives Fast-LLM weight
+        updates when multiple GPU workers share the same NCCL process group.
+        """
+        print("\n" + "=" * 60)
+        print("Starting Fast-LLM server weight update pattern test (TP=2, 1 actor, 3 GPUs)")
+        print("=" * 60)
+
+        redis_host, redis_port = redis_server
+
+        await _run_fast_llm_server_test(
             model_name=model_name,
-            server_url=server_url,
-            stream_process_output_fn=stream_process_output,
-            extra_args=[
-                "--redis-host", redis_host,
-                "--redis-port", str(redis_port),
-            ],
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            fast_llm_trainer_helper=fast_llm_trainer_helper,
+            redis_host=redis_host,
+            redis_port=redis_port,
+            vllm_server_configs=[{"port": 8001, "gpu_ids": "0,1", "actor_llm_idx": 0, "tensor_parallel_size": 2}],
+            trainer_gpu="2",
+            world_size=3,
+            timeout=2400,
         )
 
-        try:
-            # Wait for server to be ready
-            await wait_for_server_ready(server_url, server_proc, trainer_proc)
 
-            # Run generation loop
-            generations = await run_generation_loop(
-                server_url=server_url,
-                model_name=model_name,
-                simple_prompt=simple_prompt,
-                generation_config=generation_config,
-                trainer_proc=trainer_proc,
-            )
+class TestFastLLMServerMultiActor:
+    """Test Fast-LLM weight broadcast with multiple independent vLLM actors."""
 
-            # Wait for trainer to finish
-            print("[Main] Waiting for trainer to finish...")
-            for _ in range(30):
-                if trainer_proc.poll() is not None:
-                    break
-                await asyncio.sleep(1)
+    @pytest.mark.timeout(2400)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs"
+    )
+    async def test_server_fast_llm_broadcast_pattern_2actors(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        fast_llm_trainer_helper,
+        redis_server,
+        temp_dir,
+    ):
+        """Fast-LLM server test with 2 actors: servers on GPUs 0 and 1, trainer on GPU 2.
 
-            # Analyze and verify pattern
-            analyze_and_verify_pattern(generations)
-            print("\n✓ Fast-LLM server weight update pattern test PASSED")
+        Verifies that two separate vLLM servers simultaneously receive the same
+        Fast-LLM weight broadcast and produce identical generation results.
+        """
+        print("\n" + "=" * 60)
+        print("Starting Fast-LLM server weight update pattern test (TP=1, 2 actors, 3 GPUs)")
+        print("=" * 60)
 
-        finally:
-            # Cleanup - always kill process tree even if main process exited
-            # (child processes like vLLM workers might still be running)
-            print("[Main] Cleaning up processes...")
-            if server_proc:
-                print(
-                    f"[Main] Killing server process tree (PID {server_proc.pid})..."
-                )
-                kill_process_tree(server_proc.pid)
-            if trainer_proc:
-                print(
-                    f"[Main] Killing trainer process tree (PID {trainer_proc.pid})..."
-                )
-                kill_process_tree(trainer_proc.pid)
+        redis_host, redis_port = redis_server
+
+        await _run_fast_llm_server_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            fast_llm_trainer_helper=fast_llm_trainer_helper,
+            redis_host=redis_host,
+            redis_port=redis_port,
+            vllm_server_configs=[
+                {"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
+                {"port": 8001, "gpu_ids": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
+            ],
+            trainer_gpu="2",
+            world_size=3,
+            timeout=2400,
+        )
+
+    @pytest.mark.timeout(2400)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 4, reason="Requires at least 4 GPUs"
+    )
+    async def test_server_fast_llm_broadcast_pattern_3actors(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        fast_llm_trainer_helper,
+        redis_server,
+        temp_dir,
+    ):
+        """Fast-LLM server test with 3 actors: servers on GPUs 0/1/2, trainer on GPU 3.
+
+        Verifies that three separate vLLM servers simultaneously receive the same
+        Fast-LLM weight broadcast and produce identical generation results.
+        """
+        print("\n" + "=" * 60)
+        print("Starting Fast-LLM server weight update pattern test (TP=1, 3 actors, 4 GPUs)")
+        print("=" * 60)
+
+        redis_host, redis_port = redis_server
+
+        await _run_fast_llm_server_test(
+            model_name=model_name,
+            simple_prompt=simple_prompt,
+            generation_config=generation_config,
+            init_method=distributed_init_method,
+            fast_llm_trainer_helper=fast_llm_trainer_helper,
+            redis_host=redis_host,
+            redis_port=redis_port,
+            vllm_server_configs=[
+                {"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
+                {"port": 8001, "gpu_ids": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
+                {"port": 8002, "gpu_ids": "2", "actor_llm_idx": 2, "tensor_parallel_size": 1},
+            ],
+            trainer_gpu="3",
+            world_size=4,
+            timeout=2400,
+        )
