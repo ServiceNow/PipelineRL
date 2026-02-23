@@ -203,6 +203,10 @@ class WorkerExtension:
             import redis
             import orjson
 
+            # Threads default to CUDA device 0; set the correct device so NCCL
+            # communicator operations use the same device as this worker.
+            torch.cuda.set_device(self.device)
+
             r = redis.Redis(host=self.redis_host, port=self.redis_port)
             stream_key = "fast_llm_events"
             payload_key = b"event"
