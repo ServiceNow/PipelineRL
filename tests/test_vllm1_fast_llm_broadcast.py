@@ -21,6 +21,7 @@ from .server_weight_update_utils import (
     run_generation_loop,
     run_generation_loop_multi,
     analyze_and_verify_pattern,
+    analyze_and_verify_pattern_multi,
     start_vllm_server,
     start_trainer_process,
 )
@@ -278,7 +279,7 @@ async def _run_fast_llm_server_test(
                 trainer_proc=trainer_proc,
             )
         else:
-            generations = await run_generation_loop_multi(
+            per_server_generations = await run_generation_loop_multi(
                 server_urls=server_urls,
                 model_name=model_name,
                 simple_prompt=simple_prompt,
@@ -293,7 +294,10 @@ async def _run_fast_llm_server_test(
                 break
             await asyncio.sleep(1)
 
-        analyze_and_verify_pattern(generations)
+        if len(server_urls) == 1:
+            analyze_and_verify_pattern(generations)
+        else:
+            analyze_and_verify_pattern_multi(per_server_generations)
         print(f"\n✓ Fast-LLM server weight update pattern test PASSED ({len(server_urls)} server(s))")
 
     finally:

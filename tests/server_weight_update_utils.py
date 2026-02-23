@@ -212,6 +212,9 @@ def analyze_and_verify_pattern(generations):
     Args:
         generations: List of (timestamp, text) tuples
 
+    Returns:
+        Tuple of (text_a, text_b) — the original and perturbed texts.
+
     Raises:
         AssertionError: If pattern is not as expected
     """
@@ -256,6 +259,45 @@ def analyze_and_verify_pattern(generations):
     print(f"  Phase B  (perturbed):  {len(phase_b_items)} generation(s)")
     print(f"  Phase A2 (original):   {len(phase_a2_items)} generation(s)  ← matches A ✓")
     print(f"  Phase B2 (perturbed):  {len(phase_b2_items)} generation(s)  ← matches B ✓")
+
+    return phase_a_text, phase_b_text
+
+
+def analyze_and_verify_pattern_multi(per_server_generations):
+    """Verify A→B→A→B pattern independently per server, then check consistency.
+
+    Each server's generation history is checked independently (since weight
+    updates are not coordinated with requests, servers can transiently disagree).
+    After all pass, we assert that every server converged on the same text A
+    and text B.
+
+    Args:
+        per_server_generations: List of per-server generation lists, each a
+            list of (timestamp, text) tuples (as returned by
+            run_generation_loop_multi).
+
+    Raises:
+        AssertionError: If any server fails its pattern check or servers
+            disagree on text A / text B.
+    """
+    patterns = []
+    for i, generations in enumerate(per_server_generations):
+        print(f"\n{'=' * 60}")
+        print(f"Actor {i} pattern analysis")
+        text_a, text_b = analyze_and_verify_pattern(generations)
+        patterns.append((text_a, text_b))
+
+    unique_a = set(t_a for t_a, _ in patterns)
+    unique_b = set(t_b for _, t_b in patterns)
+    assert len(unique_a) == 1, (
+        f"Servers disagree on text A (original weights): "
+        f"{[t_a[:40] for t_a, _ in patterns]}"
+    )
+    assert len(unique_b) == 1, (
+        f"Servers disagree on text B (perturbed weights): "
+        f"{[t_b[:40] for _, t_b in patterns]}"
+    )
+    print(f"\n✓ All {len(patterns)} actor(s) agree on text A and text B")
 
 
 def start_vllm_server(
@@ -358,9 +400,10 @@ async def run_generation_loop_multi(
 ):
     """Run continuous generation loop querying all servers each round.
 
-    Each iteration queries ALL servers and asserts all responses are equal
-    (since they should have the same weights after a broadcast). Records one
-    (timestamp, text) entry per round.
+    Each server is tracked independently because weight updates and requests
+    are not coordinated — different actors can temporarily return different
+    results while a broadcast is in flight.  Pattern checking is therefore
+    done per-server after the loop (see analyze_and_verify_pattern_multi).
 
     Args:
         server_urls: List of server base URLs
@@ -372,10 +415,11 @@ async def run_generation_loop_multi(
         generation_interval: Time between generation rounds
 
     Returns:
-        List of (timestamp, generated_text) tuples
+        List of per-server generation lists, each a list of
+        (timestamp, generated_text) tuples (same order as server_urls).
     """
     print(f"[Main] Starting continuous generation loop across {len(server_urls)} server(s)...")
-    generations = []
+    per_server = [[] for _ in server_urls]
     start_time = time.time()
 
     payload = {
@@ -394,37 +438,26 @@ async def run_generation_loop_multi(
             print(f"[Main] Trainer exited with code {trainer_poll}")
             break
 
-        try:
-            texts = []
-            for url in server_urls:
+        for i, url in enumerate(server_urls):
+            try:
                 resp = requests.post(
                     f"{url}/v1/completions",
                     json=payload,
                     timeout=30,
                 )
                 if resp.status_code == 200:
-                    texts.append(resp.json()["choices"][0]["text"])
+                    text = resp.json()["choices"][0]["text"]
+                    timestamp = time.time() - start_time
+                    per_server[i].append((timestamp, text))
+                    print(f"[Main] [{timestamp:.1f}s] Actor {i}: '{text}'")
                 else:
-                    print(f"[Main] Generation from {url} failed with status {resp.status_code}")
-                    texts = []
-                    break
-
-            if texts:
-                # All servers should agree
-                assert len(set(texts)) == 1, (
-                    f"Servers disagree on generation: {texts}"
-                )
-                text = texts[0]
-                timestamp = time.time() - start_time
-                generations.append((timestamp, text))
-                print(f"[Main] [{timestamp:.1f}s] Generated: '{text}'")
-
-        except requests.exceptions.RequestException as e:
-            print(f"[Main] Request failed: {e}")
+                    print(f"[Main] Generation from actor {i} ({url}) failed with status {resp.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"[Main] Request to actor {i} ({url}) failed: {e}")
 
         await asyncio.sleep(generation_interval)
 
-    return generations
+    return per_server
 
 
 def start_trainer_process(

@@ -21,6 +21,7 @@ from .server_weight_update_utils import (
     run_generation_loop,
     run_generation_loop_multi,
     analyze_and_verify_pattern,
+    analyze_and_verify_pattern_multi,
     start_vllm_server,
     start_trainer_process,
 )
@@ -451,7 +452,7 @@ async def _run_server_weight_update_test(
                 trainer_proc=trainer_proc,
             )
         else:
-            generations = await run_generation_loop_multi(
+            per_server_generations = await run_generation_loop_multi(
                 server_urls=server_urls,
                 model_name=model_name,
                 simple_prompt=simple_prompt,
@@ -466,7 +467,10 @@ async def _run_server_weight_update_test(
                 break
             await asyncio.sleep(1)
 
-        analyze_and_verify_pattern(generations)
+        if len(server_urls) == 1:
+            analyze_and_verify_pattern(generations)
+        else:
+            analyze_and_verify_pattern_multi(per_server_generations)
         print(f"\n✓ Server weight update pattern test PASSED ({len(server_urls)} server(s))")
 
     finally:
@@ -1221,49 +1225,3 @@ class TestWeightUpdateMultiActor:
             world_size=4,
             timeout=2400,
         )
-
-
-# class TestConcurrentOperations:
-#     """Test concurrent generation and weight updates."""
-
-#     @pytest.mark.asyncio
-#     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
-#     async def test_multiple_generations_before_update(
-#         self,
-#         vllm_engine_factory,
-#         sample_prompts,
-#         generation_config,
-#     ):
-#         """Test that multiple generation requests work correctly."""
-#         from vllm import SamplingParams
-
-#         async with vllm_engine_factory() as manager:
-#             sampling_params = SamplingParams(
-#                 temperature=generation_config["temperature"],
-#                 top_p=generation_config["top_p"],
-#                 max_tokens=generation_config["max_tokens"],
-#                 seed=generation_config["seed"],
-#             )
-
-#             # Launch multiple generation requests
-#             tasks = []
-#             for i, prompt in enumerate(sample_prompts):
-#                 async def generate_one(prompt, idx):
-#                     request_id = f"concurrent_{idx}"
-#                     async for output in manager.engine.generate(
-#                         prompt,
-#                         sampling_params=sampling_params,
-#                         request_id=request_id,
-#                     ):
-#                         final = output
-#                     return final.outputs[0].text
-
-#                 tasks.append(generate_one(prompt, i))
-
-#             # Run all generations concurrently
-#             results = await asyncio.gather(*tasks)
-
-#             assert len(results) == len(sample_prompts)
-#             for i, result in enumerate(results):
-#                 print(f"Result {i}: {result[:50]}...")
-#                 assert len(result) > 0
