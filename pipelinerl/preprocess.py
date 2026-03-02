@@ -350,52 +350,51 @@ def write_micro_batch_slices(
 def convert_to_fast_llm_format(entry: dict) -> dict:
     """Convert a preprocessed sample entry to Fast-LLM streaming format.
 
-    Fast-LLM expects:
-    - tokens: list of token IDs
-    - tokens_dtype: string dtype (e.g., "int32")
-    - loss_masking_spans (optional): list of (start, end) tuples where loss IS computed
+    Fast-LLM RedisDocument fields:
+    - tokens: list of token IDs (full sequence: prompt + completion)
+    - loss_masking_spans: list of (start, end) spans where loss IS computed (completion only)
+    - advantage: scalar float (per-rollout GRPO advantage)
+    - old_log_probabilities: list of floats, full sequence length (zeros for prompt tokens)
     """
     input_ids = entry["input_ids"]
+    tokens = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
-    # Convert to list if tensor
-    if hasattr(input_ids, "tolist"):
-        tokens = input_ids.tolist()
-    else:
-        tokens = list(input_ids)
+    result: dict = {"tokens": tokens}
 
-    result = {
-        "tokens": tokens,
-    }
-
-    # Convert labels to loss_masking_spans if present
-    # In PipelineRL, labels=-100 means "don't compute loss" (padding/prompt)
-    # In Fast-LLM, loss_masking_spans are ranges where loss IS computed
+    # loss_masking_spans: contiguous spans where labels != -100 (completion tokens)
     if "labels" in entry:
         labels = entry["labels"]
-        if hasattr(labels, "tolist"):
-            labels = labels.tolist()
-        else:
-            labels = list(labels)
+        labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
 
-        # Find contiguous spans where labels != -100 (loss is computed)
         spans = []
         in_span = False
         span_start = 0
         for i, label in enumerate(labels):
             if label != -100 and not in_span:
-                # Start new span
                 in_span = True
                 span_start = i
             elif label == -100 and in_span:
-                # End current span
                 spans.append((span_start, i))
                 in_span = False
-        # Close final span if still open
         if in_span:
             spans.append((span_start, len(labels)))
 
         if spans:
             result["loss_masking_spans"] = spans
+
+    # advantage: scalar per rollout (populate_rl_data stores a list of per-step scalars;
+    # for single-step tasks like math there is exactly one element)
+    if "advantages" in entry:
+        advantages = entry["advantages"]
+        if advantages:
+            result["advantage"] = float(advantages[0])
+
+    # old_log_probabilities: full sequence length, zeros for prompt tokens
+    # (prepare_rl_fields pads with zeros on the left to match len(input_ids))
+    if "old_logprobs" in entry:
+        old_logprobs = entry["old_logprobs"]
+        old_logprobs = old_logprobs.tolist() if hasattr(old_logprobs, "tolist") else list(old_logprobs)
+        result["old_log_probabilities"] = [float(x) for x in old_logprobs]
 
     return result
 
