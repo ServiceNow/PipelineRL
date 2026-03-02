@@ -124,6 +124,9 @@ debug:
 # 2. Implementing the vLLM weight receiver to accept broadcasted weights
 # 3. Setting use_fast_llm=false once NCCL is working (or removing this flag entirely)
 use_fast_llm: false
+# Whether the trainer broadcasts updated weights to vLLM after each training step.
+# Must match whether the broadcast block is configured in qwen25_05B-instruct.yaml.
+weight_broadcast: true
 
 me:
   # Which job is this one? This will be autopopulated

@@ -4,6 +4,7 @@ defaults:
 
 # Enable Fast-LLM integration (disables vLLM weight updates until NCCL broadcast is implemented)
 use_fast_llm: true
+weight_broadcast: false  # broadcast block commented out in qwen25_05B-instruct.yaml
 
 actor:
   rollout_policy: pipelinerl.domains.math.generate_math_rollout
@@ -18,6 +19,7 @@ finetune:
   seq_length: 18000
 
 vllm_config:
+  use_v1: true
   vllm_kwargs:
     max_model_len: 18000
 

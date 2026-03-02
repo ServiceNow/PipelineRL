@@ -365,7 +365,6 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
 
     result = {
         "tokens": tokens,
-        "tokens_dtype": "int32",
     }
 
     # Convert labels to loss_masking_spans if present
@@ -436,13 +435,16 @@ def run_preprocessing_loop(
     # For Fast-LLM: use SingleStreamSpec with shared=True (uses orjson serialization)
     # For standard PipelineRL: use StreamRangeSpec with partitions per GPU
     if cfg.use_fast_llm:
+        from fast_llm.data.dataset.config import REDIS_DATA_STREAM as _FAST_LLM_DATA_STREAM
+        fast_llm_stream_name = _FAST_LLM_DATA_STREAM
         output_stream = SingleStreamSpec(
             exp_path=exp_root_dir,
             topic=cfg.preprocess.output,
-            partition=0,  # Single stream for Fast-LLM
+            partition=0,
         )
         use_shared_stream = True
     else:
+        fast_llm_stream_name = None
         output_stream = StreamRangeSpec(
             exp_path=exp_root_dir,
             topic=cfg.preprocess.output,
@@ -468,7 +470,7 @@ def run_preprocessing_loop(
     dataset_loader_thread.start()
     
     # Initialize TrainerState
-    trainer_state = TrainerState(exp_root_dir, use_fast_llm=cfg.use_fast_llm)
+    trainer_state = TrainerState(exp_root_dir, use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode == "preprocessor":
         logger.info("Debug mode: preprocessor")
         trainer_state.debug_mode_init()
@@ -533,7 +535,7 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
-    with write_to_streams(output_stream, shared=use_shared_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name, pipelinerl_metadata=not cfg.use_fast_llm) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
@@ -566,6 +568,7 @@ def run_preprocessing_loop(
                 fetching_took = 0
                 writing_took = 0
                 num_filtered_out = 0
+                last_backpressure_log = 0.0
                 while True:
                     if (
                         trainer_state.samples_processed is not None
@@ -638,6 +641,13 @@ def run_preprocessing_loop(
                     assert isinstance(trainer_state.samples_processed, int)
                     if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
                         # wait for the finetune loop to finish processing data
+                        now = time.time()
+                        if now - last_backpressure_log >= 10.0:
+                            last_backpressure_log = now
+                            logger.info(
+                                f"Back-pressure: published={published_samples} consumed={trainer_state.samples_processed}"
+                                f" unconsumed={published_samples - trainer_state.samples_processed} > max={max_unconsumed_samples}, waiting"
+                            )
                         continue
 
                     batch_done = False
@@ -746,7 +756,8 @@ def run_preprocessing_loop(
                         logger.info(
                             f"Processed {processed_samples} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
                             f" (fetching took {fetching_took:.3f} and writing took {writing_took:.3f})"
-                            f" and wrote to {output_stream}, total {published_samples} samples so far,"
+                            f" and wrote to {output_stream}, total {published_samples} samples so far"
+                            f" (trainer consumed {trainer_state.samples_processed}, unconsumed {published_samples - trainer_state.samples_processed}),"
                             f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
                         )
                         start_processing = time.time()

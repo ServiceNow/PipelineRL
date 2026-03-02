@@ -209,16 +209,16 @@ def run_actor_llm(
     cmd.extend(_get_quantization_args(cfg))
 
     # add vLLM kwargs as separate arguments
+    _vllm1_unsupported = {"num-scheduler-steps"}
     if cfg.vllm_config.vllm_kwargs:
         for k, v in cfg.vllm_config.vllm_kwargs.items():
+            if cfg.vllm_config.use_v1 and k in _vllm1_unsupported:
+                continue
             cmd.append(f"--{k}")
             if v not in [None, ""]:
                 cmd.append(str(v))
 
-    # Disable weight updates in debug mode or when using Fast-LLM (no NCCL group yet)
-    # TODO(fast-llm): Remove the use_fast_llm check once NCCL weight broadcast is implemented.
-    # When Fast-LLM broadcasts weights via NCCL, vLLM should join the group and receive updates.
-    if cfg.debug.mode or cfg.use_fast_llm:
+    if cfg.debug.mode or not cfg.weight_broadcast:
         cmd.append("--disable-weight-updates")
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
@@ -329,7 +329,11 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "42"
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
-    proc = _popen(cmd, env=env)
+    os.makedirs(save_dir, exist_ok=True)
+    log_file_path = save_dir / "stdout.log"
+    err_file_path = save_dir / "stderr.log"
+    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
+        proc = _popen(cmd, env=env, stdout=log_file, stderr=err_file)
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
 
@@ -516,9 +520,9 @@ def is_inference_process(proc: LaunchedProcess) -> bool:
     return proc.kind in {"actor_llm", "preprocessor_llm"}
 
 
-def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False, use_fast_llm: bool = False):
+def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False, use_fast_llm: bool = False, weight_broadcast: bool = True):
     if not debug_mode:
-        trainer_state = TrainerState(exp_path, use_fast_llm=use_fast_llm)
+        trainer_state = TrainerState(exp_path, use_fast_llm=use_fast_llm, weight_broadcast=weight_broadcast)
         trainer_state.start_listening()
     else:
         trainer_state = None
@@ -729,7 +733,7 @@ def main(cfg: DictConfig):
     if os.environ.get("DRY_RUN", "0") == "1":
         assert not processes
         return
-    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode), cfg.use_fast_llm)
+    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode), cfg.use_fast_llm, cfg.weight_broadcast)
 
 
 if __name__ == "__main__":
