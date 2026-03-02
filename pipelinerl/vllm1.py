@@ -590,8 +590,8 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
         sock.close()
 
-        # TODO: proper cleanup
-        # dist.destroy_process_group(actor_update_group)
+        # NOTE: weight-broadcast process group teardown must be coordinated with the trainer —
+        # the trainer sends training_finished, then the engine manager destroys its side here.
 
 
 def run_llm():
