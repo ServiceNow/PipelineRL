@@ -131,6 +131,93 @@ def timed_broadcast_fast_llm(
     print("[Trainer] Redis connection closed, process group destroyed, exiting")
 
 
+def rapid_broadcast_cycles_fast_llm(
+    init_method: str,
+    model_name: str,
+    server_urls: list,
+    redis_host: str = "localhost",
+    redis_port: int = 6379,
+    world_size: int = 2,
+    n_cycles: int = 6,
+):
+    """Hybrid Fast-LLM broadcast designed to catch transition/garbage generations.
+
+    Structure:
+      1. Slow broadcast: perturbed  (5 s wait after) — establishes text_B
+      2. Slow broadcast: original   (5 s wait after) — re-establishes text_A
+      3. n_cycles rapid pairs: perturbed → original  (1 s between each)
+      4. Slow broadcast: perturbed  (5 s wait after) — end on text_B so the
+         overall A→B→A→B pattern remains detectable
+    """
+    import torch.distributed as dist
+    import time
+    import redis as redis_lib
+    import orjson
+
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=world_size)
+
+    r = redis_lib.Redis(host=redis_host, port=redis_port)
+    stream_key = "fast_llm_events"
+    payload_key = "event"
+
+    _wait_for_servers_ready(server_urls, extra_wait_secs=15)
+
+    print(f"[Trainer] Loading weights from {model_name}")
+    original_state_dict, _ = _load_state_dict(model_name)
+    perturbed_state_dict = _create_perturbed_state_dict(original_state_dict)
+
+    step = 1
+
+    def broadcast_weights(state_dict, label):
+        nonlocal step
+        import torch
+        event = {"type": "weights_ready", "step": step}
+        r.xadd(stream_key, {payload_key: orjson.dumps(event)})
+        print(f"[Trainer] Sent weights_ready step={step} ({label})")
+        step += 1
+
+        for name, tensor in state_dict.items():
+            if tensor.device.type != "cuda":
+                tensor = tensor.cuda(0)
+            meta = [("", name, list(tensor.shape), str(tensor.dtype))]
+            dist.broadcast_object_list(meta, src=0, group=process_group)
+            dist.broadcast(tensor, src=0, group=process_group)
+
+        dist.broadcast_object_list([None], src=0, group=process_group)
+        print(f"[Trainer] Broadcast complete ({label})")
+
+    # --- Slow cycle: establish text_B and text_A clearly ---
+    print("[Trainer] Slow broadcast 1: perturbed (establishing text_B)...")
+    broadcast_weights(perturbed_state_dict, "perturbed slow")
+    time.sleep(5)
+
+    print("[Trainer] Slow broadcast 2: original (re-establishing text_A)...")
+    broadcast_weights(original_state_dict, "original slow")
+    time.sleep(5)
+
+    # --- Rapid cycles: 1 s between broadcasts ---
+    for i in range(n_cycles):
+        print(f"[Trainer] Rapid cycle {i + 1}/{n_cycles}: perturbed...")
+        broadcast_weights(perturbed_state_dict, f"perturbed rapid {i + 1}")
+        time.sleep(1)
+
+        print(f"[Trainer] Rapid cycle {i + 1}/{n_cycles}: original...")
+        broadcast_weights(original_state_dict, f"original rapid {i + 1}")
+        time.sleep(1)
+
+    # --- Final slow broadcast: end on perturbed so ABAB pattern holds ---
+    print("[Trainer] Final slow broadcast: perturbed (ending on text_B)...")
+    broadcast_weights(perturbed_state_dict, "perturbed final")
+    time.sleep(5)
+
+    print("[Trainer] Sending training_finished signal...")
+    r.xadd(stream_key, {payload_key: orjson.dumps({"type": "training_finished"})})
+
+    r.close()
+    dist.destroy_process_group(process_group)
+    print("[Trainer] Redis connection closed, process group destroyed, exiting")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -141,14 +228,27 @@ if __name__ == "__main__":
     parser.add_argument("--world-size", type=int, default=2, help="Total distributed world size")
     parser.add_argument("--redis-host", default="localhost", help="Redis host")
     parser.add_argument("--redis-port", type=int, default=6379, help="Redis port")
+    parser.add_argument("--n-cycles", type=int, default=0,
+                        help="If > 0, run rapid_broadcast_cycles with this many rapid pairs")
 
     args = parser.parse_args()
 
-    timed_broadcast_fast_llm(
-        init_method=args.init_method,
-        model_name=args.model,
-        server_urls=args.server_urls,
-        redis_host=args.redis_host,
-        redis_port=args.redis_port,
-        world_size=args.world_size,
-    )
+    if args.n_cycles > 0:
+        rapid_broadcast_cycles_fast_llm(
+            init_method=args.init_method,
+            model_name=args.model,
+            server_urls=args.server_urls,
+            redis_host=args.redis_host,
+            redis_port=args.redis_port,
+            world_size=args.world_size,
+            n_cycles=args.n_cycles,
+        )
+    else:
+        timed_broadcast_fast_llm(
+            init_method=args.init_method,
+            model_name=args.model,
+            server_urls=args.server_urls,
+            redis_host=args.redis_host,
+            redis_port=args.redis_port,
+            world_size=args.world_size,
+        )

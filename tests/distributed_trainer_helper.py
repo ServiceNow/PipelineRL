@@ -500,9 +500,80 @@ def timed_broadcast_server_test(
     print("[Trainer] Process group destroyed, exiting")
 
 
+def rapid_broadcast_cycles(
+    init_method: str,
+    model_name: str,
+    server_urls: list,
+    world_size: int = 2,
+    n_cycles: int = 6,
+):
+    """Hybrid broadcast designed to catch transition/garbage generations.
+
+    Structure:
+      1. Slow broadcast: perturbed  (5 s wait after) — establishes text_B
+      2. Slow broadcast: original   (5 s wait after) — re-establishes text_A
+      3. n_cycles rapid pairs: perturbed → original  (1 s between each)
+      4. Slow broadcast: perturbed  (5 s wait after) — end on text_B so the
+         overall A→B→A→B pattern remains detectable
+
+    The slow initial cycles give the generation loop enough stable time to
+    identify text_A and text_B by frequency.  The rapid cycles create many
+    short broadcast windows where mid-broadcast (garbage) generations are
+    likely to be caught by a zero-interval generation loop.
+    """
+    import torch.distributed as dist
+    import time
+    import requests
+
+    process_group = _init_actor_process_group(init_method, rank=0, world_size=world_size)
+
+    _wait_for_servers_ready(server_urls, extra_wait_secs=10)
+
+    print(f"[Trainer] Loading weights from {model_name}")
+    original_state_dict, _ = _load_state_dict(model_name)
+    perturbed_state_dict = _create_perturbed_state_dict(original_state_dict)
+
+    version = 1
+
+    # --- Slow cycle: establish text_B and text_A clearly ---
+    print("[Trainer] Slow broadcast 1: perturbed (establishing text_B)...")
+    _broadcast_via_server(perturbed_state_dict, server_urls, version=version, process_group=process_group, label="perturbed (slow)")
+    version += 1
+    time.sleep(5)
+
+    print("[Trainer] Slow broadcast 2: original (re-establishing text_A)...")
+    _broadcast_via_server(original_state_dict, server_urls, version=version, process_group=process_group, label="original (slow)")
+    version += 1
+    time.sleep(5)
+
+    # --- Rapid cycles: 1 s between broadcasts ---
+    for i in range(n_cycles):
+        print(f"[Trainer] Rapid cycle {i + 1}/{n_cycles}: perturbed...")
+        _broadcast_via_server(perturbed_state_dict, server_urls, version=version, process_group=process_group, label=f"perturbed (rapid {i + 1})")
+        version += 1
+        time.sleep(1)
+
+        print(f"[Trainer] Rapid cycle {i + 1}/{n_cycles}: original...")
+        _broadcast_via_server(original_state_dict, server_urls, version=version, process_group=process_group, label=f"original (rapid {i + 1})")
+        version += 1
+        time.sleep(1)
+
+    # --- Final slow broadcast: end on perturbed so ABAB pattern holds ---
+    print("[Trainer] Final slow broadcast: perturbed (ending on text_B)...")
+    _broadcast_via_server(perturbed_state_dict, server_urls, version=version, process_group=process_group, label="perturbed (final)")
+    time.sleep(5)
+
+    for url in server_urls:
+        print(f"[Trainer] Sending training_finished signal to {url}...")
+        requests.post(f"{url}/training_finished", timeout=10)
+
+    dist.destroy_process_group(process_group)
+    print("[Trainer] Process group destroyed, exiting")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Distributed trainer helper")
-    parser.add_argument("command", choices=["init", "broadcast", "cross_validation", "back_and_forth", "timed_broadcast_server_test"])
+    parser.add_argument("command", choices=["init", "broadcast", "cross_validation", "back_and_forth", "timed_broadcast_server_test", "rapid_broadcast_cycles"])
     parser.add_argument("--init-method", required=True)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=2)
@@ -516,6 +587,7 @@ if __name__ == "__main__":
         "--server-urls", nargs="+", help="Base URL(s) of vLLM server(s) (e.g., http://127.0.0.1:8000)"
     )
     parser.add_argument("--num-actors", type=int, default=1, help="Number of vLLM actor processes")
+    parser.add_argument("--n-cycles", type=int, default=6, help="Number of rapid broadcast cycles (rapid_broadcast_cycles command)")
 
     args = parser.parse_args()
 
@@ -558,6 +630,17 @@ if __name__ == "__main__":
                 args.model_name,
                 args.server_urls,
                 world_size=args.world_size,
+            )
+        elif args.command == "rapid_broadcast_cycles":
+            if not args.model_name or not args.server_urls:
+                print("Error: --model-name and --server-urls required for rapid_broadcast_cycles")
+                sys.exit(1)
+            rapid_broadcast_cycles(
+                args.init_method,
+                args.model_name,
+                args.server_urls,
+                world_size=args.world_size,
+                n_cycles=args.n_cycles,
             )
     except Exception as e:
         print(f"[Trainer] Error: {e}")

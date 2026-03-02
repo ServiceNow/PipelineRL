@@ -70,40 +70,78 @@ def _build_phases(generations):
     return phases
 
 
-def _find_abab_pattern(phases):
-    """Search for the A→B→A→B pattern anchored to the first and last phases.
+def _identify_stable_texts(phases, min_stable_gens=5):
+    """Return (text_a, text_b) identified from the first two stable phases.
 
-    A is always ``phases[0]`` — the text the server starts with (original weights).
-    B2 is always ``phases[-1]`` — the current/final phase (perturbed weights after
-    the 3rd broadcast).
+    Iterates phases in order, skipping any with fewer than ``min_stable_gens``
+    generations (transition artifacts).  The first stable phase gives text_A;
+    the first stable phase with a different text gives text_B.
 
-    Any transition phases in between are skipped automatically because we only
-    require that some phase after the first B has the same text as phases[0] (A),
-    without caring what sits between the first B and that return-to-A.
+    Returns (text_a, text_b) or (None, None) if two distinct stable texts
+    cannot be found.
+    """
+    text_a = None
+    text_b = None
+    for text, items in phases:
+        if len(items) < min_stable_gens:
+            continue
+        if text_a is None:
+            text_a = text
+        elif text != text_a:
+            text_b = text
+            break
+    if text_a is None or text_b is None:
+        return None, None
+    return text_a, text_b
+
+
+def _find_abab_pattern(phases, min_stable_gens=5):
+    """Search for the A→B→A→B pattern.
+
+    text_A and text_B are identified from the first two *stable* phases —
+    phases with at least ``min_stable_gens`` generations.  Short transition
+    phases (1–few gens) produced while an NCCL broadcast is in-flight are
+    automatically skipped during identification.
+
+    The test is designed so that the server always starts with a long run of
+    text_A (original weights, typically hundreds of gens) followed by a long
+    run of text_B (first perturbed broadcast, tens of gens), making them
+    unambiguous even with transition artifacts in between.
+
+    After identifying text_A and text_B the full A→B→A→B subsequence is
+    located in the phase list (transition phases between the four anchors are
+    silently skipped).
 
     Returns (phase_a, phase_b, phase_a2, phase_b2) or None.
     """
     if len(phases) < 4:
         return None
 
-    text_a = phases[0][0]
-    text_b2 = phases[-1][0]
+    text_a, text_b = _identify_stable_texts(phases, min_stable_gens)
 
-    if text_a == text_b2:
-        return None  # A and B must be distinct texts
+    if text_a is None or text_b is None:
+        return None
 
     texts = [t for t, _ in phases]
 
-    # Find the first B (same text as B2) strictly between phase 0 and last
-    for j in range(1, len(phases) - 1):
-        if texts[j] != text_b2:
-            continue
-        # Find the first return to A strictly between j and last
-        for k in range(j + 1, len(phases) - 1):
-            if texts[k] == text_a:
-                return phases[0], phases[j], phases[k], phases[-1]
+    # Find ABAB as a subsequence in the phase list
+    first_a = next((i for i, t in enumerate(texts) if t == text_a), None)
+    if first_a is None:
+        return None
 
-    return None
+    first_b = next((i for i in range(first_a + 1, len(phases)) if texts[i] == text_b), None)
+    if first_b is None:
+        return None
+
+    second_a = next((i for i in range(first_b + 1, len(phases)) if texts[i] == text_a), None)
+    if second_a is None:
+        return None
+
+    second_b = next((i for i in range(second_a + 1, len(phases)) if texts[i] == text_b), None)
+    if second_b is None:
+        return None
+
+    return phases[first_a], phases[first_b], phases[second_a], phases[second_b]
 
 
 def check_pattern_detected(generations):
@@ -232,10 +270,18 @@ def analyze_and_verify_pattern(generations):
 
     phases = _build_phases(generations)
 
+    _GRAY = "\033[90m"
+    _RESET = "\033[0m"
+    stable_a, stable_b = _identify_stable_texts(phases)
+    stable_texts = {t for t in (stable_a, stable_b) if t is not None}
     print("\n" + "=" * 60)
     print(f"Detected {len(phases)} phase(s):")
     for i, (text, items) in enumerate(phases):
-        print(f"Phase {i+1}: {len(items)} generation(s) - '{text[:60]}...'")
+        line = f"Phase {i+1}: {len(items)} generation(s) - '{text[:60]}...'"
+        if text not in stable_texts:
+            print(f"{_GRAY}{line}  ← transition{_RESET}")
+        else:
+            print(line)
     print("=" * 60)
 
     result = _find_abab_pattern(phases)
@@ -298,6 +344,79 @@ def analyze_and_verify_pattern_multi(per_server_generations):
         f"{[t_b[:40] for _, t_b in patterns]}"
     )
     print(f"\n✓ All {len(patterns)} actor(s) agree on text A and text B")
+
+
+def extract_transition_phases(generations, text_a, text_b):
+    """Return phases that are neither text_a nor text_b.
+
+    These are mid-broadcast 'garbage' generations produced while an NCCL
+    weight update was in flight and the model had partially updated weights.
+
+    Args:
+        generations: List of (timestamp, text) tuples
+        text_a: The original-weights text (established first)
+        text_b: The perturbed-weights text
+
+    Returns:
+        List of (text, items) phase tuples where text is neither text_a nor text_b
+    """
+    phases = _build_phases(generations)
+    return [(text, items) for text, items in phases if text != text_a and text != text_b]
+
+
+def analyze_and_verify_transitions(generations, n_cycles):
+    """Verify A→B→A→B pattern and assert that transition generations were caught.
+
+    The ``rapid_broadcast_cycles`` trainer command performs:
+      - 1 startup A phase (server starts on original weights)
+      - 1 slow perturbed broadcast  → text_B
+      - 1 slow original broadcast   → text_A
+      - n_cycles rapid pairs        → text_B, text_A each cycle
+      - 1 final slow perturbed      → text_B
+
+    This gives exactly ``4 + 2 * n_cycles`` stable phases.  Seeing fewer
+    means a broadcast was missed entirely (timing/sync bug).
+
+    Args:
+        generations: List of (timestamp, text) tuples
+        n_cycles: Number of rapid broadcast pairs (passed as ``--n-cycles``
+            to the trainer helper).
+
+    Raises:
+        AssertionError: If ABAB pattern is not found, stable phase count is
+            wrong, or no transition generations were caught.
+    """
+    text_a, text_b = analyze_and_verify_pattern(generations)
+
+    phases = _build_phases(generations)
+    stable_phases = [(text, items) for text, items in phases if text == text_a or text == text_b]
+    expected_stable = 4 + 2 * n_cycles
+    assert len(stable_phases) == expected_stable, (
+        f"Expected {expected_stable} stable phases (4 + 2×{n_cycles} cycles) "
+        f"but found {len(stable_phases)}. "
+        f"A broadcast may have been missed or merged. "
+        f"Stable phase counts: {[len(items) for _, items in stable_phases]}"
+    )
+    print(f"\n✓ Stable phase count correct: {len(stable_phases)} (expected {expected_stable})")
+
+    transition_phases = extract_transition_phases(generations, text_a, text_b)
+
+    print("\n" + "=" * 60)
+    print(f"TRANSITION / GARBAGE GENERATIONS: {len(transition_phases)} phase(s)")
+    print("=" * 60)
+    if transition_phases:
+        for i, (text, items) in enumerate(transition_phases):
+            ts_start = items[0][0]
+            ts_end = items[-1][0]
+            print(f"  [{i + 1}] {len(items)} gen(s) @ {ts_start:.2f}s–{ts_end:.2f}s: '{text[:120]}'")
+    else:
+        print("  (none)")
+
+    assert len(transition_phases) > 0, (
+        "No transition generations were caught. "
+        "Try increasing --n-cycles or verify generation_interval=0.0 is set."
+    )
+    print(f"\n✓ Caught {len(transition_phases)} transition phase(s)")
 
 
 def start_vllm_server(
@@ -469,6 +588,7 @@ def start_trainer_process(
     extra_args: list = None,
     gpu_id: str = "1",
     world_size: int = 2,
+    command: str = "timed_broadcast_server_test",
 ):
     """Start trainer subprocess.
 
@@ -478,9 +598,11 @@ def start_trainer_process(
         model_name: Model name
         server_urls: List of server URLs (one per actor)
         stream_process_output_fn: Function to stream process output
-        extra_args: Additional CLI arguments (e.g., ["--redis-host", "localhost"])
+        extra_args: Additional CLI arguments (e.g., ["--n-cycles", "6"])
         gpu_id: CUDA_VISIBLE_DEVICES value for the trainer GPU
         world_size: Total distributed world size
+        command: Positional command for distributed_trainer_helper.py
+            (ignored for fast_llm_trainer_helper.py which uses --init-method style)
 
     Returns:
         Tuple of (trainer_proc, stdout_thread, stderr_thread)
@@ -507,7 +629,7 @@ def start_trainer_process(
     else:
         # distributed_trainer_helper.py uses positional command + flags
         cmd.extend([
-            "timed_broadcast_server_test",
+            command,
             "--init-method", distributed_init_method,
             "--model-name", model_name,
             "--world-size", str(world_size),

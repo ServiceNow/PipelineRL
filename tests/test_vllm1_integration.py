@@ -22,6 +22,7 @@ from .server_weight_update_utils import (
     run_generation_loop_multi,
     analyze_and_verify_pattern,
     analyze_and_verify_pattern_multi,
+    analyze_and_verify_transitions,
     start_vllm_server,
     start_trainer_process,
 )
@@ -1011,6 +1012,91 @@ class TestWeightUpdateDistributed:
             world_size=2,
             timeout=2400,
         )
+
+    @pytest.mark.timeout(2400)
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
+    async def test_server_weight_update_catch_transitions(
+        self,
+        model_name,
+        simple_prompt,
+        generation_config,
+        distributed_init_method,
+        distributed_trainer_helper,
+        temp_dir,
+    ):
+        """Diagnostic test: catch garbage generations produced during NCCL weight broadcasts.
+
+        The trainer runs a slow initial cycle (perturbed → original, 5 s each)
+        to firmly establish text_A and text_B, then fires N rapid back-to-back
+        broadcast cycles (perturbed → original) with no inter-broadcast delay.
+        The generation loop runs with generation_interval=0.0 (back-to-back
+        requests) to maximise the chance of hitting a mid-broadcast state.
+
+        Assertions:
+          1. The A→B→A→B pattern is still detected (broadcasts actually worked).
+          2. At least one transition/garbage phase was captured.
+
+        Topology: 1 vLLM server on GPU 0, trainer on GPU 1 (world_size=2).
+        """
+        print("\n" + "=" * 60)
+        print("Starting transition-capture test (TP=1, 1 actor, 2 GPUs)")
+        print("=" * 60)
+
+        server_url = "http://127.0.0.1:8000"
+
+        server_proc, _, _ = start_vllm_server(
+            model_name=model_name,
+            server_port=8000,
+            distributed_init_method=distributed_init_method,
+            stream_process_output_fn=stream_process_output,
+            gpu_ids="0",
+            actor_llm_idx=0,
+            world_size=2,
+            tensor_parallel_size=1,
+        )
+
+        await asyncio.sleep(1)
+
+        trainer_proc, _, _ = start_trainer_process(
+            trainer_helper_path=distributed_trainer_helper,
+            distributed_init_method=distributed_init_method,
+            model_name=model_name,
+            server_urls=[server_url],
+            stream_process_output_fn=stream_process_output,
+            extra_args=["--n-cycles", "6"],
+            gpu_id="1",
+            world_size=2,
+            command="rapid_broadcast_cycles",
+        )
+
+        try:
+            await wait_for_server_ready(server_url, server_proc, trainer_proc)
+
+            generations = await run_generation_loop(
+                server_url=server_url,
+                model_name=model_name,
+                simple_prompt=simple_prompt,
+                generation_config=generation_config,
+                trainer_proc=trainer_proc,
+                generation_interval=0.0,
+            )
+
+            print("[Main] Waiting for trainer to finish...")
+            for _ in range(30):
+                if trainer_proc.poll() is not None:
+                    break
+                await asyncio.sleep(1)
+
+            analyze_and_verify_transitions(generations, n_cycles=6)
+            print("\n✓ Transition-capture test PASSED")
+
+        finally:
+            print("[Main] Cleaning up processes...")
+            if server_proc:
+                kill_process_tree(server_proc.pid)
+            if trainer_proc:
+                kill_process_tree(trainer_proc.pid)
 
 
 class TestWeightUpdateTP2:
