@@ -186,6 +186,8 @@ def run_actor_llm(
         if cfg.vllm_config.use_v1 else 
         "pipelinerl.entrypoints.run_vllm0"
     )
+    # fast-llm weight broadcast uses its own rendezvous port; HTTP mode uses actor_group_port
+    broadcast_port = cfg.fast_llm_broadcast_port if cfg.use_fast_llm else cfg.world.actor_group_port
     cmd = [
         "python",
         "-m",
@@ -201,7 +203,7 @@ def run_actor_llm(
         "--actor-llm-idx",
         str(actor_llm_idx),
         "--weight-update-group-init-method",
-        f"tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
+        f"tcp://{world_map.master_addr}:{broadcast_port}",
         "--weight-update-group-world-size",
         str(world_map.weight_update_group_size),
     ]
@@ -220,6 +222,13 @@ def run_actor_llm(
 
     if cfg.debug.mode or not cfg.weight_broadcast:
         cmd.append("--disable-weight-updates")
+
+    if cfg.use_fast_llm:
+        cmd += [
+            "--weight-update-mode", "fast-llm",
+            "--redis-host", cfg.streams.host,
+            "--redis-port", str(cfg.streams.port),
+        ]
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
@@ -321,7 +330,17 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         "gpt",
         "--config",
         str(config_path),
-        f"run.experiment_dir={save_dir}"
+        f"run.experiment_dir={save_dir}",
+    ]
+
+    # Override fast-llm's callback config to match actual topology.
+    # The yaml has placeholder values; these are the real ones from the world map.
+    cmd += [
+        f"callbacks.streaming.host={cfg.streams.host}",
+        f"callbacks.streaming.port={cfg.streams.port}",
+        f"callbacks.streaming.broadcast.host={world_map.master_addr}",
+        f"callbacks.streaming.broadcast.port={cfg.fast_llm_broadcast_port}",
+        f"callbacks.streaming.broadcast.external_world_size={world_map.weight_update_group_size - 1}",
     ]
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")

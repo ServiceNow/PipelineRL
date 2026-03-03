@@ -70,13 +70,13 @@ def _create_perturbed_state_dict(
     return perturbed
 
 
-def _init_actor_process_group(init_method: str, rank: int = 0, world_size: int = 2):
+def _init_actor_process_group(init_method: str, rank: int = 0, world_size: int = 2, group_name: str = "actor"):
     """Initialize the actor NCCL process group and return it."""
     import pipelinerl.torch_utils
 
-    print(f"[Trainer] Initializing process group as rank {rank}")
+    print(f"[Trainer] Initializing process group as rank {rank} (group_name={group_name!r})")
     process_group = pipelinerl.torch_utils.init_extra_process_group(
-        group_name="actor",
+        group_name=group_name,
         backend="nccl",
         init_method=init_method,
         rank=rank,

@@ -85,6 +85,8 @@ world:
 
   actor_group_port: 9000
   environment_start_port: 7777
+
+fast_llm_broadcast_port: 26901  # NCCL rendezvous port for fast-llm weight broadcast (separate from actor_group_port)
 # this will be autocreated based on the config
 jobs: []
 
@@ -115,17 +117,11 @@ debug:
   place_inference_workers: true
   use_existing_llms: false
 
-# Fast-LLM integration: when true, disables vLLM weight updates (no NCCL group)
-# and uses Fast-LLM trainer events for state synchronization.
-# TODO(fast-llm): Once data flows from actors -> Redis -> Fast-LLM training loop,
-# enable NCCL weight broadcast by setting events.weights_broadcast.enabled=true in
-# the Fast-LLM config (qwen25_05B-instruct.yaml). This requires:
-# 1. Configuring NCCL rendezvous in Fast-LLM (rdvz_master_address, port, world_size, rank)
-# 2. Implementing the vLLM weight receiver to accept broadcasted weights
-# 3. Setting use_fast_llm=false once NCCL is working (or removing this flag entirely)
+# Fast-LLM integration: when true, fast-llm is used as the trainer.
+# Data flows actors -> Redis (fast_llm_streaming) -> fast-llm training loop.
+# Weight updates are broadcast via NCCL using fast-llm's streaming callback.
 use_fast_llm: false
 # Whether the trainer broadcasts updated weights to vLLM after each training step.
-# Must match whether the broadcast block is configured in qwen25_05B-instruct.yaml.
 weight_broadcast: true
 
 me:

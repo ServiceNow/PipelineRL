@@ -80,6 +80,10 @@ class TrainerState:
             last_lag_check = 0.0
             lag_check_interval = 5.0  # seconds
 
+            # Initialize to 0 so wait_for_processed_samples() doesn't block at startup.
+            # The lag check below will update this once the data stream/consumer group exists.
+            self.samples_processed = 0
+
             logger.info(f"Listening for Fast-LLM events on Redis stream '{stream_key}'")
 
             while True:
@@ -133,13 +137,7 @@ class TrainerState:
                         event_type = event.get("type")
                         step = event.get("step")
 
-                        if event_type == "initial_weights_step":
-                            logger.info(f"Received initial_weights_step event: step={step}")
-                            self.propagated_weight_version = step
-                            # Initial step also sets samples_processed to 0
-                            if self.samples_processed is None:
-                                self.samples_processed = 0
-                        elif event_type == "weights_ready":
+                        if event_type == "weights_ready":
                             logger.info(f"Received weights_ready event: step={step}")
                             self.propagated_weight_version = step
                         elif event_type == "training_finished":

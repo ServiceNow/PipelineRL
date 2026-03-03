@@ -7,8 +7,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from trainer_test_utils import (
     _load_state_dict,
     _create_perturbed_state_dict,
-    _init_actor_process_group,
     _wait_for_servers_ready,
+    _init_actor_process_group,
 )
 
 
@@ -41,8 +41,16 @@ def timed_broadcast_fast_llm(
     import redis
     import orjson
 
-    # Initialize process group
-    process_group = _init_actor_process_group(init_method, rank=0, world_size=world_size)
+    from fast_llm.engine.training.streaming import WEIGHTS_BROADCAST_PG_NAME
+
+    print(f"[Trainer] Initializing process group as rank 0 (world_size={world_size})")
+    process_group = _init_actor_process_group(
+        init_method=init_method,
+        rank=0,
+        world_size=world_size,
+        group_name=WEIGHTS_BROADCAST_PG_NAME,
+    )
+    print("[Trainer] Process group initialized")
 
     # Connect to Redis
     print(f"[Trainer] Connecting to Redis at {redis_host}:{redis_port}")
@@ -79,11 +87,8 @@ def timed_broadcast_fast_llm(
             if tensor.device.type != "cuda":
                 tensor = tensor.cuda(0)
 
-            shard_name = ""
-            layer_name = name
-
             # Broadcast metadata
-            meta = [(shard_name, layer_name, list(tensor.shape), str(tensor.dtype))]
+            meta = [("weights", name, list(tensor.shape), str(tensor.dtype))]
             dist.broadcast_object_list(meta, src=0, group=process_group)
 
             # Broadcast tensor
@@ -154,7 +159,16 @@ def rapid_broadcast_cycles_fast_llm(
     import redis as redis_lib
     import orjson
 
-    process_group = _init_actor_process_group(init_method, rank=0, world_size=world_size)
+    from fast_llm.engine.training.streaming import WEIGHTS_BROADCAST_PG_NAME
+
+    print(f"[Trainer] Initializing process group as rank 0 (world_size={world_size})")
+    process_group = _init_actor_process_group(
+        init_method=init_method,
+        rank=0,
+        world_size=world_size,
+        group_name=WEIGHTS_BROADCAST_PG_NAME,
+    )
+    print("[Trainer] Process group initialized")
 
     r = redis_lib.Redis(host=redis_host, port=redis_port)
     stream_key = "fast_llm_events"
@@ -179,7 +193,7 @@ def rapid_broadcast_cycles_fast_llm(
         for name, tensor in state_dict.items():
             if tensor.device.type != "cuda":
                 tensor = tensor.cuda(0)
-            meta = [("", name, list(tensor.shape), str(tensor.dtype))]
+            meta = [("weights", name, list(tensor.shape), str(tensor.dtype))]
             dist.broadcast_object_list(meta, src=0, group=process_group)
             dist.broadcast(tensor, src=0, group=process_group)
 

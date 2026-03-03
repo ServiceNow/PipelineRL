@@ -81,6 +81,7 @@ class WorkerExtension:
         actor_ngpus: int,
         weight_update_group_init_method: str,
         weight_update_group_world_size: int,
+        weight_update_mode: str = "http",
     ):
         self.pg_rank = 1 + actor_idx * actor_ngpus + self.rank
         # log all you know
@@ -91,10 +92,16 @@ class WorkerExtension:
         )
         logger.info(
             prefix
-            + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
+            + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}, mode: {weight_update_mode}"
         )
+        if weight_update_mode == 'http':
+            group_name = "actor"
+        else:
+            from fast_llm.engine.training.streaming import WEIGHTS_BROADCAST_PG_NAME
+
+            group_name = WEIGHTS_BROADCAST_PG_NAME
         self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-            group_name="actor",
+            group_name=group_name,
             backend="nccl",
             init_method=weight_update_group_init_method,
             rank=self.pg_rank,
@@ -189,9 +196,7 @@ class WorkerExtension:
             # Receive metadata
             meta = [None]
             logger.debug(f"[Worker rank={self.rank}] Waiting for metadata broadcast...")
-            torch.distributed.broadcast_object_list(
-                meta, group=self.process_group, src=0
-            )
+            torch.distributed.broadcast_object_list(meta, src=0, group=self.process_group)
             logger.debug(f"[Worker rank={self.rank}] Received metadata: {meta}")
 
             # Check for end signal
@@ -202,25 +207,29 @@ class WorkerExtension:
                 break
 
             # Parse metadata: (shard_name, layer_name, shape, dtype)
+            # shard_name is a category label ("weights", "grads", etc.), not part of the HF param name
             shard_name, layer_name, shape, dtype = meta[0]
-            param_name = f"{shard_name}.{layer_name}" if shard_name else layer_name
-            param_count += 1
+            param_name = layer_name
 
+            # Convert dtype to torch dtype
+            target_dtype = string_to_dtype(str(dtype))
+
+            # Allocate buffer and receive tensor (must happen for every broadcast to stay in sync)
+            buffer = torch.empty(tuple(shape), dtype=target_dtype, device=self.device)
+            torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+
+            # Only load weight shards (skip grads, optimizer state, etc.)
+            if shard_name != "weights":
+                continue
+
+            param_count += 1
             logger.debug(
                 f"[{param_count}] Receiving: {param_name}, shape={shape}, dtype={dtype}"
             )
 
-            # Convert dtype to torch dtype
-            target_dtype = string_to_dtype(str(dtype))
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {param_name}: {dtype}")
 
-            # Allocate buffer
-            buffer = torch.empty(tuple(shape), dtype=target_dtype, device=self.device)
-
-            # Receive tensor
-            logger.debug(f"[{param_count}] Broadcasting tensor for {param_name}...")
-            torch.distributed.broadcast(buffer, src=0, group=self.process_group)
             logger.debug(f"[{param_count}] Received tensor for {param_name}")
 
             # Load weights
@@ -243,7 +252,7 @@ class WorkerExtension:
                         f"Unexpected number of parameters loaded for {param_name}"
                     )
             except Exception as e:
-                logger.error(f"ERROR loading {param_name}: {e}")
+                logger.error(f"ERROR loading {param_name}: {e!r}", exc_info=True)
                 raise
 
             if param_count % 10 == 0:
@@ -275,6 +284,7 @@ class EngineManager:
                 torch.cuda.device_count(),
                 self.args.weight_update_group_init_method,
                 self.args.weight_update_group_world_size,
+                self.args.weight_update_mode,
             ),
         )
 
@@ -484,7 +494,7 @@ class EngineManager:
                 await manager.init_actor_update_group()
 
                 # Initialize Fast-LLM mode if enabled
-                if hasattr(args, 'weight_update_mode') and args.weight_update_mode == "fast-llm":
+                if args.weight_update_mode == "fast-llm":
                     await manager.init_fast_llm_receiver()
                     await manager.start_fast_llm_monitoring()
                     logger.info("Fast-LLM weight update mode enabled")
@@ -493,7 +503,7 @@ class EngineManager:
         finally:
             if not args.disable_weight_updates:
                 # Stop Fast-LLM monitoring if enabled
-                if hasattr(args, 'weight_update_mode') and args.weight_update_mode == "fast-llm":
+                if args.weight_update_mode == "fast-llm":
                     await manager.stop_fast_llm_monitoring()
 
                 if not await manager.is_actor_update_group_destroyed():
@@ -553,7 +563,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         app = build_app(args)
 
         # Register HTTP endpoint only if using HTTP mode
-        if not hasattr(args, 'weight_update_mode') or args.weight_update_mode == "http":
+        if args.weight_update_mode == "http":
             @app.post("/receive_weight_update")
             async def _receive_weight_update(request: WeightUpdateRequest):
                 await manager.receive_weight_update(request)

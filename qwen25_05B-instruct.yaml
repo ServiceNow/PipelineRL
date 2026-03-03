@@ -57,19 +57,17 @@ run:
   experiment_dir: "/home/toolkit/test/denis/Qwen2.5-0.5B-Instruct" # Provided by pipelinerl
 
 
-# callbacks:  # Events are specified via callbacks; the only supported one so far is Redis-based
-#   streaming:  # User-defined callback name (define only one)
-#     type: streaming  # Callback handler type; supports training start, step end, and training end events via Redis,
-#                      # as well as weight broadcasts
-#     host: localhost  # Redis server host
-#     port: 11000      # Redis server port
-    # broadcast:                   # Uncomment to enable NCCL weight broadcast to vLLM
-    #   backend: nccl              # Backend used for weight broadcasts
-    #   external_world_size: 1     # Number of external clients (excluding Fast-LLM itself);
-    #                              # note that Fast-LLM currently assigns itself rank 0
-    #   host: localhost            # Broadcast rendezvous host
-    #   port: 26901                # Broadcast rendezvous port
-    # export:                      # Format of the broadcasted weights
-    #   format: llama              # Export format
-    #   model_weights: true        # Export model weights
-    #   optimizer_state: false     # Do not export optimizer state
+callbacks:
+  streaming:
+    type: streaming
+    host: localhost  # overridden by launch.py via CLI: callbacks.streaming.host=...
+    port: 11000      # overridden by launch.py via CLI: callbacks.streaming.port=...
+    broadcast:
+      backend: nccl
+      external_world_size: 1  # overridden by launch.py
+      host: localhost          # overridden by launch.py
+      port: 26901              # overridden by launch.py
+    export:
+      format: qwen2
+      model_weights: true
+      optimizer_state: false
