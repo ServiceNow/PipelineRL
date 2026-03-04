@@ -66,7 +66,7 @@ callbacks:
       backend: nccl
       external_world_size: 1  # overridden by launch.py
       host: localhost          # overridden by launch.py
-      port: 26901              # overridden by launch.py
+      port: 9000               # overridden by launch.py (world.actor_group_port)
     export:
       format: qwen2
       model_weights: true

@@ -86,7 +86,6 @@ world:
   actor_group_port: 9000
   environment_start_port: 7777
 
-fast_llm_broadcast_port: 26901  # NCCL rendezvous port for fast-llm weight broadcast (separate from actor_group_port)
 # this will be autocreated based on the config
 jobs: []
 

@@ -186,8 +186,7 @@ def run_actor_llm(
         if cfg.vllm_config.use_v1 else 
         "pipelinerl.entrypoints.run_vllm0"
     )
-    # fast-llm weight broadcast uses its own rendezvous port; HTTP mode uses actor_group_port
-    broadcast_port = cfg.fast_llm_broadcast_port if cfg.use_fast_llm else cfg.world.actor_group_port
+    broadcast_port = cfg.world.actor_group_port
     cmd = [
         "python",
         "-m",
@@ -339,7 +338,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         f"callbacks.streaming.host={cfg.streams.host}",
         f"callbacks.streaming.port={cfg.streams.port}",
         f"callbacks.streaming.broadcast.host={world_map.master_addr}",
-        f"callbacks.streaming.broadcast.port={cfg.fast_llm_broadcast_port}",
+        f"callbacks.streaming.broadcast.port={cfg.world.actor_group_port}",
         f"callbacks.streaming.broadcast.external_world_size={world_map.weight_update_group_size - 1}",
     ]
 
