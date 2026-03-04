@@ -202,14 +202,17 @@ class RedisSharedStreamWriter(StreamWriter):
         *,
         writer_id: str | None = None,
         maxlen: int = 1_000_000,
+        stream_name_override: str | None = None,
+        pipelinerl_metadata: bool = True,
     ):
         self.stream = stream
         assert isinstance(_backend, RedisConfig)
         self._redis = connect_to_redis(_backend)
-        self._stream_name = str(self.stream)
+        self._stream_name = stream_name_override if stream_name_override is not None else str(self.stream)
         self._counter_key = f"stream:{self._stream_name}:next_index"
         self._writer_id = str(writer_id) if writer_id is not None else None
         self._maxlen = maxlen
+        self._pipelinerl_metadata = pipelinerl_metadata
 
         if mode not in {"w", "a"}:
             raise ValueError(f"Invalid mode: {mode}. Only 'w' and 'a' are supported.")
@@ -241,14 +244,17 @@ class RedisSharedStreamWriter(StreamWriter):
         # Note: partition is ignored for shared streams - all data goes to a single stream
         # This is intentional for Fast-LLM integration where Fast-LLM handles its own sharding
         serialized = _serialize_with_orjson(data)
-        entry_index = self._redis.incr(self._counter_key)
-        record: dict[str, Any] = {
-            "index": str(entry_index),
-            "data": serialized,
-            "ts": f"{time.time():.6f}",
-        }
-        if self._writer_id is not None:
-            record["writer"] = self._writer_id
+        if self._pipelinerl_metadata:
+            entry_index = self._redis.incr(self._counter_key)
+            record: dict[str, Any] = {
+                "index": str(entry_index),
+                "data": serialized,
+                "ts": f"{time.time():.6f}",
+            }
+            if self._writer_id is not None:
+                record["writer"] = self._writer_id
+        else:
+            record = {"data": serialized}
         self._redis.xadd(self._stream_name, record, maxlen=self._maxlen, approximate=True)
 
 
@@ -554,11 +560,16 @@ def write_to_streams(
     *,
     shared: bool = False,
     writer_id: str | None = None,
+    stream_name_override: str | None = None,
+    pipelinerl_metadata: bool = True,
 ) -> StreamWriter:
     """Append to the end of the stream.
 
     Set ``shared`` to True when multiple producers must append to the same Redis
     stream and ServiceNow/Fast-LLM will perform downstream sharding.
+
+    ``stream_name_override`` bypasses the stream spec naming and writes directly
+    to the given Redis key. Only supported for shared Redis streams.
     """
     raise_if_backend_not_set()
     if not isinstance(streams, (SingleStreamSpec, StreamRangeSpec)):
@@ -566,7 +577,7 @@ def write_to_streams(
     if isinstance(_backend, RedisConfig):
         if isinstance(streams, SingleStreamSpec):
             if shared:
-                return RedisSharedStreamWriter(streams, mode, writer_id=writer_id)
+                return RedisSharedStreamWriter(streams, mode, writer_id=writer_id, stream_name_override=stream_name_override, pipelinerl_metadata=pipelinerl_metadata)
             return RedisStreamWriter(streams, mode)
         elif isinstance(streams, StreamRangeSpec):
             if shared:

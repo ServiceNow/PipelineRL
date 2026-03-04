@@ -333,3 +333,37 @@ PipelineRL is organized as a modular, Hydra-driven pipeline with 6 core componen
 - `training_data` stream (StreamRangeSpec(topic="training_data")): File- or Redis-backed stream used to transfer processed training micro-batches from the Preprocessor to the Trainer. Configured via `cfg.preprocess.output` and `cfg.finetune.input` (defaulting to "training_data") in `conf/base.yaml`. Written in `pipelinerl/run_preprocess.py` and consumed in `pipelinerl/run_finetune.py`.
 - `actor_test` and `stats_test` streams: analogous streams used for evaluation loops (test samples and test metrics).
 - `stats` stream (SingleStreamSpec(topic="stats")): produced by `ActorLoop.publish_stats` with sliding-window metrics; consumed by external monitoring (e.g. WANDB, logging viewers).
+
+
+
+
+# Install FastLLM+PipilineRL
+- use ` registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis` image which also includes redis server. In `~/.research-interactive-env`:
+```shell
+USE_ACCOUNT_REPO := 1
+BASE_IMAGE :=nvcr.io/nvidia/pytorch:25.12-py3
+IMAGE_REVISION := 25.12-py3-vllm014rc1redis
+EAI_PROFILE := yul201
+```
+ 
+- in running interactive instance run like this to install both Fast-LLM and PipelineRL into the same `venv` locates at PipelineRL repo folder
+```shell
+git clone git@github.com:ServiceNow/Fast-LLM.git
+git clone git@github.com:ServiceNow/PipelineRL.git
+
+cd PipelineRL
+/usr/bin/python3.12 -m venv --system-site-packages .venv
+source .venv/bin/activate
+export PIP_CONSTRAINT=""
+
+cd ../Fast-LLM
+git submodule update --init --recursive
+git checkout jlp_pipeline_rl
+pip install --no-cache-dir --no-build-isolation -e ".[CORE,OPTIONAL,HUGGINGFACE,SSM,VISION,GENERATION,STREAMING,DEV]" triton==3.5.1
+
+cd ../PipelineRL
+git checkout fast-llm
+pip install --no-cache-dir -e ".[lora]"
+```
+
+

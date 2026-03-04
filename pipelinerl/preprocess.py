@@ -350,53 +350,51 @@ def write_micro_batch_slices(
 def convert_to_fast_llm_format(entry: dict) -> dict:
     """Convert a preprocessed sample entry to Fast-LLM streaming format.
 
-    Fast-LLM expects:
-    - tokens: list of token IDs
-    - tokens_dtype: string dtype (e.g., "int32")
-    - loss_masking_spans (optional): list of (start, end) tuples where loss IS computed
+    Fast-LLM RedisDocument fields:
+    - tokens: list of token IDs (full sequence: prompt + completion)
+    - loss_masking_spans: list of (start, end) spans where loss IS computed (completion only)
+    - advantage: scalar float (per-rollout GRPO advantage)
+    - old_log_probabilities: list of floats, full sequence length (zeros for prompt tokens)
     """
     input_ids = entry["input_ids"]
+    tokens = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
-    # Convert to list if tensor
-    if hasattr(input_ids, "tolist"):
-        tokens = input_ids.tolist()
-    else:
-        tokens = list(input_ids)
+    result: dict = {"tokens": tokens}
 
-    result = {
-        "tokens": tokens,
-        "tokens_dtype": "int32",
-    }
-
-    # Convert labels to loss_masking_spans if present
-    # In PipelineRL, labels=-100 means "don't compute loss" (padding/prompt)
-    # In Fast-LLM, loss_masking_spans are ranges where loss IS computed
+    # loss_masking_spans: contiguous spans where labels != -100 (completion tokens)
     if "labels" in entry:
         labels = entry["labels"]
-        if hasattr(labels, "tolist"):
-            labels = labels.tolist()
-        else:
-            labels = list(labels)
+        labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
 
-        # Find contiguous spans where labels != -100 (loss is computed)
         spans = []
         in_span = False
         span_start = 0
         for i, label in enumerate(labels):
             if label != -100 and not in_span:
-                # Start new span
                 in_span = True
                 span_start = i
             elif label == -100 and in_span:
-                # End current span
                 spans.append((span_start, i))
                 in_span = False
-        # Close final span if still open
         if in_span:
             spans.append((span_start, len(labels)))
 
         if spans:
             result["loss_masking_spans"] = spans
+
+    # advantage: scalar per rollout (populate_rl_data stores a list of per-step scalars;
+    # for single-step tasks like math there is exactly one element)
+    if "advantages" in entry:
+        advantages = entry["advantages"]
+        if advantages:
+            result["advantage"] = float(advantages[0])
+
+    # old_log_probabilities: full sequence length, zeros for prompt tokens
+    # (prepare_rl_fields pads with zeros on the left to match len(input_ids))
+    if "old_logprobs" in entry:
+        old_logprobs = entry["old_logprobs"]
+        old_logprobs = old_logprobs.tolist() if hasattr(old_logprobs, "tolist") else list(old_logprobs)
+        result["old_log_probabilities"] = [float(x) for x in old_logprobs]
 
     return result
 
@@ -436,13 +434,16 @@ def run_preprocessing_loop(
     # For Fast-LLM: use SingleStreamSpec with shared=True (uses orjson serialization)
     # For standard PipelineRL: use StreamRangeSpec with partitions per GPU
     if cfg.use_fast_llm:
+        from fast_llm.data.dataset.config import REDIS_DATA_STREAM as _FAST_LLM_DATA_STREAM
+        fast_llm_stream_name = _FAST_LLM_DATA_STREAM
         output_stream = SingleStreamSpec(
             exp_path=exp_root_dir,
             topic=cfg.preprocess.output,
-            partition=0,  # Single stream for Fast-LLM
+            partition=0,
         )
         use_shared_stream = True
     else:
+        fast_llm_stream_name = None
         output_stream = StreamRangeSpec(
             exp_path=exp_root_dir,
             topic=cfg.preprocess.output,
@@ -468,7 +469,7 @@ def run_preprocessing_loop(
     dataset_loader_thread.start()
     
     # Initialize TrainerState
-    trainer_state = TrainerState(exp_root_dir, use_fast_llm=cfg.use_fast_llm)
+    trainer_state = TrainerState(exp_root_dir, use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode == "preprocessor":
         logger.info("Debug mode: preprocessor")
         trainer_state.debug_mode_init()
@@ -533,7 +534,7 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
-    with write_to_streams(output_stream, shared=use_shared_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name, pipelinerl_metadata=not cfg.use_fast_llm) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
@@ -566,6 +567,7 @@ def run_preprocessing_loop(
                 fetching_took = 0
                 writing_took = 0
                 num_filtered_out = 0
+                last_backpressure_log = 0.0
                 while True:
                     if (
                         trainer_state.samples_processed is not None
@@ -638,6 +640,13 @@ def run_preprocessing_loop(
                     assert isinstance(trainer_state.samples_processed, int)
                     if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
                         # wait for the finetune loop to finish processing data
+                        now = time.time()
+                        if now - last_backpressure_log >= 10.0:
+                            last_backpressure_log = now
+                            logger.info(
+                                f"Back-pressure: published={published_samples} consumed={trainer_state.samples_processed}"
+                                f" unconsumed={published_samples - trainer_state.samples_processed} > max={max_unconsumed_samples}, waiting"
+                            )
                         continue
 
                     batch_done = False
@@ -746,7 +755,8 @@ def run_preprocessing_loop(
                         logger.info(
                             f"Processed {processed_samples} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
                             f" (fetching took {fetching_took:.3f} and writing took {writing_took:.3f})"
-                            f" and wrote to {output_stream}, total {published_samples} samples so far,"
+                            f" and wrote to {output_stream}, total {published_samples} samples so far"
+                            f" (trainer consumed {trainer_state.samples_processed}, unconsumed {published_samples - trainer_state.samples_processed}),"
                             f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
                         )
                         start_processing = time.time()
