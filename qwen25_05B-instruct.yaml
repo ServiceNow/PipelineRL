@@ -1,9 +1,8 @@
 training:
   num_workers: 0
   train_iters: 100_000 # Total number of optimizer steps (provided by pipelinerl)
-  # wandb: # Enable this block if we want to log to Weights & Biases
-  #   project_name: ${job.project_name}
-  #   group_name: ${job.project_version}
+  wandb: # overridden by launch.py (project_name, group_name, entity_name, run.experiment_name)
+    entity_name: null  # null disables wandb; overridden at launch time when wandb_entity_name is set
   logs:
     interval: 1 # Logging frequency in optimizer steps (one training iteration)
   checkpoint: # How often to save checkpoints in native fast-llm format
@@ -14,7 +13,7 @@ training:
 
 batch:
   micro_batch_size: 1 # For RL, all rollouts are packed into a single sample
-  sequence_length: 8192 # Max rollout length accepted; also the training sample length
+  sequence_length: 18000 # Max rollout length accepted; also the training sample length
   batch_size: 16 # Number of samples per optimizer step
   truncate_documents: False # We do not want truncation for RL rollouts
   #use_preference_spans: true

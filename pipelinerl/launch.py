@@ -334,13 +334,21 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
 
     # Override fast-llm's callback config to match actual topology.
     # The yaml has placeholder values; these are the real ones from the world map.
+    root = cfg.wandb.wandb_workspace_root
+    save_dir_str = str(save_dir)
+    experiment_name = save_dir_str[len(root) + 1:] if root and save_dir_str.startswith(root + "/") else save_dir.name
     cmd += [
         f"callbacks.streaming.host={cfg.streams.host}",
         f"callbacks.streaming.port={cfg.streams.port}",
         f"callbacks.streaming.broadcast.host={world_map.master_addr}",
         f"callbacks.streaming.broadcast.port={cfg.world.actor_group_port}",
         f"callbacks.streaming.broadcast.external_world_size={world_map.weight_update_group_size - 1}",
+        f"training.wandb.project_name={cfg.wandb.wandb_project_name}",
+        f"training.wandb.group_name={cfg.wandb.wandb_group}",
+        f"run.experiment_name={experiment_name}",
     ]
+    if cfg.wandb.wandb_entity_name:
+        cmd.append(f"training.wandb.entity_name={cfg.wandb.wandb_entity_name}")
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
     save_command(exp_dir / "finetune", cmd)
