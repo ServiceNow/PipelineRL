@@ -4,7 +4,8 @@
     <img src="assets/logo.png" alt="PipelineRL" width="500">
 </p>
 
-[![Github](https://img.shields.io/badge/HF%20Blog%20Post-0000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
+[![Blog](https://img.shields.io/badge/HF%20Blog%20Post-0000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
+[![Paper](https://img.shields.io/badge/arXiv-2509.19128-b31b1b)](https://arxiv.org/abs/2509.19128)
 
 ## Table of Contents
 
