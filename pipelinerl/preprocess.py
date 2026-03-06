@@ -361,7 +361,8 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
 
     result: dict = {"tokens": tokens}
 
-    # loss_masking_spans: contiguous spans where labels != -100 (completion tokens)
+    # loss_masking_spans: contiguous spans where label == -100 (prompt tokens to mask out).
+    # fast-llm sets labels to -100 at these positions, so only completion tokens contribute to loss.
     if "labels" in entry:
         labels = entry["labels"]
         labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
@@ -370,10 +371,10 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
         in_span = False
         span_start = 0
         for i, label in enumerate(labels):
-            if label != -100 and not in_span:
+            if label == -100 and not in_span:
                 in_span = True
                 span_start = i
-            elif label == -100 and in_span:
+            elif label != -100 and in_span:
                 spans.append((span_start, i))
                 in_span = False
         if in_span:
