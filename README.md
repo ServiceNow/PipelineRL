@@ -1,8 +1,8 @@
+# Pipeline RL: fast LLM agent training
+
 <p align="center">
     <img src="assets/logo.png" alt="PipelineRL" width="500">
 </p>
-
-# Pipeline RL: fast LLM agent training
 
 [![Github](https://img.shields.io/badge/HF%20Blog%20Post-0000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
 
