@@ -305,57 +305,63 @@ def run_environment(cfg: DictConfig, job: Job):
 
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
     save_dir = exp_dir / "finetune"
+    os.makedirs(save_dir, exist_ok=True)
 
-    # Get absolute path to config file
-    config_path = Path(__file__).parent.parent / "qwen25_05B-instruct.yaml"
+    if not os.path.isdir(cfg.model_path):
+        raise ValueError(
+            f"fast-llm requires a local model path but got: {cfg.model_path!r}. "
+            "Download the model first and set model_path to its local directory."
+        )
 
-    # TODO: make config or make everywhere without conda
-    use_conda = False
-    if use_conda:
-        cmd = [
-            "conda",
-            "run",
-            "-n",
-            "fast-llm",
-            "--cwd",
-            str(config_path.parent),  # Set working directory for fast-llm
-        ]
-    else:
-        cmd = []
+    # Build fast-llm config, stripping callbacks when weight broadcast is disabled or in debug mode.
+    fast_llm_cfg = OmegaConf.to_container(cfg.fast_llm, resolve=True, throw_on_missing=False)
+    if not cfg.weight_broadcast or bool(cfg.debug.mode):
+        fast_llm_cfg.pop("callbacks", None)
 
-    cmd += [
-        "fast-llm",
-        "train",
-        "gpt",
-        "--config",
-        str(config_path),
-        f"run.experiment_dir={save_dir}",
-    ]
-
-    # Override fast-llm's callback config to match actual topology.
-    # The yaml has placeholder values; these are the real ones from the world map.
+    # Derive experiment name for wandb from save_dir relative to workspace root.
     root = cfg.wandb.wandb_workspace_root
     save_dir_str = str(save_dir)
     experiment_name = save_dir_str[len(root) + 1:] if root and save_dir_str.startswith(root + "/") else save_dir.name
-    cmd += [
-        f"callbacks.streaming.host={cfg.streams.host}",
-        f"callbacks.streaming.port={cfg.streams.port}",
-        f"callbacks.streaming.broadcast.host={world_map.master_addr}",
-        f"callbacks.streaming.broadcast.port={cfg.world.actor_group_port}",
-        f"callbacks.streaming.broadcast.external_world_size={world_map.weight_update_group_size - 1}",
-        f"training.wandb.project_name={cfg.wandb.wandb_project_name}",
-        f"training.wandb.group_name={cfg.wandb.wandb_group}",
-        f"run.experiment_name={experiment_name}",
+
+    # Fill in all dynamic values so the saved config is fully functional.
+    fast_llm_cfg["pretrained"]["path"] = cfg.model_path
+    fast_llm_cfg["run"]["experiment_dir"] = str(save_dir)
+    fast_llm_cfg["run"]["experiment_name"] = experiment_name
+    fast_llm_cfg["data"]["datasets"]["training"]["host"] = cfg.streams.host
+    fast_llm_cfg["data"]["datasets"]["training"]["port"] = cfg.streams.port
+    fast_llm_cfg["training"]["wandb"]["entity_name"] = cfg.wandb.wandb_entity_name
+    fast_llm_cfg["training"]["wandb"]["project_name"] = cfg.wandb.wandb_project_name
+    fast_llm_cfg["training"]["wandb"]["group_name"] = cfg.wandb.wandb_group
+    if cfg.weight_broadcast and not bool(cfg.debug.mode):
+        fast_llm_cfg["callbacks"]["streaming"]["host"] = cfg.streams.host
+        fast_llm_cfg["callbacks"]["streaming"]["port"] = cfg.streams.port
+        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["host"] = world_map.master_addr
+        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["port"] = cfg.world.actor_group_port
+        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["external_world_size"] = world_map.weight_update_group_size - 1
+
+    # Save fully populated config — fast-llm reads it directly with no further overrides.
+    config_path = save_dir / "fast_llm_config.yaml"
+    OmegaConf.save(OmegaConf.create(fast_llm_cfg), config_path)
+
+    model_type = cfg.fast_llm_finetune.model_type
+    torchrun_port = cfg.fast_llm_finetune.torchrun_port
+    cmd = [
+        "torchrun",
+        f"--nproc_per_node={len(gpus)}",
+        f"--master_port={torchrun_port}",
+        "--no_python",
+        "fast-llm",
+        "train",
+        model_type,
+        "--config",
+        str(config_path),
     ]
-    if cfg.wandb.wandb_entity_name:
-        cmd.append(f"training.wandb.entity_name={cfg.wandb.wandb_entity_name}")
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
-    save_command(exp_dir / "finetune", cmd)
+    save_command(save_dir, cmd)
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "42"
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
-    os.makedirs(save_dir, exist_ok=True)
     log_file_path = save_dir / "stdout.log"
     err_file_path = save_dir / "stderr.log"
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
@@ -740,6 +746,28 @@ def main(cfg: DictConfig):
             if (msg := next(stream.read())) != init_msg:
                 raise ValueError(f"Expected {init_msg}, got {msg}")
         logger.info(f"Orchestrator {world_map.my_rank} heard that the exp folder is ready.")
+
+    # Pre-create the broadcast rendezvous TCPStore on actor_group_port so that
+    # fast-llm (launched via torchrun) can connect as a client.  Torchrun sets
+    # TORCHELASTIC_USE_AGENT_STORE=True which makes PyTorch treat ALL ranks as
+    # clients in _create_c10d_store; without a pre-existing server the port is
+    # never opened and both fast-llm and vLLM hang forever.  Only the master
+    # node (my_rank == 0) hosts the server; vLLM workers connect via master_addr.
+    broadcast_store = None
+    if cfg.use_fast_llm and cfg.weight_broadcast and world_map.my_rank == 0:
+        from torch.distributed import TCPStore
+        broadcast_store = TCPStore(
+            host_name=world_map.master_addr,
+            port=cfg.world.actor_group_port,
+            world_size=world_map.weight_update_group_size,
+            is_master=True,
+            wait_for_workers=False,
+        )
+        logger.info(
+            f"Broadcast TCPStore server started on "
+            f"{world_map.master_addr}:{cfg.world.actor_group_port} "
+            f"(world_size={world_map.weight_update_group_size})"
+        )
 
     if cfg.debug.mode == "finetune":
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))

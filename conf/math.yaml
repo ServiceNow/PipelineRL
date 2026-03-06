@@ -2,9 +2,12 @@ defaults:
     - base
     - _self_
 
-# Enable Fast-LLM integration (disables vLLM weight updates until NCCL broadcast is implemented)
 use_fast_llm: true
 weight_broadcast: true
+
+fast_llm:
+  batch:
+    sequence_length: 18000
 
 actor:
   rollout_policy: pipelinerl.domains.math.generate_math_rollout
