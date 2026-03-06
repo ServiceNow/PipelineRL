@@ -1,11 +1,13 @@
-# Pipeline RL: fast LLM agent training
-
 <p align="center">
     <img src="assets/logo.png" alt="PipelineRL" width="500">
 </p>
 
-[![Blog](https://img.shields.io/badge/HF%20Blog%20Post-0000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
-[![Paper](https://img.shields.io/badge/arXiv-2509.19128-b31b1b)](https://arxiv.org/abs/2509.19128)
+<h1 align="center">PipelineRL: Fast LLM Agent Training</h1>
+
+<p align="center">
+    <a href="https://huggingface.co/blog/ServiceNow/pipelinerl/"><img src="https://img.shields.io/badge/HF%20Blog%20Post-0000" alt="Blog"></a>
+    <a href="https://arxiv.org/abs/2509.19128"><img src="https://img.shields.io/badge/arXiv-2509.19128-b31b1b" alt="Paper"></a>
+</p>
 
 ## Table of Contents
 
