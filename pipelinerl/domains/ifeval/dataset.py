@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import random
@@ -92,7 +93,7 @@ def _parse_ground_truth(gt_str: str | None) -> tuple[list[str], list[dict | None
         return [], []
 
     try:
-        gt = json.loads(gt_str.replace("'", '"'))
+        gt = ast.literal_eval(gt_str)
         if isinstance(gt, list) and len(gt) > 0:
             item = gt[0]
             instruction_ids = item.get("instruction_id", [])
@@ -101,7 +102,7 @@ def _parse_ground_truth(gt_str: str | None) -> tuple[list[str], list[dict | None
             if len(kwargs_list) < len(instruction_ids):
                 kwargs_list.extend([None] * (len(instruction_ids) - len(kwargs_list)))
             return instruction_ids, kwargs_list
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
+    except (ValueError, TypeError, KeyError, SyntaxError) as e:
         logger.debug(f"Failed to parse ground_truth: {e}")
 
     return [], []
