@@ -217,7 +217,19 @@ conda run --no-capture-output -n pipeline-rl pip install https://github.com/Dao-
 
 By default Pipeline-RL will use the file system as the medium for streaming the generated data to the trainer processes. This works on one node, but the files can get quite large. To use Redis instead you will need to install the Redis server in the same conda environment:
 ```bash
-conda install redis-server==7.4.0 -c conda-forge 
+conda install redis-server==7.4.0 -c conda-forge
+```
+
+### Optional: SandboxFusion for coding verification
+
+PipelineRL supports using [SandboxFusion](https://bytedance.github.io/SandboxFusion/) to execute and verify coding-task outputs in a remote sandbox.
+
+To run SandboxFusion locally, follow the deployment guide and startup logs here:
+https://bytedance.github.io/SandboxFusion/docs/docs/get-started#local-deployment
+
+Then point PipelineRL to your sandbox endpoint by setting `sandbox_endpoint` in your config (for example in `conf/coding.yaml`) or by exporting `SANDBOX_ENDPOINT`:
+```bash
+export SANDBOX_ENDPOINT=http://127.0.0.1:8080
 ```
 
 ### Optional: SandboxFusion for coding verification
