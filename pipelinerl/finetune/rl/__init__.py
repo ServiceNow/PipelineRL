@@ -313,7 +313,7 @@ def rl_step(
             clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = (clamped_group_ratio != group_ratio_new_old) & valid_mask_3d
             surr2 = clamped_group_ratio * group_advantages_t
-            # GSPO is response-level: valid responses should contribute equally regardless of length.
+            # valid responses should contribute equally regardless of length.
             sequence_weights = valid_mask_3d.to(dtype=surr1.dtype) / config.batch_size
             if batch.sentinel or surr1.numel() == 0:
                 policy_loss_total = new_logprobs[..., :1].sum() * 0.0
