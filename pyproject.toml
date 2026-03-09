@@ -64,9 +64,8 @@ fn_calling = [
     "bfcl-eval>=2025.6.8",
 ]
 logic = [
-    # i3-logic is installed via: prime env install primeintellect/i3-logic
-    # It requires the verifiers package which is on PyPI
-    "verifiers>=0.1.7",
+    # i3-logic verification code is vendored in pipelinerl/domains/logic/i3_logic/
+    # (source: https://github.com/PrimeIntellect/i3-logic)
 ]
 ifeval = [
     # IFEvalG bundled module dependencies
