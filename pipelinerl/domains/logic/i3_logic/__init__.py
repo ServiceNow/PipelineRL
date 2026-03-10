@@ -1,4 +1,4 @@
-"""Vendored i3_logic package from PrimeIntellect.
+"""Vendored i3_logic package from Prime Intellect.
 
 Source: https://github.com/PrimeIntellect/i3-logic
 License: Apache 2.0
