@@ -10,7 +10,7 @@ from collections import defaultdict
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from queue import Empty
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import aiohttp
 import hydra
@@ -41,6 +41,7 @@ from .utils import (
     wait_for_environments,
     wait_for_inference_servers,
 )
+from .curriculum import BanditConfig, CurriculumState
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,17 @@ async def schedule_rollouts(
                 sample.metadata["model_version"] = model_version
                 sample.metadata["rollout_index"] = rollout_index
                 sample.metadata["step_index"] = step_index
+                # Propagate curriculum metadata if present
+                if "_selected_category" in problem:
+                    sample.metadata["_selected_category"] = problem["_selected_category"]
+                if "id" in problem:
+                    sample.metadata["id"] = problem["id"]
+                # Propagate all configured category fields for stats tracking
+                if cfg.get("curriculum") and cfg.curriculum.get("enabled"):
+                    curriculum_config = BanditConfig(**cfg.curriculum)
+                    for field in curriculum_config.get_all_category_fields():
+                        if field in problem:
+                            sample.metadata[f"_curriculum_{field}"] = problem[field]
                 sample.group_id = full_group_id
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
@@ -308,6 +320,25 @@ class ActorLoop:
         self.is_scheduling_paused = False
         self.debug_mode = bool(cfg.debug.mode)
 
+        # Initialize curriculum learning components if enabled (only for training)
+        self.curriculum_state: Optional[CurriculumState] = None
+        self._curriculum_config: Optional[BanditConfig] = None  # Keep for validation
+        if is_training and cfg.get("curriculum") and cfg.curriculum.get("enabled", False):
+            exp_path = Path(cfg.output_dir)
+            self._curriculum_config = BanditConfig(**cfg.curriculum)
+
+            # Validate: "estimated" difficulty_source requires GRPO-like policy (attempts > 1)
+            # In estimated mode, per-group success rate is used as difficulty proxy
+            if self._curriculum_config.difficulty_source == "estimated" and cfg.attempts <= 1:
+                raise ValueError(
+                    f"Curriculum difficulty_source='estimated' requires attempts > 1 (GRPO-like policy) "
+                    f"to estimate difficulty from per-group success rate. Got attempts={cfg.attempts}"
+                )
+
+            # Feedback stream - listener will be started AFTER forking scheduler processes (fork safety)
+            self._curriculum_feedback_stream = SingleStreamSpec(exp_path=exp_path, topic="curriculum_feedback")
+            logger.info(f"Initialized curriculum learning with config: {self._curriculum_config}")
+
         # Determine the number of processes to use
         num_processes = min(self.cfg.actor.rollout_workers, len(self.llms))
         attempts = self.cfg.attempts if is_training else 1
@@ -345,12 +376,29 @@ class ActorLoop:
             process.start()
             self.rollout_processes.append(process)
 
+        # Start curriculum feedback listener AFTER forking scheduler processes (fork safety)
+        # Starting it before fork can cause multiprocessing.Queue corruption
+        if self._curriculum_config is not None and hasattr(self, '_curriculum_feedback_stream'):
+            self.curriculum_state = CurriculumState(
+                self._curriculum_config,
+                self._curriculum_feedback_stream,
+            )
+            self.curriculum_state.start_listening()
+            logger.info("Started curriculum feedback listener (after fork)")
+
     def init_stats(self):
         self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
         self.domain_counts = defaultdict(int)
+
+        # Curriculum batch-level tracking
+        self.curriculum_categories = []
+        # Track numeric values for each feature field (for computing averages)
+        self.curriculum_feature_values: Dict[str, List[float]] = defaultdict(list)
+        # Track categorical values for each feature field (for distribution plots)
+        self.curriculum_feature_categories: Dict[str, List[str]] = defaultdict(list)
     
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
@@ -398,7 +446,14 @@ class ActorLoop:
             for k, v in sliding_window_stats.items():
                 self.sliding_stats[k].append(v)
         
-
+        # Track curriculum categories and feature values from rollout metadata
+        if self.curriculum_state is not None:
+            cats, feat_vals, feat_cats = self.curriculum_state.track_rollout_results(rollout_results)
+            self.curriculum_categories.extend(cats)
+            for field, values in feat_vals.items():
+                self.curriculum_feature_values[field].extend(values)
+            for field, values in feat_cats.items():
+                self.curriculum_feature_categories[field].extend(values)
 
     def run(self, dataset: list[tuple[str, dict]]):
         loop_start_time = time.time()
@@ -418,7 +473,12 @@ class ActorLoop:
         # for test samples, loop through the dataset once
         domain_sampler = None
         if self.is_training:
-            problem_iter = random_iter(dataset)
+            if self.curriculum_state is not None:
+                problem_iter = self.curriculum_state.create_iterator(dataset)
+                logger.info("Using curriculum learning for sampling")
+            else:
+                problem_iter = random_iter(dataset)
+
             domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
             if domain_mix_cfg:
                 mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
@@ -491,6 +551,8 @@ class ActorLoop:
                                     else:
                                         problem = next(problem_iter)
                                     self.problem_queue.put(problem, block=False)
+                                    if "_selected_category" in problem:
+                                        logger.debug(f"Actor submitting problem with category: {problem['_selected_category']}")
                                     submitted_groups += 1
                                 except queue.Full:            
                                     assert False, "Problem queue was not full just a moment ago, but now it is full"
@@ -622,6 +684,16 @@ class ActorLoop:
 
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
+
+        # Add curriculum stats if available
+        if self.curriculum_state is not None:
+            curriculum_stats = self.curriculum_state.compute_batch_stats(
+                self.curriculum_categories,
+                self.curriculum_feature_values,
+                self.curriculum_feature_categories,
+            )
+            stats |= curriculum_stats
+            
         if self.cfg.wandb.use_wandb:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
