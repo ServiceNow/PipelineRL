@@ -1,10 +1,9 @@
-"""Vendored i3_logic package from Prime Intellect.
+"""This package contains a modified subset of code from Prime Intellect's i3-logic project.
 
 Source: https://github.com/PrimeIntellect/i3-logic
 License: Apache 2.0
 
-This package provides verifiers for 87+ logic task types used in the
-INTELLECT-3-RL dataset. Vendored to remove the external dependency.
+Modified for PipelineRL by retaining verifier-related files only.
 """
 
 from .task2verifier import verifier_classes
