@@ -64,4 +64,6 @@ class RolloutResult(BaseModel):
     model_version: int | None = None
     dataset_name: str | None = None
     group_id: str | None = None
+    llm_url: str = ""
+    attempt: int = 0 # number of attempt in the group of that problem
     domain: str | None = None

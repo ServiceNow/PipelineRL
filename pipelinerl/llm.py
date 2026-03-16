@@ -359,10 +359,6 @@ class TrainableLLM(LLM):
         base_url (str): Base URL of the API endpoint
         api_token (str): Authentication token for API access
     """
-
-    # TODO: use OpenAI Python client when the certificate issue is resolved.
-    # TODO: consider using litellm
-
     base_url: str = "https://api.openai.com"
     api_token: str = Field(default="", exclude=True)
     collect_logprobs: bool = False
@@ -370,7 +366,7 @@ class TrainableLLM(LLM):
     max_parallel_requests: int = 32
     max_retries: int = 5
     base_delay: float = 0.5
-    _semaphore: asyncio.Semaphore
+    _semaphore: asyncio.Semaphore = None # type: ignore
 
     def model_post_init(self, __context):
         super().model_post_init(__context)

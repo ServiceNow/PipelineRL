@@ -5,13 +5,12 @@ import time
 import aiohttp
 from omegaconf import DictConfig
 from pydantic import BaseModel
-from pipelinerl.rollouts import RolloutResult, BaseMetrics
-from pipelinerl.utils import get_environment_jobs, resolve_environment_key
+from tapeagents.core import Prompt
+from tapeagents.llms.trainable import TrainableLLM
 
 from pipelinerl.async_llm import llm_async_generate, make_training_text
-from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
-from pipelinerl.world import Job
+from pipelinerl.utils import get_environment_jobs, resolve_environment_key
 
 from .verifier_api import verify_answer_rpc
 
