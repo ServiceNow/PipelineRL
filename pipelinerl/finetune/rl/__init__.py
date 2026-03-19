@@ -297,28 +297,29 @@ def rl_step(
             group_ratio_new_old = torch.exp(lrn_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2)
             group_advantages_t = (adv_sum / tok_count.clamp(min=1e-6)).unsqueeze(1).unsqueeze(2).detach()
             zero_weights = torch.zeros_like(tokens_weights)
-            response_keep = torch.ones_like(tokens_weights)
-            if config.overlong_filtering:
-                response_keep = response_keep * (1 - overflow)
-            keep_sum, _, _ = per_segment_sums(
+            weight_sum, _, _ = per_segment_sums(
                 batch.segment_ids,
                 masks_shifted,
-                response_keep,
+                tokens_weights,
                 zero_weights,
                 seq_parallel_group=seq_parallel_group,
             )
-            valid_mask = (tok_count > 0) & (keep_sum > 0)
+            valid_mask = (tok_count > 0) & (weight_sum > 0)
             valid_mask_3d = valid_mask.unsqueeze(1).unsqueeze(2)
             surr1 = group_ratio_new_old * group_advantages_t
             clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = (clamped_group_ratio != group_ratio_new_old) & valid_mask_3d
             surr2 = clamped_group_ratio * group_advantages_t
-            # valid responses should contribute equally regardless of length.
-            sequence_weights = valid_mask_3d.to(dtype=surr1.dtype) / config.batch_size
+            # Length-proportional weighting is intentional: longer sequences carry more
+            # gradient, which complements difficulty-aware penalty (DAP) — DAP reduces the
+            # length penalty for successful hard rollouts, and length-proportional weights
+            # amplify that signal into the update. Uniform weighting hurts training dynamics.
+            sequence_weights = weight_sum.unsqueeze(1).unsqueeze(2)
             if batch.sentinel or surr1.numel() == 0:
                 policy_loss_total = new_logprobs[..., :1].sum() * 0.0
             else:
-                min_terms = torch.min(surr1, surr2) * sequence_weights
+                mask_float = valid_mask_3d.to(dtype=surr1.dtype)
+                min_terms = torch.min(surr1, surr2) * mask_float * sequence_weights
                 policy_loss_total = -min_terms.sum()
             expanded_indicators = torch.zeros_like(masks_shifted, dtype=torch.float)
             for (start, end), val in zip(segments, clamp_log_ratio_new_old_indicators.flatten()):
