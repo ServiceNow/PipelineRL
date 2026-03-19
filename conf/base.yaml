@@ -142,17 +142,13 @@ fast_llm:
       interval: 1000
       format: ${fast_llm_finetune.model_format}
 
-  batch:
-    micro_batch_size: 1  # For RL, all rollouts are packed into a single sample
-    sequence_length: 18000  # Max rollout length accepted; also the training sample length
-    batch_size: 16  # Number of samples per optimizer step
-    truncate_documents: false  # Do not truncate RL rollouts
-    use_loss_masking_spans: true
-    use_grpo_data: true
+  schedule:
+    depth_first_micro_batches: 16  # Gradient accumulation steps (sequential, one sample at a time)
 
   data:
-    sampling:
-      shuffle: disabled  # Streaming dataset ignores shuffling
+    micro_batch_size: 18000  # Tokens per sample; also the max rollout length accepted
+    truncate_documents: false  # Do not truncate RL rollouts
+    shuffle: disabled  # Streaming dataset ignores shuffling
     datasets:
       training:
         type: streaming  # Redis-backed streaming dataset

@@ -132,7 +132,7 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     os.makedirs(log_dir, exist_ok=True)
 
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "vllm.entrypoints.openai.api_server",
         "--model",
@@ -188,7 +188,7 @@ def run_actor_llm(
     )
     broadcast_port = cfg.world.actor_group_port
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         entrypoint,
         "--model",
@@ -251,7 +251,7 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 actor yet")
     llm_urls = "+".join(world_map.get_actor_urls())
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_actor",
         "--config-dir",
@@ -276,7 +276,7 @@ def run_environment(cfg: DictConfig, job: Job):
     # run in a subprocess like in the rest of the code
     run_dir = Path(cfg.output_dir) / f"environment_{job.replica_idx}"
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_environment",
         "--config-dir",
@@ -350,7 +350,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         f"--nproc_per_node={len(gpus)}",
         f"--master_port={torchrun_port}",
         "--no_python",
-        "fast-llm",
+        str(Path(sys.executable).parent / "fast-llm"),
         "train",
         model_type,
         "--config",
@@ -470,7 +470,7 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 preprocessor yet")
     llm_urls = "+".join(world_map.get_preprocessor_urls())
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_preprocess",
         "--config-dir",

@@ -6,8 +6,8 @@ use_fast_llm: true
 weight_broadcast: true
 
 fast_llm:
-  batch:
-    sequence_length: 18000
+  data:
+    micro_batch_size: 18000
 
 actor:
   rollout_policy: pipelinerl.domains.math.generate_math_rollout
