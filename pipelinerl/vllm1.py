@@ -95,23 +95,32 @@ class WorkerExtension:
             + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}, mode: {weight_update_mode}"
         )
         if weight_update_mode == 'http':
-            group_name = "actor"
+            self.process_group = pipelinerl.torch_utils.init_extra_process_group(
+                group_name="actor",
+                backend="nccl",
+                init_method=weight_update_group_init_method,
+                rank=self.pg_rank,
+                world_size=weight_update_group_world_size,
+            )
         else:
-            from fast_llm.engine.training.streaming import WEIGHTS_BROADCAST_PG_NAME
+            from fast_llm.engine.distributed.config import DistributedBackend
+            from fast_llm.engine.distributed.distributed import ProcessGroupPool
 
-            group_name = WEIGHTS_BROADCAST_PG_NAME
-        self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-            group_name=group_name,
-            backend="nccl",
-            init_method=weight_update_group_init_method,
-            rank=self.pg_rank,
-            world_size=weight_update_group_world_size,
-        )
+            self.process_group = ProcessGroupPool(
+                rank=self.pg_rank,
+                world_size=weight_update_group_world_size,
+                local_world_size=1,
+                init_method=weight_update_group_init_method,
+                backend=DistributedBackend.nccl,
+            ).get_process_group(range(weight_update_group_world_size), self.pg_rank)
         self._process_group_destroyed = False
 
     def destroy_actor_update_group(self: LikeWorker):
         self._process_group_destroyed = True
-        torch.distributed.destroy_process_group(self.process_group)
+        if isinstance(self.process_group, torch.distributed.ProcessGroup):
+            torch.distributed.destroy_process_group(self.process_group)
+        else:
+            self.process_group.shutdown()
 
     def is_actor_update_group_destroyed(self: LikeWorker) -> bool:
         return getattr(self, "_process_group_destroyed", False)
@@ -192,15 +201,16 @@ class WorkerExtension:
         expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
         param_count = 0
 
+        from fast_llm.core.distributed import broadcast as _broadcast, broadcast_object as _broadcast_object
+
         while True:
             # Receive metadata
-            meta = [None]
             logger.debug(f"[Worker rank={self.rank}] Waiting for metadata broadcast...")
-            torch.distributed.broadcast_object_list(meta, src=0, group=self.process_group)
+            meta = _broadcast_object(None, self.process_group, src=0)
             logger.debug(f"[Worker rank={self.rank}] Received metadata: {meta}")
 
             # Check for end signal
-            if meta[0] is None:
+            if meta is None:
                 logger.info(
                     f"[Worker rank={self.rank}] Received end signal, finished receiving {param_count} parameters"
                 )
@@ -208,7 +218,7 @@ class WorkerExtension:
 
             # Parse metadata: (shard_name, layer_name, shape, dtype)
             # shard_name is a category label ("weights", "grads", etc.), not part of the HF param name
-            shard_name, layer_name, shape, dtype = meta[0]
+            shard_name, layer_name, shape, dtype = meta
             param_name = layer_name
 
             # Convert dtype to torch dtype
@@ -216,7 +226,7 @@ class WorkerExtension:
 
             # Allocate buffer and receive tensor (must happen for every broadcast to stay in sync)
             buffer = torch.empty(tuple(shape), dtype=target_dtype, device=self.device)
-            torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+            _broadcast(buffer, 0, self.process_group)
 
             # Only load weight shards (skip grads, optimizer state, etc.)
             if shard_name != "weights":

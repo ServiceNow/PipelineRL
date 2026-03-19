@@ -41,15 +41,17 @@ def timed_broadcast_fast_llm(
     import redis
     import orjson
 
-    from fast_llm.engine.training.streaming import WEIGHTS_BROADCAST_PG_NAME
+    from fast_llm.engine.distributed.config import DistributedBackend
+    from fast_llm.engine.distributed.distributed import ProcessGroupPool
 
     print(f"[Trainer] Initializing process group as rank 0 (world_size={world_size})")
-    process_group = _init_actor_process_group(
-        init_method=init_method,
+    process_group = ProcessGroupPool(
         rank=0,
         world_size=world_size,
-        group_name=WEIGHTS_BROADCAST_PG_NAME,
-    )
+        local_world_size=1,
+        init_method=init_method,
+        backend=DistributedBackend.nccl,
+    ).get_process_group(range(world_size), 0)
     print("[Trainer] Process group initialized")
 
     # Connect to Redis
@@ -132,7 +134,7 @@ def timed_broadcast_fast_llm(
 
     # Cleanup — destroy_process_group now resolves because vLLM workers respond to training_finished
     r.close()
-    dist.destroy_process_group(process_group)
+    process_group.shutdown()
     print("[Trainer] Redis connection closed, process group destroyed, exiting")
 
 
@@ -159,15 +161,17 @@ def rapid_broadcast_cycles_fast_llm(
     import redis as redis_lib
     import orjson
 
-    from fast_llm.engine.training.streaming import WEIGHTS_BROADCAST_PG_NAME
+    from fast_llm.engine.distributed.config import DistributedBackend
+    from fast_llm.engine.distributed.distributed import ProcessGroupPool
 
     print(f"[Trainer] Initializing process group as rank 0 (world_size={world_size})")
-    process_group = _init_actor_process_group(
-        init_method=init_method,
+    process_group = ProcessGroupPool(
         rank=0,
         world_size=world_size,
-        group_name=WEIGHTS_BROADCAST_PG_NAME,
-    )
+        local_world_size=1,
+        init_method=init_method,
+        backend=DistributedBackend.nccl,
+    ).get_process_group(range(world_size), 0)
     print("[Trainer] Process group initialized")
 
     r = redis_lib.Redis(host=redis_host, port=redis_port)
@@ -190,14 +194,15 @@ def rapid_broadcast_cycles_fast_llm(
         print(f"[Trainer] Sent weights_ready step={step} ({label})")
         step += 1
 
+        from fast_llm.core.distributed import broadcast as _broadcast, broadcast_object as _broadcast_object
+
         for name, tensor in state_dict.items():
             if tensor.device.type != "cuda":
                 tensor = tensor.cuda(0)
-            meta = [("weights", name, list(tensor.shape), str(tensor.dtype))]
-            dist.broadcast_object_list(meta, src=0, group=process_group)
-            dist.broadcast(tensor, src=0, group=process_group)
+            _broadcast_object(("weights", name, list(tensor.shape), str(tensor.dtype)), process_group, src=0)
+            _broadcast(tensor, 0, process_group)
 
-        dist.broadcast_object_list([None], src=0, group=process_group)
+        _broadcast_object(None, process_group, src=0)
         print(f"[Trainer] Broadcast complete ({label})")
 
     # --- Slow cycle: establish text_B and text_A clearly ---
@@ -228,7 +233,7 @@ def rapid_broadcast_cycles_fast_llm(
     r.xadd(stream_key, {payload_key: orjson.dumps({"type": "training_finished"})})
 
     r.close()
-    dist.destroy_process_group(process_group)
+    process_group.shutdown()
     print("[Trainer] Redis connection closed, process group destroyed, exiting")
 
 
