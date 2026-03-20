@@ -132,6 +132,23 @@ def _serialize_tool_calls(tool_calls) -> list[dict]:
     ]
 
 
+def _parse_tool_arguments(arguments: str, *, fallback_key: str | None = None) -> dict:
+    """Parse tool-call arguments into an object payload.
+
+    Valid JSON that is not an object should not crash the rollout loop. A bare
+    string can still be recovered for simple single-field tool schemas.
+    """
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if isinstance(parsed, dict):
+        return parsed
+    if fallback_key is not None and isinstance(parsed, str):
+        return {fallback_key: parsed}
+    return {}
+
+
 def _compute_shaping(
     cfg: DictConfig,
     answer_status: str,
@@ -235,13 +252,8 @@ async def generate_tir_rollout(
 
         # Execute each tool call
         for tc in llm_call.output.tool_calls:
-            try:
-                parsed = json.loads(tc.function.arguments)
-            except (json.JSONDecodeError, TypeError):
-                parsed = None
-            args = parsed if isinstance(parsed, dict) else {}
-
             if tc.function.name == "MathAnswer":
+                args = _parse_tool_arguments(tc.function.arguments, fallback_key="answer")
                 final_answer = args.get("answer", "")
                 submitted_final_answer = True
                 messages.append({
@@ -251,6 +263,7 @@ async def generate_tir_rollout(
                 })
                 break
             elif tc.function.name == "run_python_code":
+                args = _parse_tool_arguments(tc.function.arguments, fallback_key="code")
                 code = args.get("code") or args.get("python_code", "")
                 result = await execute_python_sandbox(code, sandbox_endpoint, sandbox_timeout)
                 num_python_calls += 1
