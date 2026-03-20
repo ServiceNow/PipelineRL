@@ -1,5 +1,6 @@
 defaults:
-    - math
+    - base
+    - override rewards: success_and_format
     - _self_
 
 actor:
@@ -27,10 +28,32 @@ actor:
     Always verify with run_python_code before invoking MathAnswer.
   task_template: "{task}"
   agent_max_loops: 3
+  llm_max_rollouts: 128
+  max_rollout_retries: 20
+  rollout_workers: 8
+  shared_memory_entry_size: 1000000000
+
+rewards:
+  correct_answer_not_finished: 0.0
+  buffer_tokens: 0
+
+# Math verifier environment
+environments:
+  - key: math
+    mode: remote
+    _target_: pipelinerl.domains.math.MathEnvironment
+environment_key: math
+dataset_loader: pipelinerl.domains.math.load_datasets
+
+train_dataset_names:
+  - open_reasoner_zero_57k
+  - open_reasoner_zero_extended_72k
+test_dataset_names:
+  - aime_2025
 
 # SandboxFusion config
 sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
-sandbox_timeout: 30.0
+sandbox_timeout: 10.0
 
 # Optional reward shaping
 python_tool_shaping:
@@ -48,7 +71,26 @@ vllm_config:
 
 llm:
   parameters:
-    max_tokens: 8192
+    max_tokens: 16000
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 16000
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 50
 
 finetune:
   seq_length: 32000
+  seq_parallel: 8
+  gradient_accumulation_passes: 1024
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 8
+  shared_memory_entry_size: 1000000000

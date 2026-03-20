@@ -260,6 +260,11 @@ async def generate_tir_rollout(
             )
             break
         max_tokens_this_turn = min(configured_max_tokens, remaining)
+        if max_tokens_this_turn < configured_max_tokens:
+            logger.warning(
+                "Turn %d: capping max_tokens from %d to %d (prompt_len=%d, max_model_len=%d)",
+                _turn, configured_max_tokens, max_tokens_this_turn, prompt_len, max_model_len,
+            )
 
         llm_call = await llm_async_generate(llm, prompt, session, max_tokens_override=max_tokens_this_turn)
         llm_calls.append(llm_call)
