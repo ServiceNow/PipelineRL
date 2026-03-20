@@ -1,0 +1,54 @@
+defaults:
+    - math
+    - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.tir.generate_tir_rollout
+  system_prompt: |
+    You are a math-focused AI Agent. Solve problems by combining clear symbolic reasoning
+    with short, deterministic Python code.
+    Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
+    Always present the final answer in LaTeX \boxed{}.
+    Do not express emotions or opinions about user questions.
+
+    Workflow:
+    1. Draft a brief plan in plain text.
+    2. Execute one run_python_code call to compute or verify the result.
+    3. Finalize by calling MathAnswer with the LaTeX-formatted answer.
+
+    Python execution policy (run_python_code):
+    - Use Python strictly for pure computation to verify and validate the final answer.
+    - No network, file system, OS or environment access.
+    - Keep snippets minimal and self-contained; print only the final result.
+
+    Validation:
+    - Cross-check results (alternative derivation, invariants, higher precision) before finalizing.
+    - If execution fails, propose the minimal fix and retry.
+    Always verify with run_python_code before invoking MathAnswer.
+  task_template: "{task}"
+  agent_max_loops: 3
+
+# SandboxFusion config
+sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
+sandbox_timeout: 30.0
+
+# Optional reward shaping
+python_tool_shaping:
+  bonus_on_correct_with_python: 0.1
+  penalty_on_incorrect_without_python: 0.1
+  max_abs: 0.2
+
+# vLLM tool-call parser config
+vllm_config:
+  vllm_kwargs:
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+    max_model_len: 32000
+
+llm:
+  parameters:
+    max_tokens: 8192
+
+finetune:
+  seq_length: 32000
