@@ -276,31 +276,30 @@ def make_training_texts_from_llm_calls(
 
 
 def make_training_text_with_tools(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
-    """Build a TrainingText for an assistant turn that may contain tool_calls.
+    """Build a TrainingText for a tool-enabled assistant turn.
 
-    For turns without tool_calls this delegates to ``make_training_text``.
-    When tool_calls are present the assistant message dict includes them so
-    that ``apply_chat_template`` produces the correct token sequence matching
-    what vLLM actually generated (and for which we have logprobs).
+    This helper keeps prompts on the same chat-template path used at generation
+    time whenever ``prompt.tools`` is set, even if the current assistant turn
+    itself is plain text with no tool_calls.
     """
-    if not llm_call.output.tool_calls:
+    if not llm_call.prompt.tools and not llm_call.output.tool_calls:
         return make_training_text(llm, llm_call)
 
     llm.load_tokenizer()
 
-    # Build the assistant message with tool_calls
     assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
-    assistant_msg["tool_calls"] = [
-        {
-            "id": tc.id,
-            "type": "function",
-            "function": {
-                "name": tc.function.name,
-                "arguments": tc.function.arguments,
-            },
-        }
-        for tc in llm_call.output.tool_calls
-    ]
+    if llm_call.output.tool_calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in llm_call.output.tool_calls
+        ]
 
     full_messages = llm_call.prompt.messages + [assistant_msg]
 
