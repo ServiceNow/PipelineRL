@@ -205,19 +205,24 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             raise ValueError(f"Failed to process with vision-language processor: {e}")
     else:
         # Use tokenizer for text-only models
+        # Pass tools so the chat template matches what vLLM actually served
+        tools_kwarg = {"tools": llm_call.prompt.tools} if llm_call.prompt.tools else {}
         prompt_text = llm.tokenizer.apply_chat_template(
             conversation=llm_call.prompt.messages,
             tokenize=False,
             add_generation_prompt=True,
+            **tools_kwarg,
         )
         text = llm.tokenizer.apply_chat_template(
             full_messages,
             tokenize=False,
+            **tools_kwarg,
         )
         prompt_token_ids = llm.tokenizer.apply_chat_template(
             llm_call.prompt.messages,
             add_special_tokens=True,
             add_generation_prompt=True,
+            **tools_kwarg,
         )
 
     output_text = text[len(prompt_text) :]
