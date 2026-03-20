@@ -235,14 +235,15 @@ async def generate_tir_rollout(
 
         # Execute each tool call
         for tc in llm_call.output.tool_calls:
+            try:
+                parsed = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            args = parsed if isinstance(parsed, dict) else {}
+
             if tc.function.name == "MathAnswer":
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
                 final_answer = args.get("answer", "")
                 submitted_final_answer = True
-                # Still append tool result for completeness
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -250,16 +251,11 @@ async def generate_tir_rollout(
                 })
                 break
             elif tc.function.name == "run_python_code":
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
                 code = args.get("code") or args.get("python_code", "")
                 result = await execute_python_sandbox(code, sandbox_endpoint, sandbox_timeout)
                 num_python_calls += 1
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
             else:
-                # Unknown tool, return error
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
