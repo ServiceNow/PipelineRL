@@ -3,6 +3,7 @@ import io
 import logging
 
 import aiohttp
+import litellm
 import numpy as np
 from PIL import Image
 from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
@@ -85,6 +86,9 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
+    if prompt.tools:
+        data["tools"] = _to_plain_obj(prompt.tools)
+
     # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
     payload = _to_plain_obj({**extra_parameters, **data})
     async with session.post(
@@ -101,7 +105,8 @@ async def llm_async_generate(
 
     try:
         content = data["choices"][0]["message"]["content"]
-        if not content:
+        raw_tool_calls = data["choices"][0]["message"].get("tool_calls", [])
+        if not content and not raw_tool_calls:
             logger.warning(f"Empty completion {data}")
 
         parsed_logprobs = []
@@ -128,7 +133,9 @@ async def llm_async_generate(
         logger.exception(f"Failed to parse llm response: {data}")
         raise
 
-    output = LLMOutput(content=content)
+    output = LLMOutput(content=content or "")
+    if raw_tool_calls:
+        output.tool_calls = [litellm.ChatCompletionMessageToolCall(**tc) for tc in raw_tool_calls]
     llm_call = llm.log_output(prompt, output, count_tokens=False)
     llm_call.prompt_length_tokens = data["usage"]["prompt_tokens"]
     llm_call.output_length_tokens = data["usage"]["completion_tokens"]
@@ -249,4 +256,84 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
         visual_features=visual_features,
+    )
+
+
+def make_training_text_with_tools(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
+    """Build a TrainingText for an assistant turn that may contain tool_calls.
+
+    For turns without tool_calls this delegates to ``make_training_text``.
+    When tool_calls are present the assistant message dict includes them so
+    that ``apply_chat_template`` produces the correct token sequence matching
+    what vLLM actually generated (and for which we have logprobs).
+    """
+    if not llm_call.output.tool_calls:
+        return make_training_text(llm, llm_call)
+
+    llm.load_tokenizer()
+
+    # Build the assistant message with tool_calls
+    assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
+    assistant_msg["tool_calls"] = [
+        {
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.function.name,
+                "arguments": tc.function.arguments,
+            },
+        }
+        for tc in llm_call.output.tool_calls
+    ]
+
+    full_messages = llm_call.prompt.messages + [assistant_msg]
+
+    prompt_text = llm.tokenizer.apply_chat_template(
+        conversation=llm_call.prompt.messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=llm_call.prompt.tools,
+    )
+    text = llm.tokenizer.apply_chat_template(
+        full_messages,
+        tokenize=False,
+        tools=llm_call.prompt.tools,
+    )
+    prompt_token_ids = llm.tokenizer.apply_chat_template(
+        llm_call.prompt.messages,
+        add_special_tokens=True,
+        add_generation_prompt=True,
+        tools=llm_call.prompt.tools,
+    )
+
+    output_text = text[len(prompt_text):]
+
+    tokenizer = llm.tokenizer
+    if tokenizer.bos_token and text.startswith(tokenizer.bos_token):
+        text = text[len(tokenizer.bos_token):]
+
+    if not llm_call.logprobs:
+        raise ValueError("Logprobs are required to make training data for RL")
+
+    labels = [lp.token_id for lp in llm_call.logprobs]
+    input_ids = prompt_token_ids + labels
+    labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
+    logprobs = [lp.logprob for lp in llm_call.logprobs]
+
+    finish_reason = llm_call.llm_info.get("finish_reason")
+    if finish_reason is not None:
+        finished = finish_reason != "length"
+    else:
+        eos_token = tokenizer.eos_token or ""
+        finished = bool(eos_token) and (llm_call.output.content or "").endswith(eos_token)
+
+    return TrainingText(
+        text=text,
+        n_predicted=len(output_text),
+        input_ids=input_ids,
+        labels=labels,
+        logprobs=logprobs,
+        finished=finished,
+        prompt_tokens=llm_call.prompt_length_tokens,
+        output_tokens=llm_call.output_length_tokens,
     )
