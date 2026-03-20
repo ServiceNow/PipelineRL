@@ -55,7 +55,10 @@ def _to_plain_obj(value):
 
 
 async def llm_async_generate(
-    llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
+    llm: TrainableLLM,
+    prompt: Prompt,
+    session: aiohttp.ClientSession,
+    max_tokens_override: int | None = None,
 ) -> LLMCall:
     llm.load_tokenizer()
     headers = {"Content-Type": "application/json"}
@@ -88,6 +91,9 @@ async def llm_async_generate(
 
     if prompt.tools:
         data["tools"] = _to_plain_obj(prompt.tools)
+
+    if max_tokens_override is not None:
+        data["max_tokens"] = max_tokens_override
 
     # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
     payload = _to_plain_obj({**extra_parameters, **data})

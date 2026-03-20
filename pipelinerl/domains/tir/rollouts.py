@@ -235,10 +235,33 @@ async def generate_tir_rollout(
     agent_max_loops = int(getattr(cfg.actor, "agent_max_loops", 3))
     sandbox_endpoint = str(cfg.sandbox_endpoint)
     sandbox_timeout = float(cfg.sandbox_timeout)
+    configured_max_tokens = int(llm.parameters.get("max_tokens", 16000))
+    max_model_len = int(cfg.vllm_config.vllm_kwargs.get("max_model_len", 32000))
+    # Reserve a minimum budget so the model can still produce a useful response
+    min_generation_tokens = 256
 
     for _turn in range(agent_max_loops):
         prompt = Prompt(messages=list(messages), tools=tools)
-        llm_call = await llm_async_generate(llm, prompt, session)
+
+        # Estimate prompt length and cap max_tokens to fit within max_model_len
+        llm.load_tokenizer()
+        prompt_token_ids = llm.tokenizer.apply_chat_template(
+            messages,
+            add_special_tokens=True,
+            add_generation_prompt=True,
+            tools=tools,
+        )
+        prompt_len = len(prompt_token_ids)
+        remaining = max_model_len - prompt_len
+        if remaining < min_generation_tokens:
+            logger.warning(
+                "Prompt length %d leaves only %d tokens for generation (max_model_len=%d), stopping loop",
+                prompt_len, remaining, max_model_len,
+            )
+            break
+        max_tokens_this_turn = min(configured_max_tokens, remaining)
+
+        llm_call = await llm_async_generate(llm, prompt, session, max_tokens_override=max_tokens_this_turn)
         llm_calls.append(llm_call)
 
         if not llm_call.output.tool_calls:
