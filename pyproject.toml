@@ -72,9 +72,12 @@ ifeval = [
     "langdetect",
     "absl-py",
 ]
+tir = [
+    "sandbox-fusion>=0.3.7",
+]
 # Install all domain dependencies
 domains = [
-    "pipelinerl[coding,fn_calling,logic,ifeval]",
+    "pipelinerl[coding,fn_calling,logic,ifeval,tir]",
 ]
 
 [tool.setuptools.packages.find]
