@@ -68,6 +68,8 @@ def timed_broadcast_fast_llm(
     original_state_dict, _ = _load_state_dict(model_name)
     perturbed_state_dict = _create_perturbed_state_dict(original_state_dict)
 
+    from fast_llm.core.distributed import broadcast as _broadcast, broadcast_object as _broadcast_object
+
     # Helper function to broadcast weights using Fast-LLM protocol
     def broadcast_weights_fast_llm(state_dict, step):
         """Broadcast weights using Fast-LLM protocol.
@@ -75,9 +77,9 @@ def timed_broadcast_fast_llm(
         Protocol:
         1. Send Redis event: {type: "weights_ready", step: N}
         2. For each parameter:
-           - broadcast_object_list([(shard_name, layer_name, shape, dtype)])
+           - broadcast_object((shard_name, layer_name, shape, dtype))
            - broadcast(tensor)
-        3. Send end signal: broadcast_object_list([None])
+        3. Send end signal: broadcast_object(None)
         """
         # Send Redis stream event
         event = {"type": "weights_ready", "step": step}
@@ -89,18 +91,14 @@ def timed_broadcast_fast_llm(
             if tensor.device.type != "cuda":
                 tensor = tensor.cuda(0)
 
-            # Broadcast metadata
-            meta = [("weights", name, list(tensor.shape), str(tensor.dtype))]
-            dist.broadcast_object_list(meta, src=0, group=process_group)
-
-            # Broadcast tensor
-            dist.broadcast(tensor, src=0, group=process_group)
+            _broadcast_object(("weights", name, list(tensor.shape), str(tensor.dtype)), process_group, src=0)
+            _broadcast(tensor, 0, process_group)
 
             if (i + 1) % 50 == 0:
                 print(f"[Trainer] Broadcasted {i+1}/{len(state_dict)} parameters")
 
         # Send end signal
-        dist.broadcast_object_list([None], src=0, group=process_group)
+        _broadcast_object(None, process_group, src=0)
         print(f"[Trainer] Sent end signal, broadcast complete")
 
     # Broadcast 1: Perturbed weights
