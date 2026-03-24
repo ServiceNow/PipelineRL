@@ -39,7 +39,7 @@ preprocess:
   # ring buffer to replace old samples with new ones when training is slow
   ring_buffer_size: 128
   # "virtual" sample queue per lead trainer
-  max_ready_samples_per_lead: 64
+  max_ready_samples_per_lead: 512
   pop_old_data: ${..pop_old_data} 
   shared_memory_entry_size: 100000000
   log_every_n_samples: 128
@@ -57,7 +57,7 @@ test_llm:
     top_k: 50
 
 vllm_config:
-  use_v1: false
+  use_v1: true
   quantization: null  # or bf16_last_layer_fp32
   vllm_kwargs:
     dtype: bfloat16

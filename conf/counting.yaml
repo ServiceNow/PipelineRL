@@ -3,6 +3,21 @@ defaults:
 finetune:
     seq_length: 4000
     gradient_accumulation_passes: 1024
+fast_llm:
+    training:
+        num_workers: 1
+    schedule:
+        depth_first_micro_batches: 256
+    model:
+        base_model:
+            head:
+                losses:
+                    grpo:
+                        epsilon_low: 0.1
+                        epsilon_high: 0.1
+    optimizer:
+        learning_rate:
+            base: 1e-5
 llm:
     parameters:
         max_tokens: 1000
