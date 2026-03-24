@@ -16,8 +16,8 @@ fast_llm:
             head:
                 losses:
                     grpo:
-                        epsilon_low: 0.1
-                        epsilon_high: 0.1
+                        epsilon_low: 0.2
+                        epsilon_high: 0.2
     optimizer:
         learning_rate:
             base: 1e-5
