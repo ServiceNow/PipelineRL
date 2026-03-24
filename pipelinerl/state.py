@@ -64,7 +64,6 @@ class TrainerState:
     def _start_listening_fast_llm(self):
         """Listen to Fast-LLM trainer events directly from Redis."""
         import orjson
-        import redis
         from pipelinerl.streams import RedisConfig, _backend, connect_to_redis
 
         from fast_llm.data.dataset.config import REDIS_DATA_STREAM, REDIS_GROUP_NAME
@@ -73,48 +72,19 @@ class TrainerState:
         stream_key = FAST_LLM_EVENTS_STREAM  # "fast_llm_events"
         payload_key = b"event"  # Fast-LLM uses "event" as payload key
 
-        def listen():
+        # Initialize to 0 so wait_for_processed_samples() doesn't block at startup.
+        # The lag thread below will update this once the data stream/consumer group exists.
+        self.samples_processed = 0
+
+        def listen_events():
             assert isinstance(_backend, RedisConfig)
             r = connect_to_redis(_backend)
             last_id = "0-0"
-            last_lag_check = 0.0
-            lag_check_interval = 0.0  # seconds
-
-            # Initialize to 0 so wait_for_processed_samples() doesn't block at startup.
-            # The lag check below will update this once the data stream/consumer group exists.
-            self.samples_processed = 0
 
             logger.info(f"Listening for Fast-LLM events on Redis stream '{stream_key}'")
 
             while True:
-                # Read from stream (blocking)
                 result = r.xread({stream_key: last_id}, count=1, block=1000)
-
-                # Periodically compute samples_processed from consumer group lag
-                now = time.time()
-                if now - last_lag_check >= lag_check_interval:
-                    last_lag_check = now
-                    try:
-                        stream_info = r.xinfo_stream(REDIS_DATA_STREAM)
-                        total_len = stream_info.get("length", 0)
-                        groups = r.xinfo_groups(REDIS_DATA_STREAM)
-                        for group in groups:
-                            gname = group.get("name", "")
-                            if isinstance(gname, bytes):
-                                gname = gname.decode()
-                            if gname == REDIS_GROUP_NAME:
-                                entries_read = group.get("entries-read")
-                                if entries_read is None:
-                                    lag = group.get("lag", 0) or 0
-                                    entries_read = total_len - lag
-                                self.samples_processed = int(entries_read)
-                                logger.info(
-                                    f"Fast-LLM lag check: stream_len={total_len} entries_read={entries_read} "
-                                    f"samples_processed={self.samples_processed}"
-                                )
-                                break
-                    except Exception as e:
-                        logger.debug(f"Fast-LLM lag check failed (stream/group not yet created?): {e}")
 
                 if not result:
                     continue
@@ -123,7 +93,6 @@ class TrainerState:
                     for msg_id, msg_data in messages:
                         last_id = msg_id
 
-                        # Fast-LLM sends: {payload_key: orjson.dumps({type: "...", step: N})}
                         if payload_key not in msg_data:
                             logger.warning(f"Fast-LLM event missing '{payload_key.decode()}' field: {msg_data}")
                             continue
@@ -147,8 +116,39 @@ class TrainerState:
                         else:
                             logger.warning(f"Unknown Fast-LLM event type: {event_type}")
 
-        self._thread = threading.Thread(target=listen, daemon=True)
-        self._thread.start()
+        def poll_lag():
+            assert isinstance(_backend, RedisConfig)
+            r = connect_to_redis(_backend)
+            lag_check_interval = 0.5  # seconds
+
+            while True:
+                try:
+                    stream_info = r.xinfo_stream(REDIS_DATA_STREAM)
+                    total_len = stream_info.get("length", 0)
+                    groups = r.xinfo_groups(REDIS_DATA_STREAM)
+                    for group in groups:
+                        gname = group.get("name", "")
+                        if isinstance(gname, bytes):
+                            gname = gname.decode()
+                        if gname == REDIS_GROUP_NAME:
+                            entries_read = group.get("entries-read")
+                            if entries_read is None:
+                                lag = group.get("lag", 0) or 0
+                                entries_read = total_len - lag
+                            self.samples_processed = int(entries_read)
+                            logger.info(
+                                f"Fast-LLM lag check: stream_len={total_len} entries_read={entries_read} "
+                                f"samples_processed={self.samples_processed}"
+                            )
+                            break
+                except Exception as e:
+                    logger.debug(f"Fast-LLM lag check failed (stream/group not yet created?): {e}")
+                time.sleep(lag_check_interval)
+
+        self._event_thread = threading.Thread(target=listen_events, daemon=True)
+        self._lag_thread = threading.Thread(target=poll_lag, daemon=True)
+        self._event_thread.start()
+        self._lag_thread.start()
 
     def wait_for_training_done(self, timeout: float | None = None) -> bool:
         return self._training_done_event.wait(timeout=timeout)
