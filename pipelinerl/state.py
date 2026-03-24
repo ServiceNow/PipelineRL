@@ -78,7 +78,7 @@ class TrainerState:
             r = connect_to_redis(_backend)
             last_id = "0-0"
             last_lag_check = 0.0
-            lag_check_interval = 5.0  # seconds
+            lag_check_interval = 0.0  # seconds
 
             # Initialize to 0 so wait_for_processed_samples() doesn't block at startup.
             # The lag check below will update this once the data stream/consumer group exists.
