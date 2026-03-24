@@ -119,7 +119,7 @@ debug:
 # Fast-LLM integration: when true, fast-llm is used as the trainer.
 # Data flows actors -> Redis (fast_llm_streaming) -> fast-llm training loop.
 # Weight updates are broadcast via NCCL using fast-llm's streaming callback.
-use_fast_llm: false
+use_fast_llm: true
 # Whether the trainer broadcasts updated weights to vLLM after each training step.
 weight_broadcast: true
 

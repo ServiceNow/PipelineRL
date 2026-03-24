@@ -3,6 +3,9 @@ defaults:
 finetune:
     seq_length: 4000
     gradient_accumulation_passes: 1024
+vllm_config:
+    vllm_kwargs:
+        max_model_len: 4000
 fast_llm:
     training:
         num_workers: 1
