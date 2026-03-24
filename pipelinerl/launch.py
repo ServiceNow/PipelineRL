@@ -79,9 +79,15 @@ def validate_config(cfg: DictConfig):
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
 
     # Check that model being tuned to the max length accepted by inference
-    if cfg.finetune.seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
+    if cfg.use_fast_llm:
+        max_seq_length = cfg.fast_llm.data.micro_batch_size
+        seq_length_label = "fast_llm.data.micro_batch_size"
+    else:
+        max_seq_length = cfg.finetune.seq_length
+        seq_length_label = "finetune.seq_length"
+    if max_seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
         raise ValueError(
-            f"seq_length {cfg.finetune.seq_length} must be greater than or equal to "
+            f"{seq_length_label} {max_seq_length} must be greater than or equal to "
             f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
         )
 
