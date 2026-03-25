@@ -502,6 +502,8 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
 
 def run_redis(cfg: DictConfig):
     # Launch redis-server
+    redis_dir = Path(cfg.output_dir) / "redis"
+    os.makedirs(redis_dir, exist_ok=True)
     cmd = [
         "redis-server",
         "--bind",
@@ -514,6 +516,10 @@ def run_redis(cfg: DictConfig):
         "no",
         "--save",
         cfg.streams.save,
+        "--logfile",
+        str(redis_dir / "redis.log"),
+        "--loglevel",
+        "verbose",
     ]
     logger.info(f"Running redis with command: {' '.join(cmd)}")
     save_command(Path(cfg.output_dir) / "redis", cmd)
