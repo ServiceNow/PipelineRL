@@ -335,6 +335,9 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     fast_llm_cfg["run"]["experiment_name"] = experiment_name
     fast_llm_cfg["data"]["datasets"]["training"]["host"] = cfg.streams.host
     fast_llm_cfg["data"]["datasets"]["training"]["port"] = cfg.streams.port
+    if cfg.debug.log_data_pipeline:
+        fast_llm_cfg["data"]["datasets"]["training"]["log_data_pipeline"] = True
+        fast_llm_cfg.setdefault("schedule", {})["log_data_pipeline"] = True
     fast_llm_cfg["training"]["wandb"]["entity_name"] = cfg.wandb.wandb_entity_name
     fast_llm_cfg["training"]["wandb"]["project_name"] = cfg.wandb.wandb_project_name
     fast_llm_cfg["training"]["wandb"]["group_name"] = cfg.wandb.wandb_group

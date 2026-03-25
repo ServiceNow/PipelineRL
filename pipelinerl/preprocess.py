@@ -535,6 +535,15 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
+    pipeline_log_file = None
+    if cfg.use_fast_llm and cfg.debug.get("log_data_pipeline", False):
+        import json as _json
+        import pathlib as _pathlib
+        # Write alongside fast-llm rank files: {exp_dir}/finetune/data_pipeline_log/
+        _log_dir = _pathlib.Path(cfg.output_dir) / "finetune" / "data_pipeline_log"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        pipeline_log_file = open(_log_dir / "preprocessor.jsonl", "a")
+
     with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name, pipelinerl_metadata=not cfg.use_fast_llm) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
@@ -657,10 +666,25 @@ def run_preprocessing_loop(
 
                         # Fast-LLM path: write individual samples directly (Fast-LLM does its own packing)
                         if cfg.use_fast_llm:
+                            write_start = time.time() if pipeline_log_file else None
+                            write_samples = 0
+                            write_tokens = 0
                             while len(processed_entries_queue) > 0:
                                 entry = processed_entries_queue.popleft()
+                                if pipeline_log_file is not None:
+                                    write_samples += 1
+                                    write_tokens += len(entry.get("input_ids", []))
                                 write_sample_for_fast_llm(data_writer, entry)
                                 published_samples += 1
+                            if pipeline_log_file is not None and write_samples > 0:
+                                pipeline_log_file.write(_json.dumps({
+                                    "event": "WRITE",
+                                    "t_start": round(write_start, 3),
+                                    "t_end": round(time.time(), 3),
+                                    "samples": write_samples,
+                                    "tokens": write_tokens,
+                                }) + "\n")
+                                pipeline_log_file.flush()
                             batch_done = True  # Always mark done for Fast-LLM (no batching)
                         elif cfg.finetune.seq_packing:
                             if samples_per_trainer[trainer_id] == target_samples_per_lead:

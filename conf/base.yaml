@@ -115,6 +115,7 @@ debug:
   streams_from: null
   place_inference_workers: true
   use_existing_llms: false
+  log_data_pipeline: false
 
 # Fast-LLM integration: when true, fast-llm is used as the trainer.
 # Data flows actors -> Redis (fast_llm_streaming) -> fast-llm training loop.
