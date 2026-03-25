@@ -232,6 +232,18 @@ Then point PipelineRL to your sandbox endpoint by setting `sandbox_endpoint` in 
 export SANDBOX_ENDPOINT=http://127.0.0.1:8080
 ```
 
+### Optional: SandboxFusion for coding verification
+
+PipelineRL supports using [SandboxFusion](https://bytedance.github.io/SandboxFusion/) to execute and verify coding-task outputs in a remote sandbox.
+
+To run SandboxFusion locally, follow the deployment guide and startup logs here:
+https://bytedance.github.io/SandboxFusion/docs/docs/get-started#local-deployment
+
+Then point PipelineRL to your sandbox endpoint by setting `sandbox_endpoint` in your config (for example in `conf/coding.yaml`) or by exporting `SANDBOX_ENDPOINT`:
+```bash
+export SANDBOX_ENDPOINT=http://127.0.0.1:8080
+```
+
 ## Run experiments
 
 First, activate the conda environment:

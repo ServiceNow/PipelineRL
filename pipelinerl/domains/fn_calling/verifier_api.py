@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 AnswerStatus = Literal["correct", "wrong", "no_answer", "unparsable"]
 _VALID_STATUSES: set[str] = {"correct", "wrong", "no_answer", "unparsable"}
 
+# Categories where multiple function calls are expected
+_PARALLEL_CATEGORIES = {"parallel", "parallel_multiple", "live_parallel", "live_parallel_multiple"}
+
 # Pattern to extract tool_calls from text (fallback for non-structured output)
 _TOOL_BLOCK = re.compile(r"<tool_calls>(.*?)</tool_calls>", re.DOTALL | re.IGNORECASE)
 
@@ -124,16 +127,63 @@ def _extract_tool_calls(
     return _parse_tool_calls_from_text(generation)
 
 
+def _compute_partial_score(
+    func_descriptions: list,
+    gorilla_tool_calls: list,
+    ground_truth: list,
+    language: Any,
+    model_name_for_bfcl: str,
+) -> float:
+    """Compute partial credit for parallel categories by checking each expected call individually.
+
+    Returns fraction of ground truth calls matched (0.0 to 1.0).
+    """
+    from bfcl_eval.eval_checker.ast_eval.ast_checker import simple_function_checker, find_description
+
+    if not ground_truth:
+        return 0.0
+
+    total = len(ground_truth)
+    matched_indices: list[int] = []
+    passed = 0
+
+    for expected in ground_truth:
+        func_name_expected = list(expected.keys())[0]
+        func_description = find_description(func_descriptions, func_name_expected)
+        if func_description is None:
+            continue
+
+        for idx in range(len(gorilla_tool_calls)):
+            if idx in matched_indices:
+                continue
+            try:
+                result = simple_function_checker(
+                    func_description,
+                    gorilla_tool_calls[idx],
+                    expected,
+                    language,
+                    model_name_for_bfcl,
+                )
+                if result["valid"]:
+                    matched_indices.append(idx)
+                    passed += 1
+                    break
+            except Exception:
+                continue
+
+    return passed / total
+
+
 def verify_fn_calling_answer(
     generation: str,
     reward_context: Dict[str, Any],
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     model_name: str = "model",
-) -> AnswerStatus:
+) -> Dict[str, Any]:
     """Verify a function calling answer using BFCL AST checker.
 
     Returns:
-        AnswerStatus: "correct", "wrong", "no_answer", or "unparsable".
+        Dict with 'answer_status' (AnswerStatus) and 'partial_score' (float, 0.0-1.0).
     """
     category = reward_context.get("category", "simple")
     is_relevance = reward_context.get("is_relevance", False)
@@ -147,13 +197,14 @@ def verify_fn_calling_answer(
         has_tool_calls = len(oai_tool_calls) > 0
         if "irrelevance" in category:
             # Should NOT make any tool calls
-            return "correct" if not has_tool_calls else "wrong"
+            status = "correct" if not has_tool_calls else "wrong"
         else:
             # Should make at least one tool call
-            return "correct" if has_tool_calls else "no_answer"
+            status = "correct" if has_tool_calls else "no_answer"
+        return {"answer_status": status, "partial_score": 1.0 if status == "correct" else 0.0}
 
     if not oai_tool_calls:
-        return "no_answer"
+        return {"answer_status": "no_answer", "partial_score": 0.0}
 
     # Note: Java name normalization is handled by BFCL when using a -FC model
     # (BFCL converts ground truth dots→underscores to match model output)
@@ -162,16 +213,16 @@ def verify_fn_calling_answer(
         gorilla_tool_calls = _convert_to_gorilla(oai_tool_calls)
     except Exception as e:
         logger.debug(f"Failed to convert tool calls to Gorilla format: {e}")
-        return "unparsable"
+        return {"answer_status": "unparsable", "partial_score": 0.0}
 
     try:
         is_valid_format = bfcl["is_function_calling_format_output"](gorilla_tool_calls)
         if not is_valid_format:
             logger.debug("Invalid tool call format")
-            return "unparsable"
+            return {"answer_status": "unparsable", "partial_score": 0.0}
     except Exception as e:
         logger.debug(f"Format validation failed: {e}")
-        return "unparsable"
+        return {"answer_status": "unparsable", "partial_score": 0.0}
 
     # Always use a known -FC model for BFCL's AST checker.
     # The -FC suffix means underscore_to_dot=True, which normalizes ground truth dots→underscores
@@ -180,7 +231,7 @@ def verify_fn_calling_answer(
 
     if ground_truth is None:
         logger.warning(f"No ground truth for category '{category}'")
-        return "unparsable"
+        return {"answer_status": "unparsable", "partial_score": 0.0}
 
     # BFCL returns {'id': ..., 'ground_truth': [...]} but AST checker expects just the list
     if isinstance(ground_truth, dict) and "ground_truth" in ground_truth:
@@ -204,16 +255,26 @@ def verify_fn_calling_answer(
         )
     except Exception as e:
         logger.debug(f"AST checker failed: {e}")
-        return "unparsable"
+        return {"answer_status": "unparsable", "partial_score": 0.0}
 
     if checker_result.get("valid", False):
-        return "correct"
-    else:
-        logger.debug(
-            f"AST check failed: {checker_result.get('error', 'unknown')} "
-            f"({checker_result.get('error_type', 'unknown')})"
-        )
-        return "wrong"
+        return {"answer_status": "correct", "partial_score": 1.0}
+
+    # For parallel categories, compute partial credit per-call
+    partial_score = 0.0
+    if category in _PARALLEL_CATEGORIES and isinstance(ground_truth, list) and len(ground_truth) > 1:
+        try:
+            partial_score = _compute_partial_score(
+                function_def, gorilla_tool_calls, ground_truth, language, model_name_for_bfcl,
+            )
+        except Exception as e:
+            logger.debug(f"Partial score computation failed: {e}")
+
+    logger.debug(
+        f"AST check failed: {checker_result.get('error', 'unknown')} "
+        f"({checker_result.get('error_type', 'unknown')})"
+    )
+    return {"answer_status": "wrong", "partial_score": partial_score}
 
 
 class FnCallingVerificationRequest(BaseModel):
@@ -228,7 +289,7 @@ def _execute_verification(
     reward_context: Dict[str, Any],
     tool_calls: Optional[List[Dict[str, Any]]],
     model_name: str,
-) -> AnswerStatus:
+) -> Dict[str, Any]:
     return verify_fn_calling_answer(
         generation=generation,
         reward_context=reward_context,
@@ -246,7 +307,8 @@ async def verify_fn_calling_answer_rpc(
     reward_context: Dict[str, Any],
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     model_name: str = "model",
-) -> AnswerStatus:
+) -> Dict[str, Any]:
+    """Returns dict with 'answer_status' (AnswerStatus) and 'partial_score' (float)."""
     payload = {
         "generation": generation,
         "reward_context": reward_context,
@@ -262,7 +324,10 @@ async def verify_fn_calling_answer_rpc(
         status = str(data.get("answer_status", "")).strip().lower()
         if status not in _VALID_STATUSES:
             raise ValueError(f"fn_calling verifier produced invalid status '{status}'")
-        return cast(AnswerStatus, status)
+        return {
+            "answer_status": cast(AnswerStatus, status),
+            "partial_score": float(data.get("partial_score", 1.0 if status == "correct" else 0.0)),
+        }
 
 
 class BFCLEnvironment:
@@ -285,7 +350,7 @@ class BFCLEnvironment:
             async def verify(request: FnCallingVerificationRequest):
                 loop = asyncio.get_running_loop()
                 try:
-                    answer_status = await loop.run_in_executor(
+                    result = await loop.run_in_executor(
                         process_pool,
                         _execute_verification,
                         request.generation,
@@ -296,7 +361,7 @@ class BFCLEnvironment:
                 except Exception as exc:
                     logger.exception("fn_calling verification failed")
                     raise HTTPException(status_code=500, detail=str(exc))
-                return JSONResponse(content={"answer_status": answer_status})
+                return JSONResponse(content=result)
 
             @app.get("/health")
             async def health():

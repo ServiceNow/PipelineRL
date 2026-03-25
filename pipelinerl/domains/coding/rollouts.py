@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class CodingMetrics(BaseMetrics):
+    penalty: float = 0.0
     compile_error: bool = False
     runtime_error: bool = False
     timeout_error: bool = False
@@ -176,7 +177,7 @@ async def generate_coding_rollout(
         max_tokens = llm.parameters["max_tokens"]
     except (KeyError, TypeError):
         max_tokens = None
-    reward, _ = _compute_reward(
+    reward, overlong_penalty = _compute_reward(
         cfg,
         rewards_cfg,
         answer_status=answer_status,
@@ -202,6 +203,7 @@ async def generate_coding_rollout(
 
     metrics = CodingMetrics(
         reward=reward,
+        penalty=overlong_penalty,
         success=(verification.get("passed") == verification.get("total") and verification.get("total", 0) > 0),
         no_error=not (
             verification.get("compile_error")

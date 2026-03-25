@@ -1,0 +1,7 @@
+Third-party notices
+
+This package includes vendored code from Prime Intellect's i3-logic
+project:
+https://github.com/PrimeIntellect/i3-logic
+
+The vendored package identifies i3-logic as Apache 2.0 licensed.
