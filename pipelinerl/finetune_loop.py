@@ -41,6 +41,7 @@ from pipelinerl.finetune.checkpoints import (
 from pipelinerl.finetune.context import get_accelerator
 from pipelinerl.finetune.data import collate, collate_packed
 from pipelinerl.finetune.logging_ import log_metrics, log_time, setup_logging
+from pipelinerl.finetune.memory_debug import MemoryDebugger, create_memory_debugger
 from pipelinerl.finetune.optim import get_optimizer
 from pipelinerl.finetune.rl import (
     RLConfig,
@@ -91,6 +92,7 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
 def run_data_loader(
     data_stream: SingleStreamSpec,
     batch_queue: Queue[PipelineBatchEncoding | Exception],
+    memory_debug: MemoryDebugger | None = None,
 ):
     """Load BatchEncoding objects directly from preprocessor."""
     with read_stream(data_stream) as stream_reader:
@@ -105,8 +107,26 @@ def run_data_loader(
 
                     # Convert to PipelineBatchEncoding and move to device
                     pipeline_batch = PipelineBatchEncoding(**batch_encoding)
+                    if memory_debug is not None and memory_debug.should_log_loader_event():
+                        memory_debug.log_snapshot(
+                            "loader_after_batch_construction",
+                            batch=pipeline_batch,
+                            queue_size=batch_queue.qsize(),
+                        )
                     pipeline_batch = pipeline_batch.to_device(get_accelerator().device)
+                    if memory_debug is not None and memory_debug.should_log_loader_event():
+                        memory_debug.log_snapshot(
+                            "loader_after_to_device",
+                            batch=pipeline_batch,
+                            queue_size=batch_queue.qsize(),
+                        )
                     batch_queue.put(pipeline_batch)
+                    if memory_debug is not None and memory_debug.should_log_loader_event():
+                        memory_debug.log_snapshot(
+                            "loader_after_enqueue",
+                            batch=pipeline_batch,
+                            queue_size=batch_queue.qsize(),
+                        )
 
             except Exception as e:
                 logger.error(f"Error in stream reader: {e}")
@@ -332,7 +352,7 @@ def run_finetuning_loop(
     current_dir = output_dir / "current"
     intermediate_root_dir = output_dir / "intermediate"
     training_state_dir = output_dir / "training_state"
-    log_dir = output_dir / "logs"
+    log_dir = output_dir / "log"
 
     if args.force_restart and get_accelerator().is_main_process:
         remove_results(current_dir, intermediate_root_dir, training_state_dir, log_dir)
@@ -347,6 +367,7 @@ def run_finetuning_loop(
     else:
         logger.info(f"Last logging message from {get_accelerator().process_index}, will be quiet from now on")
         logging.disable(logging.INFO)
+    memory_debug = create_memory_debugger(args, output_dir, get_accelerator().process_index)
 
     logger.info(get_accelerator().state)
     logger.info(f"Saving experiment to {output_dir}")
@@ -459,7 +480,17 @@ def run_finetuning_loop(
             actor_update_group=actor_update_group,
         )
         logger.info("Load the first version of the model into inference LLMs")
+        if memory_debug is not None:
+            memory_debug.log_snapshot(
+                "before_weight_update_initial",
+                training_metrics=training_metrics,
+            )
         weight_update_manager.send_weight_update(training_metrics.samples)
+        if memory_debug is not None:
+            memory_debug.log_snapshot(
+                "after_weight_update_initial",
+                training_metrics=training_metrics,
+            )
     else:
         weight_update_manager = None
 
@@ -468,6 +499,7 @@ def run_finetuning_loop(
         run_data_loader,
         data_stream=data_stream,
         batch_queue=batch_queue,
+        memory_debug=memory_debug,
     )
     data_loader_thread = threading.Thread(target=data_loader_worker_fn, args=(), daemon=True)
 
@@ -487,6 +519,18 @@ def run_finetuning_loop(
         assert seq_parallel_group is not None
         substitute_hf_flash_attn(seq_parallel_group, heads_k_stride=1)
 
+    if memory_debug is not None:
+        memory_debug.log_snapshot(
+            "startup_complete",
+            training_metrics=training_metrics,
+            queue_size=batch_queue.qsize(),
+            extra={
+                "send_weight_updates": bool(args.send_weight_updates),
+                "seq_parallel": int(args.seq_parallel),
+                "gradient_accumulation_passes": int(args.gradient_accumulation_passes),
+            },
+        )
+
     try:
         logger.info("Start training")
         rl_finetuning_worker(
@@ -499,14 +543,23 @@ def run_finetuning_loop(
             training_metrics,
             batch_queue,
             weight_update_stream,
-            seq_parallel_group, 
+            seq_parallel_group,
+            memory_debug,
         )
     finally:
+        if memory_debug is not None:
+            memory_debug.log_snapshot(
+                "trainer_shutdown",
+                training_metrics=training_metrics,
+                queue_size=batch_queue.qsize(),
+            )
         if weight_update_manager is not None:
             weight_update_manager.shutdown()
         # PyNcclCommunicator doesn't need explicit destroy like torch.distributed process groups
         if actor_update_group:
             dist.destroy_process_group(actor_update_group)
+        if memory_debug is not None:
+            memory_debug.close()
 
 
 def rl_finetuning_worker(
@@ -521,6 +574,7 @@ def rl_finetuning_worker(
     batch_queue: Queue[PipelineBatchEncoding | Exception],
     weight_update_stream: SingleStreamSpec | None = None,
     seq_parallel_group = None,
+    memory_debug: MemoryDebugger | None = None,
 ):
     local_samples = torch.tensor([0], device=get_accelerator().device)
     # Create a list of tensors with matching dtype (int64)
@@ -594,15 +648,31 @@ def rl_finetuning_worker(
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
     while training_metrics.completed_steps < final_train_steps:
+        logical_step = training_metrics.completed_steps + 1
         # We include time waiting for data in the step time
         if first_pass:
             first_pass = False
             step_start_time = time.time()
             logger.info(f"Start step at {step_start_time}")
+            if memory_debug is not None and memory_debug.should_log_step(logical_step):
+                memory_debug.log_snapshot(
+                    "step_start",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    queue_size=batch_queue.qsize(),
+                )
 
         before_getting_next_batch = time.time()
 
         batch = next(data_generator)
+        if memory_debug is not None and memory_debug.should_log_micro_batch(logical_step):
+            memory_debug.log_snapshot(
+                "after_batch_dequeue",
+                logical_step=logical_step,
+                training_metrics=training_metrics,
+                batch=batch,
+                queue_size=batch_queue.qsize(),
+            )
         is_sentinel_batch = batch.sentinel
         if local_samples[0] == target_samples_per_lead:
             assert is_sentinel_batch, "We should get a sentinel batch"
@@ -690,6 +760,14 @@ def rl_finetuning_worker(
             if seq_parallel_group is not None:
                 assert batch.seq_boundaries is not None
                 update_ring_flash_attn_params(batch.seq_boundaries, seq_parallel_group)
+            if memory_debug is not None and memory_debug.should_log_micro_batch(logical_step):
+                memory_debug.log_snapshot(
+                    "before_rl_step",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    batch=batch,
+                    queue_size=batch_queue.qsize(),
+                )
             loss, this_step_rl_metrics = rl_step(
                 model,
                 batch,
@@ -698,6 +776,14 @@ def rl_finetuning_worker(
                 rl_config,
                 seq_parallel_group=seq_parallel_group,
             )
+            if memory_debug is not None and memory_debug.should_log_micro_batch(logical_step):
+                memory_debug.log_snapshot(
+                    "after_rl_step",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    batch=batch,
+                    queue_size=batch_queue.qsize(),
+                )
             if is_sentinel_batch:
                 # zero out the loss and do not update the metrics
                 loss = loss * 0.0
@@ -707,6 +793,14 @@ def rl_finetuning_worker(
                     rl_metrics[k].append(v)
 
             backward(loss, is_final_micro_batch=do_optimizer_step)
+            if memory_debug is not None and memory_debug.should_log_micro_batch(logical_step):
+                memory_debug.log_snapshot(
+                    "after_backward",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    batch=batch,
+                    queue_size=batch_queue.qsize(),
+                )
 
         if not is_sentinel_batch:
             passes_took.append(time.time() - time_before_pass)
@@ -741,8 +835,22 @@ def rl_finetuning_worker(
         except Exception as e:
             logger.warning(f"Synchronization error: {e}. Continuing anyway...")
 
+        if memory_debug is not None and memory_debug.should_log_step(logical_step):
+            memory_debug.log_snapshot(
+                "before_optimizer_step",
+                logical_step=logical_step,
+                training_metrics=training_metrics,
+                queue_size=batch_queue.qsize(),
+            )
         optimizer_step_and_zero_grad()
         lr_scheduler.step()
+        if memory_debug is not None and memory_debug.should_log_step(logical_step):
+            memory_debug.log_snapshot(
+                "after_optimizer_step",
+                logical_step=logical_step,
+                training_metrics=training_metrics,
+                queue_size=batch_queue.qsize(),
+            )
 
         metrics_dict = {}
         time_to_stop = training_metrics.completed_steps >= final_train_steps
@@ -833,11 +941,32 @@ def rl_finetuning_worker(
             and training_metrics.samples - training_metrics.last_broadcasted_version >= args.weight_update_interval
         ):
             assert weight_update_manager is not None
+            if memory_debug is not None and memory_debug.should_log_step(logical_step):
+                memory_debug.log_snapshot(
+                    "before_weight_update",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    queue_size=batch_queue.qsize(),
+                )
             weight_update_manager.send_weight_update(training_metrics.samples)
             training_metrics.last_broadcasted_version = training_metrics.samples
+            if memory_debug is not None and memory_debug.should_log_step(logical_step):
+                memory_debug.log_snapshot(
+                    "after_weight_update",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    queue_size=batch_queue.qsize(),
+                )
         get_accelerator().wait_for_everyone()
 
         if time_to_save:
+            if memory_debug is not None:
+                memory_debug.log_snapshot(
+                    "before_model_save_current",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    queue_size=batch_queue.qsize(),
+                )
             save_model_and_tokenizer(
                 current_dir,
                 model,
@@ -845,7 +974,21 @@ def rl_finetuning_worker(
                 args.lora.enabled,
                 safe_serialization=args.use_safetensors,
             )
+            if memory_debug is not None:
+                memory_debug.log_snapshot(
+                    "after_model_save_current",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    queue_size=batch_queue.qsize(),
+                )
             # Save training state to training_state.pt (for resuming).
+            if memory_debug is not None:
+                memory_debug.log_snapshot(
+                    "before_training_state_save",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    queue_size=batch_queue.qsize(),
+                )
             save_training_state(
                 training_state_dir,
                 model,
@@ -853,9 +996,23 @@ def rl_finetuning_worker(
                 lr_scheduler,
                 asdict(training_metrics),
             )
+            if memory_debug is not None:
+                memory_debug.log_snapshot(
+                    "after_training_state_save",
+                    logical_step=logical_step,
+                    training_metrics=training_metrics,
+                    queue_size=batch_queue.qsize(),
+                )
 
             if args.keep_intermediate_checkpoints:
                 intermediate_dir = intermediate_root_dir / str(training_metrics.completed_steps)
+                if memory_debug is not None:
+                    memory_debug.log_snapshot(
+                        "before_model_save_intermediate",
+                        logical_step=logical_step,
+                        training_metrics=training_metrics,
+                        queue_size=batch_queue.qsize(),
+                    )
                 save_model_and_tokenizer(
                     intermediate_dir,
                     model,
@@ -863,6 +1020,13 @@ def rl_finetuning_worker(
                     args.lora.enabled,
                     safe_serialization=args.use_safetensors,
                 )
+                if memory_debug is not None:
+                    memory_debug.log_snapshot(
+                        "after_model_save_intermediate",
+                        logical_step=logical_step,
+                        training_metrics=training_metrics,
+                        queue_size=batch_queue.qsize(),
+                    )
                 dt = log_time(dt, time_stats, "finetune/interim_save")
 
                 if args.cuda_empty_cache:
@@ -876,6 +1040,13 @@ def rl_finetuning_worker(
     dt = log_time(dt, time_stats, "finetune/train_loop")
 
     logger.info("Final model saving")
+    if memory_debug is not None:
+        memory_debug.log_snapshot(
+            "before_model_save_final",
+            logical_step=training_metrics.completed_steps,
+            training_metrics=training_metrics,
+            queue_size=batch_queue.qsize(),
+        )
     save_model_and_tokenizer(
         current_dir,
         model,
@@ -883,8 +1054,22 @@ def rl_finetuning_worker(
         args.lora.enabled,
         safe_serialization=args.use_safetensors,
     )
+    if memory_debug is not None:
+        memory_debug.log_snapshot(
+            "after_model_save_final",
+            logical_step=training_metrics.completed_steps,
+            training_metrics=training_metrics,
+            queue_size=batch_queue.qsize(),
+        )
     dt = log_time(dt, time_stats, "finetune/final_save")
     if args.save_final_training_state:
+        if memory_debug is not None:
+            memory_debug.log_snapshot(
+                "before_training_state_save_final",
+                logical_step=training_metrics.completed_steps,
+                training_metrics=training_metrics,
+                queue_size=batch_queue.qsize(),
+            )
         save_training_state(
             training_state_dir,
             model,
@@ -892,6 +1077,13 @@ def rl_finetuning_worker(
             lr_scheduler,
             asdict(training_metrics),
         )
+        if memory_debug is not None:
+            memory_debug.log_snapshot(
+                "after_training_state_save_final",
+                logical_step=training_metrics.completed_steps,
+                training_metrics=training_metrics,
+                queue_size=batch_queue.qsize(),
+            )
         dt = log_time(dt, time_stats, "finetune/final_training_state_save")
 
     if get_accelerator().is_main_process:
