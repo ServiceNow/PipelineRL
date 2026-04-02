@@ -78,6 +78,12 @@ cuda_empty_cache: True
 sft_config_name: null
 n_examples: 0 # 0 means do not limit number of samples
 log_each_n_steps: 1
+memory_debug:
+  enabled: false
+  log_every_n_steps: 100
+  capture_smaps_rollup: false
+  capture_cgroup_stats: true
+  phase_granularity: step
 also_save_steps: []
 use_safetensors: true
 save_final_training_state: True
