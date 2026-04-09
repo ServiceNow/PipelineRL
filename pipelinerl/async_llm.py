@@ -4,12 +4,13 @@ import logging
 
 import aiohttp
 import numpy as np
+import torch
 from PIL import Image
 from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
 
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from pipelinerl.rollouts import TrainingText
-from pipelinerl.processor_factory import get_processor
+from pipelinerl.vision_processor_utils import get_mm_processor
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
 
     if use_processor:
         # Use processor for vision-language models
-        processor = get_processor(llm.model_name)
+        processor = get_mm_processor(llm.model_name, mm_processor_kwargs=llm.mm_processor_kwargs)
 
         try:
             # Apply chat template using processor for proper image token handling
@@ -187,11 +188,11 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             processed = processor(
                 text=[prompt_text], images=images, padding=True, return_tensors=None
             )
+            # Convert PyTorch tensors to numpy arrays
             visual_features = {
-                key: value
+                key: value.cpu().numpy() if torch.is_tensor(value) else value
                 for key, value in processed.items()
-                if isinstance(value, np.ndarray)
-                and key not in ["input_ids", "attention_mask"]
+                if key not in ["input_ids", "attention_mask"]
             }
 
         except Exception as e:

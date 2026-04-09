@@ -356,8 +356,25 @@ def run_finetuning_loop(
     logger.info("About to load model")
     model = load_model(args, args.model_class, current_dir)
     logger.info(f"Model loaded in dtype {model.dtype}")
-
     dt = log_time(dt, time_stats, "finetune/model_load")
+
+    # Fix for multimodal models (e.g., Apriel, Qwen3-VL) with Accelerate+DeepSpeed
+    # Accelerate's _prepare_deepspeed() doesn't check text_config.hidden_size
+    if not hasattr(model.config, "hidden_size") and not hasattr(model.config, "hidden_sizes"):
+        if hasattr(model.config, "text_config"):
+            hidden_size = None
+            if hasattr(model.config.text_config, "hidden_size"):
+                hidden_size = model.config.text_config.hidden_size
+            elif hasattr(model.config.text_config, "hidden_sizes"):
+                hidden_size = max(model.config.text_config.hidden_sizes)
+
+            if hidden_size is not None:
+                if get_accelerator().is_main_process:
+                    logger.info(
+                        f"Detected multimodal model with text_config.hidden_size={hidden_size}. "
+                        f"Setting config.hidden_size to enable DeepSpeed auto-configuration."
+                    )
+                model.config.hidden_size = hidden_size
 
     data_stream = SingleStreamSpec(
         exp_path=exp_root_dir,
