@@ -15,11 +15,11 @@ environment_key: math
 dataset_loader: pipelinerl.domains.math.load_datasets
 
 finetune:
-  seq_length: 18000
+  seq_length: 20000
 
 vllm_config:
   vllm_kwargs:
-    max_model_len: 18000
+    max_model_len: 20000
 
 llm:
   parameters: 
