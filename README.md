@@ -1,6 +1,13 @@
-# Pipeline RL: fast LLM agent training
+<p align="center">
+    <img src="assets/logo.png" alt="PipelineRL" width="500">
+</p>
 
-[![Github](https://img.shields.io/badge/HF%20Blog%20Post-0000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
+<h1 align="center">PipelineRL: Fast LLM Agent Training</h1>
+
+<p align="center">
+    <a href="https://huggingface.co/blog/ServiceNow/pipelinerl/"><img src="https://img.shields.io/badge/HF%20Blog%20Post-0000" alt="Blog"></a>
+    <a href="https://arxiv.org/abs/2509.19128"><img src="https://img.shields.io/badge/arXiv-2509.19128-b31b1b" alt="Paper"></a>
+</p>
 
 ## Table of Contents
 
@@ -195,9 +202,9 @@ cd PipelineRL
 
 Create the environments with dependencies.
 ```bash
-conda create -n pipeline-rl -y python=3.12
+conda create -n pipeline-rl -y python=3.11
 conda run --no-capture-output -n pipeline-rl pip install -e .
-conda run --no-capture-output -n pipeline-rl pip install flash-attn==2.8.3 --no-build-isolation
+conda run --no-capture-output -n pipeline-rl pip install flash-attn==2.7.4.post1 --no-build-isolation
 ```
 
 Alternatively for `flash-attn`, you can install it via prebuilt packages (on Linux):
@@ -205,12 +212,36 @@ Alternatively for `flash-attn`, you can install it via prebuilt packages (on Lin
 # Check your PyTorch's C++ ABI setting first:
 # python -c "import torch; print(torch._C._GLIBCXX_USE_CXX11_ABI)"
 # Use cxx11abiTRUE or cxx11abiFALSE in the URL accordingly
-conda run --no-capture-output -n pipeline-rl pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+conda run --no-capture-output -n pipeline-rl pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
 ```
 
 By default Pipeline-RL will use the file system as the medium for streaming the generated data to the trainer processes. This works on one node, but the files can get quite large. To use Redis instead you will need to install the Redis server in the same conda environment:
 ```bash
-conda install redis-server==7.4.0 -c conda-forge 
+conda install redis-server==7.4.0 -c conda-forge
+```
+
+### Optional: SandboxFusion for coding verification
+
+PipelineRL supports using [SandboxFusion](https://bytedance.github.io/SandboxFusion/) to execute and verify coding-task outputs in a remote sandbox.
+
+To run SandboxFusion locally, follow the deployment guide and startup logs here:
+https://bytedance.github.io/SandboxFusion/docs/docs/get-started#local-deployment
+
+Then point PipelineRL to your sandbox endpoint by setting `sandbox_endpoint` in your config (for example in `conf/coding.yaml`) or by exporting `SANDBOX_ENDPOINT`:
+```bash
+export SANDBOX_ENDPOINT=http://127.0.0.1:8080
+```
+
+### Optional: SandboxFusion for coding verification
+
+PipelineRL supports using [SandboxFusion](https://bytedance.github.io/SandboxFusion/) to execute and verify coding-task outputs in a remote sandbox.
+
+To run SandboxFusion locally, follow the deployment guide and startup logs here:
+https://bytedance.github.io/SandboxFusion/docs/docs/get-started#local-deployment
+
+Then point PipelineRL to your sandbox endpoint by setting `sandbox_endpoint` in your config (for example in `conf/coding.yaml`) or by exporting `SANDBOX_ENDPOINT`:
+```bash
+export SANDBOX_ENDPOINT=http://127.0.0.1:8080
 ```
 
 ## Run experiments

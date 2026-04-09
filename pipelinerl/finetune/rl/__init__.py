@@ -310,6 +310,10 @@ def rl_step(
             clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = (clamped_group_ratio != group_ratio_new_old) & valid_mask_3d
             surr2 = clamped_group_ratio * group_advantages_t
+            # Length-proportional weighting is intentional: longer sequences carry more
+            # gradient, which complements difficulty-aware penalty (DAP) — DAP reduces the
+            # length penalty for successful hard rollouts, and length-proportional weights
+            # amplify that signal into the update. Uniform weighting hurts training dynamics.
             sequence_weights = weight_sum.unsqueeze(1).unsqueeze(2)
             if batch.sentinel or surr1.numel() == 0:
                 policy_loss_total = new_logprobs[..., :1].sum() * 0.0

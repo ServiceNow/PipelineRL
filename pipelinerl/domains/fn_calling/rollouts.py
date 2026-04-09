@@ -24,6 +24,7 @@ _reward_config_logged = False
 
 class FnCallingMetrics(BaseMetrics):
     penalty: float
+    partial_score: float = 1.0
 
 
 def _format_tools_for_prompt(tools: List[Dict[str, Any]]) -> str:
@@ -96,8 +97,7 @@ async def _run_verification(
     generation: str,
     reward_context: Dict[str, Any],
     tool_calls: Optional[List[Dict[str, Any]]],
-) -> str:
-    """Run verification via RPC to BFCLEnvironment server."""
+) -> Dict[str, Any]:
     env_key = resolve_environment_key(cfg, default="fn_calling")
     env_jobs = get_environment_jobs(cfg, env_key)
     if not env_jobs:
@@ -144,13 +144,15 @@ async def generate_fn_calling_rollout(
 
     reward_context = problem.get("reward_context", {})
 
-    answer_status = await _run_verification(
+    verification_result = await _run_verification(
         cfg=cfg,
         session=session,
         generation=llm_call.output.content,
         reward_context=reward_context,
         tool_calls=tool_calls,
     )
+    answer_status = verification_result["answer_status"]
+    partial_score = verification_result["partial_score"]
 
     rewards = RewardTable(**dict(cfg.rewards))
     trace = make_training_text(llm, llm_call)
@@ -180,6 +182,11 @@ async def generate_fn_calling_rollout(
         case _:
             raise ValueError(f"Unexpected fn_calling answer status '{answer_status}'")
 
+    # For parallel categories with partial credit, interpolate between wrong and correct reward
+    if answer_status == "wrong" and partial_score > 0.0:
+        correct_reward = rewards.correct_answer_finished if trace.finished else rewards.correct_answer_not_finished
+        reward = reward + partial_score * (correct_reward - reward)
+
     reward *= cfg.actor.discount_factor ** llm_call.output_length_tokens
 
     overlong_penalty = 0.0
@@ -201,7 +208,10 @@ async def generate_fn_calling_rollout(
         )
 
     trace.reward = reward
-    trace.metadata.setdefault("fn_calling", {}).update({"answer_status": answer_status})
+    trace.metadata.setdefault("fn_calling", {}).update({
+        "answer_status": answer_status,
+        "partial_score": partial_score,
+    })
 
     metrics = FnCallingMetrics(
         reward=reward,
@@ -209,6 +219,7 @@ async def generate_fn_calling_rollout(
         no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
         penalty=overlong_penalty,
+        partial_score=partial_score,
     )
 
     return RolloutResult(

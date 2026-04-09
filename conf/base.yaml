@@ -30,7 +30,7 @@ preprocess:
   chunk_n_groups: 2
   # queue for loaded raw groups
   raw_queue_size: 8
-  # queue for processed chunks of multiple groups  
+  # queue for processed chunks of multiple groups
   input_queue_size: 32
   # queue for ready chunks for multiple groups
   output_queue_size: 32
@@ -40,9 +40,10 @@ preprocess:
   ring_buffer_size: 128
   # "virtual" sample queue per lead trainer
   max_ready_samples_per_lead: 64
-  pop_old_data: ${..pop_old_data} 
+  pop_old_data: ${..pop_old_data}
   shared_memory_entry_size: 100000000
   log_every_n_samples: 128
+
 llm:
   parameters:
     # changed

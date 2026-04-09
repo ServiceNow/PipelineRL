@@ -40,8 +40,8 @@ def timeout(seconds=5):
 def _ensure_imports():
     global _verifier_classes, _Data
     if _verifier_classes is None:
-        from i3_logic.task2verifier import verifier_classes
-        from i3_logic.base import Data
+        from .i3_logic.task2verifier import verifier_classes
+        from .i3_logic.base import Data
         _verifier_classes = verifier_classes
         _Data = Data
 

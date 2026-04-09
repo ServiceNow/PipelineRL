@@ -300,6 +300,7 @@ _PREDEFINED_HF_DATASETS = {
     "hendrydong/gpqa_main",
     "hendrydong/gpqa_diamond",
     "GAIR/LIMO",
+    "nvidia/Nemotron-Cascade-RL-Math",
 }
 
 
@@ -388,6 +389,13 @@ def load_datasets(dataset_names: List[str] | str | None, seed: int | None = None
         logger.info(f"Loading deepscaler preview train dataset: {len(samples)} samples")
         datasets += add_ids(samples)
         remaining.discard("deepscaler_preview")
+
+    if "nemotron_cascade_math" in dataset_names:
+        dataset = load_dataset("nvidia/Nemotron-Cascade-RL-Math", split="train", trust_remote_code=True)
+        samples = [s for s in process_math(dataset, "nemotron_cascade_math") if s is not None]
+        logger.info(f"Loading nemotron cascade math dataset: {len(samples)} samples")
+        datasets += add_ids(samples)
+        remaining.discard("nemotron_cascade_math")
 
     if "math_test" in dataset_names:
         # math_dataset = load_math("test")
