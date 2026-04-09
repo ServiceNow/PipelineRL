@@ -423,16 +423,6 @@ class ActorLoop:
         logger.info(f"Stopped {len(self.rollout_processes)} rollout processes")
         self.rollout_processes = []
 
-        # Start curriculum feedback listener AFTER forking scheduler processes (fork safety)
-        # Starting it before fork can cause multiprocessing.Queue corruption
-        if self._curriculum_config is not None and hasattr(self, '_curriculum_feedback_stream'):
-            self.curriculum_state = CurriculumState(
-                self._curriculum_config,
-                self._curriculum_feedback_stream,
-            )
-            self.curriculum_state.start_listening()
-            logger.info("Started curriculum feedback listener (after fork)")
-
     def init_stats(self):
         self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.latency_list = []
