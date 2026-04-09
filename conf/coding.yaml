@@ -1,0 +1,47 @@
+defaults:
+  - base
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.coding.generate_coding_rollout
+  # Empty system prompt - the problems already include instructions like:
+  # "Read the inputs from stdin...Enclose your code within ```python delimiters."
+  # Adding extra instructions can conflict with the model's native prompt format.
+  system_prompt: ""
+  task_template: |-
+    {task}
+
+    Write your solution in Python. Be concise. Output only the code in a single ```python``` block.
+  task_prompt: ""
+  ensure_boxed_answers: false
+
+# SandboxFusion verification settings
+sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
+sandbox_timeout: 10.0
+max_tests_per_problem: 5
+
+# Use combined TACO + APPS dataset
+dataset_loader: pipelinerl.domains.coding.dataset.load_problems
+dataset_loader_params:
+  taco_split: train
+  apps_split: train
+  subset: train  # "train", "test", or "all"
+  train_ratio: 0.9
+  # Filter out HARD and VERY_HARD from TACO (APPS kept as-is)
+  taco_excluded_difficulties:
+    - HARD
+    - VERY_HARD
+  # Limit test cases per problem (aligned with median test counts)
+  max_tests_per_problem: 5
+  max_examples: null
+  seed: 42
+  huggingface_token: ${oc.env:HF_TOKEN, null}
+
+train_dataset_names:
+  - taco
+  - apps
+
+test_dataset_names:
+  - livecodebench_v5
+
+environment_key: coding

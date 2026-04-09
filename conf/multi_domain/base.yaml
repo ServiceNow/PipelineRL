@@ -1,0 +1,117 @@
+# @package _global_
+defaults:
+  - /domain_rollouts@domain_rollouts: base
+  - /domain_mix: null
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
+  # No system prompt - model's chat template provides guidance
+  system_prompt: ""
+  # Minimal task template - each problem contains its own instructions
+  task_template: |-
+    {task}
+  task_prompt: ""
+  ensure_boxed_answers: false
+  domain_rollouts:
+    math: ${domain_rollouts.math}
+    guessing: ${domain_rollouts.guessing}
+    counting: ${domain_rollouts.counting}
+    chartqa: ${domain_rollouts.chartqa}
+    miniwob: ${domain_rollouts.miniwob}
+    coding: ${domain_rollouts.coding}
+    livecodebench: ${domain_rollouts.livecodebench}
+    fn_calling: ${domain_rollouts.fn_calling}
+    logic: ${domain_rollouts.logic}
+    ifeval: ${domain_rollouts.ifeval}
+
+dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
+dataset_loader_params:
+  per_domain_params:
+    coding:
+      # TACO + APPS
+      taco_split: train
+      apps_split: train
+      subset: train
+      train_ratio: 0.9
+      max_tests_per_problem: 5
+      taco_excluded_difficulties: [VERY_HARD]
+      skip_apps: false
+      max_examples: null
+      seed: 42
+      huggingface_token: ${oc.env:HF_TOKEN, null}
+    logic:
+      dataset_id: PrimeIntellect/INTELLECT-3-RL
+      dataset_config: logic
+      split: train
+      subset: train
+      train_ratio: 0.9
+      min_difficulty: 0.0
+      max_difficulty: 1.0
+      difficulty_column: avg@16_qwen3_4b_instruct_2507
+      tasks_to_skip: [arc_agi, arc_agi_2, buggy_tables, dyck_language, dyck_language_errors, dyck_language_reasoning_errors]
+      max_examples: null
+      seed: 42
+      huggingface_token: ${oc.env:HF_TOKEN, null}
+    fn_calling:
+      # BFCL v4 function calling (Berkeley Function Calling Leaderboard)
+      categories:
+        # Simple (single function call)
+        - simple_python
+        - simple_java
+        - simple_javascript
+        # Complex (multiple calls)
+        - multiple
+        - parallel
+        - parallel_multiple
+        # Live (real-world APIs)
+        - live_simple
+        - live_multiple
+        - live_parallel
+        - live_parallel_multiple
+      max_examples_per_category: null
+      max_examples: null
+      subset: train  # "train", "test" (90/10 split), or "all" (no split, all categories)
+      train_ratio: 0.9
+      seed: 42
+    livecodebench:
+      version: release_latest
+      max_examples: null
+      max_tests_per_problem: 15
+      seed: 42
+      huggingface_token: ${oc.env:HF_TOKEN, null}
+    ifeval:
+      # AllenAI IF_multi_constraints for train, Google IFEval for test
+      subset: train  # "train" (AllenAI 95k), "test" (Google 541)
+      max_examples: null
+      max_constraints: null
+      # Filter out prompts exceeding this token count (max_model_len - max_tokens - buffer)
+      max_prompt_tokens: 42000
+      seed: 42
+      huggingface_token: ${oc.env:HF_TOKEN, null}
+
+train_dataset_names: []
+test_dataset_names: []
+
+environments:
+  - key: math
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.math.MathEnvironment
+  - key: logic
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.logic.LogicEnvironment
+  - key: ifeval
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.ifeval.IFEvalEnvironment
+  - key: fn_calling
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.fn_calling.BFCLEnvironment
+
+environment_key: null
+
+world:
+  env_replicas_per_actor: 1

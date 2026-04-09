@@ -1,0 +1,33 @@
+# @package _global_
+defaults:
+  - /base
+  - /domain_rollouts@domain_rollouts: base
+  - override /rewards: success_and_format
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.dispatcher.generate_multidomain_rollout
+  llm_max_rollouts: 2
+  rollout_workers: 1
+  domain_rollouts:
+    math: ${domain_rollouts.math}
+    guessing: ${domain_rollouts.guessing}
+    coding: ${domain_rollouts.coding}
+
+dataset_loader: pipelinerl.domains.multidomain.load_problems
+train_dataset_names:
+  - math_debug
+  - guessing_debug
+  - coding_debug
+test_dataset_names:
+  - math_debug
+  - coding_debug
+
+environments:
+  - key: math
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.math.MathEnvironment
+
+world:
+  env_replicas_per_actor: 1

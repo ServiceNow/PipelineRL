@@ -1,0 +1,8 @@
+# @package actor.domain_mix
+# Default domain mix weights for multi-domain training
+
+math: 0.35
+coding: 0.25
+logic: 0.15
+ifeval: 0.15
+fn_calling: 0.10

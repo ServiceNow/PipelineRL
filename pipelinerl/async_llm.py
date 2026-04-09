@@ -34,13 +34,10 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
                     # Handle base64 format
                     url = content_item["image_url"]["url"]
                     if url.startswith("data:image;base64,"):
-                        try:
-                            base64_data = url.split("data:image;base64,")[1]
-                            image_data = base64.b64decode(base64_data)
-                            image = Image.open(io.BytesIO(image_data))
-                            images.append(image)
-                        except Exception as e:
-                            raise e
+                        base64_data = url.split("data:image;base64,")[1]
+                        image_data = base64.b64decode(base64_data)
+                        image = Image.open(io.BytesIO(image_data))
+                        images.append(image)
 
     return images
 
@@ -89,7 +86,8 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
-    payload = _to_plain_obj({**data, **extra_parameters})
+    # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
+    payload = _to_plain_obj({**extra_parameters, **data})
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
         json=payload,
@@ -127,9 +125,9 @@ async def llm_async_generate(
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
         finish_reason = data["choices"][0].get("finish_reason")
-    except Exception as e:
+    except Exception:
         logger.exception(f"Failed to parse llm response: {data}")
-        raise e
+        raise
 
     output = LLMOutput(content=content)
     llm_call = llm.log_output(prompt, output, count_tokens=False)

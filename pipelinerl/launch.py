@@ -256,7 +256,6 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     if proc is not None:
         yield LaunchedProcess(kind="actor", handle=proc)
 
-
 def run_environment(cfg: DictConfig, job: Job):
     # run in a subprocess like in the rest of the code
     run_dir = Path(cfg.output_dir) / f"environment_{job.replica_idx}"

@@ -306,6 +306,7 @@ async def _execute_rollout_with_timeout(
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
+        domain="miniwob",
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
     )
@@ -338,6 +339,7 @@ def _create_failed_rollout_result(problem: dict, start_time: float, error_type: 
         metrics=metrics,
         latency=latency,
         dataset_name=problem["dataset"],
+        domain="miniwob",
         prompt_tokens=[],
         output_tokens=[],
     )

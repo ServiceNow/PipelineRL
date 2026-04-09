@@ -1,0 +1,47 @@
+defaults:
+  - base
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.ifeval.generate_ifeval_rollout
+  system_prompt: ""
+  task_template: |-
+    {task}
+
+    Be concise and direct in your response. Do not add unnecessary elaboration.
+  task_prompt: ""
+  ensure_boxed_answers: false
+
+  # IFEval verification options
+  ifeval_partial_credit: true  # If true, give partial reward for some constraints met
+
+dataset_loader: pipelinerl.domains.ifeval.dataset.load_problems
+dataset_loader_params:
+  # AllenAI IF_multi_constraints_upto5 (95k training samples with up to 5 constraints)
+  max_examples: null
+  max_constraints: null  # Optionally limit max constraints per sample
+  seed: 42
+  huggingface_token: ${oc.env:HF_TOKEN, null}
+  # Train/test split: ~550 held-out for testing (similar to Google IFEval size)
+  test_size: 550
+  # Filter out prompts exceeding this token count (max_model_len - max_tokens - buffer)
+  # With max_model_len=48000 and max_tokens=4096: 48000 - 4096 - 1000 = 42904
+  max_prompt_tokens: 42000
+
+train_dataset_names:
+  - ifeval
+
+test_dataset_names:
+  - ifeval_test
+
+environments:
+  - key: ifeval
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.ifeval.IFEvalEnvironment
+
+world:
+  env_replicas_per_actor: 1
+
+# IFEval verification via RPC to IFEvalEnvironment server
+environment_key: ifeval

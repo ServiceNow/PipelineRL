@@ -5,6 +5,8 @@ from datasets import load_dataset
 
 logger = logging.getLogger(__name__)
 
+DOMAIN = "chartqa"
+
 
 def process_chartqa(dataset, dataset_name: str):
     """Process ChartQA dataset into standardized format."""
@@ -31,6 +33,7 @@ def add_ids(dataset: list[dict]):
     """Add sequential IDs to dataset items."""
     for i, entry in enumerate(dataset):
         entry["id"] = i
+        entry.setdefault("domain", DOMAIN)
     return dataset
 
 

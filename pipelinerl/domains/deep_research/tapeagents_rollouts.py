@@ -65,4 +65,4 @@ async def generate_rollout(
     agent.llms["default"].generate = generate  # type: ignore
     samples, metrics = await asyncio.to_thread(run_tapeagent, task, agent, environment, cfg.max_loops)
     latency = time.time() - time_start
-    return RolloutResult(training_texts=samples, metrics=metrics, latency=latency, dataset_name=problem.get("dataset"))
+    return RolloutResult(training_texts=samples, metrics=metrics, latency=latency, dataset_name=problem.get("dataset"), domain="deep_research")

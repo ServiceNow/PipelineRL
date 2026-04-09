@@ -145,4 +145,5 @@ async def generate_chartqa_rollout(
         metrics=metrics,
         dataset_name=problem.get("dataset"),
         latency=latency,
+        domain="chartqa",
     )

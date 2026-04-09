@@ -1,0 +1,49 @@
+defaults:
+  - base
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.logic.generate_logic_rollout
+  system_prompt: ""
+  task_template: |-
+    {task}
+
+  task_prompt: ""
+  ensure_boxed_answers: false
+
+dataset_loader: pipelinerl.domains.logic.dataset.load_problems
+dataset_loader_params:
+  # PrimeIntellect INTELLECT-3-RL logic domain (11.6k samples, 87 task types)
+  dataset_id: PrimeIntellect/INTELLECT-3-RL
+  dataset_config: logic
+  split: train
+  subset: train  # "train" or "test"
+  # Fixed test size similar to IFEval (~550 held-out samples)
+  test_size: 550
+  # Difficulty filtering using model solve rates
+  min_difficulty: 0.0
+  max_difficulty: 1.0
+  difficulty_column: avg@16_qwen3_4b_instruct_2507
+  # Skip certain task types (as recommended by i3-logic)
+  tasks_to_skip: [arc_agi, arc_agi_2, buggy_tables, dyck_language, dyck_language_errors, dyck_language_reasoning_errors]
+  max_examples: null
+  seed: 42
+  huggingface_token: ${oc.env:HF_TOKEN, null}
+
+train_dataset_names:
+  - logic
+
+test_dataset_names:
+  - logic_test
+
+environments:
+  - key: logic
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.logic.LogicEnvironment
+
+world:
+  env_replicas_per_actor: 1
+
+# Logic verification via RPC to LogicEnvironment server
+environment_key: logic
