@@ -12,6 +12,7 @@ from pipelinerl.domains.logic.dataset import load_problems as load_logic_problem
 from pipelinerl.domains.miniwob.load_tasks import load_tasks as load_miniwob_tasks
 from pipelinerl.domains.ifeval.dataset import load_problems as load_ifeval_problems
 from pipelinerl.domains.ifeval.google_ifeval import load_problems as load_google_ifeval_problems
+from pipelinerl.domains.privacy_agent.dataset import load_problems as load_privacy_agent_problems
 
 
 def _load_math(dataset_names: Sequence[str], *, seed=None, **_: dict) -> List[Dict]:
@@ -58,6 +59,10 @@ def _load_google_ifeval(dataset_names: Sequence[str], **loader_kwargs: dict) -> 
     return load_google_ifeval_problems(list(dataset_names), **loader_kwargs)
 
 
+def _load_privacy_agent(dataset_names: Sequence[str], **loader_kwargs: dict) -> List[Dict]:
+    return load_privacy_agent_problems(list(dataset_names), **loader_kwargs)
+
+
 DOMAIN_LOADERS = {
     "math": _load_math,
     "guessing": _load_guessing,
@@ -70,6 +75,7 @@ DOMAIN_LOADERS = {
     "logic": _load_logic,
     "ifeval": _load_ifeval,
     "google_ifeval": _load_google_ifeval,
+    "privacy_agent": _load_privacy_agent,
 }
 
 

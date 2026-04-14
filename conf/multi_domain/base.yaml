@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
   - /domain_rollouts@domain_rollouts: base
+  - /domain_params@privacy_agent: privacy_agent
   - /domain_mix: null
   - _self_
 
@@ -24,6 +25,7 @@ actor:
     fn_calling: ${domain_rollouts.fn_calling}
     logic: ${domain_rollouts.logic}
     ifeval: ${domain_rollouts.ifeval}
+    privacy_agent: ${domain_rollouts.privacy_agent}
 
 dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
 dataset_loader_params:
@@ -89,6 +91,7 @@ dataset_loader_params:
       max_prompt_tokens: 42000
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
+    privacy_agent: ${privacy_agent}
 
 train_dataset_names: []
 test_dataset_names: []
