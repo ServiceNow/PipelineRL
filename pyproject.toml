@@ -75,9 +75,9 @@ ifeval = [
     "absl-py",
 ]
 terminalbench = [
-    "cube-standard[toolkit] @ file:///home/toolkit/cube-standard",
-    "cube-harness @ file:///home/toolkit/cube-harness",
-    "terminalbench-cube @ file:///home/toolkit/cube-harness/cubes/terminalbench-cube",
+    "cube-standard[toolkit] @ git+https://github.com/The-AI-Alliance/cube-standard.git@a5947a0",
+    "cube-harness @ git+https://github.com/The-AI-Alliance/cube-harness.git@064efc6",
+    "terminalbench-cube @ git+https://github.com/The-AI-Alliance/cube-harness.git@064efc6#subdirectory=cubes/terminalbench-cube",
 ]
 # Install all domain dependencies
 domains = [
@@ -97,9 +97,9 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-cube-standard = { path = "/home/toolkit/cube-standard", editable = true }
-cube-harness = { path = "/home/toolkit/cube-harness", editable = true }
-terminalbench-cube = { path = "/home/toolkit/cube-harness/cubes/terminalbench-cube", editable = true }
+cube-standard = { git = "https://github.com/The-AI-Alliance/cube-standard.git", rev = "a5947a0" }
+cube-harness = { git = "https://github.com/The-AI-Alliance/cube-harness.git", rev = "064efc6" }
+terminalbench-cube = { git = "https://github.com/The-AI-Alliance/cube-harness.git", rev = "064efc6", subdirectory = "cubes/terminalbench-cube" }
 
 [tool.setuptools.packages.find]
 where = ["."]
