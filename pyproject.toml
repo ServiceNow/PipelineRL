@@ -74,32 +74,18 @@ ifeval = [
     "langdetect",
     "absl-py",
 ]
-terminalbench = [
-    "cube-standard[toolkit] @ file:///home/toolkit/cube-standard",
-    "cube-harness @ file:///home/toolkit/cube-harness",
-    "terminalbench-cube @ file:///home/toolkit/cube-harness/cubes/terminalbench-cube",
-]
 # Install all domain dependencies
 domains = [
     "pipelinerl[coding,fn_calling,logic,ifeval]",
 ]
 
 [tool.uv]
-conflicts = [
-    [{ extra = "terminalbench" }, { extra = "tapeagents" }],
-    [{ extra = "lora" }, { extra = "tapeagents" }],
-]
 # tapeagents==0.1.16 requires transformers<4.52 and accelerate<1.8, which conflict with the project's versions.
 # Overrides to allow resolution to proceed; tapeagents extra will be broken at runtime until it supports newer versions.
 override-dependencies = [
     "transformers>=4.51.0",
     "accelerate>=1.7.0",
 ]
-
-[tool.uv.sources]
-cube-standard = { path = "/home/toolkit/cube-standard", editable = true }
-cube-harness = { path = "/home/toolkit/cube-harness", editable = true }
-terminalbench-cube = { path = "/home/toolkit/cube-harness/cubes/terminalbench-cube", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["."]
