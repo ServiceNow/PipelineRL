@@ -4,7 +4,7 @@ requires = [
     "wheel",
     "numpy>=1.26.0",
     "packaging>=23.0",
-    "torch~=2.6.0",
+    "torch~=2.7.0",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -13,19 +13,18 @@ name = "pipelinerl"
 version = "0.1.0"
 description = "A scalable asynchronous reinforcement learning implementation with in-flight weight updates."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [
     { name = "ServiceNow" },
 ]
 dependencies = [
     "aiohttp>=3.9.0",
-    "vllm==0.8.5.post1",
+    "vllm==0.10.0",
     "accelerate==1.12.0",
-    "deepspeed==0.15.4",
-    "browsergym>=0.13.0",
+    "deepspeed~=0.18.0",
     "datasets>=2.21.0",
-    "transformers~=4.52.0" ,
+    "transformers~=4.57.0" ,
     "fastapi>=0.115.0",
     "joblib>=1.3.2",
     "jsonref>=1.1.0",
@@ -54,9 +53,12 @@ tapeagents = [
     "Tapeagents[finetune]==0.1.16",
 ]
 lora = [
-    "peft==0.18.0",
+    "peft~=0.18.0",
 ]
 # Domain-specific dependencies
+miniwob = [
+    "browsergym~=0.14.0",
+]
 coding = [
     "sandbox-fusion>=0.3.7",
 ]
@@ -72,10 +74,32 @@ ifeval = [
     "langdetect",
     "absl-py",
 ]
+terminalbench = [
+    "cube-standard[toolkit] @ file:///home/toolkit/cube-standard",
+    "cube-harness @ file:///home/toolkit/cube-harness",
+    "terminalbench-cube @ file:///home/toolkit/cube-harness/cubes/terminalbench-cube",
+]
 # Install all domain dependencies
 domains = [
     "pipelinerl[coding,fn_calling,logic,ifeval]",
 ]
+
+[tool.uv]
+conflicts = [
+    [{ extra = "terminalbench" }, { extra = "tapeagents" }],
+    [{ extra = "lora" }, { extra = "tapeagents" }],
+]
+# tapeagents==0.1.16 requires transformers<4.52 and accelerate<1.8, which conflict with the project's versions.
+# Overrides to allow resolution to proceed; tapeagents extra will be broken at runtime until it supports newer versions.
+override-dependencies = [
+    "transformers>=4.51.0",
+    "accelerate>=1.7.0",
+]
+
+[tool.uv.sources]
+cube-standard = { path = "/home/toolkit/cube-standard", editable = true }
+cube-harness = { path = "/home/toolkit/cube-harness", editable = true }
+terminalbench-cube = { path = "/home/toolkit/cube-harness/cubes/terminalbench-cube", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -2,7 +2,7 @@
 This module provides a custom vLLM inference server with dynamic weight updates using the legacy V0 engine architecture.
 
 Compatibility:
-    - vLLM versions <= 0.10.0 only
+    - vLLM versions < 0.11.0 only
     - Use vllm1.py for vLLM >= 0.11.0 as the V0 engine was removed in vLLM 0.11.0
 """
 from packaging import version as version_parser
@@ -11,12 +11,14 @@ import vllm
 # Check vLLM version compatibility
 vllm_version = version_parser.parse(vllm.__version__)
 
-if vllm_version > version_parser.parse("0.10.0"):
+if vllm_version >= version_parser.parse("0.11.0"):
     raise ImportError(
         f"pipelinerl.vllm0 is not compatible with vLLM {vllm.__version__}. "
         "This module only works with vLLM <= 0.10.0. "
         "Please use pipelinerl.vllm1 for vLLM >= 0.11.0 instead."
     )
+
+VLLM_PRE_0_10 = vllm_version < version_parser.parse("0.10.0")
 
 
 import asyncio
@@ -45,8 +47,12 @@ from vllm.executor.mp_distributed_executor import MultiprocessingDistributedExec
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
 from vllm.usage.usage_lib import UsageContext
-from vllm.worker.multi_step_worker import MultiStepWorker
-from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+if VLLM_PRE_0_10:
+    from vllm.worker.multi_step_worker import MultiStepWorker
+    from vllm.worker.multi_step_model_runner import MultiStepModelRunner
+else:
+    MultiStepWorker = None
+    MultiStepModelRunner = None
 
 
 from pipelinerl.finetune_loop import TrainerMessage, WeightUpdateRequest
@@ -66,6 +72,11 @@ logger.addHandler(handler)
 
 
 def make_worker_class(multi_step: bool):
+    if multi_step and not VLLM_PRE_0_10:
+        raise ImportError(
+            f"MultiStepWorker (num_scheduler_steps > 1) is not available in vLLM {vllm.__version__}. "
+            "It was removed in vLLM 0.10.0. Use --num-scheduler-steps 1."
+        )
     base_class = MultiStepWorker if multi_step else Worker
 
     class NewWorkerClass(base_class):
@@ -88,14 +99,14 @@ def make_worker_class(multi_step: bool):
                 + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
             )
             # Use StatelessProcessGroup + PyNcclCommunicator for cross-process NCCL communication
-            # self.process_group = torch_utils.stateless_init_process_group(
-            self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-                group_name="actor",
-                backend="nccl",
+            self.process_group = torch_utils.stateless_init_process_group(
+            # self.process_group = pipelinerl.torch_utils.init_extra_process_group(
+                # group_name="actor",
+                # backend="nccl",
                 init_method=weight_update_group_init_method,
                 rank=self.pg_rank,
                 world_size=weight_update_group_world_size,
-                # device=self.device,
+                device=self.device,
             )
             logger.info(prefix + "Actor update process group initialized")
 
@@ -107,9 +118,10 @@ def make_worker_class(multi_step: bool):
                 if target_dtype not in expected_dtypes:
                     logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
                 buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
-                # self.process_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
-                torch.distributed.broadcast(buffer, src=0, group=self.process_group)
-                if isinstance(self.model_runner, MultiStepModelRunner):
+                self.process_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
+                # Previously used torch.distributed.broadcast
+                # torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+                if VLLM_PRE_0_10 and isinstance(self.model_runner, MultiStepModelRunner):
                     loaded_params = self.model_runner._base_model_runner.model.load_weights(
                         weights=[(info.name, buffer)]
                     )
@@ -124,7 +136,7 @@ def make_worker_class(multi_step: bool):
 
 
 AsyncRLWorker = make_worker_class(multi_step=False)
-AsyncRLMultiStepWorker = make_worker_class(multi_step=True)
+AsyncRLMultiStepWorker = make_worker_class(multi_step=True) if VLLM_PRE_0_10 else None
 
 executor_lock = asyncio.Lock()
 
@@ -146,8 +158,9 @@ class WeightUpdateManager:
     def __init__(self, args, executor: AsyncRLExecutor):
         self.executor = executor
         self.driver_worker = getattr(executor, "driver_worker")
-        self.multi_step = args.num_scheduler_steps > 1
-        assert isinstance(self.driver_worker.worker, AsyncRLMultiStepWorker if self.multi_step else AsyncRLWorker)
+        self.multi_step = getattr(args, "num_scheduler_steps", 1) > 1
+        expected_cls = AsyncRLMultiStepWorker if self.multi_step else AsyncRLWorker
+        assert isinstance(self.driver_worker.worker, expected_cls)
         self.other_workers = getattr(executor, "workers")
         self.args = args
 
@@ -220,7 +233,12 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Build the engine with the bespoke Executor and Worker classes
-    multi_step = args.num_scheduler_steps > 1
+    multi_step = getattr(args, "num_scheduler_steps", 1) > 1
+    if multi_step and not VLLM_PRE_0_10:
+        raise ImportError(
+            f"num_scheduler_steps > 1 is not supported in vLLM {vllm.__version__}. "
+            "MultiStepWorker was removed in vLLM 0.10.0. Use --num-scheduler-steps 1."
+        )
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     engine_config.parallel_config.distributed_executor_backend = AsyncRLExecutor

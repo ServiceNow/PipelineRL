@@ -74,7 +74,7 @@ vllm_config:
     # V1 specific settings
     # logprobs-mode: processed_logprobs
     # V0 specific settings
-    num-scheduler-steps: 1
+    # num-scheduler-steps: 1
     disable-log-requests: ""
     disable-frontend-multiprocessing: ""
 
@@ -94,7 +94,6 @@ jobs: []
 
 eval_every_n_versions: 78000
 
-# changed
 model_path: Qwen/Qwen2.5-7B
 
 # will use default based on the chosen backend
