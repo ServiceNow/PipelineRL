@@ -8,7 +8,7 @@ from PIL import Image
 from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
 
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
-from pipelinerl.rollouts import TrainingText
+from pipelinerl.rollouts import TrainingText, apply_rollout_reward
 from pipelinerl.processor_factory import get_processor
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -250,3 +250,14 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         output_tokens=output_tokens,
         visual_features=visual_features,
     )
+
+
+def make_training_texts_from_llm_calls(
+    llm: TrainableLLM,
+    llm_calls: list[LLMCall],
+    reward: float | None = None,
+) -> list[TrainingText]:
+    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
+    if reward is not None:
+        training_texts = apply_rollout_reward(training_texts, reward)
+    return training_texts
