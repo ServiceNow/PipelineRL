@@ -161,10 +161,7 @@ async def generate_rollout(
                 f"{traceback.format_exc()}"
             )
 
-    logger.error(
-        f"All env servers failed for task {problem.get('task_id', '?')}. Returning failed rollout."
-    )
-    return _failed_rollout(problem, start_time)
+    raise RuntimeError(f"All env servers failed for task {problem.get('task_id', '?')}")
 
 
 # ── Agent loop ─────────────────────────────────────────────────────────────────
@@ -207,11 +204,26 @@ async def _run_rollout(
 
         for _step in range(max_steps):
             prompt = Prompt(messages=list(messages))
-            llm_call = await llm_async_generate(llm, prompt, session)
+            try:
+                llm_call = await llm_async_generate(llm, prompt, session)
+            except aiohttp.ClientResponseError as e:
+                if e.status == 400:
+                    if not llm_calls:
+                        raise RuntimeError(f"Context length exceeded on first LLM call for task {problem.get('task_id', '?')}") from e
+                    logger.warning(f"Context length exceeded for task {problem.get('task_id', '?')}, ending rollout")
+                else:
+                    if not llm_calls:
+                        raise
+                    logger.warning(f"LLM call failed (HTTP {e.status}) for task {problem.get('task_id', '?')}, ending rollout: {e}")
+                break
             llm_calls.append(llm_call)
 
             response_text = llm_call.output.content or ""
             messages.append({"role": "assistant", "content": response_text})
+
+            if llm_call.llm_info.get("finish_reason") == "length":
+                logger.warning(f"Output truncated (finish_reason=length) for task {problem.get('task_id', '?')}, ending rollout")
+                break
 
             if "TASK_COMPLETE" in response_text:
                 break
