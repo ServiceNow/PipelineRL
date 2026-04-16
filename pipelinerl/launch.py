@@ -240,7 +240,9 @@ def run_actor_llm(
     save_command(log_dir, cmd)
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
+    # Give each actor a distinct base port so vLLM's get_open_port() race condition
+    # (TOCTOU: find-free-port then bind) doesn't cause EADDRINUSE when multiple servers start simultaneously.
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, "VLLM_PORT": str(30000 + actor_llm_idx * 20), **_get_quantization_env(cfg)}
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
