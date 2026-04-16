@@ -420,7 +420,7 @@ class BrowseCompSearchTool(Tool):
     def execute(self, query: str, context: ResearchContext) -> Dict[str, Any]:
         """Execute BrowseComp search and return results."""
         if self.use_remote:
-            return self._execute_remote(query)
+            return self._execute_remote(query, context)
 
         if not self.searcher or not self.lookup:
             output = self.create_error_output(
@@ -438,7 +438,7 @@ class BrowseCompSearchTool(Tool):
             )
             return output
 
-    def _execute_remote(self, query: str) -> Dict[str, Any]:
+    def _execute_remote(self, query: str, context: ResearchContext) -> Dict[str, Any]:
         if self.helper_client is None:
             output = self.create_error_output(
                 "browsecomp_search",

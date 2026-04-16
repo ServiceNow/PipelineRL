@@ -1,10 +1,12 @@
+"""Dataset loader for the simplified privacy hop-QA domain."""
+
 import json
 from pathlib import Path
 from typing import Any
 
-from .drbench.paths import DEFAULT_ANNOTATIONS_PATH, DEFAULT_CURATED_CHAINS_PATH
+from .paths import DEFAULT_ANNOTATIONS_PATH, DEFAULT_CURATED_CHAINS_PATH
 
-DOMAIN_NAME = "privacy_agent"
+DOMAIN_NAME = "privacy_hopqa"
 DEFAULT_DATASET_NAME = "seed20"
 DEFAULT_SAMPLE_SIZE = 20
 
@@ -65,9 +67,9 @@ def _flatten_problem(row: dict, idx: int, dataset_name: str) -> dict:
             }
         )
 
-    problem = {
+    return {
         "id": idx,
-        "problem_id": f"privacy_agent_{row['chain_id']}",
+        "problem_id": f"{DOMAIN_NAME}_{row['chain_id']}",
         "task": chain.get("numbered_questions", ""),
         "dataset": dataset_name,
         "domain": DOMAIN_NAME,
@@ -89,7 +91,6 @@ def _flatten_problem(row: dict, idx: int, dataset_name: str) -> dict:
             "source_file": row.get("source_file"),
         },
     }
-    return problem
 
 
 def _load_from_materialized_jsonl(path: str | Path) -> list[dict]:
@@ -100,7 +101,7 @@ def _load_from_materialized_jsonl(path: str | Path) -> list[dict]:
         row.setdefault("domain", DOMAIN_NAME)
         row.setdefault("dataset", Path(path).stem)
         row.setdefault("id", idx)
-        row.setdefault("problem_id", f"privacy_agent_{row.get('chain_id', idx)}")
+        row.setdefault("problem_id", f"{DOMAIN_NAME}_{row.get('chain_id', idx)}")
         problems.append(row)
     return problems
 
@@ -119,7 +120,7 @@ def _ensure_seed20_sources_exist(
     if missing:
         joined = ", ".join(missing)
         raise FileNotFoundError(
-            "privacy_agent seed20 inputs are missing. "
+            "privacy_hopqa seed20 inputs are missing. "
             f"Set explicit dataset inputs ({joined}) or pass a materialized JSONL file "
             "as train/test dataset name."
         )
@@ -152,9 +153,9 @@ def load_problems(
             loaded = _load_from_materialized_jsonl(dataset_path)
         else:
             normalized_name = str(dataset_name).strip()
-            if normalized_name not in {DEFAULT_DATASET_NAME, "accepted20", "privacy_agent_seed20"}:
+            if normalized_name not in {DEFAULT_DATASET_NAME, "accepted20", "privacy_hopqa_seed20", "privacy_agent_seed20"}:
                 raise ValueError(
-                    f"Unsupported privacy_agent dataset '{dataset_name}'. "
+                    f"Unsupported privacy_hopqa dataset '{dataset_name}'. "
                     f"Use '{DEFAULT_DATASET_NAME}' or pass a materialized JSONL file."
                 )
             annotations_file, curated_file = _ensure_seed20_sources_exist(

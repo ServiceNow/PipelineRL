@@ -1,4 +1,4 @@
-"""Configuration helpers for the privacy_agent domain."""
+"""Configuration helpers for the privacy_hopqa domain."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 from omegaconf import DictConfig, OmegaConf
 
-from .drbench.paths import (
+from .paths import (
     DEFAULT_ANNOTATIONS_PATH,
     DEFAULT_BROWSECOMP_CORPUS,
     DEFAULT_BROWSECOMP_INDEX_GLOB,
@@ -29,22 +29,21 @@ def _extract_settings_block(cfg: DictConfig | Mapping[str, Any] | None) -> dict[
     if not root:
         return {}
 
-    direct = _to_plain_dict(root.get("privacy_agent"))
+    direct = _to_plain_dict(root.get("privacy_hopqa"))
     if direct:
         return direct
 
     dataset_loader_params = _to_plain_dict(root.get("dataset_loader_params"))
     per_domain = _to_plain_dict(dataset_loader_params.get("per_domain_params"))
-    domain_block = _to_plain_dict(per_domain.get("privacy_agent"))
+    domain_block = _to_plain_dict(per_domain.get("privacy_hopqa"))
     if domain_block:
         return domain_block
 
-    # Standalone configs may pass the settings directly as dataset_loader_params.
     return dataset_loader_params
 
 
 @dataclass(slots=True)
-class PrivacyAgentSettings:
+class PrivacyHopQASettings:
     annotations_path: Path = DEFAULT_ANNOTATIONS_PATH
     curated_path: Path = DEFAULT_CURATED_CHAINS_PATH
     sample_size: int = 20
@@ -54,16 +53,20 @@ class PrivacyAgentSettings:
     local_index_mmap_mode: str = "r"
     helper_service_url: str | None = None
     helper_timeout_s: float = 30.0
-    use_remote_embeddings: bool = True
     use_remote_local_search: bool = True
     use_remote_browsecomp: bool = True
     capture_mode: str = "all_calls"
     answer_match_f1_threshold: float = 0.75
-    use_research_plan: bool = False
-    max_iterations: int = 10
-    concurrent_actions: int = 3
+    max_iterations: int = 12
+    max_parallel_retrieval_actions: int = 3
+    retrieval_top_k: int = 5
+    choose_top_k: int = 3
+    max_candidate_cards: int = 20
+    chooser_excerpt_chars: int = 120
+    reader_excerpt_chars: int = 2500
+    max_history_entries: int = 10
+    local_search_threshold: float = 0.0
     semantic_threshold: float = 0.7
-    report_style: str = "concise_qa"
     browsecomp_enabled: bool = True
     browsecomp_device: str = "cpu"
     browsecomp_index_glob: str = DEFAULT_BROWSECOMP_INDEX_GLOB
@@ -71,90 +74,58 @@ class PrivacyAgentSettings:
     browsecomp_corpus: str = DEFAULT_BROWSECOMP_CORPUS
     browsecomp_top_k: int = 5
     browsecomp_max_chars: int = 8000
-    local_document_search_mode: str = "retrieve_only"
     llm_provider: str = "vllm"
     embedding_provider: str | None = "huggingface"
     embedding_model: str | None = "Qwen/Qwen3-Embedding-4B"
-    log_searches: bool = False
     log_prompts: bool = False
-    log_generations: bool = False
     verbose: bool = False
     no_web: bool = False
+    parallel_searches: bool = True
+    max_parallel_doc_reads: int = 3
 
     @classmethod
-    def from_cfg(cls, cfg: DictConfig | Mapping[str, Any] | None) -> "PrivacyAgentSettings":
+    def from_cfg(cls, cfg: DictConfig | Mapping[str, Any] | None) -> "PrivacyHopQASettings":
         data = _extract_settings_block(cfg)
-        local_document_search_mode = str(
-            data.get(
-                "local_document_search_mode",
-                "synthesize" if bool(data.get("local_document_search_synthesis", False)) else "retrieve_only",
-            )
-        ).strip().lower()
-        if local_document_search_mode not in {"retrieve_only", "synthesize"}:
-            local_document_search_mode = "retrieve_only"
         return cls(
             annotations_path=Path(data.get("annotations_path", DEFAULT_ANNOTATIONS_PATH)).expanduser(),
             curated_path=Path(data.get("curated_path", DEFAULT_CURATED_CHAINS_PATH)).expanduser(),
             sample_size=int(data.get("sample_size", 20)),
-            max_examples=(
-                int(data["max_examples"])
-                if data.get("max_examples") is not None
-                else None
-            ),
+            max_examples=(int(data["max_examples"]) if data.get("max_examples") is not None else None),
             task_data_root=Path(data.get("task_data_root", DEFAULT_TASK_DATA_ROOT)).expanduser(),
-            local_index_root=Path(
-                data.get("local_index_root", DEFAULT_LOCAL_INDEX_ROOT)
-            ).expanduser(),
+            local_index_root=Path(data.get("local_index_root", DEFAULT_LOCAL_INDEX_ROOT)).expanduser(),
             local_index_mmap_mode=str(data.get("local_index_mmap_mode", "r")),
-            helper_service_url=(
-                str(data["helper_service_url"])
-                if data.get("helper_service_url") is not None
-                else None
-            ),
+            helper_service_url=(str(data["helper_service_url"]) if data.get("helper_service_url") is not None else None),
             helper_timeout_s=float(data.get("helper_timeout_s", 30.0)),
-            use_remote_embeddings=bool(data.get("use_remote_embeddings", True)),
             use_remote_local_search=bool(data.get("use_remote_local_search", True)),
             use_remote_browsecomp=bool(data.get("use_remote_browsecomp", True)),
             capture_mode=str(data.get("capture_mode", "all_calls")),
             answer_match_f1_threshold=float(data.get("answer_match_f1_threshold", 0.75)),
-            use_research_plan=bool(data.get("use_research_plan", False)),
-            max_iterations=int(data.get("max_iterations", 10)),
-            concurrent_actions=int(data.get("concurrent_actions", 3)),
+            max_iterations=int(data.get("max_iterations", 12)),
+            max_parallel_retrieval_actions=int(data.get("max_parallel_retrieval_actions", 3)),
+            retrieval_top_k=int(data.get("retrieval_top_k", 5)),
+            choose_top_k=int(data.get("choose_top_k", 3)),
+            max_candidate_cards=int(data.get("max_candidate_cards", 20)),
+            chooser_excerpt_chars=int(data.get("chooser_excerpt_chars", 120)),
+            reader_excerpt_chars=int(data.get("reader_excerpt_chars", 2500)),
+            max_history_entries=int(data.get("max_history_entries", 10)),
+            local_search_threshold=float(data.get("local_search_threshold", 0.0)),
             semantic_threshold=float(data.get("semantic_threshold", 0.7)),
-            report_style=str(data.get("report_style", "concise_qa")),
             browsecomp_enabled=bool(data.get("browsecomp_enabled", True)),
             browsecomp_device=str(data.get("browsecomp_device", "cpu")),
-            browsecomp_index_glob=str(
-                data.get(
-                    "browsecomp_index_glob",
-                    DEFAULT_BROWSECOMP_INDEX_GLOB,
-                )
-            ),
-            browsecomp_model_name=str(
-                data.get("browsecomp_model_name", "Qwen/Qwen3-Embedding-4B")
-            ),
-            browsecomp_corpus=str(
-                data.get("browsecomp_corpus", DEFAULT_BROWSECOMP_CORPUS)
-            ),
-            browsecomp_top_k=int(data.get("browsecomp_top_k", 5)),
+            browsecomp_index_glob=str(data.get("browsecomp_index_glob", DEFAULT_BROWSECOMP_INDEX_GLOB)),
+            browsecomp_model_name=str(data.get("browsecomp_model_name", "Qwen/Qwen3-Embedding-4B")),
+            browsecomp_corpus=str(data.get("browsecomp_corpus", DEFAULT_BROWSECOMP_CORPUS)),
+            browsecomp_top_k=int(data.get("browsecomp_top_k", data.get("retrieval_top_k", 5))),
             browsecomp_max_chars=int(data.get("browsecomp_max_chars", 8000)),
-            local_document_search_mode=local_document_search_mode,
             llm_provider=str(data.get("llm_provider", "vllm")),
-            embedding_provider=str(data.get("embedding_provider", "huggingface")),
-            embedding_model=(
-                str(data["embedding_model"])
-                if data.get("embedding_model") is not None
-                else None
-            ),
-            log_searches=bool(data.get("log_searches", False)),
+            embedding_provider=(str(data["embedding_provider"]) if data.get("embedding_provider") is not None else None),
+            embedding_model=(str(data["embedding_model"]) if data.get("embedding_model") is not None else None),
             log_prompts=bool(data.get("log_prompts", False)),
-            log_generations=bool(data.get("log_generations", False)),
             verbose=bool(data.get("verbose", False)),
             no_web=bool(data.get("no_web", False)),
+            parallel_searches=bool(data.get("parallel_searches", True)),
+            max_parallel_doc_reads=int(data.get("max_parallel_doc_reads", 3)),
         )
-
-    def task_config_path(self, task_id: str) -> str:
-        return str(self.task_data_root / task_id / "config")
 
     def dataset_loader_kwargs(self) -> dict[str, Any]:
         return {

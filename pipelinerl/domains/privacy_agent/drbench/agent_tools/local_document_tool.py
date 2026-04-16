@@ -650,23 +650,34 @@ class LocalFileSearchTool(Tool):
                 log_local_document_search(self.run_config, search_query, params, result)
                 return result
 
-            # Synthesize results
-            synthesis = self._synthesize_local_results(local_results, search_query, context)
+            search_mode = str(getattr(self.run_config, "local_document_search_mode", "")).strip().lower()
+            if not search_mode:
+                search_mode = (
+                    "synthesize"
+                    if bool(getattr(self.run_config, "local_document_search_synthesis", False))
+                    else "retrieve_only"
+                )
+            if search_mode not in {"synthesize", "retrieve_only"}:
+                search_mode = "retrieve_only"
+            synthesis_enabled = search_mode == "synthesize"
+            synthesis = None
 
-            # Store synthesis in vector store with source tracking
+            # Store synthesis in vector store with source tracking when enabled.
             source_doc_ids = [result.get("doc_id") for result in local_results if result.get("doc_id")]
-            if self.vector_store and synthesis and source_doc_ids:
-                synthesis_metadata = {
-                    "tool_used": "local_document_search",
-                    "type": "ai_synthesis_with_sources",
-                    "source": "local_synthesis",
-                    "query_context": search_query,
-                    "synthesis_method": "local_document_search",
-                    "source_document_ids": source_doc_ids,
-                    "timestamp": datetime.now().isoformat(),
-                }
+            if synthesis_enabled:
+                synthesis = self._synthesize_local_results(local_results, search_query, context)
+                if self.vector_store and synthesis and source_doc_ids:
+                    synthesis_metadata = {
+                        "tool_used": "local_document_search",
+                        "type": "ai_synthesis_with_sources",
+                        "source": "local_synthesis",
+                        "query_context": search_query,
+                        "synthesis_method": "local_document_search",
+                        "source_document_ids": source_doc_ids,
+                        "timestamp": datetime.now().isoformat(),
+                    }
 
-                self.vector_store.store_document(content=synthesis, metadata=synthesis_metadata)
+                    self.vector_store.store_document(content=synthesis, metadata=synthesis_metadata)
 
             # Extract file statistics
             file_paths = set()
@@ -690,9 +701,10 @@ class LocalFileSearchTool(Tool):
                 folders_searched=list(folders),
                 results_count=len(local_results),
                 data_retrieved=True,
-                stored_in_vector=True,  # Prevent duplicate storage as research_finding
+                stored_in_vector=bool(synthesis_enabled and synthesis),  # Prevent duplicate storage as research_finding
                 results={
                     "synthesis": synthesis,
+                    "mode": search_mode,
                     "local_documents": [
                         {
                             "file_path": r.get("metadata", {}).get("file_path"),
@@ -707,7 +719,13 @@ class LocalFileSearchTool(Tool):
                     ],
                 },
             )
-            log_local_document_search(self.run_config, search_query, params, result)
+            log_local_document_search(
+                self.run_config,
+                search_query,
+                params,
+                result,
+                extra={"mode": search_mode},
+            )
             return result
 
         except Exception as e:

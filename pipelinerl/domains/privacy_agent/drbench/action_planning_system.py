@@ -42,6 +42,8 @@ _ACTION_TYPE_ALIASES = {
     "internet_search": "web_search",
     "web": "web_search",
     "web_search": "web_search",
+    "browsecomp_search": "web_search",
+    "analyze": "data_analysis",
     "enhanced_url_fetch": "url_fetch",
     "url_fetch": "url_fetch",
     "file_download": "file_download",
@@ -476,10 +478,21 @@ def _get_action_plan_guidelines(available_tool_names, report_style: str):
 
 
 def _get_qa_action_plan_guidelines(available_tool_names):
-    """QA-mode action plan guidelines: no source hierarchy, equal priority for local and web."""
+    """QA-mode action plan guidelines: lightweight multihop research guidance."""
 
     has_local_docs = any("LocalFileSearchTool" in tool_name for tool_name in available_tool_names)
     has_web = any("InternetSearchTool" in t or "BrowseCompSearchTool" in t for t in available_tool_names)
+    has_analysis = any("SmartAnalysisTool" in t for t in available_tool_names)
+
+    allowed_action_types = []
+    if has_web:
+        allowed_action_types.append(ActionType.WEB_SEARCH)
+    if has_local_docs:
+        allowed_action_types.append(ActionType.LOCAL_DOCUMENT_SEARCH)
+    if has_analysis:
+        allowed_action_types.append(ActionType.DATA_ANALYSIS)
+    if not allowed_action_types:
+        allowed_action_types.append(ActionType.WEB_SEARCH)
 
     # Build tool-aware examples
     examples = []
@@ -489,7 +502,7 @@ def _get_qa_action_plan_guidelines(available_tool_names):
         "description": "Search local documents for [specific query]",
         "parameters": {"query": "specific search terms", "top_k": 10},
         "priority": 0.8,
-        "expected_output": "Answer to question N from local documents",
+        "expected_output": "Relevant evidence from local documents",
         "preferred_tool": "LocalFileSearchTool"
     }""")
     if has_web:
@@ -499,25 +512,29 @@ def _get_qa_action_plan_guidelines(available_tool_names):
         "description": "Search web for [specific query]",
         "parameters": {{"query": "specific search terms", "num_results": 10}},
         "priority": 0.8,
-        "expected_output": "Answer to question N from web sources",
+        "expected_output": "Relevant evidence from web sources",
         "preferred_tool": "{web_tool}"
     }}""")
+    if has_analysis:
+        examples.append("""{
+        "type": "data_analysis",
+        "description": "Analyze the collected evidence to resolve a specific uncertainty",
+        "parameters": {"query": "specific analytical question to answer from collected evidence"},
+        "priority": 0.6,
+        "expected_output": "A synthesis of the most relevant evidence and remaining gaps",
+        "preferred_tool": "SmartAnalysisTool"
+    }""")
 
-    action_types = ', '.join([action_type.value for action_type in ActionType])
+    action_types = ", ".join(action_type.value for action_type in allowed_action_types)
 
-    return f"""Generate search actions to answer each research question.
+    return f"""Generate a small set of useful research actions for this investigation area.
 
-    For questions needing INTERNAL data (company-specific metrics, internal reports):
-    - Use LOCAL_DOCUMENT_SEARCH with specific search terms
-    - Priority: 0.8
+    These numbered questions are part of one larger multihop task. Choose actions that seem most useful for improving the final answer.
 
-    For questions needing EXTERNAL data (general knowledge, public facts):
-    - Use WEB_SEARCH with specific search terms
-    - Priority: 0.8
-
-    For questions where the source is unclear:
-    - Generate BOTH a local search AND a web search
-    - Priority: 0.7 each
+    Guidance:
+    - One action may help answer more than one numbered question
+    - Prefer specific, high-signal search queries over broad exploratory ones
+    - Prefer retrieval actions first; use data_analysis only when synthesizing collected evidence would clarify the answer
 
     For each action, specify:
     1. Action type ({action_types})
@@ -527,10 +544,11 @@ def _get_qa_action_plan_guidelines(available_tool_names):
     5. Preferred tool (choose from available tools)
 
     Requirements:
-    - Generate 1-2 actions per question (local search, web search, or both)
+    - Generate only the actions that seem worthwhile for this investigation area
     - Search queries should be specific and targeted
-    - Do NOT generate data_analysis or context_synthesis actions
-    - Do NOT generate URL_FETCH actions
+    - Action types should be one of: {action_types}
+    - Do NOT generate URL_FETCH, FILE_DOWNLOAD, ENTERPRISE_API, MCP_QUERY, or CONTEXT_SYNTHESIS actions
+    - Do not invent unsupported actions or tools
     - Action types should be one of: {action_types}
 
     Return a JSON array of actions:
@@ -681,6 +699,44 @@ class ActionPlanner:
 
         return normalized
 
+    def _allowed_action_types(self, tool_registry) -> set[ActionType]:
+        """Return the action types that are actually supported in the current mode."""
+        if self.run_config.report_style != "concise_qa":
+            return set(ActionType)
+
+        available_tool_names = [tool.__class__.__name__ for tool in tool_registry.tools]
+        allowed: set[ActionType] = set()
+
+        if any("InternetSearchTool" in t or "BrowseCompSearchTool" in t for t in available_tool_names):
+            allowed.add(ActionType.WEB_SEARCH)
+        if any("LocalFileSearchTool" in t for t in available_tool_names):
+            allowed.add(ActionType.LOCAL_DOCUMENT_SEARCH)
+        if any("SmartAnalysisTool" in t for t in available_tool_names):
+            allowed.add(ActionType.DATA_ANALYSIS)
+
+        if not allowed:
+            allowed.add(ActionType.WEB_SEARCH)
+
+        return allowed
+
+    def _filter_supported_actions(self, actions: List[Action], tool_registry) -> List[Action]:
+        """Drop actions that are not supported in the current run mode."""
+        allowed_action_types = self._allowed_action_types(tool_registry)
+        filtered: List[Action] = []
+
+        for action in actions:
+            if action.type not in allowed_action_types:
+                logger.info(
+                    "Dropping unsupported action for mode %s: %s (%s)",
+                    self.run_config.report_style,
+                    action.type.value,
+                    action.description[:120],
+                )
+                continue
+            filtered.append(action)
+
+        return filtered
+
     def _generate_actions_for_task(self, task: Dict[str, Any], tool_registry, context: ResearchContext) -> List[Action]:
         """Generate specific actions for a research task"""
 
@@ -697,15 +753,21 @@ class ActionPlanner:
         # Generate dynamic tool guidelines from registry
         tool_guidelines = self._generate_tool_guidelines(tool_registry)
         available_tool_names = [tool.__class__.__name__ for tool in tool_registry.tools]
+        task_context_block = context.get_task_context_block()
+
+        task_prompt_header = "Generate specific executable actions for this research investigation area:"
+        if self.run_config.report_style != "concise_qa":
+            task_prompt_header = "Generate specific executable actions for this research investigation area with SOURCE PRIORITIZATION:"
 
         prompt = f"""
-    Generate specific executable actions for this research investigation area with SOURCE PRIORITIZATION:
+    {task_prompt_header}
 
     Research Focus: {research_focus}
     Information Needs: {information_needs}
     Knowledge Sources: {knowledge_sources}
     Research Approach: {research_approach}
     Key Concepts: {key_concepts}
+    {task_context_block}
     Available Tools: {available_tool_names}
 
     Tool Selection Guidelines:
@@ -743,7 +805,9 @@ class ActionPlanner:
                     logger.warning(f"Error parsing action config. Skipping action: {e}")
                     continue
 
-            # Use LLM to detect dependencies (skip in QA mode — actions are independent per question)
+            actions = self._filter_supported_actions(actions, tool_registry)
+
+            # Skip dependency detection in QA mode to keep the action graph simple.
             if len(actions) > 1 and self.run_config.report_style != "concise_qa":
                 detected_deps = self._detect_action_dependencies(actions, research_focus)
 
@@ -768,7 +832,7 @@ class ActionPlanner:
         actions = []
 
         # Prioritize local document search if available
-        if any("localdocument" in tool_name for tool_name in available_tool_names):
+        if any("localfilesearchtool" in tool_name for tool_name in available_tool_names):
             actions.append(
                 Action(
                     id=f"{task_id}_local_doc_search",
@@ -796,7 +860,7 @@ class ActionPlanner:
             )
 
         # Add enterprise API search if available
-        if any("enterprise" in tool_name for tool_name in available_tool_names):
+        if self.run_config.report_style != "concise_qa" and any("enterprise" in tool_name for tool_name in available_tool_names):
             actions.append(
                 Action(
                     id=f"{task_id}_enterprise_search",
@@ -809,7 +873,7 @@ class ActionPlanner:
                 )
             )
 
-        return actions
+        return self._filter_supported_actions(actions, tool_registry)
 
     def _generate_fallback_actions(self, context: ResearchContext, tool_registry) -> List[Action]:
         """Generate basic actions when no research plan is available"""
@@ -819,13 +883,19 @@ class ActionPlanner:
 
         # Generate tool guidelines
         tool_guidelines = self._generate_tool_guidelines(tool_registry)
+        task_context_block = context.get_task_context_block()
 
         available_tool_names = [tool.__class__.__name__ for tool in tool_registry.tools]
 
+        task_prompt_header = "Generate specific executable actions for this research task:"
+        if self.run_config.report_style != "concise_qa":
+            task_prompt_header = "Generate specific executable actions for this research task with SOURCE PRIORITIZATION:"
+
         prompt = f"""
-    Generate specific executable actions for this research task with SOURCE PRIORITIZATION:
+    {task_prompt_header}
 
     Task: {query}
+    {task_context_block}
     Available Tools: {available_tool_names}
 
     Tool Selection Guidelines:
@@ -864,7 +934,7 @@ class ActionPlanner:
                     logger.warning(f"Error parsing fallback action config: {e}")
                     continue
 
-            return actions
+            return self._filter_supported_actions(actions, tool_registry)
 
         except Exception as e:
             logger.error(f"Error generating fallback actions: {e}")
@@ -893,7 +963,7 @@ class ActionPlanner:
             )
 
         # Try enterprise search if available
-        if any("enterprise" in tool_name for tool_name in available_tool_names):
+        if self.run_config.report_style != "concise_qa" and any("enterprise" in tool_name for tool_name in available_tool_names):
             actions.append(
                 Action(
                     id="basic_enterprise_search",
@@ -907,7 +977,7 @@ class ActionPlanner:
                 )
             )
 
-        return actions
+        return self._filter_supported_actions(actions, tool_registry)
 
     def _generate_adaptive_actions(
         self,
@@ -937,7 +1007,13 @@ class ActionPlanner:
                 findings_json = str(new_findings)
 
         if self.run_config.report_style == "concise_qa":
-            prompt = self._build_qa_adaptive_prompt(action_plan, completed_actions, findings_json, tool_registry)
+            prompt = self._build_qa_adaptive_prompt(
+                action_plan,
+                completed_actions,
+                findings_json,
+                tool_registry,
+                context,
+            )
         else:
             prompt = self._build_report_adaptive_prompt(
                 action_plan, completed_actions, findings_json, new_findings, tool_registry
@@ -984,15 +1060,19 @@ class ActionPlanner:
                     logger.warning(f"Error parsing adaptive action config. Skipping action: {e}")
                     continue
 
-            return new_actions
+            return self._filter_supported_actions(new_actions, tool_registry)
 
         except Exception as e:
             logger.warning(f"Adaptive action generation failed (continuing with existing actions): {e}")
             return []
 
-    def _build_qa_adaptive_prompt(self, action_plan, completed_actions, findings_json, tool_registry):
+    def _build_qa_adaptive_prompt(self, action_plan, completed_actions, findings_json, tool_registry, context):
         """Build a simple adaptive prompt for QA mode with lightweight source awareness."""
         available_tool_names = [tool.__class__.__name__ for tool in tool_registry.tools]
+        allowed_action_types = sorted(
+            action_type.value for action_type in self._allowed_action_types(tool_registry)
+        )
+        task_context_block = context.get_task_context_block()
 
         # Lightweight action-type summary instead of full source composition analysis
         type_counts = {}
@@ -1001,20 +1081,22 @@ class ActionPlanner:
             type_counts[t] = type_counts.get(t, 0) + 1
         action_type_summary = ", ".join(f"{v} {k}" for k, v in type_counts.items()) or "none"
 
-        return f"""You are answering numbered research questions. Here is what we've found so far:
+        return f"""You are continuing a multihop research task made up of numbered questions.
 
 Original Questions: {action_plan.research_query}
+{task_context_block}
 Completed Actions: {len(completed_actions)} ({action_type_summary})
 Available Tools: {available_tool_names}
 Latest Findings: {findings_json}
 
-Which questions still lack clear answers? Suggest 1-3 targeted follow-up searches.
-- Try different search terms for unanswered questions
-- If local search didn't find it, try web search (and vice versa)
-- Do NOT repeat previous search queries
-- Action types should be one of: {', '.join([at.value for at in ActionType])}
+Suggest the next 0-3 actions that seem most useful for improving the overall final answer.
+- Later questions may depend on earlier findings, but you do not need to work strictly in order
+- Prefer actions that resolve an important uncertainty, dependency, or ambiguity
+- Avoid repeating prior searches unless you are meaningfully refining them
+- Action types should be one of: {', '.join(allowed_action_types)}
+- Do NOT generate URL_FETCH, FILE_DOWNLOAD, ENTERPRISE_API, MCP_QUERY, or CONTEXT_SYNTHESIS actions
 
-Return a JSON array of 0-3 new actions, or [] if all questions are adequately answered.
+Return a JSON array of 0-3 new actions, or [] if the current evidence already seems sufficient.
 Each action: {{"type": "...", "description": "...", "parameters": {{}}, "priority": 0.8, "expected_output": "...", "preferred_tool": "..."}}
 
 Just return valid JSON, no other text.

@@ -1,4 +1,4 @@
-"""Runtime configuration for the vendored privacy_agent DRBench slice."""
+"""Runtime configuration for the privacy_hopqa domain."""
 
 import os
 from dataclasses import dataclass

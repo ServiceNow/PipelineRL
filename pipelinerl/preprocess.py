@@ -18,6 +18,11 @@ import datasets
 import transformers
 from litellm import BaseModel, Field
 
+from pipelinerl.domains.privacy_agent.size_debug import (
+    format_privacy_agent_payload_summary,
+    should_log_privacy_agent_payload,
+    summarize_privacy_agent_payload,
+)
 from pipelinerl.finetune.logging_ import flatten_dict_config
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.shared_memory_array import SharedMemoryQueue
@@ -48,6 +53,45 @@ from pipelinerl.streams import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_privacy_agent_preprocess_payload(
+    label: str,
+    samples: list[dict],
+    *,
+    container,
+    limit_bytes: int,
+    extra_fields: dict | None = None,
+    always_log: bool = False,
+    log_summary: bool = True,
+) -> dict | None:
+    summary = summarize_privacy_agent_payload(
+        samples,
+        container=container,
+        limit_bytes=limit_bytes,
+    )
+    if not summary:
+        return None
+
+    if extra_fields:
+        summary.update(extra_fields)
+
+    if log_summary and (always_log or should_log_privacy_agent_payload(summary)):
+        limit_utilization = float(summary.get("limit_utilization") or 0.0)
+        if always_log:
+            log_level = logging.ERROR
+        elif limit_utilization >= 0.8:
+            log_level = logging.WARNING
+        else:
+            log_level = logging.INFO
+        logger.log(
+            log_level,
+            "privacy_agent preprocess %s payload summary: %s",
+            label,
+            format_privacy_agent_payload_summary(summary),
+        )
+
+    return summary
 
 
 
@@ -273,8 +317,19 @@ def process_chunk(
     """Worker process function to preprocess chunks of data"""
     try:
         while True:
+            chunk = None
+            chunk_summary = None
+            dataset = None
+            dataset_summary = None
             try:
                 chunk = input_queue.get()
+                chunk_summary = _summarize_privacy_agent_preprocess_payload(
+                    "input_chunk",
+                    chunk,
+                    container=chunk,
+                    limit_bytes=input_queue.shared_array.max_entry_size,
+                    log_summary=False,
+                )
                 dataset = preprocess_dataset(
                     llm=llm,
                     data=chunk,
@@ -282,8 +337,58 @@ def process_chunk(
                     seq_length=seq_length,
                     rl_config=rl_config,
                 )
-                output_queue.put(dataset)
+                extra_fields = None
+                if chunk_summary:
+                    input_pickle_bytes = int(chunk_summary.get("container_pickle_bytes") or 0)
+                    extra_fields = {
+                        "input_chunk_pickle_bytes": input_pickle_bytes,
+                    }
+                dataset_summary = _summarize_privacy_agent_preprocess_payload(
+                    "output_dataset",
+                    dataset,
+                    container=dataset,
+                    limit_bytes=output_queue.shared_array.max_entry_size,
+                    extra_fields=extra_fields,
+                    log_summary=False,
+                )
+                if dataset_summary and chunk_summary:
+                    input_pickle_bytes = int(chunk_summary.get("container_pickle_bytes") or 0)
+                    output_pickle_bytes = int(dataset_summary.get("container_pickle_bytes") or 0)
+                    dataset_summary["expansion_ratio_vs_input"] = round(
+                        output_pickle_bytes / max(1, input_pickle_bytes),
+                        4,
+                    )
+                if dataset_summary and should_log_privacy_agent_payload(dataset_summary):
+                    limit_utilization = float(dataset_summary.get("limit_utilization") or 0.0)
+                    log_level = logging.WARNING if limit_utilization >= 0.8 else logging.INFO
+                    logger.log(
+                        log_level,
+                        "privacy_agent preprocess output_dataset payload summary: %s",
+                        format_privacy_agent_payload_summary(dataset_summary),
+                    )
+                try:
+                    output_queue.put(dataset)
+                except Exception:
+                    if dataset_summary:
+                        _summarize_privacy_agent_preprocess_payload(
+                            "output_dataset_failed_put",
+                            dataset,
+                            container=dataset,
+                            limit_bytes=output_queue.shared_array.max_entry_size,
+                            extra_fields=dataset_summary,
+                            always_log=True,
+                        )
+                    raise
             except Exception as e:
+                if chunk_summary:
+                    _summarize_privacy_agent_preprocess_payload(
+                        "input_chunk_error_context",
+                        chunk,
+                        container=chunk,
+                        limit_bytes=input_queue.shared_array.max_entry_size,
+                        extra_fields={"error": str(e)},
+                        always_log=True,
+                    )
                 error_info = {
                     "error": str(e),
                     "traceback": traceback.format_exc()
@@ -510,7 +615,25 @@ def run_preprocessing_loop(
                                 raise raw_chunk
                             
                             # Put chunk in the input queue for workers
-                            input_queue.put(raw_chunk)
+                            raw_chunk_summary = _summarize_privacy_agent_preprocess_payload(
+                                "raw_chunk",
+                                raw_chunk,
+                                container=raw_chunk,
+                                limit_bytes=input_queue.shared_array.max_entry_size,
+                            )
+                            try:
+                                input_queue.put(raw_chunk)
+                            except Exception:
+                                if raw_chunk_summary:
+                                    _summarize_privacy_agent_preprocess_payload(
+                                        "raw_chunk_failed_put",
+                                        raw_chunk,
+                                        container=raw_chunk,
+                                        limit_bytes=input_queue.shared_array.max_entry_size,
+                                        extra_fields=raw_chunk_summary,
+                                        always_log=True,
+                                    )
+                                raise
                             submitted_chunks += 1
                             next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
                         except Empty:

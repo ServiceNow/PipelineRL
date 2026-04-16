@@ -20,6 +20,11 @@ from pydantic import BaseModel, Field
 
 import wandb
 from pipelinerl.domain_sampling import DomainWeightedSampler
+from pipelinerl.domains.privacy_agent.size_debug import (
+    format_privacy_agent_payload_summary,
+    should_log_privacy_agent_payload,
+    summarize_privacy_agent_payload,
+)
 from pipelinerl.domains.math.rollouts import length_penalty
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
@@ -108,6 +113,34 @@ class SlidingWindowAggregator:
 
 def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
+
+
+def _log_privacy_agent_result_queue_payload(
+    group_rollout_results: list[RolloutResult],
+    *,
+    limit_bytes: int,
+) -> dict | None:
+    samples = []
+    for rollout_result in group_rollout_results:
+        for text in rollout_result.training_texts:
+            samples.append(text.model_dump())
+
+    summary = summarize_privacy_agent_payload(
+        samples,
+        container=group_rollout_results,
+        limit_bytes=limit_bytes,
+    )
+    if not summary or not should_log_privacy_agent_payload(summary):
+        return summary
+
+    limit_utilization = float(summary.get("limit_utilization") or 0.0)
+    log_level = logging.WARNING if limit_utilization >= 0.8 else logging.INFO
+    logger.log(
+        log_level,
+        "privacy_agent actor result_queue payload summary: %s",
+        format_privacy_agent_payload_summary(summary),
+    )
+    return summary
 
 
 async def schedule_rollouts(
@@ -215,7 +248,19 @@ async def schedule_rollouts(
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
                 random.shuffle(group_rollouts[group_id])
-                result_queue.put(group_rollouts[group_id])
+                payload_summary = _log_privacy_agent_result_queue_payload(
+                    group_rollouts[group_id],
+                    limit_bytes=result_queue.shared_array.max_entry_size,
+                )
+                try:
+                    result_queue.put(group_rollouts[group_id])
+                except Exception:
+                    if payload_summary:
+                        logger.error(
+                            "privacy_agent actor result_queue put failed: %s",
+                            format_privacy_agent_payload_summary(payload_summary),
+                        )
+                    raise
                 del group_rollouts[group_id]
             finished_rollouts += 1
         except Exception as e:
@@ -434,12 +479,16 @@ class ActorLoop:
                 if dataset_name is not None:
                     self.dataset_to_domain[str(dataset_name)] = domain_key
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
-            all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
+            all_metrics = result.metrics.model_dump(exclude_none=True) | domain_agnostic_metrics
             for k, v in all_metrics.items():
                 if isinstance(v, list):
                     self.stats[k][dataset_name][group_id] += v
+                elif v is None:
+                    continue
                 elif isinstance(v, float) | isinstance(v, bool) | isinstance(v, int):
                     self.stats[k][dataset_name][group_id].append(v)
+                elif isinstance(v, str):
+                    continue
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
         

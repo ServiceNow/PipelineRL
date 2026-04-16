@@ -2,6 +2,7 @@
 defaults:
   - /domain_rollouts@domain_rollouts: base
   - /domain_params@privacy_agent: privacy_agent
+  - /domain_params@privacy_hopqa: privacy_hopqa
   - /domain_mix: null
   - _self_
 
@@ -26,6 +27,7 @@ actor:
     logic: ${domain_rollouts.logic}
     ifeval: ${domain_rollouts.ifeval}
     privacy_agent: ${domain_rollouts.privacy_agent}
+    privacy_hopqa: ${domain_rollouts.privacy_hopqa}
 
 dataset_loader: pipelinerl.domains.multidomain.loader.load_datasets
 dataset_loader_params:
@@ -92,6 +94,7 @@ dataset_loader_params:
       seed: 42
       huggingface_token: ${oc.env:HF_TOKEN, null}
     privacy_agent: ${privacy_agent}
+    privacy_hopqa: ${privacy_hopqa}
 
 train_dataset_names: []
 test_dataset_names: []

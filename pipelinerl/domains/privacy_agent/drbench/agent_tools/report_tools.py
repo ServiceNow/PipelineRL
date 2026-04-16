@@ -96,6 +96,7 @@ class ReportAssembler:
     def _generate_concise_qa_report(self, context: ResearchContext, action_plan=None) -> str:
         """Generate a concise Q&A report with ANSWER_N/JUSTIFICATION_N format for easy parsing."""
         clean_question = self._extract_clean_question(context.original_question)
+        task_context_block = context.get_task_context_block()
 
         # Parse sub-questions from the original question
         # Handles: "1. text", "2) text", "4 (final). text"
@@ -155,6 +156,7 @@ class ReportAssembler:
 Original Research Question:
 {clean_question}
 
+{task_context_block}
 Sub-questions to answer:
 {q_list}
 

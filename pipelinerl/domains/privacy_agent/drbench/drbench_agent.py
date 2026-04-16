@@ -300,11 +300,18 @@ class DrBenchAgent(BaseAgent):
         context = ResearchContext(
             original_question=query,
             task_id=kwargs.get("task_id"),
+            company_name=kwargs.get("company_name"),
+            company_description=kwargs.get("company_description"),
             vector_store=self.vector_store,
         )
 
         if self.use_research_plan:
-            context.plan = self.planner.create_research_plan(query, tool_registry=self.tool_registry, env=env)
+            context.plan = self.planner.create_research_plan(
+                query,
+                tool_registry=self.tool_registry,
+                env=env,
+                context=context,
+            )
             if self.verbose:
                 logger.info(
                     f"📋 Research plan created with {len(context.plan.get('research_investigation_areas', []))} investigation areas"  # noqa: E501
@@ -597,11 +604,19 @@ class DrBenchAgent(BaseAgent):
         """Execute action using intelligent tool selection via action planner and enhanced purpose descriptions"""
 
         try:
+            candidate_tools = self._candidate_tools_for_action(action)
+            if not candidate_tools:
+                return {
+                    "action": action.id,
+                    "success": False,
+                    "error": f"No compatible tool available for action type {action.type.value}",
+                }
+
             # Step 1: Use preferred tool if specified by action planner
             preferred_tool = getattr(action, "preferred_tool", None)
             if preferred_tool:
                 tool = self._get_tool_by_name(preferred_tool)
-                if tool:
+                if tool and any(candidate is tool for candidate in candidate_tools):
                     if self.verbose:
                         logger.info(f"🎯 Using preferred tool: {preferred_tool}")
                     query = self._get_query_for_tool(action)
@@ -616,28 +631,22 @@ class DrBenchAgent(BaseAgent):
                     return result
                 else:
                     if self.verbose:
-                        logger.warning(f"⚠️ Preferred tool {preferred_tool} not found, using intelligent selection")
+                        logger.warning(
+                            f"⚠️ Preferred tool {preferred_tool} is unavailable or incompatible with {action.type.value}, using constrained selection"
+                        )
 
-            # Step 2: Intelligent tool selection using all available tools
-            available_tools = self.tool_registry.select_tools()
-            if available_tools:
-                tool = self._select_best_tool(available_tools, action)
-                query = self._get_query_for_tool(action)
-                result = tool.execute(query, context)
-                log_tool_call(
-                    self.run_config,
-                    tool.__class__.__name__,
-                    query[:500] if query else "",
-                    status="success" if result.get("success", True) else "error",
-                )
-                self._process_action_results(action, result, context)
-                return result
-
-            return {
-                "action": action.id,
-                "success": False,
-                "error": "No tools available for execution",
-            }
+            # Step 2: Constrained tool selection based on the action type
+            tool = self._select_best_tool(candidate_tools, action)
+            query = self._get_query_for_tool(action)
+            result = tool.execute(query, context)
+            log_tool_call(
+                self.run_config,
+                tool.__class__.__name__,
+                query[:500] if query else "",
+                status="success" if result.get("success", True) else "error",
+            )
+            self._process_action_results(action, result, context)
+            return result
 
         except Exception as e:
             tool_name = getattr(action, "preferred_tool", None) or action.type.value
@@ -715,6 +724,45 @@ class DrBenchAgent(BaseAgent):
         # Default to first available tool - the action planner should have made the right choice
         # or specified a preferred tool if it mattered
         return candidate_tools[0]
+
+    def _candidate_tools_for_action(self, action) -> List:
+        """Return only the tools that are valid for this action type in the current mode."""
+        action_type = action.type
+
+        if self.run_config.report_style == "concise_qa":
+            allowed_action_types = {
+                ActionType.WEB_SEARCH,
+                ActionType.LOCAL_DOCUMENT_SEARCH,
+                ActionType.DATA_ANALYSIS,
+            }
+            if action_type not in allowed_action_types:
+                return []
+
+        compatible_tool_names: List[str] = []
+
+        if action_type == ActionType.WEB_SEARCH:
+            compatible_tool_names = ["BrowseCompSearchTool", "InternetSearchTool"]
+        elif action_type == ActionType.LOCAL_DOCUMENT_SEARCH:
+            compatible_tool_names = ["LocalFileSearchTool"]
+        elif action_type in [ActionType.DATA_ANALYSIS, ActionType.CONTEXT_SYNTHESIS]:
+            compatible_tool_names = ["SmartAnalysisTool"]
+        elif action_type == ActionType.URL_FETCH:
+            compatible_tool_names = ["EnhancedURLFetchTool"]
+        elif action_type == ActionType.ENTERPRISE_API:
+            compatible_tool_names = ["EnterpriseAPITool"]
+        elif action_type == ActionType.MCP_QUERY:
+            compatible_tool_names = ["MCPTool"]
+        elif action_type == ActionType.FILE_DOWNLOAD:
+            compatible_tool_names = []
+
+        candidates = [
+            tool for tool in self.tool_registry.tools if tool.__class__.__name__ in compatible_tool_names
+        ]
+
+        if action_type == ActionType.URL_FETCH and self.run_config.browsecomp_enabled:
+            return []
+
+        return candidates
 
     def _is_significant_finding(self, result: Dict[str, Any]) -> bool:
         """

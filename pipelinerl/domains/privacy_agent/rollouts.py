@@ -117,9 +117,14 @@ def _run_privacy_agent_rollout_sync(cfg: DictConfig, llm: TrainableLLM, problem:
         browsecomp_corpus=settings.browsecomp_corpus,
         browsecomp_top_k=settings.browsecomp_top_k,
         browsecomp_max_chars=settings.browsecomp_max_chars,
+        local_document_search_mode=settings.local_document_search_mode,
     )
 
     task = Task(Path(problem["task_id"]) / "config", data_dir=settings.task_data_root)
+    task_config = task.get_task_config() or {}
+    company_info = dict(task_config.get("company_info") or {})
+    company_name = str(company_info.get("name") or problem.get("company") or "").strip() or None
+    company_description = str(company_info.get("description") or "").strip() or None
     helper_client = None
     if (
         settings.use_remote_embeddings
@@ -149,6 +154,9 @@ def _run_privacy_agent_rollout_sync(cfg: DictConfig, llm: TrainableLLM, problem:
     adapter = PrivacyAgentLLMAdapter(
         llm=llm,
         capture_mode=settings.capture_mode,
+        rollout_id=run_root.name,
+        task_id=str(problem.get("task_id") or ""),
+        chain_id=str(problem.get("chain_id") or ""),
     )
 
     answers: dict[str, str] = {}
@@ -191,6 +199,7 @@ def _run_privacy_agent_rollout_sync(cfg: DictConfig, llm: TrainableLLM, problem:
             vector_store_base_dir=str(run_root / "vector_stores"),
             embedding_model=run_cfg.get_embedding_model(),
             embedding_provider=run_cfg.get_embedding_provider(),
+            use_research_plan=settings.use_research_plan,
             concurrent_actions=run_cfg.concurrent_actions,
             verbose=run_cfg.verbose,
             shared_browsecomp=shared_browsecomp,
@@ -204,6 +213,8 @@ def _run_privacy_agent_rollout_sync(cfg: DictConfig, llm: TrainableLLM, problem:
         final_report, _ = agent.generate_report(
             query=problem["numbered_questions"],
             task_id=problem["task_id"],
+            company_name=company_name,
+            company_description=company_description,
             local_files=task.get_local_files_list(),
             extract_insights=False,
             as_dict=False,

@@ -1,27 +1,18 @@
-"""PipelineRL LLM adapter for the vendored privacy_agent DRBench slice."""
-
+"""Async LLM adapter for the simplified privacy_hopqa domain."""
 
 import json
 import logging
 from dataclasses import dataclass
 from typing import Any
 
-from pipelinerl.async_llm import make_training_text as make_rl_training_text
-from pipelinerl.domains.privacy_agent.size_debug import (
-    should_log_privacy_agent_prompt_summary,
-    summarize_privacy_agent_prompt,
-)
+import aiohttp
+
+from pipelinerl.async_llm import llm_async_generate, make_training_text as make_rl_training_text
 from pipelinerl.llm import LLMCall, Prompt, TrainableLLM
 
-PLANNING_LOG_NAMES = {
-    "query_planner",
-    "action_plan_initial",
-    "action_plan_fallback",
-    "action_dependencies",
-}
-PLANNING_LOG_PREFIXES = ("adaptive_iter",)
-
 logger = logging.getLogger(__name__)
+
+PLANNING_LOG_NAMES = {"hop_plan", "doc_choose", "hop_resolve"}
 
 
 @dataclass
@@ -31,17 +22,11 @@ class CapturedLLMCall:
     requested_model: str | None
 
 
-class PrivacyAgentLLMAdapter:
-    """Route vendored DRBench prompts through the rollout LLM.
-
-    The vendored agent code passes prompt strings into this adapter. The adapter keeps
-    PipelineRL's normal token accounting and `TrainingText` creation while exposing a
-    small interface that is easy for the copied DRBench modules to use.
-    """
-
+class PrivacyHopQALLMAdapter:
     def __init__(
         self,
         llm: TrainableLLM,
+        session: aiohttp.ClientSession,
         capture_mode: str = "all_calls",
         *,
         rollout_id: str = "",
@@ -52,6 +37,7 @@ class PrivacyAgentLLMAdapter:
             raise ValueError(f"Unsupported capture_mode: {capture_mode}")
 
         self.llm = llm
+        self.session = session
         self.capture_mode = capture_mode
         self.rollout_id = rollout_id
         self.task_id = task_id
@@ -64,33 +50,23 @@ class PrivacyAgentLLMAdapter:
         self.captured_output_tokens = 0
         self.max_prompt_tokens_by_log_name: dict[str, int] = {}
 
-    def _log_prompt_budget(
-        self,
-        prompt_text: str,
-        *,
-        log_name: str,
-        prompt_tokens: int,
-        force: bool = False,
-    ) -> None:
+    def _should_capture(self, log_name: str) -> bool:
+        if self.capture_mode == "all_calls":
+            return True
+        return log_name in PLANNING_LOG_NAMES
+
+    def _log_prompt_summary(self, *, log_name: str, prompt_tokens: int, force: bool = False) -> None:
         previous_max = self.max_prompt_tokens_by_log_name.get(log_name, 0)
-        if prompt_tokens <= previous_max and not force:
+        if not force and prompt_tokens <= previous_max and prompt_tokens < 4096:
             return
-
-        summary = summarize_privacy_agent_prompt(
-            prompt_text,
-            log_name=log_name,
-            token_counter=lambda text: self.llm.count_tokens(text),
-        )
-        if not force and not should_log_privacy_agent_prompt_summary(summary):
-            self.max_prompt_tokens_by_log_name[log_name] = max(previous_max, prompt_tokens)
-            return
-
-        log_level = logging.WARNING if prompt_tokens >= 8192 or force else logging.INFO
-        logger.log(
-            log_level,
-            "privacy_agent prompt budget summary: %s",
-            summary,
-        )
+        record = {
+            "rollout_id": self.rollout_id,
+            "task_id": self.task_id,
+            "chain_id": self.chain_id,
+            "log_name": log_name,
+            "prompt_tokens": int(prompt_tokens),
+        }
+        logger.info("privacy_hopqa prompt summary: %s", json.dumps(record, sort_keys=True))
         self.max_prompt_tokens_by_log_name[log_name] = max(previous_max, prompt_tokens)
 
     def _log_call_summary(
@@ -113,47 +89,32 @@ class PrivacyAgentLLMAdapter:
             "captured": self._should_capture(log_name),
             "requested_model": requested_model or self.llm.model_name,
         }
-        logger.info("privacy_agent llm call summary: %s", json.dumps(record, sort_keys=True))
+        logger.info("privacy_hopqa llm call summary: %s", json.dumps(record, sort_keys=True))
 
-    def _should_capture(self, log_name: str) -> bool:
-        if self.capture_mode == "all_calls":
-            return True
-        if log_name in PLANNING_LOG_NAMES:
-            return True
-        return any(log_name.startswith(prefix) for prefix in PLANNING_LOG_PREFIXES)
-
-    def _run_generation(self, prompt: Prompt, requested_model: str | None) -> LLMCall:
+    async def _run_generation(self, prompt: Prompt, requested_model: str | None) -> LLMCall:
         if requested_model and requested_model != self.llm.model_name:
             raise ValueError(
-                "privacy_agent routes all vendored DRBench calls through the rollout LLM. "
+                "privacy_hopqa routes domain calls through the rollout LLM. "
                 f"Requested model '{requested_model}' does not match rollout model '{self.llm.model_name}'."
             )
+        return await llm_async_generate(self.llm, prompt, self.session)
 
-        llm_stream = self.llm.generate(prompt)
-        return llm_stream.get_llm_call()
-
-    def generate_text(self, prompt: str, model: str | None = None, log_name: str = "llm") -> str:
+    async def generate_text(self, prompt: str, *, model: str | None = None, log_name: str = "llm") -> str:
         prompt_text = str(prompt)
         prompt_obj = Prompt(messages=[{"role": "user", "content": prompt_text}])
         estimated_prompt_tokens = max(0, self.llm.count_tokens(prompt_obj.messages))
-        self._log_prompt_budget(prompt_text, log_name=log_name, prompt_tokens=estimated_prompt_tokens)
+        self._log_prompt_summary(log_name=log_name, prompt_tokens=estimated_prompt_tokens)
 
         try:
-            llm_call = self._run_generation(prompt_obj, requested_model=model)
+            llm_call = await self._run_generation(prompt_obj, requested_model=model)
         except Exception as exc:
             exc_text = str(exc).lower()
             if "maximum context length" in exc_text or "requested" in exc_text or "context" in exc_text:
-                self._log_prompt_budget(
-                    prompt_text,
-                    log_name=log_name,
-                    prompt_tokens=estimated_prompt_tokens,
-                    force=True,
-                )
+                self._log_prompt_summary(log_name=log_name, prompt_tokens=estimated_prompt_tokens, force=True)
             raise
 
         prompt_tokens = max(0, llm_call.prompt_length_tokens)
         output_tokens = max(0, llm_call.output_length_tokens)
-
         self.total_calls += 1
         self.total_prompt_tokens += prompt_tokens
         self.total_output_tokens += output_tokens
@@ -191,7 +152,7 @@ class PrivacyAgentLLMAdapter:
                 trace.output_tokens = max(0, captured.llm_call.output_length_tokens)
 
             trace.group_id = group_id
-            trace.metadata.setdefault("privacy_agent", {}).update(
+            trace.metadata.setdefault("privacy_hopqa", {}).update(
                 {
                     **base_metadata,
                     "captured_call_index": idx,
@@ -201,5 +162,4 @@ class PrivacyAgentLLMAdapter:
                 }
             )
             traces.append(trace)
-
         return traces

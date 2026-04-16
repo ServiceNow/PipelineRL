@@ -16,6 +16,8 @@ class ResearchContext:
 
     original_question: str
     task_id: str | None = None
+    company_name: str | None = None
+    company_description: str | None = None
     plan: Optional[Dict] = None
     findings: Dict[str, Any] = field(default_factory=dict)
     files_created: List[str] = field(default_factory=list)
@@ -70,6 +72,17 @@ class ResearchContext:
             "recent_findings": {k: self._summarize_finding(v) for k, v in list(self.findings.items())[-5:]},
             "category_summaries": self.findings_summary,
         }
+
+    def get_task_context_block(self) -> str:
+        """Return lightweight task metadata for prompt grounding."""
+        lines: List[str] = []
+        if self.company_name:
+            lines.append(f"Company: {self.company_name}")
+        if self.company_description:
+            lines.append(f"Company Description: {self.company_description}")
+        if not lines:
+            return ""
+        return "Task Context:\n" + "\n".join(lines) + "\n"
 
     def _summarize_finding(self, finding: Any) -> str:
         """Create a brief summary of a finding"""
@@ -335,6 +348,7 @@ class QueryPlanner:
         question: str,
         tool_registry: ToolRegistry = None,
         env: Optional[Any] = None,
+        context: Optional[ResearchContext] = None,
     ) -> Dict:
         """Generate structured research plan with sections and sub-queries"""
 
@@ -353,39 +367,43 @@ Available Research Tools:
 Available Enterprise Services:
 {chr(10).join(f"- {service}" for service in enterprise_services)}
 """
+        task_context_block = context.get_task_context_block() if context is not None else ""
 
         if self.run_config.report_style == "concise_qa":
-            planning_prompt = f"""You are answering a set of numbered research questions. Some answers may be in the provided local documents, others may require web search.
+            planning_prompt = f"""You are solving a multihop research task expressed as numbered questions. Some answers may be in the provided local documents, others may require web search, and later questions may depend on earlier findings.
 
 Questions:
 "{question}"
 
+{task_context_block}
 {tools_section}
 
-Parse the numbered questions and plan how to find each answer.
+Plan a useful investigation strategy for answering the overall task.
 
 Return JSON:
 {{
   "research_investigation_areas": [
     {{
       "area_id": 1,
-      "research_focus": "the question text",
-      "information_needs": ["what specific fact or answer is needed"],
+      "research_focus": "the main uncertainty, dependency, or evidence need to investigate",
+      "information_needs": ["facts, relationships, or comparisons that need to be resolved"],
       "knowledge_sources": ["internal", "external", or "both"],
-      "key_concepts": ["key search terms"]
+      "key_concepts": ["useful search terms"]
     }}
   ]
 }}
 
-Create one investigation area per numbered question. For each:
-- If the question asks about a specific company's internal data → knowledge_sources: "internal"
-- If the question asks about general/public knowledge → knowledge_sources: "external"
-- If unclear → knowledge_sources: "both"
+Guidance:
+- The numbered questions are parts of one larger research task.
+- Create the investigation areas that seem useful; they do not need to map 1:1 to the numbered questions.
+- Related questions can be grouped together, and it can be useful to focus first on an earlier dependency that unlocks later answers.
+- Set knowledge_sources to the mix of sources that seems most useful for the investigation area.
 """
         else:
             planning_prompt = f"""
 Design a comprehensive enterprise research strategy for: "{question}"
 
+{task_context_block}
 {tools_section}
 
 As a senior enterprise researcher with deep business intelligence expertise, create a thorough investigation plan that combines rigorous research methodology with strategic business analysis. Your goal is to provide insights that drive informed decision-making in complex enterprise environments.
