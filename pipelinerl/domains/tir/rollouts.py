@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from sandbox_fusion import RunCodeRequest, set_sandbox_endpoint, run_code_async
 
-from pipelinerl.async_llm import llm_async_generate, make_training_text_with_tools
+from pipelinerl.async_llm import llm_async_generate, make_training_texts_from_llm_calls
 from pipelinerl.domains.math import RewardTable, get_reward, length_penalty, verify_answer_rpc
 from pipelinerl.llm import Prompt, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
@@ -350,9 +350,8 @@ async def generate_tir_rollout(
     reward = base_reward + shaping
 
     # 7. Build training texts (tool-call aware)
-    training_texts = [make_training_text_with_tools(llm, call) for call in llm_calls]
+    training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     for text in training_texts:
-        text.reward = reward
         text.finished = submitted_final_answer
 
     latency = time.perf_counter() - start

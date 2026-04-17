@@ -157,9 +157,20 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     images = []
     use_processor = False
     visual_features = None
-    full_messages = llm_call.prompt.messages + [
-        {"role": "assistant", "content": llm_call.output.content}
-    ]
+    assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
+    if llm_call.output.tool_calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in llm_call.output.tool_calls
+        ]
+    full_messages = llm_call.prompt.messages + [assistant_msg]
 
     if hasattr(llm_call.prompt, "messages"):
         images = extract_images_from_messages(llm_call.prompt.messages)
@@ -253,7 +264,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         finished = finish_reason != "length"
     else:
         eos_token = tokenizer.eos_token or ""
-        finished = bool(eos_token) and llm_call.output.content.endswith(eos_token)
+        finished = bool(eos_token) and (llm_call.output.content or "").endswith(eos_token)
     prompt_tokens = llm_call.prompt_length_tokens
     output_tokens = llm_call.output_length_tokens
 
@@ -280,81 +291,3 @@ def make_training_texts_from_llm_calls(
         training_texts = apply_rollout_reward(training_texts, reward)
     return training_texts
 
-
-def make_training_text_with_tools(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
-    """Build a TrainingText for a tool-enabled assistant turn.
-
-    This helper keeps prompts on the same chat-template path used at generation
-    time whenever ``prompt.tools`` is set, even if the current assistant turn
-    itself is plain text with no tool_calls.
-    """
-    if not llm_call.prompt.tools and not llm_call.output.tool_calls:
-        return make_training_text(llm, llm_call)
-
-    llm.load_tokenizer()
-
-    assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
-    if llm_call.output.tool_calls:
-        assistant_msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            }
-            for tc in llm_call.output.tool_calls
-        ]
-
-    full_messages = llm_call.prompt.messages + [assistant_msg]
-
-    prompt_text = llm.tokenizer.apply_chat_template(
-        conversation=llm_call.prompt.messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        tools=llm_call.prompt.tools,
-    )
-    text = llm.tokenizer.apply_chat_template(
-        full_messages,
-        tokenize=False,
-        tools=llm_call.prompt.tools,
-    )
-    prompt_token_ids = llm.tokenizer.apply_chat_template(
-        llm_call.prompt.messages,
-        add_special_tokens=True,
-        add_generation_prompt=True,
-        tools=llm_call.prompt.tools,
-    )
-
-    output_text = text[len(prompt_text):]
-
-    tokenizer = llm.tokenizer
-    if tokenizer.bos_token and text.startswith(tokenizer.bos_token):
-        text = text[len(tokenizer.bos_token):]
-
-    if not llm_call.logprobs:
-        raise ValueError("Logprobs are required to make training data for RL")
-
-    labels = [lp.token_id for lp in llm_call.logprobs]
-    input_ids = prompt_token_ids + labels
-    labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
-    logprobs = [lp.logprob for lp in llm_call.logprobs]
-
-    finish_reason = llm_call.llm_info.get("finish_reason")
-    if finish_reason is not None:
-        finished = finish_reason != "length"
-    else:
-        eos_token = tokenizer.eos_token or ""
-        finished = bool(eos_token) and (llm_call.output.content or "").endswith(eos_token)
-
-    return TrainingText(
-        text=text,
-        n_predicted=len(output_text),
-        input_ids=input_ids,
-        labels=labels,
-        logprobs=logprobs,
-        finished=finished,
-        prompt_tokens=llm_call.prompt_length_tokens,
-        output_tokens=llm_call.output_length_tokens,
-    )
