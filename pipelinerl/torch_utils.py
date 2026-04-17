@@ -1,10 +1,13 @@
+import datetime
 import logging
+import socket
 from datetime import timedelta
 from typing import Any, Optional, Union
 from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
+from torch.distributed import TCPStore
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
@@ -19,6 +22,49 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger(__name__)
+
+
+def _create_stateless_pg(host, port, rank, world_size):
+    """Create a StatelessProcessGroup that works across multiple nodes.
+
+    The upstream StatelessProcessGroup.create() binds its listening socket
+    to `host`, which fails in multi-node setups when `host` is a DNS name
+    that doesn't resolve to a local interface address (OSError: [Errno 99]
+    Cannot assign requested address).
+
+    We fix this by binding to 0.0.0.0 on rank 0 (accept connections on any
+    interface) while still passing the real hostname to TCPStore so that
+    non-rank-0 processes can connect to it.
+    """
+    launch_server = rank == 0
+    if launch_server:
+        listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Bind to all interfaces so it works regardless of hostname resolution
+        listen_socket.bind(("0.0.0.0", port))
+        listen_socket.listen()
+        listen_fd = listen_socket.fileno()
+    else:
+        listen_socket = None
+        listen_fd = None
+
+    store = TCPStore(
+        host_name=host,
+        port=port,
+        world_size=world_size,
+        is_master=launch_server,
+        timeout=datetime.timedelta(seconds=300),
+        use_libuv=False,
+        master_listen_fd=listen_fd,
+    )
+
+    return StatelessProcessGroup(
+        rank=rank,
+        world_size=world_size,
+        store=store,
+        socket=listen_socket,
+        data_expiration_seconds=3600,
+    )
 
 
 def stateless_init_process_group(init_method, rank, world_size, device):
@@ -41,7 +87,7 @@ def stateless_init_process_group(init_method, rank, world_size, device):
     master_port = parsed.port or 9000
     logger.debug(f"Parsed master_address: {master_address}, master_port: {master_port}")
 
-    pg = StatelessProcessGroup.create(
+    pg = _create_stateless_pg(
         host=master_address, port=master_port, rank=rank, world_size=world_size
     )
     pynccl = PyNcclCommunicator(pg, device=device)

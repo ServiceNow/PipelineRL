@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import torch
-from peft.mapping import get_peft_model
+from peft import get_peft_model
 from peft.peft_model import PeftModel
 from peft.tuners.lora import LoraConfig
 from peft.utils.other import prepare_model_for_kbit_training
