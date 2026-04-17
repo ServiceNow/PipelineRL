@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 _SANDBOX_CONFIGURED = False
 
-# Python safety blocklist: patterns that must not appear in user-submitted code
 _BLOCKED_PATTERNS = [
     re.compile(r"\bsys\.exit\b"),
     re.compile(r"\bos\._exit\b"),
@@ -67,7 +66,6 @@ def build_tool_definitions() -> list[dict]:
 
 
 def _check_code_safety(code: str) -> str | None:
-    """Return a rejection message if the code matches a blocked pattern, else None."""
     for pattern in _BLOCKED_PATTERNS:
         if pattern.search(code):
             return f"Blocked: code contains forbidden pattern '{pattern.pattern}'"
@@ -206,7 +204,6 @@ def _compute_shaping(
 class Metrics(BaseMetrics):
     num_python_calls: int = 0
     num_steps: int = 0
-    n_llm_calls: int = 0
     overflow: bool = False
 
 
@@ -218,16 +215,13 @@ async def generate_tir_rollout(
 ) -> RolloutResult:
     start = time.perf_counter()
 
-    # 1. Build initial messages
     messages: list[dict] = []
     if cfg.actor.system_prompt:
         messages.append({"role": "system", "content": cfg.actor.system_prompt})
     messages.append({"role": "user", "content": cfg.actor.task_template.format(task=problem["task"])})
 
-    # 2. Tool definitions
     tools = build_tool_definitions()
 
-    # 3. Multi-turn loop
     llm_calls = []
     final_answer = None
     submitted_final_answer = False
@@ -237,13 +231,11 @@ async def generate_tir_rollout(
     sandbox_timeout = float(cfg.sandbox_timeout)
     configured_max_tokens = int(llm.parameters.get("max_tokens", 16000))
     max_model_len = int(cfg.vllm_config.vllm_kwargs.get("max_model_len", 32000))
-    # Reserve a minimum budget so the model can still produce a useful response
     min_generation_tokens = 256
 
     for _turn in range(agent_max_loops):
         prompt = Prompt(messages=list(messages), tools=tools)
 
-        # Estimate prompt length and cap max_tokens to fit within max_model_len
         llm.load_tokenizer()
         prompt_token_ids = llm.tokenizer.apply_chat_template(
             messages,
@@ -270,15 +262,12 @@ async def generate_tir_rollout(
         llm_calls.append(llm_call)
 
         if not llm_call.output.tool_calls:
-            # Text-only response, no tool call -- end the loop
             break
 
-        # Append assistant message with tool_calls to conversation history
         assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
         assistant_msg["tool_calls"] = _serialize_tool_calls(llm_call.output.tool_calls)
         messages.append(assistant_msg)
 
-        # Execute each tool call
         for tc in llm_call.output.tool_calls:
             if tc.function.name == "MathAnswer":
                 args = _parse_tool_arguments(tc.function.arguments, fallback_key="answer")
@@ -306,7 +295,6 @@ async def generate_tir_rollout(
         if submitted_final_answer:
             break
 
-    # 4. Determine prediction for grading
     if final_answer is not None:
         prediction = final_answer
     elif llm_calls:
@@ -314,7 +302,6 @@ async def generate_tir_rollout(
     else:
         prediction = ""
 
-    # 5. Verify answer via math verifier
     env_key = resolve_environment_key(cfg, default="math")
     env_jobs = get_environment_jobs(cfg, env_key)
     if not env_jobs:
@@ -330,7 +317,6 @@ async def generate_tir_rollout(
         strict=True,
     )
 
-    # 6. Compute reward
     reward_table = RewardTable(**dict(cfg.rewards))
     base_reward = get_reward(answer_status, submitted_final_answer, reward_table)
 
@@ -349,7 +335,6 @@ async def generate_tir_rollout(
     shaping = _compute_shaping(cfg, answer_status, num_python_calls, llm_calls, llm)
     reward = base_reward + shaping
 
-    # 7. Build training texts (tool-call aware)
     training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     for text in training_texts:
         text.finished = submitted_final_answer
@@ -363,7 +348,6 @@ async def generate_tir_rollout(
         no_answer=answer_status == "no_answer",
         num_python_calls=num_python_calls,
         num_steps=len(llm_calls),
-        n_llm_calls=len(llm_calls),
         overflow=not submitted_final_answer,
     )
 

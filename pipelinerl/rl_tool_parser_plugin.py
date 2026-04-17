@@ -3,9 +3,8 @@ Tool parser plugin for RL tool calling format.
 """
 
 import json
-import re
-from typing import Any  # noqa: F401
 import logging
+import re
 
 from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
