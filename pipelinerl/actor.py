@@ -24,7 +24,7 @@ from pipelinerl.domains.math.rollouts import length_penalty
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.llm import TrainableLLM
-from pipelinerl.rollouts import BaseMetrics, RolloutResult
+from pipelinerl.rollouts import BaseMetrics, RolloutResult, rollout_has_overflow
 from pipelinerl.shared_memory_array import SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import (
@@ -393,7 +393,7 @@ class ActorLoop:
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
         metrics = {}
         
-        metrics['overflow'] = all([not training_text.finished for training_text in result.training_texts ])
+        metrics['overflow'] = rollout_has_overflow(result.training_texts)
         metrics['num_turns'] = len(result.training_texts)
         metrics['prompt_tokens'] = [training_text.prompt_tokens for training_text in result.training_texts]
         metrics['output_tokens'] = [training_text.output_tokens for training_text in result.training_texts]

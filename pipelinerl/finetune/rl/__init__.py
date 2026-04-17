@@ -1,7 +1,7 @@
 import logging
 import os
 from functools import partial
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 import numpy as np
@@ -9,9 +9,13 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
-from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.rl.utils import per_segment_sums
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+else:
+    PreTrainedModel = Any
 
 from .utils import (
     sum_sum,
@@ -427,22 +431,29 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df_init = pd.DataFrame(dataset)
     assert isinstance(df_init, pd.DataFrame)
 
-    # Step 1: calculate group-level statistics
+    # Step 1: calculate rollout- and group-level statistics
     df_stats = df_init[["group_id", "rollout_index", "step_index"]].copy()
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
-    # We assume that rewards for all tokens are the same
+    # RL preprocessing currently assumes a single reward per rollout.
     df_stats["rollout_reward"] = df_init["rewards"].apply(lambda x: x[0])
-    # Check that the reward is the same for each step in the rollout
-    assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1
-    # Only keep step_index == 0
-    df_stats = df_stats[df_stats["step_index"] == 0].drop(columns=["step_index"])
+    assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1, (
+        "RL preprocessing expects the same reward for every step in a rollout"
+    )
+    df_rollouts = (
+        df_stats.groupby(["group_id", "rollout_index"])
+        .agg(
+            rollout_reward=("rollout_reward", "first"),
+            rollout_tokens=("num_tokens", "sum"),
+        )
+        .reset_index()
+    )
     df_grouped = (
-        df_stats.groupby("group_id")
+        df_rollouts.groupby("group_id")
         .agg(
             rollout_reward_sum=("rollout_reward", "sum"),
             rollout_reward_count=("rollout_reward", "count"),
             rollout_reward_std=("rollout_reward", "std"),
-            group_tokens=("num_tokens", "mean"),
+            group_tokens=("rollout_tokens", "mean"),
         )
         .reset_index()
     )
