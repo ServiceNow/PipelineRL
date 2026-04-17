@@ -74,7 +74,6 @@ vllm_config:
     # V1 specific settings
     # logprobs-mode: processed_logprobs
     # V0 specific settings
-    # num-scheduler-steps: 1
     disable-log-requests: ""
     disable-frontend-multiprocessing: ""
 
