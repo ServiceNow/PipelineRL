@@ -4,10 +4,11 @@ import logging
 import random
 import re
 import time
+from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 import aiohttp
 from omegaconf import DictConfig
-from pydantic import BaseModel
 
 from sandbox_fusion import RunCodeRequest, set_sandbox_endpoint, run_code_async
 
@@ -147,58 +148,100 @@ def _parse_tool_arguments(arguments: str, *, fallback_key: str | None = None) ->
     return {}
 
 
-def _compute_shaping(
-    cfg: DictConfig,
-    answer_status: str,
-    num_python_calls: int,
-    llm_calls: list,
-    llm: TrainableLLM,
-) -> float:
-    """Compute reward shaping (python tool bonus + length shaping)."""
-    total = 0.0
+@dataclass
+class _ToolContext:
+    sandbox_endpoint: str
+    sandbox_timeout: float
+    messages: list[dict]
+    final_answer: str | None = None
+    submitted_final_answer: bool = False
+    num_python_calls: int = 0
 
-    shaping_cfg = getattr(cfg, "python_tool_shaping", None)
-    if shaping_cfg is not None:
-        bonus = float(getattr(shaping_cfg, "bonus_on_correct_with_python", 0.0))
-        penalty = float(getattr(shaping_cfg, "penalty_on_incorrect_without_python", 0.0))
-        max_abs = float(getattr(shaping_cfg, "max_abs", 0.2))
 
+ToolHandler = Callable[[object, _ToolContext], Awaitable[None]]
+
+
+async def _handle_math_answer(tc, ctx: _ToolContext) -> None:
+    args = _parse_tool_arguments(tc.function.arguments, fallback_key="answer")
+    ctx.final_answer = args.get("answer", "")
+    ctx.submitted_final_answer = True
+    ctx.messages.append({
+        "role": "tool",
+        "tool_call_id": tc.id,
+        "content": f"Answer submitted: {ctx.final_answer}",
+    })
+
+
+async def _handle_run_python_code(tc, ctx: _ToolContext) -> None:
+    args = _parse_tool_arguments(tc.function.arguments, fallback_key="code")
+    code = args.get("code") or args.get("python_code", "")
+    result = await execute_python_sandbox(code, ctx.sandbox_endpoint, ctx.sandbox_timeout)
+    ctx.num_python_calls += 1
+    ctx.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+
+async def _handle_unknown_tool(tc, ctx: _ToolContext) -> None:
+    ctx.messages.append({
+        "role": "tool",
+        "tool_call_id": tc.id,
+        "content": f"Unknown tool: {tc.function.name}",
+    })
+
+
+_TOOL_HANDLERS: dict[str, ToolHandler] = {
+    "MathAnswer": _handle_math_answer,
+    "run_python_code": _handle_run_python_code,
+}
+
+
+class RewardShaper:
+    def __init__(self, cfg: DictConfig, llm: TrainableLLM):
+        self._python_cfg = getattr(cfg, "python_tool_shaping", None)
+        self._length_cfg = getattr(cfg, "length_shaping", None)
+        self._max_gen_tokens = int(llm.parameters.get("max_tokens", 2048))
+
+    def compute(self, answer_status: str, num_python_calls: int, llm_calls: list) -> float:
+        return (
+            self._python_tool_bonus(answer_status, num_python_calls)
+            + self._length_adjustment(answer_status, llm_calls)
+        )
+
+    def _python_tool_bonus(self, answer_status: str, num_python_calls: int) -> float:
+        cfg = self._python_cfg
+        if cfg is None:
+            return 0.0
+        bonus = float(getattr(cfg, "bonus_on_correct_with_python", 0.0))
+        penalty = float(getattr(cfg, "penalty_on_incorrect_without_python", 0.0))
+        max_abs = float(getattr(cfg, "max_abs", 0.2))
+        total = 0.0
         if answer_status == "correct" and num_python_calls >= 1:
             total += bonus
         if answer_status in ("wrong", "unparsable") and num_python_calls == 0:
             total -= penalty
+        return max(-max_abs, min(max_abs, total))
 
-        total = max(-max_abs, min(max_abs, total))
+    def _length_adjustment(self, answer_status: str, llm_calls: list) -> float:
+        cfg = self._length_cfg
+        if cfg is None or not llm_calls:
+            return 0.0
+        if hasattr(cfg, "target_ratio"):
+            ratio = float(getattr(cfg, "target_ratio"))
+            target = int(max(1, ratio * self._max_gen_tokens))
+            target = max(int(getattr(cfg, "min_target_tokens", 0)), target)
+            target = min(int(getattr(cfg, "max_target_tokens", 10**9)), target)
+        else:
+            target = int(getattr(cfg, "target_output_tokens", 512))
+        slope = float(getattr(cfg, "slope", 0.0))
+        max_penalty = float(getattr(cfg, "max_penalty", 0.0))
+        bonus_short_correct = float(getattr(cfg, "bonus_on_short_correct", 0.0))
 
-    length_cfg = getattr(cfg, "length_shaping", None)
-    if length_cfg is not None:
-        try:
-            if hasattr(length_cfg, "target_ratio"):
-                ratio = float(getattr(length_cfg, "target_ratio"))
-                max_gen = int(llm.parameters.get("max_tokens", 2048))
-                target_tokens = int(max(1, ratio * max_gen))
-                min_t = int(getattr(length_cfg, "min_target_tokens", 0))
-                max_t = int(getattr(length_cfg, "max_target_tokens", 10**9))
-                target_tokens = max(min_t, min(max_t, target_tokens))
-            else:
-                target_tokens = int(getattr(length_cfg, "target_output_tokens", 512))
-            slope = float(getattr(length_cfg, "slope", 0.0))
-            max_penalty = float(getattr(length_cfg, "max_penalty", 0.0))
-            bonus_short_correct = float(getattr(length_cfg, "bonus_on_short_correct", 0.0))
-        except Exception:
-            target_tokens, slope, max_penalty, bonus_short_correct = 512, 0.0, 0.0, 0.0
-
-        total_output_tokens = sum(getattr(c, "output_length_tokens", 0) for c in llm_calls)
-        avg_output_tokens = total_output_tokens / max(1, len(llm_calls))
-
-        if slope > 0.0 and max_penalty > 0.0 and avg_output_tokens > target_tokens:
-            over_by = float(avg_output_tokens - target_tokens)
-            total -= min(max_penalty, slope * over_by)
-
-        if bonus_short_correct > 0.0 and answer_status == "correct" and avg_output_tokens <= target_tokens:
+        avg_out = sum(getattr(c, "output_length_tokens", 0) for c in llm_calls) / len(llm_calls)
+        total = 0.0
+        if slope > 0.0 and max_penalty > 0.0 and avg_out > target:
+            total -= min(max_penalty, slope * (avg_out - target))
+        if bonus_short_correct > 0.0 and answer_status == "correct" and avg_out <= target:
             total += bonus_short_correct
-
-    return total
+        return total
 
 
 class Metrics(BaseMetrics):
@@ -223,12 +266,12 @@ async def generate_tir_rollout(
     tools = build_tool_definitions()
 
     llm_calls = []
-    final_answer = None
-    submitted_final_answer = False
-    num_python_calls = 0
+    ctx = _ToolContext(
+        sandbox_endpoint=str(cfg.sandbox_endpoint),
+        sandbox_timeout=float(cfg.sandbox_timeout),
+        messages=messages,
+    )
     agent_max_loops = int(getattr(cfg.actor, "agent_max_loops", 3))
-    sandbox_endpoint = str(cfg.sandbox_endpoint)
-    sandbox_timeout = float(cfg.sandbox_timeout)
     configured_max_tokens = int(llm.parameters.get("max_tokens", 16000))
     max_model_len = int(cfg.vllm_config.vllm_kwargs.get("max_model_len", 32000))
     min_generation_tokens = 256
@@ -269,34 +312,16 @@ async def generate_tir_rollout(
         messages.append(assistant_msg)
 
         for tc in llm_call.output.tool_calls:
-            if tc.function.name == "MathAnswer":
-                args = _parse_tool_arguments(tc.function.arguments, fallback_key="answer")
-                final_answer = args.get("answer", "")
-                submitted_final_answer = True
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": f"Answer submitted: {final_answer}",
-                })
+            handler = _TOOL_HANDLERS.get(tc.function.name, _handle_unknown_tool)
+            await handler(tc, ctx)
+            if ctx.submitted_final_answer:
                 break
-            elif tc.function.name == "run_python_code":
-                args = _parse_tool_arguments(tc.function.arguments, fallback_key="code")
-                code = args.get("code") or args.get("python_code", "")
-                result = await execute_python_sandbox(code, sandbox_endpoint, sandbox_timeout)
-                num_python_calls += 1
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-            else:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": f"Unknown tool: {tc.function.name}",
-                })
 
-        if submitted_final_answer:
+        if ctx.submitted_final_answer:
             break
 
-    if final_answer is not None:
-        prediction = final_answer
+    if ctx.final_answer is not None:
+        prediction = ctx.final_answer
     elif llm_calls:
         prediction = llm_calls[-1].output.content or ""
     else:
@@ -318,7 +343,7 @@ async def generate_tir_rollout(
     )
 
     reward_table = RewardTable(**dict(cfg.rewards))
-    base_reward = get_reward(answer_status, submitted_final_answer, reward_table)
+    base_reward = get_reward(answer_status, ctx.submitted_final_answer, reward_table)
 
     discount_factor = float(getattr(cfg.actor, "discount_factor", 1.0))
     if discount_factor != 1.0:
@@ -332,12 +357,12 @@ async def generate_tir_rollout(
         if max_tokens > 0:
             base_reward += length_penalty(max_tokens, total_output_tokens, buffer_tokens)
 
-    shaping = _compute_shaping(cfg, answer_status, num_python_calls, llm_calls, llm)
+    shaping = RewardShaper(cfg, llm).compute(answer_status, ctx.num_python_calls, llm_calls)
     reward = base_reward + shaping
 
     training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     for text in training_texts:
-        text.finished = submitted_final_answer
+        text.finished = ctx.submitted_final_answer
 
     latency = time.perf_counter() - start
 
@@ -346,9 +371,9 @@ async def generate_tir_rollout(
         success=answer_status == "correct",
         no_error=answer_status != "unparsable",
         no_answer=answer_status == "no_answer",
-        num_python_calls=num_python_calls,
+        num_python_calls=ctx.num_python_calls,
         num_steps=len(llm_calls),
-        overflow=not submitted_final_answer,
+        overflow=not ctx.submitted_final_answer,
     )
 
     return RolloutResult(
