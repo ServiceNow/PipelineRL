@@ -100,9 +100,6 @@ def make_worker_class(multi_step: bool):
             )
             # Use StatelessProcessGroup + PyNcclCommunicator for cross-process NCCL communication
             self.process_group = torch_utils.stateless_init_process_group(
-            # self.process_group = pipelinerl.torch_utils.init_extra_process_group(
-                # group_name="actor",
-                # backend="nccl",
                 init_method=weight_update_group_init_method,
                 rank=self.pg_rank,
                 world_size=weight_update_group_world_size,
@@ -118,9 +115,8 @@ def make_worker_class(multi_step: bool):
                 if target_dtype not in expected_dtypes:
                     logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
                 buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
-                self.process_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
                 # Previously used torch.distributed.broadcast
-                # torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+                self.process_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
                 if VLLM_PRE_0_10 and isinstance(self.model_runner, MultiStepModelRunner):
                     loaded_params = self.model_runner._base_model_runner.model.load_weights(
                         weights=[(info.name, buffer)]
