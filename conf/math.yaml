@@ -22,12 +22,16 @@ vllm_config:
     max_model_len: 20000
 
 llm:
-  parameters: 
+  parameters:
     max_tokens: 16000
+  chat_template_kwargs:
+    enable_thinking: false
 
 test_llm:
-  parameters: 
+  parameters:
     max_tokens: 16000
+  chat_template_kwargs:
+    enable_thinking: false
 
 train_dataset_names:
 - open_reasoner_zero_57k

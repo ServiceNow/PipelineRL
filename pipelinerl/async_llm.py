@@ -83,6 +83,9 @@ async def llm_async_generate(
             f"LLM parameters must serialize to a mapping, got {type(extra_parameters)}"
         )
 
+    if llm.chat_template_kwargs:
+        extra_parameters = {**extra_parameters, "chat_template_kwargs": _to_plain_obj(llm.chat_template_kwargs)}
+
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
     # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
@@ -198,19 +201,23 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             raise ValueError(f"Failed to process with vision-language processor: {e}")
     else:
         # Use tokenizer for text-only models
+        chat_kwargs = _to_plain_obj(llm.chat_template_kwargs) if llm.chat_template_kwargs else {}
         prompt_text = llm.tokenizer.apply_chat_template(
             conversation=llm_call.prompt.messages,
             tokenize=False,
             add_generation_prompt=True,
+            **chat_kwargs,
         )
         text = llm.tokenizer.apply_chat_template(
             full_messages,
             tokenize=False,
+            **chat_kwargs,
         )
         prompt_token_ids = llm.tokenizer.apply_chat_template(
             llm_call.prompt.messages,
             add_special_tokens=True,
             add_generation_prompt=True,
+            **chat_kwargs,
         )
 
     output_text = text[len(prompt_text) :]
