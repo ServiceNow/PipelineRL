@@ -1,4 +1,5 @@
 import logging
+import os
 import signal
 import torch
 import uvloop
@@ -76,6 +77,17 @@ class WorkerExtension:
             prefix
             + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
         )
+
+        # vLLM batch_invariant mode sets restrictive NCCL env vars (single channel,
+        # tree algo, simple proto, P2P disabled) that the trainer does not share.
+        # Clear them so the weight-update NCCL comm matches trainer defaults.
+        # Safe at tp=1 because no intra-engine NCCL comm has been created yet.
+        for _k in (
+            "NCCL_LAUNCH_MODE", "NCCL_COLLNET_ENABLE", "NCCL_NVLS_ENABLE",
+            "NCCL_P2P_NET_DISABLE", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS",
+            "NCCL_PROTO", "NCCL_ALGO", "NCCL_NTHREADS", "NCCL_SOCKET_NTHREADS",
+        ):
+            os.environ.pop(_k, None)
 
         # Use vLLM's StatelessProcessGroup instead of torch.distributed
         self.model_update_group = stateless_init_process_group(
