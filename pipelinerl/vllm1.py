@@ -15,7 +15,6 @@ from vllm.entrypoints.openai.api_server import (
     init_app_state,
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm._version import version
 from vllm.usage.usage_lib import UsageContext
 from vllm.config import ModelConfig
@@ -29,6 +28,11 @@ from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from pipelinerl.torch_utils import stateless_init_process_group
 from typing import Any, Protocol, runtime_checkable
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
+
+try:
+    from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+except ModuleNotFoundError:
+    from vllm.tool_parsers import ToolParserManager
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messign
@@ -146,10 +150,13 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
 
-    valide_tool_parses = ToolParserManager.tool_parsers.keys()
-    if args.enable_auto_tool_choice and args.tool_call_parser not in valide_tool_parses:
+    if hasattr(ToolParserManager, "list_registered"):
+        valid_tool_parses = ToolParserManager.list_registered()
+    else:
+        valid_tool_parses = list(ToolParserManager.tool_parsers.keys())
+    if args.enable_auto_tool_choice and args.tool_call_parser not in valid_tool_parses:
         raise KeyError(
-            f"invalid tool call parser: {args.tool_call_parser} (chose from {{ {','.join(valide_tool_parses)} }})"
+            f"invalid tool call parser: {args.tool_call_parser} (chose from {{ {','.join(valid_tool_parses)} }})"
         )
 
     # workaround to make sure that we bind the port before the engine is set up.
@@ -186,7 +193,9 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     # Run HTTP server
     sock_addr = (args.host or "", args.port)
     sock = create_server_socket(sock_addr)
-    app = build_app(args)
+    supported_tasks = await engine.get_supported_tasks()
+    logger.info(f"Supported tasks: {supported_tasks}")
+    app = build_app(args, supported_tasks)
 
     @app.post("/receive_weight_update")
     async def _receive_weight_update(request: WeightUpdateRequest):
@@ -195,7 +204,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         await weight_update_manager.receive_weight_update(request)
         return {"status": "ok"}
 
-    await init_app_state(engine, app.state, args)
+    await init_app_state(engine, app.state, args, supported_tasks)
     shutdown_task = await serve_http(
         app,
         sock,

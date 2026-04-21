@@ -123,9 +123,26 @@ def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
     return env
 
 
+def _get_vllm_kwargs(cfg: DictConfig, *, use_v1: bool) -> dict:
+    """Return launchable vLLM CLI kwargs, dropping legacy flags for V1."""
+    kwargs = OmegaConf.to_container(cfg.vllm_config.vllm_kwargs, resolve=True)
+    if kwargs is None:
+        return {}
+    if not isinstance(kwargs, dict):
+        raise TypeError(f"vllm_kwargs must resolve to a mapping, got {type(kwargs)}")
+
+    if use_v1:
+        for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
+            if legacy_flag in kwargs:
+                kwargs.pop(legacy_flag)
+                logger.info(f"Dropping legacy vLLM flag '--{legacy_flag}' for V1 launch")
+
+    return kwargs
+
+
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
-    kwargs = cfg.vllm_config.vllm_kwargs
-    if kwargs["num-scheduler-steps"] > 1:
+    kwargs = _get_vllm_kwargs(cfg, use_v1=cfg.vllm_config.use_v1)
+    if kwargs.get("num-scheduler-steps", 1) > 1:
         kwargs["num-scheduler-steps"] = 1
         logger.warning("Set num-scheduler-steps to 1 for reference vLLM")
     log_dir = exp_dir / f"ref_vllm_{preprocessor_llm_idx}"
@@ -209,8 +226,9 @@ def run_actor_llm(
     cmd.extend(_get_quantization_args(cfg))
 
     # add vLLM kwargs as separate arguments
-    if cfg.vllm_config.vllm_kwargs:
-        for k, v in cfg.vllm_config.vllm_kwargs.items():
+    kwargs = _get_vllm_kwargs(cfg, use_v1=cfg.vllm_config.use_v1)
+    if kwargs:
+        for k, v in kwargs.items():
             cmd.append(f"--{k}")
             if v not in [None, ""]:
                 cmd.append(str(v))
