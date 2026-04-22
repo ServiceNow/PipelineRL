@@ -1,0 +1,47 @@
+defaults:
+    - base
+    - _self_
+    - override finetune: gspo
+
+model_path: Qwen/Qwen3-8B
+
+actor:
+  rollout_policy: pipelinerl.domains.swe.rollouts.generate_swe_rollout
+  success_threshold: 0.8
+
+environments: null
+
+dataset_loader: pipelinerl.domains.swe.load_datasets.load_local_swe_dataset
+dataset_loader_params:
+  seed: ${seed}
+  # max_samples: 1000  # uncomment to cap the number of loaded samples (applies to both train and test)
+
+# HuggingFace Hub dataset IDs (or local disk paths).
+# Append ":split" to restrict to a specific split, e.g. SWE-bench/SWE-smith-py:train
+train_dataset_names:
+  - SWE-bench/SWE-smith-py
+test_dataset_names:
+  - SWE-bench/SWE-smith-py
+
+finetune:
+  seq_length: 24000
+  rl:
+    filter_zero_advantage_groups: false
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 24000
+
+llm:
+  parameters:
+    max_tokens: 4096
+    temperature: 1.0
+  chat_template_kwargs:
+    enable_thinking: false
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+    temperature: 0.0
+  chat_template_kwargs:
+    enable_thinking: false

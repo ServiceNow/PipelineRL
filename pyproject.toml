@@ -65,6 +65,9 @@ coding = [
 fn_calling = [
     "bfcl-eval>=2025.6.8",
 ]
+swe = [
+    "unidiff>=0.7.5",
+]
 logic = [
     # i3-logic verification code is vendored in pipelinerl/domains/logic/i3_logic/
     # (source: https://github.com/PrimeIntellect/i3-logic)

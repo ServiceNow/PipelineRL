@@ -1,0 +1,15 @@
+# Config for swe_preprocessor.py.
+# Clones repos, extracts gold_file_contents at base_commit, applies token
+# filtering, and saves a training-ready HuggingFace disk dataset.
+#
+# Run: python -m pipelinerl.domains.swe.swe_preprocessor --config-name=swe/preprocess
+
+hf_dataset_name: SWE-bench/SWE-smith-py
+hf_split_name: train
+repo_path: /path/to/repos
+dataset_path: /path/to/output_ds
+tokenizer_model: Qwen/Qwen3-8B
+min_token_threshold: null   # set to an int to filter out very short examples
+max_token_threshold: 16000  # set to null to disable
+num_map_processes: 32
+force_reprocess: false
