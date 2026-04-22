@@ -253,6 +253,7 @@ def rl_step(
     assert new_logprobs.shape == ref_logprobs.shape
 
     log_ratio_new_old = new_logprobs - old_logprobs
+    abs_log_ratio_new_old = torch.abs(log_ratio_new_old)
     ratio_new_old = torch.exp(log_ratio_new_old)
     log_ratio_ref_new = ref_logprobs - new_logprobs
     assert torch.isfinite(log_ratio_ref_new).all(), f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
@@ -406,6 +407,9 @@ def rl_step(
         "min_advantage": advantages[masks_shifted].min().item(),
         "kl": sum_sum(approx_kl / num_labels_in_seq, masks_shifted, segments).item(),
         "kl_new_old": sum_sum(approx_kl_new_old / num_labels_in_seq, masks_shifted, segments).item(),
+        "mean_abs_log_ratio_new_old": sum_sum(
+            abs_log_ratio_new_old / num_labels_in_seq, masks_shifted, segments
+        ).item(),
         "max_kl": approx_kl[masks_shifted].max().item(),
         "min_kl": approx_kl[masks_shifted].min().item(),
         "ratio_new_old": sum_sum(ratio_new_old / num_labels_in_seq, masks_shifted, segments).item(),
