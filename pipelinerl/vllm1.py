@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import signal
@@ -53,7 +54,7 @@ class LikeWorker(Protocol):
     device: torch.device
     model_runner: GPUModelRunner
     pg_rank: int
-    process_group: Any
+    model_update_group: Any
     model_config: ModelConfig
 
 
@@ -78,16 +79,23 @@ class WorkerExtension:
             + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
         )
 
-        # vLLM batch_invariant mode sets restrictive NCCL env vars (single channel,
-        # tree algo, simple proto, P2P disabled) that the trainer does not share.
-        # Clear them so the weight-update NCCL comm matches trainer defaults.
-        # Safe at tp=1 because no intra-engine NCCL comm has been created yet.
-        for _k in (
-            "NCCL_LAUNCH_MODE", "NCCL_COLLNET_ENABLE", "NCCL_NVLS_ENABLE",
-            "NCCL_P2P_NET_DISABLE", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS",
-            "NCCL_PROTO", "NCCL_ALGO", "NCCL_NTHREADS", "NCCL_SOCKET_NTHREADS",
-        ):
-            os.environ.pop(_k, None)
+        batch_invariant_env = os.getenv("VLLM_BATCH_INVARIANT", "0")
+        try:
+            batch_invariant_enabled = int(batch_invariant_env) != 0
+        except ValueError:
+            batch_invariant_enabled = False
+
+        if batch_invariant_enabled:
+            # vLLM batch_invariant mode sets restrictive NCCL env vars (single channel,
+            # tree algo, simple proto, P2P disabled) that the trainer does not share.
+            # Clear them so the weight-update NCCL comm matches trainer defaults.
+            # Safe at tp=1 because no intra-engine NCCL comm has been created yet.
+            for _k in (
+                "NCCL_LAUNCH_MODE", "NCCL_COLLNET_ENABLE", "NCCL_NVLS_ENABLE",
+                "NCCL_P2P_NET_DISABLE", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS",
+                "NCCL_PROTO", "NCCL_ALGO", "NCCL_NTHREADS", "NCCL_SOCKET_NTHREADS",
+            ):
+                os.environ.pop(_k, None)
 
         # Use vLLM's StatelessProcessGroup instead of torch.distributed
         self.model_update_group = stateless_init_process_group(
@@ -130,6 +138,7 @@ class WeightUpdateManager:
         self.args = args
         self.engine = engine
         self.engine_client = engine_client
+        self.update_lock = asyncio.Lock()
 
     async def input_process_groups(self):
         await self.engine_client.collective_rpc_async(
@@ -143,11 +152,21 @@ class WeightUpdateManager:
         )
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
-        logger.info("Starting weight update...")
-        await self.engine_client.collective_rpc_async(
-            "receive_weight_update", args=(request.model_dump_json(),)
-        )
-        logger.info("Weight update processed")
+        async with self.update_lock:
+            paused = False
+            logger.info("Pausing generation for weight update")
+            await self.engine.pause_generation(mode="keep", clear_cache=False)
+            paused = True
+            try:
+                logger.info("Starting weight update...")
+                await self.engine_client.collective_rpc_async(
+                    "receive_weight_update", args=(request.model_dump_json(),)
+                )
+                logger.info("Weight update processed")
+            finally:
+                if paused:
+                    logger.info("Resuming generation after weight update")
+                    await self.engine.resume_generation()
 
     async def close_communicator(self):
         """Closes the communicator when weight synchronization is no longer needed."""
