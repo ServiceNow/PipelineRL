@@ -51,7 +51,7 @@ def _popen(
 
 
 def validate_config(cfg: DictConfig):
-    if cfg.world.preprocessor_fraction == 0 and cfg.finetune.rl.kl_coef > 0.0:
+    if cfg.world.preprocessor_fraction == 0 and max(cfg.finetune.rl.kl_coef, cfg.finetune.rl.final_kl_coef) > 0.0:
         raise ValueError("Preprocessor fraction must be > 0 if KL is used")
     
     # Check for vision language model constraints
