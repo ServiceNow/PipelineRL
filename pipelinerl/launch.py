@@ -132,12 +132,25 @@ def _get_vllm_kwargs(cfg: DictConfig, *, use_v1: bool) -> dict:
         raise TypeError(f"vllm_kwargs must resolve to a mapping, got {type(kwargs)}")
 
     if use_v1:
+        # Keep V1 actor/reference serving closer to the legacy V0 path by default.
+        kwargs.setdefault("enable-prefix-caching", False)
+        kwargs.setdefault("async-scheduling", False)
         for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
             if legacy_flag in kwargs:
                 kwargs.pop(legacy_flag)
                 logger.info(f"Dropping legacy vLLM flag '--{legacy_flag}' for V1 launch")
 
     return kwargs
+
+
+def _append_vllm_kwargs(cmd: list[str], kwargs: dict) -> None:
+    for k, v in kwargs.items():
+        if isinstance(v, bool):
+            cmd.append(f"--{k}" if v else f"--no-{k}")
+            continue
+        cmd.append(f"--{k}")
+        if v not in [None, ""]:
+            cmd.append(str(v))
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
@@ -164,11 +177,7 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
-    for k, v in kwargs.items():
-        cmd.append(f"--{k}")
-        if v not in [None, ""]:
-            cmd.append(str(v))
+    _append_vllm_kwargs(cmd, kwargs)
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
@@ -225,13 +234,9 @@ def run_actor_llm(
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
     kwargs = _get_vllm_kwargs(cfg, use_v1=cfg.vllm_config.use_v1)
     if kwargs:
-        for k, v in kwargs.items():
-            cmd.append(f"--{k}")
-            if v not in [None, ""]:
-                cmd.append(str(v))
+        _append_vllm_kwargs(cmd, kwargs)
 
     if cfg.debug.mode:
         cmd.append("--disable-weight-updates")
