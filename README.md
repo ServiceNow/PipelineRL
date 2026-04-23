@@ -212,7 +212,7 @@ Alternatively for `flash-attn`, you can install it via prebuilt packages (on Lin
 # Check your PyTorch's C++ ABI setting first:
 # python -c "import torch; print(torch._C._GLIBCXX_USE_CXX11_ABI)"
 # Use cxx11abiTRUE or cxx11abiFALSE in the URL accordingly
-conda run --no-capture-output -n pipeline-rl pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3+cu126torch2.10-cp312-cp312-linux_x86_64.whl
+conda run --no-capture-output -n pipeline-rl pip install https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 ```
 
 By default Pipeline-RL will use the file system as the medium for streaming the generated data to the trainer processes. This works on one node, but the files can get quite large. To use Redis instead you will need to install the Redis server in the same conda environment:
