@@ -356,7 +356,7 @@ class EngineManager:
     async def receive_weight_update(self, request: WeightUpdateRequest):
         async with self.update_lock:
             logger.info("Pausing generation for weight update")
-            await self.engine.pause_generation(mode="keep", clear_cache=False)
+            await self.engine.pause_generation(wait_for_inflight_requests=True, clear_cache=False)
             try:
                 logger.info("Starting weight update...")
                 await self.engine.engine_core.collective_rpc_async(
@@ -378,6 +378,31 @@ class EngineManager:
         logger.info(
             f"Fast-LLM receiver initialized (Redis {self._redis_host}:{self._redis_port})"
         )
+
+    async def receive_weight_update_fast_llm(self):
+        """Run a fast-llm broadcast weight update paused-for-the-duration.
+
+        Pause/resume wraps the collective RPC symmetrically with the HTTP path
+        so that in-flight generation cannot interleave with a mid-broadcast
+        parameter swap (the source of logprob drift PR #137 closed).
+
+        NOTE: this must NOT be used for the very first weights_ready event
+        after process startup, because at that point the actor has not yet
+        begun issuing rollouts (it's blocked in wait_for_model_version) and
+        pause_generation will deadlock waiting for an in-flight-decode state
+        that never arrives. The monitor thread gates this accordingly.
+        """
+        async with self.update_lock:
+            logger.info("Pausing generation for fast-llm weight update")
+            await self.engine.pause_generation(wait_for_inflight_requests=True, clear_cache=False)
+            try:
+                await self.engine.engine_core.collective_rpc_async(
+                    "receive_weight_update_fast_llm", args=()
+                )
+                logger.info("Fast-llm weight update processed")
+            finally:
+                logger.info("Resuming generation after fast-llm weight update")
+                await self.engine.resume_generation()
 
     async def start_fast_llm_monitoring(self):
         """Start a single Redis monitoring thread in the main process.
@@ -403,6 +428,13 @@ class EngineManager:
             stream_key = "fast_llm_events"
             payload_key = b"event"
             last_id = "0-0"
+            # First weights_ready event since this vLLM process started is the
+            # initial broadcast (step can be 0 on fresh start or k>0 on resume).
+            # Actor is still blocked in wait_for_model_version at this point, so
+            # vLLM has zero in-flight requests — pause_generation would deadlock.
+            # Take the raw RPC path for the first event; wrap with pause/resume
+            # thereafter, matching PR #137's guard against mid-rollout weight swaps.
+            first_weights_ready_seen = False
 
             logger.info("[FastLLM] Main-process Redis monitoring started")
 
@@ -432,16 +464,21 @@ class EngineManager:
                             step = event.get("step")
 
                             if event_type == "weights_ready":
-                                logger.info(
-                                    f"[FastLLM] weights_ready step={step}, dispatching to workers"
-                                )
-                                try:
-                                    future = asyncio.run_coroutine_threadsafe(
-                                        self.engine.engine_core.collective_rpc_async(
-                                            "receive_weight_update_fast_llm", args=()
-                                        ),
-                                        loop,
+                                if not first_weights_ready_seen:
+                                    logger.info(
+                                        f"[FastLLM] weights_ready step={step} (initial broadcast — no pause wrap)"
                                     )
+                                    coro = self.engine.engine_core.collective_rpc_async(
+                                        "receive_weight_update_fast_llm", args=()
+                                    )
+                                    first_weights_ready_seen = True
+                                else:
+                                    logger.info(
+                                        f"[FastLLM] weights_ready step={step}, dispatching to workers"
+                                    )
+                                    coro = self.receive_weight_update_fast_llm()
+                                try:
+                                    future = asyncio.run_coroutine_threadsafe(coro, loop)
                                     future.result()
                                     logger.info(
                                         f"[FastLLM] Weight update complete: step={step}"
