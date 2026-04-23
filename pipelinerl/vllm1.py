@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import os
 import signal
@@ -315,6 +316,18 @@ class WorkerExtension:
             logger.info("Weight update communicator closed")
 
 
+async def _pause_generation(engine: AsyncLLM) -> None:
+    """Pause generation, draining in-flight requests before returning.
+
+    Adapts to the installed vLLM version at runtime: newer builds expose
+    pause_generation(mode=) while older ones use wait_for_inflight_requests=.
+    """
+    if 'mode' in inspect.signature(engine.pause_generation).parameters:
+        await engine.pause_generation(mode="wait", clear_cache=False)
+    else:
+        await engine.pause_generation(wait_for_inflight_requests=True, clear_cache=False)
+
+
 class EngineManager:
     def __init__(self, args, engine: AsyncLLM, engine_config: Any):
         self.args = args
@@ -356,7 +369,7 @@ class EngineManager:
     async def receive_weight_update(self, request: WeightUpdateRequest):
         async with self.update_lock:
             logger.info("Pausing generation for weight update")
-            await self.engine.pause_generation(wait_for_inflight_requests=True, clear_cache=False)
+            await _pause_generation(self.engine)
             try:
                 logger.info("Starting weight update...")
                 await self.engine.engine_core.collective_rpc_async(
@@ -394,7 +407,7 @@ class EngineManager:
         """
         async with self.update_lock:
             logger.info("Pausing generation for fast-llm weight update")
-            await self.engine.pause_generation(wait_for_inflight_requests=True, clear_cache=False)
+            await _pause_generation(self.engine)
             try:
                 await self.engine.engine_core.collective_rpc_async(
                     "receive_weight_update_fast_llm", args=()
