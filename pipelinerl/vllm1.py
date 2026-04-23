@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 import torch
 import uvloop
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -153,20 +154,35 @@ class WeightUpdateManager:
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
         async with self.update_lock:
+            version = getattr(request, "version", "unknown")
             paused = False
-            logger.info("Pausing generation for weight update")
+            pause_started_at = time.perf_counter()
+            logger.info(f"Pausing generation for weight update version={version}")
             await self.engine.pause_generation(mode="keep", clear_cache=False)
             paused = True
+            logger.info(
+                f"Generation paused for weight update version={version} "
+                f"in {time.perf_counter() - pause_started_at:.3f}s"
+            )
             try:
-                logger.info("Starting weight update...")
+                update_started_at = time.perf_counter()
+                logger.info(f"Starting weight update version={version}")
                 await self.engine_client.collective_rpc_async(
                     "receive_weight_update", args=(request.model_dump_json(),)
                 )
-                logger.info("Weight update processed")
+                logger.info(
+                    f"Weight update processed version={version} "
+                    f"in {time.perf_counter() - update_started_at:.3f}s"
+                )
             finally:
                 if paused:
-                    logger.info("Resuming generation after weight update")
+                    resume_started_at = time.perf_counter()
+                    logger.info(f"Resuming generation after weight update version={version}")
                     await self.engine.resume_generation()
+                    logger.info(
+                        f"Generation resumed after weight update version={version} "
+                        f"in {time.perf_counter() - resume_started_at:.3f}s"
+                    )
 
     async def close_communicator(self):
         """Closes the communicator when weight synchronization is no longer needed."""
