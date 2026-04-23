@@ -19,6 +19,7 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 
 import wandb
+from pipelinerl.async_llm import RetryableAbortedCompletionError
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.domains.math.rollouts import length_penalty
 from pipelinerl.finetune_loop import calculate_train_steps
@@ -142,7 +143,12 @@ async def schedule_rollouts(
 
     final_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
-    retryable_rollout_exceptions = (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError)
+    retryable_rollout_exceptions = (
+        aiohttp.ServerTimeoutError,
+        asyncio.TimeoutError,
+        TimeoutError,
+        RetryableAbortedCompletionError,
+    )
     max_rollout_retries = int(getattr(cfg.actor, "max_rollout_retries", -1))  # -1 means infinite retries
     retry_initial_delay_s = float(getattr(cfg.actor, "rollout_retry_initial_delay_s", 1.0))
     retry_max_delay_s = float(getattr(cfg.actor, "rollout_retry_max_delay_s", 30.0))

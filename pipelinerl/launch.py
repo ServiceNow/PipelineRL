@@ -123,9 +123,35 @@ def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
     return env
 
 
+def _get_vllm_kwargs(cfg: DictConfig) -> dict:
+    """Return launchable vLLM CLI kwargs for the supported V1 server path."""
+    kwargs = OmegaConf.to_container(cfg.vllm_config.vllm_kwargs, resolve=True)
+    if kwargs is None:
+        return {}
+    if not isinstance(kwargs, dict):
+        raise TypeError(f"vllm_kwargs must resolve to a mapping, got {type(kwargs)}")
+
+    for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
+        if legacy_flag in kwargs:
+            kwargs.pop(legacy_flag)
+            logger.info(f"Dropping legacy vLLM flag '--{legacy_flag}' for V1 launch")
+
+    return kwargs
+
+
+def _append_vllm_kwargs(cmd: list[str], kwargs: dict) -> None:
+    for k, v in kwargs.items():
+        if isinstance(v, bool):
+            cmd.append(f"--{k}" if v else f"--no-{k}")
+            continue
+        cmd.append(f"--{k}")
+        if v not in [None, ""]:
+            cmd.append(str(v))
+
+
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
-    kwargs = cfg.vllm_config.vllm_kwargs
-    if kwargs["num-scheduler-steps"] > 1:
+    kwargs = _get_vllm_kwargs(cfg)
+    if kwargs.get("num-scheduler-steps", 1) > 1:
         kwargs["num-scheduler-steps"] = 1
         logger.warning("Set num-scheduler-steps to 1 for reference vLLM")
     log_dir = exp_dir / f"ref_vllm_{preprocessor_llm_idx}"
@@ -147,11 +173,7 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
-    for k, v in kwargs.items():
-        cmd.append(f"--{k}")
-        if v not in [None, ""]:
-            cmd.append(str(v))
+    _append_vllm_kwargs(cmd, kwargs)
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
@@ -181,11 +203,7 @@ def run_actor_llm(
     # TODO: add support for tensor and process parallelism
     log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
-    entrypoint = (
-        "pipelinerl.entrypoints.run_vllm1" 
-        if cfg.vllm_config.use_v1 else 
-        "pipelinerl.entrypoints.run_vllm0"
-    )
+    entrypoint = "pipelinerl.entrypoints.run_vllm1"
     cmd = [
         "python",
         "-m",
@@ -208,12 +226,9 @@ def run_actor_llm(
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
-    if cfg.vllm_config.vllm_kwargs:
-        for k, v in cfg.vllm_config.vllm_kwargs.items():
-            cmd.append(f"--{k}")
-            if v not in [None, ""]:
-                cmd.append(str(v))
+    kwargs = _get_vllm_kwargs(cfg)
+    if kwargs:
+        _append_vllm_kwargs(cmd, kwargs)
 
     if cfg.debug.mode:
         cmd.append("--disable-weight-updates")
