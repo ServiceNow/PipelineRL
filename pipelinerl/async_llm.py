@@ -152,11 +152,10 @@ async def llm_async_generate(
             usage.get("prompt_tokens"),
             usage.get("completion_tokens"),
         )
-        if attempt == 0:
-            continue
-        raise RetryableAbortedCompletionError(
-            f"Repeated aborted completion for prompt {prompt.id}: {abort_reason}"
-        )
+        if attempt == 1:
+            raise RetryableAbortedCompletionError(
+                f"Repeated aborted completion for prompt {prompt.id}: {abort_reason}"
+            )
 
     assert response_data is not None, "response_data is None"
 
