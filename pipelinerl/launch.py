@@ -611,8 +611,10 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
 
 
 def run_redis(cfg: DictConfig):
-    # Launch redis-server
-    redis_dir = Path(cfg.output_dir) / "redis"
+    # Launch redis-server. Resolve paths to absolutes because redis-server
+    # chdir's to --dir before opening --logfile, which breaks relative paths.
+    output_dir = Path(cfg.output_dir).resolve()
+    redis_dir = output_dir / "redis"
     os.makedirs(redis_dir, exist_ok=True)
     cmd = [
         "redis-server",
@@ -621,7 +623,7 @@ def run_redis(cfg: DictConfig):
         "--port",
         str(cfg.streams.port),
         "--dir",
-        str(cfg.output_dir),
+        str(output_dir),
         "--protected-mode",
         "no",
         "--save",
