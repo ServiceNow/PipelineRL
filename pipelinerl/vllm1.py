@@ -120,12 +120,13 @@ class WorkerExtension:
                 os.environ.pop(_k, None)
 
         if weight_update_mode == 'http':
-            self.model_update_group = pipelinerl.torch_utils.init_extra_process_group(
-                group_name="actor",
-                backend="nccl",
+            # HTTP mode uses vLLM's StatelessProcessGroup to match the trainer,
+            # which in pipelinerl/finetune_loop.py uses torch_utils.stateless_init_process_group.
+            self.model_update_group = stateless_init_process_group(
                 init_method=weight_update_group_init_method,
                 rank=self.pg_rank,
                 world_size=weight_update_group_world_size,
+                device=self.device,
             )
         else:
             from fast_llm.engine.distributed.config import DistributedBackend
@@ -145,8 +146,9 @@ class WorkerExtension:
         self._process_group_destroyed = True
         if isinstance(self.model_update_group, torch.distributed.ProcessGroup):
             torch.distributed.destroy_process_group(self.model_update_group)
-        else:
+        elif hasattr(self.model_update_group, "shutdown"):
             self.model_update_group.shutdown()
+        # StatelessProcessGroup has no shutdown method; rely on GC.
 
     def is_actor_update_group_destroyed(self: LikeWorker) -> bool:
         return getattr(self, "_process_group_destroyed", False)
@@ -178,7 +180,12 @@ class WorkerExtension:
             )
 
             logger.debug(f"  - Calling broadcast for {info.name}...")
-            torch.distributed.broadcast(buffer, src=0, group=self.model_update_group)
+            # StatelessProcessGroup exposes .broadcast(); torch.distributed.ProcessGroup
+            # (fast-llm path) uses the functional torch.distributed.broadcast.
+            if isinstance(self.model_update_group, torch.distributed.ProcessGroup):
+                torch.distributed.broadcast(buffer, src=0, group=self.model_update_group)
+            else:
+                self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
             logger.debug(f"  - Broadcast received for {info.name}")
 
             logger.debug(f"  - Loading weights for {info.name}...")

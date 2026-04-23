@@ -68,7 +68,10 @@ async def generate_guessing_rollout(
             break
     latency = time.time() - time_start        
 
-    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
+    # vLLM can occasionally return finish_reason='abort' (race with mid-rollout
+    # weight updates) with an empty logprobs array. Skip those rather than letting
+    # make_training_text raise; the rest of the rollout is still useful.
+    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls if llm_call.logprobs]
     for text in training_texts:
         text.reward = reward
 
