@@ -329,7 +329,7 @@ class EngineManager:
                 torch.cuda.device_count(),
                 self.args.weight_update_group_init_method,
                 self.args.weight_update_group_world_size,
-                self.args.weight_update_mode,
+                getattr(self.args, "weight_update_mode", "http"),
             ),
         )
 
@@ -564,11 +564,12 @@ class EngineManager:
         try:
             assert isinstance(engine.engine_core, AsyncMPClient)
             manager = EngineManager(args, engine, engine_config)
+            weight_update_mode = getattr(args, "weight_update_mode", "http")
             if not args.disable_weight_updates:
                 await manager.init_actor_update_group()
 
                 # Initialize Fast-LLM mode if enabled
-                if args.weight_update_mode == "fast-llm":
+                if weight_update_mode == "fast-llm":
                     await manager.init_fast_llm_receiver()
                     await manager.start_fast_llm_monitoring()
                     logger.info("Fast-LLM weight update mode enabled")
@@ -577,7 +578,7 @@ class EngineManager:
         finally:
             if not args.disable_weight_updates:
                 # Stop Fast-LLM monitoring if enabled
-                if args.weight_update_mode == "fast-llm":
+                if weight_update_mode == "fast-llm":
                     await manager.stop_fast_llm_monitoring()
 
                 if not await manager.is_actor_update_group_destroyed():
@@ -643,7 +644,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         app = build_app(args, supported_tasks)
 
         # Register HTTP endpoint only if using HTTP mode
-        if args.weight_update_mode == "http":
+        if getattr(args, "weight_update_mode", "http") == "http":
             @app.post("/receive_weight_update")
             async def _receive_weight_update(request: WeightUpdateRequest):
                 await manager.receive_weight_update(request)
