@@ -155,11 +155,9 @@ class WeightUpdateManager:
     async def receive_weight_update(self, request: WeightUpdateRequest):
         async with self.update_lock:
             version = getattr(request, "version", "unknown")
-            paused = False
             pause_started_at = time.perf_counter()
             logger.info(f"Pausing generation for weight update version={version}")
             await self.engine.pause_generation(mode="keep", clear_cache=False)
-            paused = True
             logger.info(
                 f"Generation paused for weight update version={version} "
                 f"in {time.perf_counter() - pause_started_at:.3f}s"
@@ -175,14 +173,13 @@ class WeightUpdateManager:
                     f"in {time.perf_counter() - update_started_at:.3f}s"
                 )
             finally:
-                if paused:
-                    resume_started_at = time.perf_counter()
-                    logger.info(f"Resuming generation after weight update version={version}")
-                    await self.engine.resume_generation()
-                    logger.info(
-                        f"Generation resumed after weight update version={version} "
-                        f"in {time.perf_counter() - resume_started_at:.3f}s"
-                    )
+                resume_started_at = time.perf_counter()
+                logger.info(f"Resuming generation after weight update version={version}")
+                await self.engine.resume_generation()
+                logger.info(
+                    f"Generation resumed after weight update version={version} "
+                    f"in {time.perf_counter() - resume_started_at:.3f}s"
+                )
 
     async def close_communicator(self):
         """Closes the communicator when weight synchronization is no longer needed."""
