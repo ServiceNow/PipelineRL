@@ -379,25 +379,6 @@ class EngineManager:
             f"Fast-LLM receiver initialized (Redis {self._redis_host}:{self._redis_port})"
         )
 
-    async def receive_weight_update_fast_llm(self):
-        """Run a fast-llm broadcast weight update, paused-for-the-duration.
-
-        Pause/resume wraps the collective RPC symmetrically with the HTTP path
-        (see receive_weight_update) so that in-flight generation doesn't race
-        against mid-broadcast parameter swaps.
-        """
-        async with self.update_lock:
-            logger.info("Pausing generation for fast-llm weight update")
-            await self.engine.pause_generation(mode="keep", clear_cache=False)
-            try:
-                await self.engine.engine_core.collective_rpc_async(
-                    "receive_weight_update_fast_llm", args=()
-                )
-                logger.info("Fast-llm weight update processed")
-            finally:
-                logger.info("Resuming generation after fast-llm weight update")
-                await self.engine.resume_generation()
-
     async def start_fast_llm_monitoring(self):
         """Start a single Redis monitoring thread in the main process.
 
@@ -456,7 +437,9 @@ class EngineManager:
                                 )
                                 try:
                                     future = asyncio.run_coroutine_threadsafe(
-                                        self.receive_weight_update_fast_llm(),
+                                        self.engine.engine_core.collective_rpc_async(
+                                            "receive_weight_update_fast_llm", args=()
+                                        ),
                                         loop,
                                     )
                                     future.result()
@@ -645,10 +628,17 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         # Run HTTP server
         sock_addr = (args.host or "", args.port)
         sock = create_server_socket(sock_addr)
-        # vLLM 0.18.1 requires supported_tasks to build the app and app state.
-        supported_tasks = await manager.engine.get_supported_tasks()
-        logger.info(f"Supported tasks: {supported_tasks}")
-        app = build_app(args, supported_tasks)
+        # vLLM 0.18.1+ requires supported_tasks to build the app and app state;
+        # older vllm (e.g. 0.14.x) has 1-arg build_app / 3-arg init_app_state.
+        import inspect as _inspect
+        _build_app_params = _inspect.signature(build_app).parameters
+        if "supported_tasks" in _build_app_params and hasattr(manager.engine, "get_supported_tasks"):
+            supported_tasks = await manager.engine.get_supported_tasks()
+            logger.info(f"Supported tasks: {supported_tasks}")
+            app = build_app(args, supported_tasks)
+        else:
+            supported_tasks = None
+            app = build_app(args)
 
         # Register HTTP endpoint only if using HTTP mode
         if getattr(args, "weight_update_mode", "http") == "http":
@@ -667,7 +657,10 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         else:
             logger.info("Fast-LLM mode: using Redis stream (no HTTP endpoint registered)")
 
-        await init_app_state(manager.engine, app.state, args, supported_tasks)
+        if "supported_tasks" in _inspect.signature(init_app_state).parameters:
+            await init_app_state(manager.engine, app.state, args, supported_tasks)
+        else:
+            await init_app_state(manager.engine, app.state, args)
         shutdown_task = await serve_http(
             app,
             sock,
