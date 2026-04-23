@@ -15,6 +15,10 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 logger = logging.getLogger(__name__)
 
 
+class RetryableAbortedCompletionError(TimeoutError):
+    """Abort-shaped completion that should be retried instead of treated as data."""
+
+
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
     """Extract PIL Images from multimodal messages."""
 
@@ -51,6 +55,31 @@ def _to_plain_obj(value):
     if isinstance(value, (list, tuple)):
         return [_to_plain_obj(item) for item in value]
     return value
+
+
+def _is_retryable_abort_response(data: dict, collect_logprobs: bool) -> tuple[bool, str | None]:
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return False, None
+
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == "abort":
+        return True, "finish_reason=abort"
+
+    if not collect_logprobs:
+        return False, None
+
+    try:
+        content = choice["message"]["content"]
+        completion_logprobs = choice["logprobs"]["content"]
+        completion_tokens = data["usage"]["completion_tokens"]
+    except (KeyError, TypeError):
+        return False, None
+
+    if completion_tokens == 0 and not content and completion_logprobs == []:
+        return True, "empty completion with empty logprobs"
+    return False, None
 
 
 async def llm_async_generate(
@@ -90,27 +119,56 @@ async def llm_async_generate(
 
     # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
     payload = _to_plain_obj({**extra_parameters, **data})
-    async with session.post(
-        url=f"{llm.base_url}/v1/chat/completions",
-        json=payload,
-        headers=headers,
-        ssl=False,
-    ) as response:
-        if not response.ok:
-            error_text = await response.text()
-            logger.error(f"Failed to get completion: {error_text}")
-            response.raise_for_status()
-        data = await response.json()
+    response_data = None
+    for attempt in range(2):
+        async with session.post(
+            url=f"{llm.base_url}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            ssl=False,
+        ) as response:
+            if not response.ok:
+                error_text = await response.text()
+                logger.error(f"Failed to get completion: {error_text}")
+                response.raise_for_status()
+            response_data = await response.json()
+
+        is_retryable_abort, abort_reason = _is_retryable_abort_response(
+            response_data, llm.collect_logprobs
+        )
+        if not is_retryable_abort:
+            break
+
+        choice = response_data.get("choices", [{}])[0]
+        usage = response_data.get("usage", {})
+        logger.warning(
+            "Retryable aborted completion prompt_id=%s response_id=%s attempt=%s/2 reason=%s "
+            "finish_reason=%s prompt_tokens=%s completion_tokens=%s",
+            prompt.id,
+            response_data.get("id", "<unknown>"),
+            attempt + 1,
+            abort_reason,
+            choice.get("finish_reason"),
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
+        )
+        if attempt == 0:
+            continue
+        raise RetryableAbortedCompletionError(
+            f"Repeated aborted completion for prompt {prompt.id}: {abort_reason}"
+        )
+
+    assert response_data is not None, "response_data is None"
 
     try:
-        content = data["choices"][0]["message"]["content"]
+        content = response_data["choices"][0]["message"]["content"]
         if not content:
-            logger.warning(f"Empty completion {data}")
+            logger.warning(f"Empty completion {response_data}")
 
         parsed_logprobs = []
         finish_reason = None
         if llm.collect_logprobs:
-            completion_logprobs = data["choices"][0]["logprobs"]["content"]
+            completion_logprobs = response_data["choices"][0]["logprobs"]["content"]
             for logprob in completion_logprobs:
                 if logprob:
                     try:
@@ -126,15 +184,15 @@ async def llm_async_generate(
                     except Exception as e:
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
-        finish_reason = data["choices"][0].get("finish_reason")
+        finish_reason = response_data["choices"][0].get("finish_reason")
     except Exception:
-        logger.exception(f"Failed to parse llm response: {data}")
+        logger.exception(f"Failed to parse llm response: {response_data}")
         raise
 
     output = LLMOutput(content=content)
     llm_call = llm.log_output(prompt, output, count_tokens=False)
-    llm_call.prompt_length_tokens = data["usage"]["prompt_tokens"]
-    llm_call.output_length_tokens = data["usage"]["completion_tokens"]
+    llm_call.prompt_length_tokens = response_data["usage"]["prompt_tokens"]
+    llm_call.output_length_tokens = response_data["usage"]["completion_tokens"]
     if finish_reason:
         llm_call.llm_info["finish_reason"] = finish_reason
     assert llm_call is not None, "llm_call is None"
@@ -143,6 +201,12 @@ async def llm_async_generate(
 
 
 def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
+    finish_reason = llm_call.llm_info.get("finish_reason")
+    if finish_reason == "abort":
+        raise RetryableAbortedCompletionError(
+            f"Aborted completion for prompt {llm_call.prompt.id} should be retried"
+        )
+
     # Extract visual features if present
     images = []
     use_processor = False
@@ -237,7 +301,6 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
     logprobs = [lp.logprob for lp in llm_call.logprobs]
-    finish_reason = llm_call.llm_info.get("finish_reason")
     if finish_reason is not None:
         finished = finish_reason != "length"
     else:
