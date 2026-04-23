@@ -33,13 +33,10 @@ def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
                     # Handle base64 format
                     url = content_item["image_url"]["url"]
                     if url.startswith("data:image;base64,"):
-                        try:
-                            base64_data = url.split("data:image;base64,")[1]
-                            image_data = base64.b64decode(base64_data)
-                            image = Image.open(io.BytesIO(image_data))
-                            images.append(image)
-                        except Exception as e:
-                            raise e
+                        base64_data = url.split("data:image;base64,")[1]
+                        image_data = base64.b64decode(base64_data)
+                        image = Image.open(io.BytesIO(image_data))
+                        images.append(image)
 
     return images
 
@@ -86,9 +83,13 @@ async def llm_async_generate(
             f"LLM parameters must serialize to a mapping, got {type(extra_parameters)}"
         )
 
+    if llm.chat_template_kwargs:
+        extra_parameters = {**extra_parameters, "chat_template_kwargs": _to_plain_obj(llm.chat_template_kwargs)}
+
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
-    payload = _to_plain_obj({**data, **extra_parameters})
+    # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
+    payload = _to_plain_obj({**extra_parameters, **data})
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
         json=payload,
@@ -126,9 +127,9 @@ async def llm_async_generate(
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
         finish_reason = data["choices"][0].get("finish_reason")
-    except Exception as e:
+    except Exception:
         logger.exception(f"Failed to parse llm response: {data}")
-        raise e
+        raise
 
     output = LLMOutput(content=content)
     llm_call = llm.log_output(prompt, output, count_tokens=False)
@@ -200,19 +201,23 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             raise ValueError(f"Failed to process with vision-language processor: {e}")
     else:
         # Use tokenizer for text-only models
+        chat_kwargs = _to_plain_obj(llm.chat_template_kwargs) if llm.chat_template_kwargs else {}
         prompt_text = llm.tokenizer.apply_chat_template(
             conversation=llm_call.prompt.messages,
             tokenize=False,
             add_generation_prompt=True,
+            **chat_kwargs,
         )
         text = llm.tokenizer.apply_chat_template(
             full_messages,
             tokenize=False,
+            **chat_kwargs,
         )
         prompt_token_ids = llm.tokenizer.apply_chat_template(
             llm_call.prompt.messages,
             add_special_tokens=True,
             add_generation_prompt=True,
+            **chat_kwargs,
         )
 
     output_text = text[len(prompt_text) :]

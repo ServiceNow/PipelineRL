@@ -30,7 +30,7 @@ preprocess:
   chunk_n_groups: 2
   # queue for loaded raw groups
   raw_queue_size: 8
-  # queue for processed chunks of multiple groups  
+  # queue for processed chunks of multiple groups
   input_queue_size: 32
   # queue for ready chunks for multiple groups
   output_queue_size: 32
@@ -40,9 +40,10 @@ preprocess:
   ring_buffer_size: 128
   # "virtual" sample queue per lead trainer
   max_ready_samples_per_lead: 512
-  pop_old_data: ${..pop_old_data} 
+  pop_old_data: ${..pop_old_data}
   shared_memory_entry_size: 100000000
   log_every_n_samples: 128
+
 llm:
   parameters:
     # changed
@@ -62,9 +63,6 @@ vllm_config:
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
-    num-scheduler-steps: 1
-    disable-log-requests: ""
-    disable-frontend-multiprocessing: ""
     max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 1024
     enable-chunked-prefill: ""
@@ -73,6 +71,11 @@ vllm_config:
     pipeline-parallel-size: 1
     generation-config: vllm
     max_model_len: 10000
+    # V1 specific settings
+    # logprobs-mode: processed_logprobs
+    # V0 specific settings
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
 
 world:
   replicas: 1
@@ -91,7 +94,6 @@ jobs: []
 
 eval_every_n_versions: 78000
 
-# changed
 model_path: Qwen/Qwen2.5-7B
 
 # will use default based on the chosen backend
@@ -229,4 +231,3 @@ wandb:
   wandb_dir: null
   # Comma-separated list of keywords to tag the run.
   tags: []
-

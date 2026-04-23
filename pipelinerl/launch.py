@@ -129,9 +129,39 @@ def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
     return env
 
 
+def _get_vllm_kwargs(cfg: DictConfig, *, use_v1: bool) -> dict:
+    """Return launchable vLLM CLI kwargs, dropping legacy flags for V1."""
+    kwargs = OmegaConf.to_container(cfg.vllm_config.vllm_kwargs, resolve=True)
+    if kwargs is None:
+        return {}
+    if not isinstance(kwargs, dict):
+        raise TypeError(f"vllm_kwargs must resolve to a mapping, got {type(kwargs)}")
+
+    if use_v1:
+        # Keep V1 actor/reference serving closer to the legacy V0 path by default.
+        kwargs.setdefault("enable-prefix-caching", False)
+        kwargs.setdefault("async-scheduling", False)
+        for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
+            if legacy_flag in kwargs:
+                kwargs.pop(legacy_flag)
+                logger.info(f"Dropping legacy vLLM flag '--{legacy_flag}' for V1 launch")
+
+    return kwargs
+
+
+def _append_vllm_kwargs(cmd: list[str], kwargs: dict) -> None:
+    for k, v in kwargs.items():
+        if isinstance(v, bool):
+            cmd.append(f"--{k}" if v else f"--no-{k}")
+            continue
+        cmd.append(f"--{k}")
+        if v not in [None, ""]:
+            cmd.append(str(v))
+
+
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
-    kwargs = cfg.vllm_config.vllm_kwargs
-    if kwargs["num-scheduler-steps"] > 1:
+    kwargs = _get_vllm_kwargs(cfg, use_v1=cfg.vllm_config.use_v1)
+    if kwargs.get("num-scheduler-steps", 1) > 1:
         kwargs["num-scheduler-steps"] = 1
         logger.warning("Set num-scheduler-steps to 1 for reference vLLM")
     log_dir = exp_dir / f"ref_vllm_{preprocessor_llm_idx}"
@@ -153,11 +183,7 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
-    for k, v in kwargs.items():
-        cmd.append(f"--{k}")
-        if v not in [None, ""]:
-            cmd.append(str(v))
+    _append_vllm_kwargs(cmd, kwargs)
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
@@ -215,25 +241,26 @@ def run_actor_llm(
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
-    _vllm1_unsupported = {"num-scheduler-steps"}
-    if cfg.vllm_config.vllm_kwargs:
-        for k, v in cfg.vllm_config.vllm_kwargs.items():
-            if cfg.vllm_config.use_v1 and k in _vllm1_unsupported:
-                continue
-            cmd.append(f"--{k}")
-            if v not in [None, ""]:
-                cmd.append(str(v))
+    kwargs = _get_vllm_kwargs(cfg, use_v1=cfg.vllm_config.use_v1)
+    # vLLM v1 rejects num-scheduler-steps; defensively drop it for v1 launches.
+    if cfg.vllm_config.use_v1 and "num-scheduler-steps" in kwargs:
+        kwargs.pop("num-scheduler-steps")
+    if kwargs:
+        _append_vllm_kwargs(cmd, kwargs)
 
     if cfg.debug.mode or not cfg.weight_broadcast:
         cmd.append("--disable-weight-updates")
 
+    # Always tell the vLLM actor server which weight-update protocol to use,
+    # so its conditional init takes the right branch (HTTP vs fast-llm broadcast).
     if cfg.use_fast_llm:
         cmd += [
             "--weight-update-mode", "fast-llm",
             "--redis-host", cfg.streams.host,
             "--redis-port", str(cfg.streams.port),
         ]
+    else:
+        cmd += ["--weight-update-mode", "http"]
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
@@ -278,7 +305,6 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     )
     if proc is not None:
         yield LaunchedProcess(kind="actor", handle=proc)
-
 
 def run_environment(cfg: DictConfig, job: Job):
     # run in a subprocess like in the rest of the code

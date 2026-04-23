@@ -199,18 +199,36 @@ def rl_step(
     
     outputs = model(**model_inputs)
 
-    # compute log probs and entropy
+    # compute log probs for actual tokens without materializing full logprobs unless needed
     logits = outputs.logits[:, :-1, :]
     logits = logits / config.temperature
-    logprobs = F.log_softmax(logits, dim=-1)
-    probs = F.softmax(logits, dim=-1)
-    entropy = -(probs * logprobs).sum(dim=-1)
-    del logits, probs
-    
-    # get log probs for actual tokens
-    new_logprobs = torch.gather(logprobs, dim=2, index=batch.input_ids[:, 1:].unsqueeze(2)).squeeze(2)
+    next_token_ids = batch.input_ids[:, 1:].unsqueeze(2)
+    selected_logits = torch.gather(logits, dim=2, index=next_token_ids).squeeze(2)
+    log_norm = torch.logsumexp(logits, dim=-1)
+    new_logprobs = selected_logits - log_norm
     assert torch.isfinite(new_logprobs).all(), f"new_logprobs is not finite: {new_logprobs}"
-    del logprobs
+
+    use_entropy_loss = config.entropy_bonus != 0.0 or config.final_entropy_bonus != 0.0
+    if use_entropy_loss:
+        logprobs = logits - log_norm.unsqueeze(-1)
+        probs = torch.exp(logprobs)
+        entropy = -(probs * logprobs).sum(dim=-1)
+        del logprobs, probs
+    else:
+        # Keep exact entropy stats without allocating full-vocab softmax/log-softmax tensors.
+        entropy = torch.zeros_like(log_norm)
+        detached_logits = logits.detach()
+        detached_log_norm = log_norm.detach()
+        log_norm_unsqueezed = detached_log_norm.unsqueeze(-1)
+        vocab_chunk_size = 4096
+        with torch.no_grad():
+            for start in range(0, detached_logits.shape[-1], vocab_chunk_size):
+                chunk = detached_logits[..., start:start + vocab_chunk_size]
+                chunk_logprobs = chunk - log_norm_unsqueezed
+                chunk_probs = torch.exp(chunk_logprobs)
+                entropy -= (chunk_probs * chunk_logprobs).sum(dim=-1)
+
+    del logits, selected_logits, log_norm
 
     # get shifted values and compute ratios
     rewards = batch.rewards[:, 1:]
@@ -235,6 +253,7 @@ def rl_step(
     assert new_logprobs.shape == ref_logprobs.shape
 
     log_ratio_new_old = new_logprobs - old_logprobs
+    abs_log_ratio_new_old = torch.abs(log_ratio_new_old)
     ratio_new_old = torch.exp(log_ratio_new_old)
     log_ratio_ref_new = ref_logprobs - new_logprobs
     assert torch.isfinite(log_ratio_ref_new).all(), f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
@@ -310,6 +329,10 @@ def rl_step(
             clamped_group_ratio = torch.clamp(group_ratio_new_old, 1 - config.epsilon_low, 1 + config.epsilon_high)
             clamp_log_ratio_new_old_indicators = (clamped_group_ratio != group_ratio_new_old) & valid_mask_3d
             surr2 = clamped_group_ratio * group_advantages_t
+            # Length-proportional weighting is intentional: longer sequences carry more
+            # gradient, which complements difficulty-aware penalty (DAP) — DAP reduces the
+            # length penalty for successful hard rollouts, and length-proportional weights
+            # amplify that signal into the update. Uniform weighting hurts training dynamics.
             sequence_weights = weight_sum.unsqueeze(1).unsqueeze(2)
             if batch.sentinel or surr1.numel() == 0:
                 policy_loss_total = new_logprobs[..., :1].sum() * 0.0
@@ -326,7 +349,10 @@ def rl_step(
 
     # combine loss components
     if config.policy_loss != "gspo":
-        loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
+        if use_entropy_loss:
+            loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy
+        else:
+            loss = policy_loss - kl_coef * approx_kl
         assert loss.shape == tokens_weights.shape, (
             f"Loss shape {loss.shape} does not match example weights shape {tokens_weights.shape}"
         )
@@ -381,6 +407,9 @@ def rl_step(
         "min_advantage": advantages[masks_shifted].min().item(),
         "kl": sum_sum(approx_kl / num_labels_in_seq, masks_shifted, segments).item(),
         "kl_new_old": sum_sum(approx_kl_new_old / num_labels_in_seq, masks_shifted, segments).item(),
+        "mean_abs_log_ratio_new_old": sum_sum(
+            abs_log_ratio_new_old / num_labels_in_seq, masks_shifted, segments
+        ).item(),
         "max_kl": approx_kl[masks_shifted].max().item(),
         "min_kl": approx_kl[masks_shifted].min().item(),
         "ratio_new_old": sum_sum(ratio_new_old / num_labels_in_seq, masks_shifted, segments).item(),

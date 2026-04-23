@@ -1,22 +1,22 @@
+import asyncio
 import logging
+import os
 import signal
 import torch
 import uvloop
-from vllm.utils.system_utils import set_ulimit
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.system_utils import set_ulimit
 from vllm.entrypoints.openai.cli_args import (
     make_arg_parser,
     validate_parsed_serve_args,
 )
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.api_server import (
-    run_server,
     create_server_socket,
     build_app,
     init_app_state,
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.tool_parsers import ToolParserManager
 from vllm._version import version
 from vllm.usage.usage_lib import UsageContext
 from vllm.config import ModelConfig
@@ -30,9 +30,15 @@ from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from typing import Any, Protocol, runtime_checkable, Dict, Optional
 from fastapi import BackgroundTasks
 import pipelinerl.torch_utils
+from pipelinerl.torch_utils import stateless_init_process_group
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 from vllm.distributed import cleanup_dist_env_and_memory
 from contextlib import asynccontextmanager
+
+try:
+    from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+except ModuleNotFoundError:
+    from vllm.tool_parsers import ToolParserManager
 
 logger = logging.getLogger(__name__)
 # configure this logger individually, in order to avoid messing
@@ -60,7 +66,7 @@ class LikeWorker(Protocol):
     device: torch.device
     model_runner: GPUModelRunner
     pg_rank: int
-    process_group: Any
+    model_update_group: Any
     model_config: ModelConfig
 
 
@@ -94,8 +100,27 @@ class WorkerExtension:
             prefix
             + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}, mode: {weight_update_mode}"
         )
+
+        batch_invariant_env = os.getenv("VLLM_BATCH_INVARIANT", "0")
+        try:
+            batch_invariant_enabled = int(batch_invariant_env) != 0
+        except ValueError:
+            batch_invariant_enabled = False
+
+        if batch_invariant_enabled:
+            # vLLM batch_invariant mode sets restrictive NCCL env vars (single channel,
+            # tree algo, simple proto, P2P disabled) that the trainer does not share.
+            # Clear them so the weight-update NCCL comm matches trainer defaults.
+            # Safe at tp=1 because no intra-engine NCCL comm has been created yet.
+            for _k in (
+                "NCCL_LAUNCH_MODE", "NCCL_COLLNET_ENABLE", "NCCL_NVLS_ENABLE",
+                "NCCL_P2P_NET_DISABLE", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS",
+                "NCCL_PROTO", "NCCL_ALGO", "NCCL_NTHREADS", "NCCL_SOCKET_NTHREADS",
+            ):
+                os.environ.pop(_k, None)
+
         if weight_update_mode == 'http':
-            self.process_group = pipelinerl.torch_utils.init_extra_process_group(
+            self.model_update_group = pipelinerl.torch_utils.init_extra_process_group(
                 group_name="actor",
                 backend="nccl",
                 init_method=weight_update_group_init_method,
@@ -106,7 +131,7 @@ class WorkerExtension:
             from fast_llm.engine.distributed.config import DistributedBackend
             from fast_llm.engine.distributed.distributed import ProcessGroupPool
 
-            self.process_group = ProcessGroupPool(
+            self.model_update_group = ProcessGroupPool(
                 rank=self.pg_rank,
                 world_size=weight_update_group_world_size,
                 local_world_size=1,
@@ -114,18 +139,20 @@ class WorkerExtension:
                 backend=DistributedBackend.nccl,
             ).get_process_group(range(weight_update_group_world_size), self.pg_rank)
         self._process_group_destroyed = False
+        logger.info(prefix + "Actor update process group initialized")
 
     def destroy_actor_update_group(self: LikeWorker):
         self._process_group_destroyed = True
-        if isinstance(self.process_group, torch.distributed.ProcessGroup):
-            torch.distributed.destroy_process_group(self.process_group)
+        if isinstance(self.model_update_group, torch.distributed.ProcessGroup):
+            torch.distributed.destroy_process_group(self.model_update_group)
         else:
-            self.process_group.shutdown()
+            self.model_update_group.shutdown()
 
     def is_actor_update_group_destroyed(self: LikeWorker) -> bool:
         return getattr(self, "_process_group_destroyed", False)
 
-    def receive_weight_update(self: LikeWorker, request: WeightUpdateRequest):
+    def receive_weight_update(self: LikeWorker, request_json: str):
+        request = WeightUpdateRequest.model_validate_json(request_json)
         torch.cuda.synchronize(self.device)
         logger.info(
             f"Start receiving weight update: {len(request.parameters_info)} parameters"
@@ -151,7 +178,7 @@ class WorkerExtension:
             )
 
             logger.debug(f"  - Calling broadcast for {info.name}...")
-            torch.distributed.broadcast(buffer, src=0, group=self.process_group)
+            torch.distributed.broadcast(buffer, src=0, group=self.model_update_group)
             logger.debug(f"  - Broadcast received for {info.name}")
 
             logger.debug(f"  - Loading weights for {info.name}...")
@@ -206,7 +233,7 @@ class WorkerExtension:
         while True:
             # Receive metadata
             logger.debug(f"[Worker rank={self.rank}] Waiting for metadata broadcast...")
-            meta = _broadcast_object(None, self.process_group, src=0)
+            meta = _broadcast_object(None, self.model_update_group, src=0)
             logger.debug(f"[Worker rank={self.rank}] Received metadata: {meta}")
 
             # Check for end signal
@@ -226,7 +253,7 @@ class WorkerExtension:
 
             # Allocate buffer and receive tensor (must happen for every broadcast to stay in sync)
             buffer = torch.empty(tuple(shape), dtype=target_dtype, device=self.device)
-            _broadcast(buffer, 0, self.process_group)
+            _broadcast(buffer, 0, self.model_update_group)
 
             # Only load weight shards (skip grads, optimizer state, etc.)
             if shard_name != "weights":
@@ -273,12 +300,20 @@ class WorkerExtension:
             f"[Worker rank={self.rank}] Fast-LLM weight update complete - {param_count} parameters processed"
         )
 
+    def close_communicator(self):
+        """Closes the communicator when weight synchronization is no longer needed."""
+        if hasattr(self, "model_update_group") and self.model_update_group is not None:
+            del self.model_update_group
+            self.model_update_group = None
+            logger.info("Weight update communicator closed")
+
 
 class EngineManager:
     def __init__(self, args, engine: AsyncLLM, engine_config: Any):
         self.args = args
         self.engine = engine
         self.engine_config = engine_config
+        self.update_lock = asyncio.Lock()
 
     async def is_extension_loaded(self):
         return await self.engine.engine_core.collective_rpc_async(
@@ -312,10 +347,22 @@ class EngineManager:
         return all(results)
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
-        await self.engine.engine_core.collective_rpc_async(
-            "receive_weight_update", args=(request,)
-        )
-        logger.info("Weight update processed")
+        async with self.update_lock:
+            logger.info("Pausing generation for weight update")
+            await self.engine.pause_generation(mode="keep", clear_cache=False)
+            try:
+                logger.info("Starting weight update...")
+                await self.engine.engine_core.collective_rpc_async(
+                    "receive_weight_update", args=(request.model_dump_json(),)
+                )
+                logger.info("Weight update processed")
+            finally:
+                logger.info("Resuming generation after weight update")
+                await self.engine.resume_generation()
+
+    async def close_communicator(self):
+        """Closes the communicator when weight synchronization is no longer needed."""
+        await self.engine.engine_core.collective_rpc_async("close_communicator")
 
     async def init_fast_llm_receiver(self):
         """Store Redis connection info for the main-process monitoring thread."""
@@ -324,6 +371,25 @@ class EngineManager:
         logger.info(
             f"Fast-LLM receiver initialized (Redis {self._redis_host}:{self._redis_port})"
         )
+
+    async def receive_weight_update_fast_llm(self):
+        """Run a fast-llm broadcast weight update, paused-for-the-duration.
+
+        Pause/resume wraps the collective RPC symmetrically with the HTTP path
+        (see receive_weight_update) so that in-flight generation doesn't race
+        against mid-broadcast parameter swaps.
+        """
+        async with self.update_lock:
+            logger.info("Pausing generation for fast-llm weight update")
+            await self.engine.pause_generation(mode="keep", clear_cache=False)
+            try:
+                await self.engine.engine_core.collective_rpc_async(
+                    "receive_weight_update_fast_llm", args=()
+                )
+                logger.info("Fast-llm weight update processed")
+            finally:
+                logger.info("Resuming generation after fast-llm weight update")
+                await self.engine.resume_generation()
 
     async def start_fast_llm_monitoring(self):
         """Start a single Redis monitoring thread in the main process.
@@ -383,9 +449,7 @@ class EngineManager:
                                 )
                                 try:
                                     future = asyncio.run_coroutine_threadsafe(
-                                        self.engine.engine_core.collective_rpc_async(
-                                            "receive_weight_update_fast_llm", args=()
-                                        ),
+                                        self.receive_weight_update_fast_llm(),
                                         loop,
                                     )
                                     future.result()
@@ -543,10 +607,13 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
 
-    valide_tool_parses = ToolParserManager.tool_parsers.keys()
-    if args.enable_auto_tool_choice and args.tool_call_parser not in valide_tool_parses:
+    if hasattr(ToolParserManager, "list_registered"):
+        valid_tool_parses = ToolParserManager.list_registered()
+    else:
+        valid_tool_parses = list(ToolParserManager.tool_parsers.keys())
+    if args.enable_auto_tool_choice and args.tool_call_parser not in valid_tool_parses:
         raise KeyError(
-            f"invalid tool call parser: {args.tool_call_parser} (chose from {{ {','.join(valide_tool_parses)} }})"
+            f"invalid tool call parser: {args.tool_call_parser} (chose from {{ {','.join(valid_tool_parses)} }})"
         )
 
     # workaround to make sure that we bind the port before the engine is set up.
@@ -570,7 +637,10 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         # Run HTTP server
         sock_addr = (args.host or "", args.port)
         sock = create_server_socket(sock_addr)
-        app = build_app(args)
+        # vLLM 0.18.1 requires supported_tasks to build the app and app state.
+        supported_tasks = await manager.engine.get_supported_tasks()
+        logger.info(f"Supported tasks: {supported_tasks}")
+        app = build_app(args, supported_tasks)
 
         # Register HTTP endpoint only if using HTTP mode
         if args.weight_update_mode == "http":
@@ -589,7 +659,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         else:
             logger.info("Fast-LLM mode: using Redis stream (no HTTP endpoint registered)")
 
-        await init_app_state(manager.engine, app.state, args)
+        await init_app_state(manager.engine, app.state, args, supported_tasks)
         shutdown_task = await serve_http(
             app,
             sock,
