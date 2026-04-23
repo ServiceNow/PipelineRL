@@ -64,14 +64,15 @@ vllm_config:
     gpu-memory-utilization: 0.9
     max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 1024
+    logprobs-mode: processed_logprobs
+    enable-prefix-caching: false
+    async-scheduling: false
     enable-chunked-prefill: ""
     return-tokens-as-token-ids: ""
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
     max_model_len: 10000
-    # V1 specific settings
-    # logprobs-mode: processed_logprobs
 
 world:
   replicas: 1

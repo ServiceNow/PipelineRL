@@ -131,9 +131,6 @@ def _get_vllm_kwargs(cfg: DictConfig) -> dict:
     if not isinstance(kwargs, dict):
         raise TypeError(f"vllm_kwargs must resolve to a mapping, got {type(kwargs)}")
 
-    # Keep V1 actor/reference serving closer to the legacy V0 path by default.
-    kwargs.setdefault("enable-prefix-caching", False)
-    kwargs.setdefault("async-scheduling", False)
     for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
         if legacy_flag in kwargs:
             kwargs.pop(legacy_flag)
