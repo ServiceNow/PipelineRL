@@ -728,8 +728,11 @@ def run_preprocessing_loop(
                                     current_length = 0
                                     logger.debug(f"[inner loop] Packed microbatch with {len(current_batch)} samples for trainer {trainer_id}")
                         else:
+                            # Unpacked path: need a full micro-batch before collating.
+                            if len(processed_entries_queue) < cfg.finetune.train_batch_size:
+                                break  # wait for more data; outer loop will refill the queue
                             batch_entries = []
-                            for _ in range(cfg.finetune.train_batch_size ):
+                            for _ in range(cfg.finetune.train_batch_size):
                                 batch_entries.append(processed_entries_queue.popleft())
                             batch_encoding = collate(batch_entries, tokenizer=tokenizer)
                             write_micro_batch_slices(trainer_id, data_writer, batch_encoding, cfg.finetune.seq_parallel)
