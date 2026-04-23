@@ -824,6 +824,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
+            chat_template_kwargs=cfg.llm.get("chat_template_kwargs", {}),
         )
         for url in llm_urls
     ]
@@ -834,6 +835,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
+            chat_template_kwargs=cfg.test_llm.get("chat_template_kwargs", {}),
         )
         for url in llm_urls
     ]
