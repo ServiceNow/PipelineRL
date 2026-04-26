@@ -46,6 +46,7 @@ from pipelinerl.streams import (
     set_streams_backend,
     write_to_streams,
 )
+from pipelinerl.curriculum import BanditConfig, compute_category_feedback, CurriculumFeedbackTracker
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +382,16 @@ def run_preprocessing_loop(
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
     logger.info("Streams initialized")
 
+    # Curriculum feedback stream (only used if curriculum learning is enabled)
+    curriculum_enabled = cfg.get("curriculum") and cfg.curriculum.get("enabled", False)
+    curriculum_stream = None
+    curriculum_category_fields: list[str] = []
+    if curriculum_enabled:
+        curriculum_stream = SingleStreamSpec(exp_path=exp_root_dir, topic="curriculum_feedback")
+        curriculum_config = BanditConfig(**cfg.curriculum)
+        curriculum_category_fields = curriculum_config.get_all_category_fields()
+        logger.info(f"Curriculum feedback enabled with category fields: {curriculum_category_fields}")
+
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
     pop_old_data = cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode
@@ -495,6 +506,7 @@ def run_preprocessing_loop(
                 fetching_took = 0
                 writing_took = 0
                 num_filtered_out = 0
+                curriculum_tracker = CurriculumFeedbackTracker(cfg.preprocess.log_every_n_samples)
                 while True:
                     if (
                         trainer_state.samples_processed is not None
@@ -528,6 +540,21 @@ def run_preprocessing_loop(
                             total_filtered_out += num_filtered_out
                             if num_filtered_out > 0:
                                 logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
+
+                        # Compute and publish curriculum feedback if enabled
+                        if curriculum_stream is not None and dataset:
+                            feedback = compute_category_feedback(
+                                dataset=dataset,
+                                category_fields=curriculum_category_fields,
+                            )
+                            with write_to_streams(curriculum_stream) as curriculum_writer:
+                                curriculum_writer.write(feedback.model_dump())
+                            curriculum_tracker.update(feedback)
+                            if curriculum_tracker.time_to_log():
+                                logger.info(
+                                    f"Published curriculum feedback to actor: {curriculum_tracker.get_summary_and_reset()}"
+                                )
+
                         fetching_took += time.time() - start_fetching
                     except Empty:
                         pass
