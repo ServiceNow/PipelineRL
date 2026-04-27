@@ -411,27 +411,15 @@ PipelineRL can span multiple nodes, with actor (vLLM) and trainer roles on separ
 
 ### Running and resuming multi-node jobs
 
-**`world.run_id` is required for multi-node jobs.** It must be a string that is unique per job run. It is used to namespace the pod IP exchange directory on the shared NFS mount so that stale files from a previous run are never seen.
-
-On EAI (and any torchrun-based launcher), `MASTER_ADDR` is unique per replica group and makes a good default:
+**`world.run_id` is required for multi-node jobs.** It must be a string that is unique per job run. It namespaces the pod IP exchange directory on the shared NFS mount so that stale files from a previous run are never picked up by a new one. Any value that your cluster scheduler guarantees to be unique per job works — a job UUID, a replica-group ID, or the job's `MASTER_ADDR` (which is unique per torchrun launch):
 
 ```bash
 python -m pipelinerl.launch ... 'world.run_id=${MASTER_ADDR}'
 ```
 
-The `submit_eai_math_7b_multinode.sh` script sets this automatically.
+**To resume a preempted run**, reuse the same `output_dir` as the original job. fast-LLM automatically finds the latest checkpoint in `output_dir/finetune/checkpoint/` and resumes from it. WandB also resumes the same run because fast-LLM persists the run ID in `output_dir/finetune/wandb_config.yaml` on the first launch and reloads it on every subsequent launch.
 
-**To resume a preempted run**, pass the original experiment timestamp as the third argument so the same output directory (and therefore the same WandB run and checkpoint) is reused:
-
-```bash
-# Fresh run — creates a new experiment directory
-bash submit_eai_math_7b_multinode.sh 4 60
-
-# Resume — reuses math_7b_4node_mb5x12_20260427_144646/
-bash submit_eai_math_7b_multinode.sh 4 60 20260427_144646
-```
-
-On resume the script appends a unique `_resume_<timestamp>` suffix to the EAI job name (required because job names must be unique). A new `world.run_id` value (`MASTER_ADDR` of the new job) is used automatically, so the pod IP exchange directory is always fresh.
+Each resumed job must still use a fresh `world.run_id` (the new job's ID, not the original one), so the pod IP exchange directory is always clean.
 
 # Install FastLLM+PipilineRL
 - use ` registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis` image which also includes redis server. In `~/.research-interactive-env`:
