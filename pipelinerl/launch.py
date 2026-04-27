@@ -142,6 +142,9 @@ def _get_vllm_kwargs(cfg: DictConfig, *, use_v1: bool) -> dict:
         # Keep V1 actor/reference serving closer to the legacy V0 path by default.
         kwargs.setdefault("enable-prefix-caching", False)
         kwargs.setdefault("async-scheduling", False)
+        # processed_logprobs returns log-probs computed during the forward pass,
+        # avoiding stale values if weights change between generation and scoring.
+        kwargs.setdefault("logprobs-mode", "processed_logprobs")
         for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
             if legacy_flag in kwargs:
                 kwargs.pop(legacy_flag)
