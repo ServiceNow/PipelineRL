@@ -702,6 +702,11 @@ def clean_up(exp_dir, force_restart):
             os.remove(f"{exp_dir}/streams")
     if os.path.exists(f"{exp_dir}/dump.rdb"):
         os.remove(f"{exp_dir}/dump.rdb")
+    # Remove stale pod IP files so the exchange waits for all live ranks.
+    pod_ips_dir = Path(exp_dir) / ".pod_ips"
+    if pod_ips_dir.exists():
+        shutil.rmtree(pod_ips_dir)
+        logger.info("Removed stale .pod_ips directory")
 
     if force_restart:
         if os.path.exists(f"{exp_dir}/finetune"):

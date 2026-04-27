@@ -35,8 +35,9 @@ EXP_NAME="math_7b_${NODES}node_mb${DEPTH_FIRST}x${BDP}_${TIMESTAMP}"
 EXP_DIR="${RESULTS_DIR}/${EXP_NAME}"
 
 if [ -n "${3:-}" ]; then
-  JOB_NAME="${EXP_NAME}_resume"
-  echo "RESUMING: ${EXP_DIR}"
+  RESUME_TS=$(date +%Y%m%d_%H%M%S)
+  JOB_NAME="${EXP_NAME}_resume_${RESUME_TS}"
+  echo "RESUMING: ${EXP_DIR} (job: ${JOB_NAME})"
 else
   JOB_NAME="${EXP_NAME}"
 fi
