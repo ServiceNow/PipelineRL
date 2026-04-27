@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import logging
@@ -130,6 +131,11 @@ async def llm_async_generate(
     except Exception:
         logger.exception(f"Failed to parse llm response: {data}")
         raise
+
+    if finish_reason == "abort":
+        raise asyncio.TimeoutError(
+            f"vLLM aborted request (weight update in progress); will retry"
+        )
 
     output = LLMOutput(content=content)
     llm_call = llm.log_output(prompt, output, count_tokens=False)
