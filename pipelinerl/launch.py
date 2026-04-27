@@ -6,7 +6,6 @@ import socket
 import subprocess
 import sys
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, TextIO
@@ -862,31 +861,12 @@ def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path) -> None:
     # Save DNS names before overwriting so DeepSpeed hostfile can use them.
     world_map.dns_address_map = dict(world_map.address_map)
 
-    ip_dir = exp_dir / ".pod_ips"
+    # Use a per-job subdirectory so stale files from previous runs are never seen.
+    # MASTER_ADDR is unique per distributed job (set by torchrun / any launcher).
+    job_id = os.environ.get("MASTER_ADDR", "localhost")
+    ip_dir = exp_dir / ".pod_ips" / job_id
+    ip_dir.mkdir(parents=True, exist_ok=True)
     my_ip = _get_pod_ip()
-    session_file = ip_dir / "session"
-
-    # Use the job-unique DNS name as the session token. MASTER_ADDR contains a
-    # job-specific string (e.g. "dns-<uuid>-0") that differs between EAI runs,
-    # so non-zero ranks can reject a stale session left by a previous job.
-    job_token = world_map.dns_address_map[0]
-
-    if world_map.my_rank == 0:
-        # Wipe any stale files from a previous job, then write the job token.
-        if ip_dir.exists():
-            shutil.rmtree(ip_dir)
-        ip_dir.mkdir(parents=True)
-        session_file.write_text(job_token)
-        logger.info(f"Pod IP exchange: rank 0 created fresh session (token={job_token})")
-    else:
-        # Wait until session exists AND contains this job's token.
-        # A stale session from a previous job has a different token and is ignored.
-        waited = 0
-        while not (session_file.exists() and session_file.read_text().strip() == job_token):
-            time.sleep(0.5)
-            waited += 0.5
-            if waited % 10 == 0:
-                logger.info(f"Waiting for pod IP session token from rank 0 ({waited:.0f}s)...")
 
     ip_file = ip_dir / f"rank_{world_map.my_rank}.txt"
     ip_file.write_text(my_ip)
