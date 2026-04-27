@@ -848,7 +848,7 @@ def _get_pod_ip() -> str:
         s.close()
 
 
-def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path) -> None:
+def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path, run_id: str) -> None:
     """Exchange pod IPs across replicas via the shared NFS mount.
 
     Kubernetes Services only expose the declared master port; all other ports
@@ -861,10 +861,7 @@ def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path) -> None:
     # Save DNS names before overwriting so DeepSpeed hostfile can use them.
     world_map.dns_address_map = dict(world_map.address_map)
 
-    # Use a per-job subdirectory so stale files from previous runs are never seen.
-    # MASTER_ADDR is unique per distributed job (set by torchrun / any launcher).
-    job_id = os.environ.get("MASTER_ADDR", "localhost")
-    ip_dir = exp_dir / ".pod_ips" / job_id
+    ip_dir = exp_dir / ".pod_ips" / run_id
     ip_dir.mkdir(parents=True, exist_ok=True)
     my_ip = _get_pod_ip()
 
@@ -923,7 +920,8 @@ def main(cfg: DictConfig):
     # Pod IPs bypass kube-proxy and have all ports open, so we exchange pod IPs via
     # a shared NFS file and update address_map before any TCP connections are made.
     if world_map.world_size > 1:
-        _exchange_pod_ips(world_map, exp_dir)
+        run_id = cfg.world.get("run_id") or os.environ.get("MASTER_ADDR", "default")
+        _exchange_pod_ips(world_map, exp_dir, run_id)
 
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
 

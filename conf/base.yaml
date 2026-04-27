@@ -78,7 +78,7 @@ vllm_config:
 
 world:
   replicas: 1
-  
+
   actor_fraction: 4
   preprocessor_fraction: 0
   finetune_fraction: 4
@@ -87,6 +87,10 @@ world:
 
   actor_group_port: 9000
   environment_start_port: 7777
+  # Unique identifier for this job run, used to namespace the pod IP exchange
+  # directory so stale files from previous runs are never seen.
+  # Defaults to $MASTER_ADDR when null (suitable for EAI and torchrun jobs).
+  run_id: null
 
 # this will be autocreated based on the config
 jobs: []
