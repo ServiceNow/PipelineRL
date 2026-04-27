@@ -866,19 +866,23 @@ def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path) -> None:
     my_ip = _get_pod_ip()
     session_file = ip_dir / "session"
 
+    # Use the job-unique DNS name as the session token. MASTER_ADDR contains a
+    # job-specific string (e.g. "dns-<uuid>-0") that differs between EAI runs,
+    # so non-zero ranks can reject a stale session left by a previous job.
+    job_token = world_map.dns_address_map[0]
+
     if world_map.my_rank == 0:
-        # Wipe any stale files from a previous job, then create a fresh session token.
-        # Non-zero ranks wait for this token before writing their own IPs, preventing
-        # them from seeing stale IP files from the previous job.
+        # Wipe any stale files from a previous job, then write the job token.
         if ip_dir.exists():
             shutil.rmtree(ip_dir)
         ip_dir.mkdir(parents=True)
-        session_file.write_text(uuid.uuid4().hex)
-        logger.info("Pod IP exchange: rank 0 created fresh session")
+        session_file.write_text(job_token)
+        logger.info(f"Pod IP exchange: rank 0 created fresh session (token={job_token})")
     else:
-        # Wait until rank 0 has wiped stale data and written the session token.
+        # Wait until session exists AND contains this job's token.
+        # A stale session from a previous job has a different token and is ignored.
         waited = 0
-        while not session_file.exists():
+        while not (session_file.exists() and session_file.read_text().strip() == job_token):
             time.sleep(0.5)
             waited += 0.5
             if waited % 10 == 0:
