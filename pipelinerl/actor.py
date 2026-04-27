@@ -256,12 +256,11 @@ async def schedule_rollouts(
                     del group_rollouts[group_id]
                     finished_rollouts += 1
                     return
-                # This is blocking call, but there's just one other thread reading from this queue.
                 random.shuffle(valid_results)
-                _t_put_start = time.monotonic()
-                result_queue.put(valid_results)
-                _put_duration = time.monotonic() - _t_put_start
                 del group_rollouts[group_id]
+                _t_put_start = time.monotonic()
+                await asyncio.get_event_loop().run_in_executor(None, result_queue.put, valid_results)
+                _put_duration = time.monotonic() - _t_put_start
                 if _pb_log_file is not None:
                     _pb_log_file.write(_json_b.dumps({
                         "wall": time.time(),
