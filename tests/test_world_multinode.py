@@ -647,3 +647,196 @@ class TestDeepSpeedEntrypointPath:
         assert Path(finetune_script).exists(), (
             f"run_finetune.py absolute path must exist: {finetune_script!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-node file naming: fast-llm and DeepSpeed avoid NFS write races
+# ---------------------------------------------------------------------------
+
+class TestPerNodeFileNaming:
+    """Verify that multinode fast-llm and DeepSpeed finetune runs write separate
+    output files per node (config, start.sh, stdout, stderr) to avoid NFS races."""
+
+    def _capture_fast_llm_files(self, world_map, gpus=None):
+        """Run _run_finetune_fast_llm and return captured file suffix info."""
+        from pipelinerl.launch import _run_finetune_fast_llm
+
+        cfg = OmegaConf.create({
+            "model_path": "/tmp/fake_model",
+            "weight_broadcast": False,
+            "debug": {"mode": "", "log_data_pipeline": False},
+            "streams": {"host": "localhost", "port": 11000},
+            "wandb": {
+                "wandb_workspace_root": "/tmp",
+                "wandb_entity_name": "test",
+                "wandb_project_name": "test",
+                "wandb_group": "test",
+            },
+            "fast_llm": {
+                "training": {
+                    "train_iters": 10,
+                    "wandb": {"entity_name": None, "project_name": None, "group_name": None},
+                },
+                "data": {"datasets": {"training": {"type": "streaming", "host": None, "port": None}}},
+                "pretrained": {"format": "llama", "path": None, "model_weights": True},
+                "run": {"experiment_dir": None, "experiment_name": None},
+                "callbacks": {},
+            },
+            "fast_llm_finetune": {
+                "model_type": "llama",
+                "torchrun_port": 29500,
+                "model_format": "llama",
+            },
+        })
+
+        written_files = {}
+
+        real_open = open
+
+        def mock_popen(cmd, **kwargs):
+            written_files["stdout"] = str(kwargs.get("stdout", {}).name if hasattr(kwargs.get("stdout"), "name") else "")
+            written_files["stderr"] = str(kwargs.get("stderr", {}).name if hasattr(kwargs.get("stderr"), "name") else "")
+            return None
+
+        captured_save = {}
+
+        def mock_save_command(script_dir, cmd, suffix=""):
+            captured_save["suffix"] = suffix
+            captured_save["dir"] = str(script_dir)
+
+        captured_config = {}
+
+        real_omegaconf_save = None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exp_dir = Path(tmp)
+            with patch("pipelinerl.launch._popen", side_effect=mock_popen):
+                with patch("pipelinerl.launch.save_command", side_effect=mock_save_command):
+                    with patch("os.path.isdir", return_value=True):
+                        with patch("omegaconf.OmegaConf.save") as mock_cfg_save:
+                            list(_run_finetune_fast_llm(cfg, world_map, gpus=gpus or [0, 1, 2, 3], exp_dir=exp_dir))
+                            if mock_cfg_save.call_args:
+                                # OmegaConf.save(cfg, path) — second positional arg is path
+                                args = mock_cfg_save.call_args[0]
+                                captured_config["path"] = str(args[1]) if len(args) > 1 else ""
+
+            return {
+                "config_path": captured_config.get("path", ""),
+                "save_suffix": captured_save.get("suffix", ""),
+                "stdout": written_files.get("stdout", ""),
+                "stderr": written_files.get("stderr", ""),
+            }
+
+    def _capture_deepspeed_files(self, world_map, gpus=None):
+        """Run _run_finetune_deepspeed and return captured file suffix."""
+        from pipelinerl.launch import _run_finetune_deepspeed
+
+        cfg = OmegaConf.create({
+            "use_deepspeed": True,
+            "use_fsdp": False,
+            "deepspeed_config": "zero2",
+            "accelerate_config": None,
+            "world": {"actor_group_port": 9000},
+            "debug": {"mode": ""},
+        })
+
+        captured_save = {}
+        written_files = {}
+
+        def mock_popen(cmd, **kwargs):
+            written_files["stdout"] = str(kwargs.get("stdout", {}).name if hasattr(kwargs.get("stdout"), "name") else "")
+            written_files["stderr"] = str(kwargs.get("stderr", {}).name if hasattr(kwargs.get("stderr"), "name") else "")
+            return None
+
+        def mock_save_command(script_dir, cmd, suffix=""):
+            captured_save["suffix"] = suffix
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exp_dir = Path(tmp)
+            with patch("pipelinerl.launch._popen", side_effect=mock_popen):
+                with patch("pipelinerl.launch.save_command", side_effect=mock_save_command):
+                    with patch.dict(os.environ, {"MASTER_ADDR": "dns-test-0", "MASTER_PORT": "29501"}):
+                        list(_run_finetune_deepspeed(cfg, world_map, gpus=gpus or [0, 1, 2, 3], exp_dir=exp_dir))
+
+        return {
+            "save_suffix": captured_save.get("suffix", ""),
+            "stdout": written_files.get("stdout", ""),
+            "stderr": written_files.get("stderr", ""),
+        }
+
+    # --- fast-llm single-node: no suffix ---
+
+    def test_fast_llm_single_node_no_suffix(self):
+        """Single-node fast-llm: no _node0 suffix — backward compat."""
+        cfg = _make_cfg(actor_fraction=2, finetune_fraction=6)
+        with patch("torch.cuda.device_count", return_value=8):
+            with patch("pipelinerl.utils.collect_environment_specs", return_value=[]):
+                with patch("pipelinerl.world.WorldMap._place_environments"):
+                    from pipelinerl.world import WorldMap
+                    wm = WorldMap(cfg, verbose=False)
+
+        result = self._capture_fast_llm_files(wm)
+        assert result["save_suffix"] == "", f"Single-node must have no suffix, got: {result['save_suffix']!r}"
+        assert "_node" not in result["config_path"], f"Single-node config must have no _node suffix: {result['config_path']}"
+
+    # --- fast-llm multinode: each node gets its own suffix ---
+
+    def test_fast_llm_multinode_node0_suffix(self):
+        """4-node fast-llm, finetune node 0: files get _node0 suffix.
+        Actor takes the last node (rank 3), so ranks 0/1/2 are finetune."""
+        cfg = _make_cfg(actor_fraction=1, finetune_fraction=3)
+        wm = _make_world_map(cfg, world_size=4, rank=0)  # rank 0 = first finetune node
+
+        result = self._capture_fast_llm_files(wm)
+        assert result["save_suffix"] == "_node0", f"Expected _node0, got: {result['save_suffix']!r}"
+        assert "_node0" in result["config_path"], f"Config path must contain _node0: {result['config_path']}"
+
+    def test_fast_llm_multinode_node1_suffix(self):
+        """4-node fast-llm, finetune node 1: files get _node1 suffix."""
+        cfg = _make_cfg(actor_fraction=1, finetune_fraction=3)
+        wm = _make_world_map(cfg, world_size=4, rank=1)  # rank 1 = second finetune node
+
+        result = self._capture_fast_llm_files(wm)
+        assert result["save_suffix"] == "_node1", f"Expected _node1, got: {result['save_suffix']!r}"
+        assert "_node1" in result["config_path"]
+
+    def test_fast_llm_multinode_node2_suffix(self):
+        """4-node fast-llm, finetune node 2: files get _node2 suffix."""
+        cfg = _make_cfg(actor_fraction=1, finetune_fraction=3)
+        wm = _make_world_map(cfg, world_size=4, rank=2)  # rank 2 = third finetune node
+
+        result = self._capture_fast_llm_files(wm)
+        assert result["save_suffix"] == "_node2", f"Expected _node2, got: {result['save_suffix']!r}"
+
+    # --- DeepSpeed single-node: no suffix ---
+
+    def test_deepspeed_single_node_no_suffix(self):
+        """Single-node DeepSpeed: no _node suffix."""
+        cfg = _make_cfg(actor_fraction=2, finetune_fraction=6, use_fast_llm=False)
+        with patch("torch.cuda.device_count", return_value=8):
+            with patch("pipelinerl.utils.collect_environment_specs", return_value=[]):
+                with patch("pipelinerl.world.WorldMap._place_environments"):
+                    from pipelinerl.world import WorldMap
+                    wm = WorldMap(cfg, verbose=False)
+
+        result = self._capture_deepspeed_files(wm)
+        assert result["save_suffix"] == "", f"Single-node must have no suffix, got: {result['save_suffix']!r}"
+
+    # --- DeepSpeed multinode: each node gets its own suffix ---
+
+    def test_deepspeed_multinode_node0_suffix(self):
+        """4-node DeepSpeed, finetune node 0: save_command gets _node0 suffix.
+        Actor takes the last node (rank 3), so ranks 0/1/2 are finetune."""
+        cfg = _make_cfg(actor_fraction=1, finetune_fraction=3, use_fast_llm=False)
+        wm = _make_world_map(cfg, world_size=4, rank=0)  # rank 0 = first finetune node
+
+        result = self._capture_deepspeed_files(wm)
+        assert result["save_suffix"] == "_node0", f"Expected _node0, got: {result['save_suffix']!r}"
+
+    def test_deepspeed_multinode_node2_suffix(self):
+        """4-node DeepSpeed, finetune node 2: save_command gets _node2 suffix."""
+        cfg = _make_cfg(actor_fraction=1, finetune_fraction=3, use_fast_llm=False)
+        wm = _make_world_map(cfg, world_size=4, rank=2)  # rank 2 = third finetune node
+
+        result = self._capture_deepspeed_files(wm)
+        assert result["save_suffix"] == "_node2", f"Expected _node2, got: {result['save_suffix']!r}"

@@ -412,14 +412,18 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
     if cfg.debug.mode in ["finetune", "open_loop", "finetune+preprocessor"]:
         cmd.append("finetune.send_weight_updates=False")
 
+    finetune_nodes = world_map.nodes_with_finetuning()
+    finetune_rank = world_map.my_finetuning_rank()
+    node_suffix = f"_node{finetune_rank}" if len(finetune_nodes) > 1 else ""
+
     logger.info(f"Running DeepSpeed finetune with command: {' '.join(cmd)}")
-    save_command(exp_dir / "finetune", cmd)
+    save_command(exp_dir / "finetune", cmd, suffix=node_suffix)
     env = dict(os.environ)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
     save_dir = exp_dir / "finetune"
     os.makedirs(save_dir, exist_ok=True)
-    log_file_path = save_dir / "stdout.log"
-    err_file_path = save_dir / "stderr.log"
+    log_file_path = save_dir / f"stdout{node_suffix}.log"
+    err_file_path = save_dir / f"stderr{node_suffix}.log"
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(cmd, env=env, stdout=log_file, stderr=err_file)
     if proc is not None:
@@ -467,20 +471,24 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
         fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["port"] = cfg.world.actor_group_port
         fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["external_world_size"] = world_map.weight_update_group_size - 1
 
-    # Save fully populated config — fast-llm reads it directly with no further overrides.
-    config_path = save_dir / "fast_llm_config.yaml"
-    OmegaConf.save(OmegaConf.create(fast_llm_cfg), config_path)
-
+    # Use per-node suffixes for all output files to avoid NFS write races when multiple
+    # finetune nodes share the same experiment directory.
     model_type = cfg.fast_llm_finetune.model_type
     torchrun_port = cfg.fast_llm_finetune.torchrun_port
     finetune_nodes = world_map.nodes_with_finetuning()
+    finetune_rank = world_map.my_finetuning_rank()
+    node_suffix = f"_node{finetune_rank}" if len(finetune_nodes) > 1 else ""
+
+    config_path = save_dir / f"fast_llm_config{node_suffix}.yaml"
+    OmegaConf.save(OmegaConf.create(fast_llm_cfg), config_path)
+
     if len(finetune_nodes) > 1:
         finetune_master = world_map.address_map[finetune_nodes[0]]
         cmd = [
             "torchrun",
             f"--nproc_per_node={len(gpus)}",
             f"--nnodes={len(finetune_nodes)}",
-            f"--node_rank={world_map.my_finetuning_rank()}",
+            f"--node_rank={finetune_rank}",
             "--rdzv_backend=static",
             "--rdzv_id=0",
             f"--rdzv_endpoint={finetune_master}:{torchrun_port}",
@@ -507,12 +515,12 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
         ]
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
-    save_command(save_dir, cmd)
+    save_command(save_dir, cmd, suffix=node_suffix)
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "42"
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
-    log_file_path = save_dir / "stdout.log"
-    err_file_path = save_dir / "stderr.log"
+    log_file_path = save_dir / f"stdout{node_suffix}.log"
+    err_file_path = save_dir / f"stderr{node_suffix}.log"
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(cmd, env=env, stdout=log_file, stderr=err_file)
     if proc is not None:
@@ -670,9 +678,9 @@ def run_redis(cfg: DictConfig):
         yield LaunchedProcess(kind="redis", handle=proc)
 
 
-def save_command(script_dir: Path, cmd):
+def save_command(script_dir: Path, cmd, suffix: str = ""):
     os.makedirs(script_dir, exist_ok=True)
-    script_path = script_dir / "start.sh"
+    script_path = script_dir / f"start{suffix}.sh"
     with open(script_path, "w") as f:
         f.write("#!/bin/bash\n")
         # Properly quote arguments for the shell script
