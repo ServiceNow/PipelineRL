@@ -3,6 +3,7 @@ import inspect
 import logging
 import os
 import signal
+import time
 import torch
 import uvloop
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -368,17 +369,32 @@ class EngineManager:
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
         async with self.update_lock:
-            logger.info("Pausing generation for weight update")
+            version = getattr(request, "version", "unknown")
+            pause_started_at = time.perf_counter()
+            logger.info(f"Pausing generation for weight update version={version}")
             await _pause_generation(self.engine)
+            logger.info(
+                f"Generation paused for weight update version={version} "
+                f"in {time.perf_counter() - pause_started_at:.3f}s"
+            )
             try:
-                logger.info("Starting weight update...")
+                update_started_at = time.perf_counter()
+                logger.info(f"Starting weight update version={version}")
                 await self.engine.engine_core.collective_rpc_async(
                     "receive_weight_update", args=(request.model_dump_json(),)
                 )
-                logger.info("Weight update processed")
+                logger.info(
+                    f"Weight update processed version={version} "
+                    f"in {time.perf_counter() - update_started_at:.3f}s"
+                )
             finally:
-                logger.info("Resuming generation after weight update")
+                resume_started_at = time.perf_counter()
+                logger.info(f"Resuming generation after weight update version={version}")
                 await self.engine.resume_generation()
+                logger.info(
+                    f"Generation resumed after weight update version={version} "
+                    f"in {time.perf_counter() - resume_started_at:.3f}s"
+                )
 
     async def close_communicator(self):
         """Closes the communicator when weight synchronization is no longer needed."""
@@ -406,16 +422,30 @@ class EngineManager:
         that never arrives. The monitor thread gates this accordingly.
         """
         async with self.update_lock:
+            pause_started_at = time.perf_counter()
             logger.info("Pausing generation for fast-llm weight update")
             await _pause_generation(self.engine)
+            logger.info(
+                f"Generation paused for fast-llm weight update "
+                f"in {time.perf_counter() - pause_started_at:.3f}s"
+            )
             try:
+                update_started_at = time.perf_counter()
                 await self.engine.engine_core.collective_rpc_async(
                     "receive_weight_update_fast_llm", args=()
                 )
-                logger.info("Fast-llm weight update processed")
+                logger.info(
+                    f"Fast-llm weight update processed "
+                    f"in {time.perf_counter() - update_started_at:.3f}s"
+                )
             finally:
+                resume_started_at = time.perf_counter()
                 logger.info("Resuming generation after fast-llm weight update")
                 await self.engine.resume_generation()
+                logger.info(
+                    f"Generation resumed after fast-llm weight update "
+                    f"in {time.perf_counter() - resume_started_at:.3f}s"
+                )
 
     async def start_fast_llm_monitoring(self):
         """Start a single Redis monitoring thread in the main process.

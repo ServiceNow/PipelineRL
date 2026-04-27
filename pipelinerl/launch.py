@@ -130,25 +130,18 @@ def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
     return env
 
 
-def _get_vllm_kwargs(cfg: DictConfig, *, use_v1: bool) -> dict:
-    """Return launchable vLLM CLI kwargs, dropping legacy flags for V1."""
+def _get_vllm_kwargs(cfg: DictConfig) -> dict:
+    """Return launchable vLLM CLI kwargs for the supported V1 server path."""
     kwargs = OmegaConf.to_container(cfg.vllm_config.vllm_kwargs, resolve=True)
     if kwargs is None:
         return {}
     if not isinstance(kwargs, dict):
         raise TypeError(f"vllm_kwargs must resolve to a mapping, got {type(kwargs)}")
 
-    if use_v1:
-        # Keep V1 actor/reference serving closer to the legacy V0 path by default.
-        kwargs.setdefault("enable-prefix-caching", False)
-        kwargs.setdefault("async-scheduling", False)
-        # processed_logprobs returns log-probs computed during the forward pass,
-        # avoiding stale values if weights change between generation and scoring.
-        kwargs.setdefault("logprobs-mode", "processed_logprobs")
-        for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
-            if legacy_flag in kwargs:
-                kwargs.pop(legacy_flag)
-                logger.info(f"Dropping legacy vLLM flag '--{legacy_flag}' for V1 launch")
+    for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
+        if legacy_flag in kwargs:
+            kwargs.pop(legacy_flag)
+            logger.info(f"Dropping legacy vLLM flag '--{legacy_flag}' for V1 launch")
 
     return kwargs
 
@@ -164,7 +157,7 @@ def _append_vllm_kwargs(cmd: list[str], kwargs: dict) -> None:
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
-    kwargs = _get_vllm_kwargs(cfg, use_v1=cfg.vllm_config.use_v1)
+    kwargs = _get_vllm_kwargs(cfg)
     if kwargs.get("num-scheduler-steps", 1) > 1:
         kwargs["num-scheduler-steps"] = 1
         logger.warning("Set num-scheduler-steps to 1 for reference vLLM")
@@ -217,11 +210,7 @@ def run_actor_llm(
     # TODO: add support for tensor and process parallelism
     log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
-    entrypoint = (
-        "pipelinerl.entrypoints.run_vllm1" 
-        if cfg.vllm_config.use_v1 else 
-        "pipelinerl.entrypoints.run_vllm0"
-    )
+    entrypoint = "pipelinerl.entrypoints.run_vllm1"
     broadcast_port = cfg.world.actor_group_port
     cmd = [
         sys.executable,
@@ -245,9 +234,9 @@ def run_actor_llm(
 
     cmd.extend(_get_quantization_args(cfg))
 
-    kwargs = _get_vllm_kwargs(cfg, use_v1=cfg.vllm_config.use_v1)
-    # vLLM v1 rejects num-scheduler-steps; defensively drop it for v1 launches.
-    if cfg.vllm_config.use_v1 and "num-scheduler-steps" in kwargs:
+    kwargs = _get_vllm_kwargs(cfg)
+    # vLLM v1 rejects num-scheduler-steps; defensively drop it.
+    if "num-scheduler-steps" in kwargs:
         kwargs.pop("num-scheduler-steps")
     if kwargs:
         _append_vllm_kwargs(cmd, kwargs)
