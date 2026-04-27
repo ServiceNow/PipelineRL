@@ -376,6 +376,39 @@ PipelineRL is organized as a modular, Hydra-driven pipeline with 6 core componen
 
 
 
+## Multi-Node Requirements
+
+PipelineRL can span multiple nodes, with actor (vLLM) and trainer roles on separate machines. Each role opens outbound TCP connections to other roles; every target port must be reachable from the source node.
+
+### Ports and config params
+
+| Port (default) | Config param | Direction | Purpose |
+|---|---|---|---|
+| `streams.port` (11000) | `conf/streams/redis.yaml` | all nodes → rank-0 node | Redis data streams (actor → preprocessor → trainer) |
+| `world.actor_group_port` (9000) | `conf/base.yaml` | actor node → trainer node | Weight-broadcast process group (NCCL TCPStore rendezvous) |
+| `world.environment_start_port` (7777) | `conf/base.yaml` | actor node → environment node | Remote environment HTTP server |
+| `8080 + gpu_local_idx` | derived from GPU placement | trainer node → actor node | vLLM HTTP endpoints for weight updates, one per GPU |
+| `MASTER_PORT` env var | set by your cluster launcher | trainer nodes ↔ each other | torchrun / accelerate rendezvous between finetune ranks |
+
+### What each node connects to
+
+**Trainer node** opens connections to:
+- `{actor_node_ip}:{8080 + i}` for each vLLM GPU `i` — to POST updated weights after each optimizer step.
+- `{rank_0_ip}:{streams.port}` — to read training batches from Redis (when `streams=redis`).
+
+**Actor node** opens connections to:
+- `{rank_0_ip}:{streams.port}` — to publish rollout data to Redis.
+- `{rank_0_ip}:{world.actor_group_port}` — to join the NCCL weight-broadcast process group (vLLM workers connect as clients; the trainer creates the TCPStore server on this port).
+- `{env_node_ip}:{world.environment_start_port + i}` — to call remote environment servers (if `environments[*].mode=remote`).
+
+**All finetune nodes** connect to each other on `MASTER_PORT` for the distributed training rendezvous (rank-0 finetune node is the server).
+
+### Topology assumptions
+
+- With fast-llm (`use_fast_llm=true`), each component must occupy whole nodes — torchrun requires every finetune rank to see a complete, identical GPU set.
+- With `world.preprocessor_fraction=0`, every node is either a pure actor node or a pure trainer node (no mixing).
+- The DeepSpeed hostfile and `--deepspeed_inclusion_filter` use DNS/hostname names (not IPs), so the cluster rendezvous port (`MASTER_PORT`) must be reachable via those names. All other cross-node connections use IP addresses and are independent of DNS.
+
 # Install FastLLM+PipilineRL
 - use ` registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis` image which also includes redis server. In `~/.research-interactive-env`:
 ```shell

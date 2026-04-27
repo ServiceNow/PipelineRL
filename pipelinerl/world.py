@@ -152,6 +152,26 @@ class WorldMap:
             max(int(total_gpus * preprocessor_fraction), self.gpus_per_llm) if cfg.world.preprocessor_fraction else 0
         )
         desired_finetune_gpu_share = total_gpus - desired_actor_gpu_share - desired_preprocessor_gpu_share
+
+        # For multi-node fast-llm spanning more than one node, every component
+        # must occupy whole nodes so torchrun's rdzv gets a clean full-node GPU
+        # set. Snap all three components; actor takes whatever remains.
+        # When fast-llm lands on a single node proportional allocation is fine.
+        if self.world_size > 1 and cfg.get("use_fast_llm", False):
+            finetune_frac = cfg.world.finetune_fraction / fraction_sum
+            finetune_nodes = max(1, round(self.world_size * finetune_frac))
+            preprocessor_nodes = (
+                max(1, round(self.world_size * preprocessor_fraction))
+                if cfg.world.preprocessor_fraction else 0
+            )
+            actor_nodes = self.world_size - finetune_nodes - preprocessor_nodes
+            if cfg.world.actor_fraction > 0 and actor_nodes < 1:
+                finetune_nodes -= 1
+                actor_nodes += 1
+            if finetune_nodes > 1:
+                desired_finetune_gpu_share = finetune_nodes * self.node_size
+                desired_preprocessor_gpu_share = preprocessor_nodes * self.node_size
+                desired_actor_gpu_share = actor_nodes * self.node_size
         self._log_info(
             f"Desired GPU share: {desired_actor_gpu_share} for actors,"
             f"{desired_preprocessor_gpu_share} for preprocessors, {desired_finetune_gpu_share} for finetune"

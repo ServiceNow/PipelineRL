@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -354,8 +355,9 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
     ]
     if world_map.world_size > 1:
         assert cfg.use_deepspeed
-        assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-        hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+        # Use original DNS names (pod IP exchange may have replaced address_map with IPs).
+        dns_map = getattr(world_map, "dns_address_map", world_map.address_map)
+        hosts = [dns_map[i] for i in range(world_map.world_size)]
         filter_parts = []
         for rank, job_list in world_map.job_map.items():
             for job in job_list:
@@ -398,7 +400,7 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
         cmd += ["--gpu-ids", gpus_str]
     cmd += [
         "--num_processes", str(world_map.total_finetune_gpus),
-        "pipelinerl/entrypoints/run_finetune.py",
+        str(this_file_path / "entrypoints/run_finetune.py"),
         "--config-dir", f"{exp_dir}/conf",
         "--config-name", "exp_config",
         f"output_dir={exp_dir}",
@@ -414,7 +416,12 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
     save_command(exp_dir / "finetune", cmd)
     env = dict(os.environ)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
-    proc = _popen(cmd, env=env)
+    save_dir = exp_dir / "finetune"
+    os.makedirs(save_dir, exist_ok=True)
+    log_file_path = save_dir / "stdout.log"
+    err_file_path = save_dir / "stderr.log"
+    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
+        proc = _popen(cmd, env=env, stdout=log_file, stderr=err_file)
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
 
@@ -454,7 +461,9 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
     if cfg.weight_broadcast and not bool(cfg.debug.mode):
         fast_llm_cfg["callbacks"]["streaming"]["host"] = cfg.streams.host
         fast_llm_cfg["callbacks"]["streaming"]["port"] = cfg.streams.port
-        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["host"] = world_map.master_addr
+        # fast-llm runs on node 0 (same node as the TCPStore server); use localhost
+        # to avoid DNS self-resolution issues.  vLLM (on node 1) uses master_addr.
+        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["host"] = "localhost"
         fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["port"] = cfg.world.actor_group_port
         fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["external_world_size"] = world_map.weight_update_group_size - 1
 
@@ -464,17 +473,38 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
 
     model_type = cfg.fast_llm_finetune.model_type
     torchrun_port = cfg.fast_llm_finetune.torchrun_port
-    cmd = [
-        "torchrun",
-        f"--nproc_per_node={len(gpus)}",
-        f"--master_port={torchrun_port}",
-        "--no_python",
-        str(Path(sys.executable).parent / "fast-llm"),
-        "train",
-        model_type,
-        "--config",
-        str(config_path),
-    ]
+    finetune_nodes = world_map.nodes_with_finetuning()
+    if len(finetune_nodes) > 1:
+        finetune_master = world_map.address_map[finetune_nodes[0]]
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={len(gpus)}",
+            f"--nnodes={len(finetune_nodes)}",
+            f"--node_rank={world_map.my_finetuning_rank()}",
+            "--rdzv_backend=static",
+            "--rdzv_id=0",
+            f"--rdzv_endpoint={finetune_master}:{torchrun_port}",
+            "--rdzv_conf=timeout=3600",
+            "--max_restarts=0",
+            "--no_python",
+            str(Path(sys.executable).parent / "fast-llm"),
+            "train",
+            model_type,
+            "--config",
+            str(config_path),
+        ]
+    else:
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={len(gpus)}",
+            f"--master_port={torchrun_port}",
+            "--no_python",
+            str(Path(sys.executable).parent / "fast-llm"),
+            "train",
+            model_type,
+            "--config",
+            str(config_path),
+        ]
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
     save_command(save_dir, cmd)
@@ -798,6 +828,65 @@ def setup_logging(log_file: Path):
     logger.info("Logging setup complete")
 
 
+def _get_pod_ip() -> str:
+    """Return this pod's primary IP (bypasses Kubernetes Service kube-proxy)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path) -> None:
+    """Exchange pod IPs across replicas via the shared NFS mount.
+
+    Kubernetes Services only expose the declared master port; all other ports
+    (Redis, vLLM HTTP, TCPStore) are silently dropped for Service ClusterIPs.
+    Using pod IPs bypasses kube-proxy and gives full port access.
+
+    After the exchange, all Job.url and Job.hostname fields are updated to use
+    pod IPs so every cross-node HTTP/TCP connection bypasses the Service.
+    """
+    # Save DNS names before overwriting so DeepSpeed hostfile can use them.
+    world_map.dns_address_map = dict(world_map.address_map)
+
+    ip_dir = exp_dir / ".pod_ips"
+    ip_dir.mkdir(parents=True, exist_ok=True)
+    my_ip = _get_pod_ip()
+    ip_file = ip_dir / f"rank_{world_map.my_rank}.txt"
+    ip_file.write_text(my_ip)
+    logger.info(f"Pod IP exchange: rank {world_map.my_rank} pod IP = {my_ip}")
+
+    pod_ips = {}
+    for rank in range(world_map.world_size):
+        peer_file = ip_dir / f"rank_{rank}.txt"
+        waited = 0
+        while not peer_file.exists():
+            time.sleep(0.5)
+            waited += 0.5
+            if waited % 10 == 0:
+                logger.info(f"Waiting for pod IP from rank {rank} ({waited:.0f}s)...")
+        pod_ip = peer_file.read_text().strip()
+        pod_ips[rank] = pod_ip
+        world_map.address_map[rank] = pod_ip
+        logger.info(f"Pod IP exchange: rank {rank} → {pod_ip}")
+
+    world_map.master_addr = pod_ips[0]
+    logger.info(f"Updated master_addr to pod IP: {world_map.master_addr}")
+
+    # Update all Job URLs and hostnames to pod IPs so cross-node connections
+    # bypass the Kubernetes Service (which only exposes declared ports).
+    for node, jobs in world_map.job_map.items():
+        pod_ip = pod_ips[node]
+        dns_name = world_map.dns_address_map[node]
+        for job in jobs:
+            job.hostname = pod_ip
+            if job.url:
+                job.url = job.url.replace(dns_name, pod_ip)
+    logger.info("Updated all job URLs to pod IPs for direct pod-to-pod connectivity.")
+
+
 @hydra.main(
     config_path="../conf/",
     config_name="base",
@@ -813,6 +902,15 @@ def main(cfg: DictConfig):
     log_file = exp_dir / "launcher" / f"launcher_{os.environ.get('RANK', 0)}.log"
     setup_logging(log_file)
     world_map = WorldMap(cfg, verbose=True)
+
+    # In multi-node EAI jobs the `dns-<uuid>-<rank>` names are Kubernetes Services
+    # that expose only the declared master port.  Connecting to those Service IPs
+    # on any other port (Redis, vLLM HTTP, TCPStore) gets SYN-dropped by kube-proxy.
+    # Pod IPs bypass kube-proxy and have all ports open, so we exchange pod IPs via
+    # a shared NFS file and update address_map before any TCP connections are made.
+    if world_map.world_size > 1:
+        _exchange_pod_ips(world_map, exp_dir)
+
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
 
     group = str(exp_dir)
@@ -832,7 +930,15 @@ def main(cfg: DictConfig):
             )
             cfg.finetune.gradient_accumulation_passes = new_accum_passes
     if cfg.streams.backend == "redis":
-        cfg.streams.host = world_map.master_addr
+        if world_map.world_size > 1:
+            # Multi-node: use the pod IP of rank 0 (world_map.master_addr after pod IP
+            # exchange).  Pod-to-pod connections are unrestricted on all ports, so rank 0
+            # can reach its own Redis via its pod IP, and rank 1 via the cross-node pod IP.
+            # Using the pod IP (not localhost or a DNS name) also ensures the saved
+            # exp_config.yaml has a reachable address for DeepSpeed workers on node 1.
+            cfg.streams.host = world_map.master_addr
+        else:
+            cfg.streams.host = "localhost"
     set_streams_backend(**cfg.streams)
 
     processes = []
@@ -850,8 +956,9 @@ def main(cfg: DictConfig):
             redis.flushall()
 
         if world_map.world_size > 1:
-            assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-            hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+            # Use original DNS names (pod IP exchange may have replaced address_map with IPs).
+            dns_map = getattr(world_map, "dns_address_map", world_map.address_map)
+            hosts = [dns_map[i] for i in range(world_map.world_size)]
             hostfile_lines = [f"{host} slots=8" for host in hosts]
             deepspeed_hostfile_content = "\n".join(hostfile_lines)
             hostfile_path = str(exp_dir / "hostfile.txt")
@@ -884,7 +991,7 @@ def main(cfg: DictConfig):
     if cfg.use_fast_llm and cfg.weight_broadcast and world_map.my_rank == 0:
         from torch.distributed import TCPStore
         broadcast_store = TCPStore(
-            host_name=world_map.master_addr,
+            host_name="0.0.0.0",
             port=cfg.world.actor_group_port,
             world_size=world_map.weight_update_group_size,
             is_master=True,
