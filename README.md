@@ -409,6 +409,30 @@ PipelineRL can span multiple nodes, with actor (vLLM) and trainer roles on separ
 - With `world.preprocessor_fraction=0`, every node is either a pure actor node or a pure trainer node (no mixing).
 - The DeepSpeed hostfile and `--deepspeed_inclusion_filter` use DNS/hostname names (not IPs), so the cluster rendezvous port (`MASTER_PORT`) must be reachable via those names. All other cross-node connections use IP addresses and are independent of DNS.
 
+### Running and resuming multi-node jobs
+
+**`world.run_id` is required for multi-node jobs.** It must be a string that is unique per job run. It is used to namespace the pod IP exchange directory on the shared NFS mount so that stale files from a previous run are never seen.
+
+On EAI (and any torchrun-based launcher), `MASTER_ADDR` is unique per replica group and makes a good default:
+
+```bash
+python -m pipelinerl.launch ... 'world.run_id=${MASTER_ADDR}'
+```
+
+The `submit_eai_math_7b_multinode.sh` script sets this automatically.
+
+**To resume a preempted run**, pass the original experiment timestamp as the third argument so the same output directory (and therefore the same WandB run and checkpoint) is reused:
+
+```bash
+# Fresh run — creates a new experiment directory
+bash submit_eai_math_7b_multinode.sh 4 60
+
+# Resume — reuses math_7b_4node_mb5x12_20260427_144646/
+bash submit_eai_math_7b_multinode.sh 4 60 20260427_144646
+```
+
+On resume the script appends a unique `_resume_<timestamp>` suffix to the EAI job name (required because job names must be unique). A new `world.run_id` value (`MASTER_ADDR` of the new job) is used automatically, so the pod IP exchange directory is always fresh.
+
 # Install FastLLM+PipilineRL
 - use ` registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis` image which also includes redis server. In `~/.research-interactive-env`:
 ```shell
