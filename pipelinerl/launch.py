@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, TextIO
@@ -702,12 +703,6 @@ def clean_up(exp_dir, force_restart):
             os.remove(f"{exp_dir}/streams")
     if os.path.exists(f"{exp_dir}/dump.rdb"):
         os.remove(f"{exp_dir}/dump.rdb")
-    # Remove stale pod IP files so the exchange waits for all live ranks.
-    pod_ips_dir = Path(exp_dir) / ".pod_ips"
-    if pod_ips_dir.exists():
-        shutil.rmtree(pod_ips_dir)
-        logger.info("Removed stale .pod_ips directory")
-
     if force_restart:
         if os.path.exists(f"{exp_dir}/finetune"):
             logger.info("Cleaning up finetune directory")
@@ -868,8 +863,27 @@ def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path) -> None:
     world_map.dns_address_map = dict(world_map.address_map)
 
     ip_dir = exp_dir / ".pod_ips"
-    ip_dir.mkdir(parents=True, exist_ok=True)
     my_ip = _get_pod_ip()
+    session_file = ip_dir / "session"
+
+    if world_map.my_rank == 0:
+        # Wipe any stale files from a previous job, then create a fresh session token.
+        # Non-zero ranks wait for this token before writing their own IPs, preventing
+        # them from seeing stale IP files from the previous job.
+        if ip_dir.exists():
+            shutil.rmtree(ip_dir)
+        ip_dir.mkdir(parents=True)
+        session_file.write_text(uuid.uuid4().hex)
+        logger.info("Pod IP exchange: rank 0 created fresh session")
+    else:
+        # Wait until rank 0 has wiped stale data and written the session token.
+        waited = 0
+        while not session_file.exists():
+            time.sleep(0.5)
+            waited += 0.5
+            if waited % 10 == 0:
+                logger.info(f"Waiting for pod IP session token from rank 0 ({waited:.0f}s)...")
+
     ip_file = ip_dir / f"rank_{world_map.my_rank}.txt"
     ip_file.write_text(my_ip)
     logger.info(f"Pod IP exchange: rank {world_map.my_rank} pod IP = {my_ip}")
