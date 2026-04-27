@@ -56,6 +56,7 @@ PYTHONHASHSEED=42 python -m pipelinerl.launch \
   world.actor_fraction=1 \
   world.preprocessor_fraction=0 \
   world.finetune_fraction=${FINETUNE_NODES} \
+  'world.run_id=\${MASTER_ADDR}' \
   model_path=${MODEL_PATH} \
   output_dir=${EXP_DIR} \
   wandb.wandb_workspace_root=${RESULTS_DIR} \

@@ -862,8 +862,22 @@ def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path, run_id: str) -> None
     world_map.dns_address_map = dict(world_map.address_map)
 
     ip_dir = exp_dir / ".pod_ips" / run_id
-    ip_dir.mkdir(parents=True, exist_ok=True)
     my_ip = _get_pod_ip()
+
+    if world_map.my_rank == 0:
+        if ip_dir.exists():
+            raise RuntimeError(
+                f"Pod IP exchange directory already exists for run_id={run_id!r}. "
+                "world.run_id must be unique per job run."
+            )
+        ip_dir.mkdir(parents=True)
+    else:
+        waited = 0
+        while not ip_dir.exists():
+            time.sleep(0.5)
+            waited += 0.5
+            if waited % 10 == 0:
+                logger.info(f"Waiting for rank 0 to create pod IP dir ({waited:.0f}s)...")
 
     ip_file = ip_dir / f"rank_{world_map.my_rank}.txt"
     ip_file.write_text(my_ip)
@@ -920,7 +934,9 @@ def main(cfg: DictConfig):
     # Pod IPs bypass kube-proxy and have all ports open, so we exchange pod IPs via
     # a shared NFS file and update address_map before any TCP connections are made.
     if world_map.world_size > 1:
-        run_id = cfg.world.get("run_id") or os.environ.get("MASTER_ADDR", "default")
+        run_id = cfg.world.get("run_id")
+        if not run_id:
+            raise ValueError("world.run_id must be set for multi-node jobs (use a unique value per job run)")
         _exchange_pod_ips(world_map, exp_dir, run_id)
 
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
