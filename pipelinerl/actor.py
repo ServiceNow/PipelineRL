@@ -158,6 +158,7 @@ async def schedule_rollouts(
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
     retryable_rollout_exceptions = (
         aiohttp.ServerTimeoutError,
+        aiohttp.ServerDisconnectedError,
         asyncio.TimeoutError,
         TimeoutError,
         RetryableAbortedCompletionError,

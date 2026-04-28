@@ -25,7 +25,6 @@ finetune:
   seq_length: 20000
 
 vllm_config:
-  use_v1: true
   vllm_kwargs:
     max_model_len: 20000
 
