@@ -210,8 +210,12 @@ def init_wandb(
 
     python_env = {}
     for dist in distributions():
+        if dist.metadata is None:
+            continue
         try:
-            python_env[dist.metadata["Name"]] = dist.version
+            name = dist.metadata["Name"]
+            if name is not None:
+                python_env[name] = dist.version
         except Exception as e:
             logger.warning(f"Accessing {dist} resulted in error {e}")
     config_for_wandb["python_env"] = python_env
