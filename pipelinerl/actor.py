@@ -692,7 +692,18 @@ class ActorLoop:
                 for r in rollout_results:
                     for text in r.training_texts:
                         all_text_dumps.append(text.model_dump())
-                data_stream_writer.write(all_text_dumps)
+                if all_text_dumps:
+                    data_stream_writer.write(all_text_dumps)
+                else:
+                    # A whole group can be filtered out upstream when every
+                    # rollout has zero advantage. Do not publish an empty
+                    # training record; the preprocessor expects real samples.
+                    logger.warning(
+                        "Skipping empty %s group publish for group_id=%s with %s rollout results",
+                        "train" if self.is_training else "test",
+                        rollout_results[0].group_id,
+                        len(rollout_results),
+                    )
                 in_progress = submitted_groups - finished_groups
                 logger.info(
                     f"Published {group_samples} {'train' if self.is_training else 'test'} samples"

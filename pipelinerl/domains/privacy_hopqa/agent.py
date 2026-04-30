@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .llm_adapter import PrivacyHopQALLMAdapter
+from .llm_adapter import PrivacyHopQALLMAdapter, is_llm_infrastructure_error
 from .prompts import (
     build_doc_choose_prompt,
     build_doc_reader_prompt,
@@ -393,62 +393,99 @@ class PrivacyHopQAAgent:
         return actions[: self.settings.max_parallel_retrieval_actions]
 
     async def _plan_retrieval_actions(self, hop: HopState, iteration: int) -> list[RetrievalActionRecord]:
-        prompt = build_hop_plan_prompt(
-            numbered_questions=self.numbered_questions,
-            current_hop_number=hop.hop_number,
-            current_hop_question=self._materialize_question(hop.question),
-            resolved_answers=self._resolved_answers(),
-            search_history=self._recent_search_history(hop),
-            recent_reader_results=self._recent_reader_results(hop),
-            company_name=self.company_name,
-            company_description=self.company_description,
-            max_parallel_retrieval_actions=self.settings.max_parallel_retrieval_actions,
-            no_web=self.settings.no_web,
-        )
-        self._save_prompt(f"hop_plan_iter{iteration}_hop{hop.hop_number}", prompt)
         started = self._elapsed_s()
-        try:
-            response = await self.llm_adapter.generate_text(prompt, log_name="hop_plan")
-            payload = extract_json(response)
-        except Exception as exc:
-            logger.warning("hop planner failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)
-            self._record_error(stage="hop_plan", hop_number=hop.hop_number, iteration=iteration, exc=exc)
-            payload = []
-
-        raw_actions = payload if isinstance(payload, list) else []
-        records: list[RetrievalActionRecord] = []
-        seen_keys: set[tuple[str, str]] = set()
-        seen_recent = {
-            (entry.get("type", ""), _normalize_query(entry.get("query", "")))
-            for entry in self._recent_search_history(hop)
-        }
-        for idx, raw in enumerate(raw_actions[: self.settings.max_parallel_retrieval_actions]):
-            if not isinstance(raw, dict):
-                continue
-            action_type = str(raw.get("type") or "").strip().lower()
-            if action_type not in {"web_search", "local_document_search"}:
-                continue
-            if action_type == "web_search" and self.settings.no_web:
-                continue
-            parameters = raw.get("parameters") if isinstance(raw.get("parameters"), dict) else {}
-            query = str(parameters.get("query") or raw.get("description") or "").strip()
-            if not query:
-                continue
-            key = (action_type, _normalize_query(query))
-            if key in seen_keys or key in seen_recent:
-                continue
-            seen_keys.add(key)
-            records.append(
-                RetrievalActionRecord(
-                    id=f"iter{iteration}_{action_type}_{idx}",
-                    type=action_type,
-                    description=str(raw.get("description") or f"{action_type} for hop {hop.hop_number}"),
-                    parameters={"query": query},
-                    priority=float(raw.get("priority", 0.5)),
-                    expected_output=str(raw.get("expected_output") or "Candidate evidence"),
-                )
+        planned_actions: list[RetrievalActionRecord] = []
+        retry_guidance: str | None = None
+        attempt_count = 0
+        fallback_used = False
+        for plan_attempt in range(max(1, self.settings.hop_plan_attempts)):
+            attempt_count = plan_attempt + 1
+            prompt = build_hop_plan_prompt(
+                numbered_questions=self.numbered_questions,
+                current_hop_number=hop.hop_number,
+                current_hop_question=self._materialize_question(hop.question),
+                resolved_answers=self._resolved_answers(),
+                search_history=self._recent_search_history(hop),
+                recent_reader_results=self._recent_reader_results(hop),
+                company_name=self.company_name,
+                company_description=self.company_description,
+                max_parallel_retrieval_actions=self.settings.max_parallel_retrieval_actions,
+                no_web=self.settings.no_web,
+                retry_guidance=retry_guidance,
             )
-        planned_actions = records or self._fallback_actions(hop, iteration)
+            prompt_name = f"hop_plan_iter{iteration}_hop{hop.hop_number}"
+            if plan_attempt > 0:
+                prompt_name = f"{prompt_name}_attempt{plan_attempt + 1}"
+            self._save_prompt(prompt_name, prompt)
+            try:
+                response = await self.llm_adapter.generate_text(prompt, log_name="hop_plan")
+                payload = extract_json(response)
+            except Exception as exc:
+                if is_llm_infrastructure_error(exc):
+                    raise
+                logger.warning("hop planner failed for hop %s iteration %s attempt %s: %s", hop.hop_number, iteration, attempt_count, exc)
+                self._record_error(stage="hop_plan", hop_number=hop.hop_number, iteration=iteration, exc=exc)
+                payload = []
+                retry_guidance = "The previous response was not valid JSON or could not be parsed. Return a valid JSON array of retrieval actions."
+                continue
+
+            raw_actions = payload if isinstance(payload, list) else []
+            records: list[RetrievalActionRecord] = []
+            seen_keys: set[tuple[str, str]] = set()
+            seen_recent = {
+                (entry.get("type", ""), _normalize_query(entry.get("query", "")))
+                for entry in self._recent_search_history(hop)
+            }
+            invalid_count = 0
+            duplicate_count = 0
+            for idx, raw in enumerate(raw_actions[: self.settings.max_parallel_retrieval_actions]):
+                if not isinstance(raw, dict):
+                    invalid_count += 1
+                    continue
+                action_type = str(raw.get("type") or "").strip().lower()
+                if action_type not in {"web_search", "local_document_search"}:
+                    invalid_count += 1
+                    continue
+                if action_type == "web_search" and self.settings.no_web:
+                    invalid_count += 1
+                    continue
+                parameters = raw.get("parameters") if isinstance(raw.get("parameters"), dict) else {}
+                query = str(parameters.get("query") or raw.get("description") or "").strip()
+                if not query:
+                    invalid_count += 1
+                    continue
+                key = (action_type, _normalize_query(query))
+                if key in seen_keys or key in seen_recent:
+                    duplicate_count += 1
+                    continue
+                seen_keys.add(key)
+                records.append(
+                    RetrievalActionRecord(
+                        id=f"iter{iteration}_{action_type}_{idx}",
+                        type=action_type,
+                        description=str(raw.get("description") or f"{action_type} for hop {hop.hop_number}"),
+                        parameters={"query": query},
+                        priority=float(raw.get("priority", 0.5)),
+                        expected_output=str(raw.get("expected_output") or "Candidate evidence"),
+                    )
+                )
+            if records:
+                planned_actions = records
+                break
+            if raw_actions:
+                retry_guidance = (
+                    "The previous plan did not produce any usable new retrieval actions. "
+                    f"Invalid actions: {invalid_count}. Duplicate or already-tried actions: {duplicate_count}. "
+                    "Return up to the allowed number of concrete, non-duplicate retrieval actions for this hop, or [] if no useful retrieval remains."
+                )
+            else:
+                retry_guidance = (
+                    "The previous plan was empty. Return up to the allowed number of concrete retrieval actions for this hop, "
+                    "or [] only if you truly believe no useful retrieval remains."
+                )
+        if not planned_actions and self.settings.enable_generic_retrieval_fallback:
+            planned_actions = self._fallback_actions(hop, iteration)
+            fallback_used = True
         ended = self._elapsed_s()
         self._record_event(
             stage="hop_plan",
@@ -459,6 +496,8 @@ class PrivacyHopQAAgent:
             meta={
                 "hop_number": hop.hop_number,
                 "iteration": iteration,
+                "plan_attempts": attempt_count,
+                "fallback_used": fallback_used,
                 "planned_actions": [
                     {
                         "action_id": action.id,
@@ -704,6 +743,8 @@ class PrivacyHopQAAgent:
             response = await self.llm_adapter.generate_text(prompt, log_name="doc_choose")
             payload = extract_json(response)
         except Exception as exc:
+            if is_llm_infrastructure_error(exc):
+                raise
             logger.warning("doc chooser failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)
             self._record_error(stage="doc_choose", hop_number=hop.hop_number, iteration=iteration, exc=exc)
             payload = {}
@@ -764,6 +805,8 @@ class PrivacyHopQAAgent:
                 missing_information=str(payload.get("missing_information") or "").strip(),
             )
         except Exception as exc:
+            if is_llm_infrastructure_error(exc):
+                raise
             logger.warning("doc read failed for %s: %s", candidate.doc_id, exc)
             self._record_error(
                 stage="doc_read",
@@ -919,6 +962,8 @@ class PrivacyHopQAAgent:
                 "selected_doc_ids": payload.get("selected_doc_ids") if isinstance(payload.get("selected_doc_ids"), list) else [],
             }
         except Exception as exc:
+            if is_llm_infrastructure_error(exc):
+                raise
             logger.warning("hop resolver failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)
             self._record_error(stage="hop_resolve", hop_number=hop.hop_number, iteration=iteration, exc=exc)
             resolution = self._fallback_resolution(reader_results)
@@ -1018,6 +1063,11 @@ class PrivacyHopQAAgent:
             iterations_used = iteration + 1
             hop.attempts += 1
             retrieval_actions = await self._plan_retrieval_actions(hop, iteration)
+            if not retrieval_actions:
+                hop.status = "pending"
+                hop.resolution_reason = "No usable retrieval plan was produced for this hop in this iteration."
+                stalled = True
+                continue
             candidates = await self._run_retrieval_actions(retrieval_actions, hop, iteration)
             resolution = await self._work_candidate_pool(hop, iteration, candidates)
             hop.resolution_reason = resolution.get("reason") or ""
@@ -1031,7 +1081,7 @@ class PrivacyHopQAAgent:
                 hop.status = "pending"
                 if not candidates:
                     stalled = True
-                    break
+                    continue
 
         report_started = self._elapsed_s()
         final_report = build_deterministic_report(

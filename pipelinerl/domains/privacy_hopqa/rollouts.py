@@ -23,7 +23,7 @@ from .resources import (
 )
 
 from .agent import PrivacyHopQAAgent
-from .llm_adapter import PrivacyHopQALLMAdapter
+from .llm_adapter import PrivacyHopQALLMAdapter, is_llm_infrastructure_error
 from .reward import score_chain_answers
 from .settings import PrivacyHopQASettings
 
@@ -36,6 +36,9 @@ class PrivacyHopQAMetrics(BaseMetrics):
     hop_accuracy: float = 0.0
     final_correct: bool = False
     chain_complete: bool = False
+    n_question_hops: int = 0
+    n_unique_docs: int = 0
+    n_cross_doc_transitions: int = 0
     llm_calls_total: int = 0
     llm_calls_captured: int = 0
     prompt_tokens: int = 0
@@ -154,6 +157,8 @@ async def _run_privacy_hopqa_rollout_async(
         docs_read = sum(len(hop.get("selected_doc_ids", [])) for hop in agent_result.hop_states)
         iterations_used = int(report_metadata.get("iterations_used") or 0)
     except Exception as exc:
+        if is_llm_infrastructure_error(exc):
+            raise
         logger.exception("privacy_hopqa rollout failed for chain %s", problem.get("chain_id"))
         error = str(exc)
         final_report = ""
@@ -168,6 +173,9 @@ async def _run_privacy_hopqa_rollout_async(
         answers,
         f1_threshold=settings.answer_match_f1_threshold,
     )
+    n_question_hops = int(problem.get("n_question_hops") or problem.get("n_hops") or len(problem.get("hops") or []))
+    n_unique_docs = int(problem.get("n_unique_docs") or 0)
+    n_cross_doc_transitions = int(problem.get("n_cross_doc_transitions") or max(0, n_unique_docs - 1))
     group_id = str(problem.get("chain_id") or problem.get("problem_id"))
     base_metadata = {
         "chain_id": problem.get("chain_id"),
@@ -179,6 +187,9 @@ async def _run_privacy_hopqa_rollout_async(
         "searches_total": searches_total,
         "docs_read": docs_read,
         "hops_resolved": hops_resolved,
+        "n_question_hops": n_question_hops,
+        "n_unique_docs": n_unique_docs,
+        "n_cross_doc_transitions": n_cross_doc_transitions,
         "report_metadata": report_metadata,
         "error_summary": error_summary,
     }
@@ -196,6 +207,9 @@ async def _run_privacy_hopqa_rollout_async(
         hop_accuracy=score["hop_accuracy"],
         final_correct=bool(score["final_correct"]),
         chain_complete=bool(score["chain_complete"]),
+        n_question_hops=n_question_hops,
+        n_unique_docs=n_unique_docs,
+        n_cross_doc_transitions=n_cross_doc_transitions,
         llm_calls_total=adapter.total_calls,
         llm_calls_captured=len(training_texts),
         prompt_tokens=adapter.total_prompt_tokens,

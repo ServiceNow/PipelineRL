@@ -20,6 +20,7 @@ def build_hop_plan_prompt(
     company_description: str | None,
     max_parallel_retrieval_actions: int,
     no_web: bool,
+    retry_guidance: str | None = None,
 ) -> str:
     company_lines = []
     if company_name:
@@ -31,6 +32,14 @@ def build_hop_plan_prompt(
         task_context = f"Task Context:\n{task_context}\n"
 
     action_types = ["local_document_search"] if no_web else ["web_search", "local_document_search"]
+    retry_block = ""
+    if retry_guidance:
+        retry_block = f"""
+Previous Planning Attempt Was Unusable:
+{retry_guidance}
+
+Please try again and return a usable retrieval plan for the current hop.
+"""
     return f"""You are solving a multihop QA chain one hop at a time.
 
 Full Numbered Questions:
@@ -48,6 +57,7 @@ Recent Search History For This Hop:
 
 Recent Document-Reading Results For This Hop:
 {_json_block(recent_reader_results or [])}
+{retry_block}
 
 Plan up to {max_parallel_retrieval_actions} retrieval actions that would best help answer the CURRENT hop.
 - It is good to try different phrasings in parallel when useful

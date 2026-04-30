@@ -1,5 +1,6 @@
 """Async LLM adapter for the simplified privacy_hopqa domain."""
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -13,6 +14,31 @@ from pipelinerl.llm import LLMCall, Prompt, TrainableLLM
 logger = logging.getLogger(__name__)
 
 PLANNING_LOG_NAMES = {"hop_plan", "doc_choose", "hop_resolve"}
+
+
+class PrivacyHopQALLMInfrastructureError(RuntimeError):
+    """Inference service failure that should be handled by PipelineRL, not the agent."""
+
+
+def is_llm_infrastructure_error(exc: BaseException) -> bool:
+    """Return true for rollout-LLM transport/server failures, not bad model outputs."""
+    if isinstance(exc, PrivacyHopQALLMInfrastructureError):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status >= 500
+    if isinstance(
+        exc,
+        (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerTimeoutError,
+            asyncio.TimeoutError,
+            TimeoutError,
+        ),
+    ):
+        return True
+    text = str(exc).lower()
+    return "asyncenginedeaderror" in text or "engine background task failed" in text
 
 
 @dataclass
@@ -97,7 +123,15 @@ class PrivacyHopQALLMAdapter:
                 "privacy_hopqa routes domain calls through the rollout LLM. "
                 f"Requested model '{requested_model}' does not match rollout model '{self.llm.model_name}'."
             )
-        return await llm_async_generate(self.llm, prompt, self.session)
+        try:
+            return await llm_async_generate(self.llm, prompt, self.session)
+        except Exception as exc:
+            if is_llm_infrastructure_error(exc):
+                # Let PipelineRL's actor fail-fast path handle dead vLLM shards.
+                raise PrivacyHopQALLMInfrastructureError(
+                    f"LLM infrastructure failure at {self.llm.base_url}: {exc}"
+                ) from exc
+            raise
 
     async def generate_text(self, prompt: str, *, model: str | None = None, log_name: str = "llm") -> str:
         prompt_text = str(prompt)

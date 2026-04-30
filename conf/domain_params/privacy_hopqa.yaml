@@ -12,6 +12,10 @@ use_remote_browsecomp: true
 capture_mode: all_calls
 answer_match_f1_threshold: 0.75
 max_iterations: 12
+# Keep retries/fallback explicit: hidden generic local+web fallback changes
+# the source-selection policy and can mask whether the model learned the tool.
+hop_plan_attempts: 1
+enable_generic_retrieval_fallback: false
 max_parallel_retrieval_actions: 3
 retrieval_top_k: 5
 choose_top_k: 3

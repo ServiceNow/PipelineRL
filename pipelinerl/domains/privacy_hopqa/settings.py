@@ -58,6 +58,8 @@ class PrivacyHopQASettings:
     capture_mode: str = "all_calls"
     answer_match_f1_threshold: float = 0.75
     max_iterations: int = 12
+    hop_plan_attempts: int = 1
+    enable_generic_retrieval_fallback: bool = False
     max_parallel_retrieval_actions: int = 3
     retrieval_top_k: int = 5
     choose_top_k: int = 3
@@ -101,6 +103,8 @@ class PrivacyHopQASettings:
             capture_mode=str(data.get("capture_mode", "all_calls")),
             answer_match_f1_threshold=float(data.get("answer_match_f1_threshold", 0.75)),
             max_iterations=int(data.get("max_iterations", 12)),
+            hop_plan_attempts=int(data.get("hop_plan_attempts", 1)),
+            enable_generic_retrieval_fallback=bool(data.get("enable_generic_retrieval_fallback", False)),
             max_parallel_retrieval_actions=int(data.get("max_parallel_retrieval_actions", 3)),
             retrieval_top_k=int(data.get("retrieval_top_k", 5)),
             choose_top_k=int(data.get("choose_top_k", 3)),
