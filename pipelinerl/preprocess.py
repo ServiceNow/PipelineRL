@@ -398,9 +398,11 @@ def run_preprocessing_loop(
     
     # Initialize TrainerState
     trainer_state = TrainerState(exp_root_dir)
-    if cfg.debug.mode == "preprocessor":
-        logger.info("Debug mode: preprocessor")
+    trainer_feedback_enabled = True
+    if cfg.debug.mode in {"preprocessor", "actor+preprocessor"}:
+        logger.info(f"Debug mode: {cfg.debug.mode} (no finetune feedback)")
         trainer_state.debug_mode_init()
+        trainer_feedback_enabled = False
     elif cfg.debug.mode == "finetune+preprocessor":
         logger.info("Debug mode: finetune+preprocessor")
         trainer_state.start_listening()
@@ -412,6 +414,8 @@ def run_preprocessing_loop(
     final_train_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
+    served_model_name = cfg.vllm_config.vllm_kwargs.get("served_model_name") if cfg.vllm_config.vllm_kwargs else None
+
     # Load published samples from state file
     llms = [
         TrainableLLM(
@@ -419,6 +423,7 @@ def run_preprocessing_loop(
             model_name=cfg.finetune.config_name,
             tokenizer_name=cfg.finetune.config_name,
             parameters=cfg.llm.parameters,
+            served_model_name=served_model_name,
         )
         for url in llm_urls
     ]
@@ -440,6 +445,18 @@ def run_preprocessing_loop(
     # Sequence packing configuration
     num_trainers = world_map.total_finetune_gpus
     num_lead_trainers = world_map.total_finetune_gpus // cfg.finetune.seq_parallel
+    if num_lead_trainers == 0:
+        if trainer_feedback_enabled:
+            raise ValueError(
+                "No lead finetune trainers available. Ensure at least one finetune GPU "
+                "or use a debug mode that does not require trainer feedback."
+            )
+        logger.info(
+            "No finetune trainers detected in debug mode; using synthetic single-trainer "
+            "preprocess bookkeeping."
+        )
+        num_trainers = 1
+        num_lead_trainers = 1
     gradient_accumulation_passes_per_lead = cfg.finetune.gradient_accumulation_passes // num_lead_trainers
     samples_per_lead_per_step = cfg.finetune.train_batch_size * gradient_accumulation_passes_per_lead
     train_batch_size = samples_per_lead_per_step * num_lead_trainers
@@ -497,6 +514,8 @@ def run_preprocessing_loop(
                 num_filtered_out = 0
                 while True:
                     if (
+                        trainer_feedback_enabled
+                        and
                         trainer_state.samples_processed is not None
                         and trainer_state.samples_processed >= samples_target
                     ):
@@ -564,10 +583,11 @@ def run_preprocessing_loop(
                     
                     max_unconsumed_samples = cfg.preprocess.max_ready_samples_per_lead * num_trainers
 
-                    assert isinstance(trainer_state.samples_processed, int)
-                    if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
-                        # wait for the finetune loop to finish processing data
-                        continue
+                    if trainer_feedback_enabled:
+                        assert isinstance(trainer_state.samples_processed, int)
+                        if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
+                            # wait for the finetune loop to finish processing data
+                            continue
 
                     batch_done = False
                     start_writing = time.time()

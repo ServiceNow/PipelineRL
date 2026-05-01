@@ -13,7 +13,7 @@ name = "pipelinerl"
 version = "0.1.0"
 description = "A scalable asynchronous reinforcement learning implementation with in-flight weight updates."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 license = { file = "LICENSE" }
 authors = [
     { name = "ServiceNow" },
@@ -21,11 +21,11 @@ authors = [
 dependencies = [
     "aiohttp>=3.9.0",
     "vllm==0.8.5.post1",
-    "accelerate==1.12.0",
+    "accelerate>=1.7.0,<1.8.dev0",
     "deepspeed==0.15.4",
     "browsergym>=0.13.0",
     "datasets>=2.21.0",
-    "transformers~=4.52.0" ,
+    "transformers>=4.51.0,<4.52.dev0",
     "fastapi>=0.115.0",
     "joblib>=1.3.2",
     "jsonref>=1.1.0",
@@ -36,6 +36,7 @@ dependencies = [
     "Pillow>=10.0.0",
     "psutil>=5.9.0",
     "pydantic>=2.9.0",
+    "peft==0.12.0",
     "ring-flash-attn==0.1.8",
     "math-verify[antlr4_9_3]==0.8.0",
     "orjson~=3.11.0",
@@ -47,39 +48,29 @@ dependencies = [
     "uvloop>=0.19.0",
     "wandb>=0.16.0",
     "hydra-core>=1.3.2",
+    "flash-attn",
+    "debugpy>=1.8.20",
+    "cube-standard",
 ]
 
 [project.optional-dependencies]
-tapeagents = [
-    "Tapeagents[finetune]==0.1.16",
-]
-lora = [
-    "peft==0.18.0",
-]
 # Domain-specific dependencies
-coding = [
-    "sandbox-fusion>=0.3.7",
-]
-fn_calling = [
-    "bfcl-eval>=2025.6.8",
-]
-logic = [
-    # i3-logic verification code is vendored in pipelinerl/domains/logic/i3_logic/
-    # (source: https://github.com/PrimeIntellect/i3-logic)
-]
-ifeval = [
-    # IFEvalG bundled module dependencies
-    "langdetect",
-    "absl-py",
-]
-tir = [
+math_tool_use = [
     "sandbox-fusion>=0.3.7",
 ]
 # Install all domain dependencies
 domains = [
-    "pipelinerl[coding,fn_calling,logic,ifeval,tir]",
+    "pipelinerl[math_tool_use]",
 ]
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pipelinerl*"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+
+[tool.uv.sources]
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
+cube-harness = { path = "../cube-harness", editable = true }
+math-tool-use = { path = "../cube-harness/cubes/math-tool-use", editable = true }
+cube-standard = { path = "../cube-standard" }

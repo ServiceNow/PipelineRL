@@ -183,6 +183,8 @@ package-lock.json
 package.json
 results
 results/
+results-batch-jobs
+results-batch-jobs/
 data/
 cache/
 dump.rdb
