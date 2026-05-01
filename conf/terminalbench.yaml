@@ -1,0 +1,70 @@
+defaults:
+  - base
+  - override streams: files
+  - _self_
+
+world:
+  actor_fraction: 4
+  preprocessor_fraction: 0
+  finetune_fraction: 4
+
+model_path: Qwen/Qwen2.5-7B
+
+finetune:
+  seq_length: 100000  # input + output tokens
+  max_train_steps: 1024
+  train_batch_size: 1
+  gradient_accumulation_passes: 8
+  seq_parallel: 4
+  rl:
+    policy_loss: gspo
+    epsilon_high: 4e-4
+    epsilon_low: 3e-4
+
+eval_every_n_versions: 0
+
+llm:
+  parameters:
+    max_tokens: 16000  # output tokens
+    temperature: 1.0
+test_llm:
+  parameters:
+    max_tokens: ${...llm.parameters.max_tokens}
+    temperature: 1.0
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 100000  # input + output tokens
+
+actor:
+  rollout_policy: pipelinerl.domains.terminalbench.rollouts.generate_rollout
+  shared_memory_entry_size: 200000000
+  llm_max_rollouts: 1  # container tasks are slow; keep concurrency low
+  max_steps: 100       # max LLM calls per rollout
+
+preprocess:
+  shared_memory_entry_size: 200000000
+
+
+# ENVIRONMENT CONFIGURATION
+environment:
+  _target_: pipelinerl.domains.terminalbench.environment_server.ContainerEnvironmentServer
+  cube_backend:
+    _target_: cube.backends.toolkit.ToolkitContainerBackend
+    account: snow.research.adea
+    timeout_seconds: 1800
+  n_parallel_envs: 8
+  host: "0.0.0.0"
+  env_call_timeout: 120      # timeout per exec/evaluate call in seconds
+  start_task_timeout: 600    # timeout for container launch (queuing + running)
+
+# DATASET CONFIGURATION
+dataset_loader: pipelinerl.domains.terminalbench.load_tasks.load_tasks
+dataset_loader_params:
+  train_split: 0.6
+  max_train_examples: 32
+  max_test_examples: 4
+train_dataset_names:
+  - train
+test_dataset_names:
+  - test
