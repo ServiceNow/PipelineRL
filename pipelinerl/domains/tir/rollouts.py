@@ -42,24 +42,24 @@ def build_tool_definitions() -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name": "run_python_code",
-                "description": "Execute Python code. Print only the final result.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"code": {"type": "string", "description": "Python code to execute"}},
-                    "required": ["code"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "MathAnswer",
                 "description": "Submit the final answer in LaTeX \\boxed{} format.",
                 "parameters": {
                     "type": "object",
                     "properties": {"answer": {"type": "string", "description": "The final answer"}},
                     "required": ["answer"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_python_code",
+                "description": "Execute Python code. Print only the final result.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string", "description": "Python code to execute"}},
+                    "required": ["code"],
                 },
             },
         },
@@ -322,8 +322,8 @@ async def generate_tir_rollout(
 
     if ctx.final_answer is not None:
         prediction = ctx.final_answer
-    elif llm_calls:
-        prediction = llm_calls[-1].output.content or ""
+    elif ctx.num_python_calls > 0:
+        prediction = ctx.messages[-1].get('content', '')
     else:
         prediction = ""
 
@@ -357,8 +357,9 @@ async def generate_tir_rollout(
         if max_tokens > 0:
             base_reward += length_penalty(max_tokens, total_output_tokens, buffer_tokens)
 
-    shaping = RewardShaper(cfg, llm).compute(answer_status, ctx.num_python_calls, llm_calls)
-    reward = base_reward + shaping
+    # shaping = RewardShaper(cfg, llm).compute(answer_status, ctx.num_python_calls, llm_calls)
+    # reward = base_reward + shaping
+    reward = base_reward
 
     training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     for text in training_texts:

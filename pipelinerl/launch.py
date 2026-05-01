@@ -235,14 +235,19 @@ def run_actor_llm(
         yield LaunchedProcess(kind="actor_llm", handle=proc)
 
 
-def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
+def run_actor(cfg: DictConfig, world_map: WorldMap, actor_idx: int, exp_dir: Path):
     if actor_idx != 0:
         raise NotImplementedError("Can only do 1 actor yet")
     llm_urls = "+".join(world_map.get_actor_urls())
+    actor_launcher = str(getattr(cfg.actor, "launcher", "asyncio")).strip().lower()
+    if actor_launcher == "ray":
+        actor_entrypoint = "pipelinerl.entrypoints.run_actor_ray"
+    else:
+        actor_entrypoint = "pipelinerl.entrypoints.run_actor"
     cmd = [
         "python",
         "-m",
-        "pipelinerl.entrypoints.run_actor",
+        actor_entrypoint,
         "--config-dir",
         f"{exp_dir}/conf",
         "--config-name",
@@ -466,12 +471,13 @@ def clean_up(exp_dir, force_restart):
         log_files = list(exp_dir.glob("**/*.log"))
         for log_file in log_files:
             logger.info(f"Erasing {log_file}")
-            with open(log_file, "r"):
-                pass
+            os.remove(log_file)
+            # with open(log_file, "r"):
+            #     pass
 
 
-def is_inference_process(proc: LaunchedProcess) -> bool:
-    return proc.kind in {"actor_llm", "preprocessor_llm"}
+def is_service_process(proc: LaunchedProcess) -> bool:
+    return proc.kind in {"actor_llm", "preprocessor_llm", "environment"}
 
 
 def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False):
@@ -510,20 +516,25 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                     sys.exit(1)
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
-            if alive and all(is_inference_process(proc) for proc in alive):
-                # shut down inference servers after training is complete
+            if alive and all(is_service_process(proc) for proc in alive):
+                # shut down long-running services after training is complete
                 if trainer_state is not None and not trainer_state.training_done:
                     # check if training is completed
                     logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
                     trainer_state.wait_for_training_done(timeout=5.0)
                     continue
-                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} inference server(s)")
+                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} service process(es)")
                 for proc in list(alive):
-                    logger.info(f"Terminating inference server {proc.handle.args}")
+                    logger.info(f"Terminating service process {proc.handle.args}")
                     terminate_with_children(proc.handle.pid)
                 for proc in list(alive):
-                    proc.handle.wait()
-                    logger.info(f"Inference server {proc.handle.args} stopped")
+                    try:
+                        proc.handle.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Service process {proc.handle.args} did not stop; forcing termination")
+                        terminate_with_children(proc.handle.pid)
+                        proc.handle.wait(timeout=10)
+                    logger.info(f"Service process {proc.handle.args} stopped")
                     alive.remove(proc)
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
@@ -548,7 +559,7 @@ def debug_link_streams(cfg: DictConfig, topics: list[str]):
         target_topic_dir = stream_dir / topic
         if not os.path.exists(source_topic_dir):
             raise ValueError(f"Source topic {source_topic_dir} does not exist")
-        os.symlink(source_topic_dir, target_topic_dir)
+        os.symlink(source_topic_dir.absolute(), target_topic_dir.absolute())
         logger.info(f"Linked {source_topic_dir} to {target_topic_dir}")
 
 
@@ -564,7 +575,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
         if job.kind not in job_kind_filter:
             continue
         if job.kind == "actor":
-            processes.extend(run_actor(world_map, job.replica_idx, exp_dir))
+            processes.extend(run_actor(cfg, world_map, job.replica_idx, exp_dir))
         elif job.kind == "environment":
             processes.extend(run_environment(cfg, job))
         elif job.kind == "actor_llm":

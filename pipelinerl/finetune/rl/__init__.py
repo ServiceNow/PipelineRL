@@ -103,6 +103,10 @@ class RLConfig(BaseModel):
         default=0.0,
         description="Coefficient for the value loss in the final loss",
     )
+    per_step_rewards: bool = Field(
+        default=False,
+        description="Allow rollout steps in the same rollout_index to have different rewards.",
+    )
 
 
 def make_rl_data_callback(args, current_dir, rl_config, model):
@@ -431,73 +435,74 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df_init = pd.DataFrame(dataset)
     assert isinstance(df_init, pd.DataFrame)
 
-    # Step 1: calculate rollout- and group-level statistics
+    # Step 1: calculate group-level statistics
     df_stats = df_init[["group_id", "rollout_index", "step_index"]].copy()
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
-    # RL preprocessing currently assumes a single reward per rollout.
-    df_stats["rollout_reward"] = df_init["rewards"].apply(lambda x: x[0])
-    assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1, (
-        "RL preprocessing expects the same reward for every step in a rollout"
-    )
-    df_rollouts = (
-        df_stats.groupby(["group_id", "rollout_index"])
-        .agg(
-            rollout_reward=("rollout_reward", "first"),
-            rollout_tokens=("num_tokens", "sum"),
+    df_stats["sample_reward"] = df_init["rewards"].apply(lambda x: x[0])
+
+    if config.per_step_rewards:
+        df_grouped = (
+            df_stats.groupby(["group_id", "step_index"])
+            .agg(
+                reward_sum=("sample_reward", "sum"),
+                reward_count=("sample_reward", "count"),
+                reward_std=("sample_reward", "std"),
+                group_tokens=("num_tokens", "mean"),
+            )
+            .reset_index()
         )
-        .reset_index()
-    )
-    df_grouped = (
-        df_rollouts.groupby("group_id")
-        .agg(
-            rollout_reward_sum=("rollout_reward", "sum"),
-            rollout_reward_count=("rollout_reward", "count"),
-            rollout_reward_std=("rollout_reward", "std"),
-            group_tokens=("rollout_tokens", "mean"),
+        merge_keys = ["group_id", "step_index"]
+    else:
+        assert df_stats.groupby(["group_id", "rollout_index"])["sample_reward"].nunique().max() == 1, (
+            "RL preprocessing expects the same reward for every step in a rollout "
+            "unless rl.per_step_rewards=true"
         )
-        .reset_index()
-    )
-    assert df_grouped.columns.tolist() == [
-        "group_id",
-        "rollout_reward_sum",
-        "rollout_reward_count",
-        "rollout_reward_std",
-        "group_tokens",
-    ]
+        df_rollouts = (
+            df_stats.groupby(["group_id", "rollout_index"])
+            .agg(
+                rollout_reward=("sample_reward", "first"),
+                rollout_tokens=("num_tokens", "sum"),
+            )
+            .reset_index()
+        )
+        df_grouped = (
+            df_rollouts.groupby("group_id")
+            .agg(
+                reward_sum=("rollout_reward", "sum"),
+                reward_count=("rollout_reward", "count"),
+                reward_std=("rollout_reward", "std"),
+                group_tokens=("rollout_tokens", "mean"),
+            )
+            .reset_index()
+        )
+        merge_keys = ["group_id"]
 
     # Step 2: calculate advantages for each sample
-    df_advantages = pd.merge(
-        df_init[["group_id", "rollout_index", "step_index", "rewards"]],
-        df_grouped,
-        on="group_id",
-        how="left"
-    )
+    df_advantages = pd.merge(df_init[["group_id", "rollout_index", "step_index", "rewards"]], df_grouped, on=merge_keys, how="left")
     assert len(df_advantages) == len(df_init)
+
     def calculate_advantages(row):
         rewards = row["rewards"]
-        group_sum = row["rollout_reward_sum"]
-        group_count = row["rollout_reward_count"]
+        group_sum = row["reward_sum"]
+        group_count = row["reward_count"]
         current_reward = rewards[0]
         if group_count > 1:
             loo_mean = (group_sum - current_reward) / (group_count - 1)
         else:
             loo_mean = current_reward
-        std = row["rollout_reward_std"]
+        std = row["reward_std"]
         if config.divide_advantage_by_std:
             return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
         return [(r - loo_mean) for r in rewards]
 
     df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
-    df_advantages = df_advantages.drop(
-        columns=["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
-    )
-    assert df_advantages.columns.tolist() == [
-        "group_id",
-        "rollout_index",
-        "step_index",
-        "group_tokens",
-        "advantages",
-    ]
+    drop_cols = ["rewards", "reward_sum", "reward_count", "reward_std"]
+    if config.per_step_rewards:
+        keep_cols = ["group_id", "rollout_index", "step_index", "group_tokens", "advantages"]
+    else:
+        keep_cols = ["group_id", "rollout_index", "step_index", "group_tokens", "advantages"]
+    df_advantages = df_advantages.drop(columns=drop_cols)
+    assert df_advantages.columns.tolist() == keep_cols
 
     # Step 3: bring advantages and group level stats back to the main df
     df = df_init.drop(columns=["advantages", "group_tokens"])

@@ -1,0 +1,105 @@
+defaults:
+  - base
+  - override rewards: success_and_format
+  - _self_
+
+output_dir: results/cube_math_tool/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /mnt/llmd/base_models/Qwen2.5-7B-Instruct
+litellm_logging_level: info
+ray_debug: 0
+ray_local_mode: false
+
+actor:
+  launcher: ray
+  ray_num_cpus: null
+  cube_actor_num_cpus: 1.0
+  llm_max_rollouts: 128
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+
+llm:
+  parameters:
+    max_tokens: 16000
+    max_completion_tokens: 16000
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 16000
+    max_completion_tokens: 16000
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 50
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 32000
+    served_model_name: Qwen2.5-7B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+finetune:
+  seq_length: 32000
+  seq_parallel: 8
+  gradient_accumulation_passes: 1024
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 8
+  shared_memory_entry_size: 1000000000
+
+cube_params:
+  name: tir
+  resource_guard:
+    actor_memory_gb: 1.25
+    memory_overhead_gb: 8.0
+    memory_usage_threshold: 0.90
+  benchmark:
+    _target_: math_tool_use.benchmark.MathToolUseBenchmark
+    default_tool_config:
+      _target_: math_tool_use.tool.MathToolUseToolConfig
+      sandbox_endpoint: http://dns-24e3447c-506e-4b21-92df-156e18db5087-sandboxfusion
+  agent:
+    _target_: cube_harness.agents.tir.TirAgentConfig
+    llm_config:
+      _target_: cube_harness.llm.LLMConfig
+      model_name: ${vllm_config.vllm_kwargs.served_model_name}
+      num_retries: 20
+      extra_body:
+        return_token_ids: true
+    system_prompt: |
+      You are a math-focused AI Agent. Solve problems by combining clear symbolic reasoning
+      with short, deterministic Python code.
+      Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
+      Always present the final answer in LaTeX \boxed{}.
+      Do not express emotions or opinions about user questions.
+
+      Workflow:
+      1. Draft a brief plan in plain text.
+      2. Execute one run_python_code call to compute or verify the result.
+      3. Finalize by calling MathAnswer with the LaTeX-formatted answer.
+
+      Python execution policy (run_python_code):
+      - Use Python strictly for pure computation to verify and validate the final answer.
+      - No network, file system, OS or environment access.
+      - Keep snippets minimal and self-contained; print only the final result.
+
+      Validation:
+      - Cross-check results (alternative derivation, invariants, higher precision) before finalizing.
+      - If execution fails, propose the minimal fix and retry.
+      Always verify with run_python_code before invoking MathAnswer.
+    max_actions: 3
+  seed: ${seed}
+
+train_dataset_names:
+  - open_reasoner_zero_57k
+  - open_reasoner_zero_extended_72k
+test_dataset_names:
+  - aime_2025

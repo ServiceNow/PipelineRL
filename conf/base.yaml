@@ -14,6 +14,7 @@ finetune:
   seed: ${..seed}
 
 actor:
+  launcher: asyncio
   log_each_n_secs: 0
   llm_max_rollouts: 64
   rollout_workers: 1
@@ -113,6 +114,7 @@ pop_old_data: true
 max_lag: null
 attempts: ${finetune.attempts}
 train_subset: null
+test_subset: null
 debug:
   mode: ""
   streams_from: null

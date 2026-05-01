@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PipelineRL Results Viewer</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260430-chart-inline-size" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="mark">PRL</div>
+        <div>
+          <h1>Results Viewer</h1>
+          <p id="rootPath"></p>
+        </div>
+      </div>
+      <label class="field">
+        <span>Experiment</span>
+        <select id="experimentSelect"></select>
+      </label>
+      <div id="experimentList" class="experiment-list"></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h2 id="experimentTitle">No experiment selected</h2>
+          <p id="experimentMeta"></p>
+        </div>
+        <button id="refreshButton" class="icon-button" title="Refresh data">↻</button>
+      </header>
+
+      <section id="summaryCards" class="summary-grid"></section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>Training Stats</h3>
+            <p>Training-step snapshots from stats streams.</p>
+          </div>
+          <div class="controls">
+            <select id="trainingStatsTopic">
+              <option value="stats">train</option>
+              <option value="stats_test">test</option>
+            </select>
+            <select id="trainingMetricSelect"></select>
+          </div>
+        </div>
+        <canvas id="trainingStatsChart" class="chart-canvas" height="190"></canvas>
+        <div id="trainingLatestStats" class="kv-grid"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>Visible Rollout Stats</h3>
+            <p>Computed from the currently visible rollout rows.</p>
+          </div>
+          <div class="controls">
+            <select id="metricSelect"></select>
+          </div>
+        </div>
+        <canvas id="statsChart" class="chart-canvas" height="190"></canvas>
+        <div id="latestStats" class="kv-grid"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>Rollouts</h3>
+            <p>Rows from actor streams. Each row is a prompt group; rollout_index separates attempts and step_index orders calls.</p>
+          </div>
+          <div class="controls">
+            <select id="rolloutTopic">
+              <option value="actor">train</option>
+              <option value="actor_test">test</option>
+            </select>
+            <select id="successFilter">
+              <option value="all">all outcomes</option>
+              <option value="true">success</option>
+              <option value="false">failure</option>
+            </select>
+            <input id="searchInput" type="search" placeholder="Search group, dataset, text" />
+          </div>
+        </div>
+        <div id="rolloutCount" class="count"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Outcome</th>
+                <th>Reward</th>
+                <th>Attempts</th>
+                <th>Steps</th>
+                <th>Tokens</th>
+                <th>Group</th>
+                <th>Preview</th>
+              </tr>
+            </thead>
+            <tbody id="rolloutRows"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="prevPage">Previous</button>
+          <span id="pageLabel"></span>
+          <button id="nextPage">Next</button>
+        </div>
+      </section>
+
+      <section class="panel detail-panel">
+        <div class="panel-header">
+          <div>
+            <h3>Rollout Detail</h3>
+            <p id="detailMeta">Select a prompt group to inspect attempts and call traces.</p>
+          </div>
+        </div>
+        <div id="detail"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=20260430-chart-inline-size"></script>
+  </body>
+</html>
