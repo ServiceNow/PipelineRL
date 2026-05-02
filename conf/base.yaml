@@ -23,6 +23,10 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  difficulty_aware_penalty:
+    enabled: false
+    gamma: 0.5
+    failure_scale: 0.5
 environment: null
 preprocess:
   input: actor

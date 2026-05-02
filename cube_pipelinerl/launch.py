@@ -86,7 +86,6 @@ def _init_ray_runtime(cfg: DictConfig, owner_name: str, min_num_cpus: int = 1) -
         _log_ray_cpu_capacity(owner_name, required_num_cpus=min_num_cpus)
         return False
 
-    log_to_driver = bool(getattr(cfg.actor, "ray_log_to_driver", False))
     ray_address = getattr(cfg.actor, "ray_address", None)
     if ray_address:
         ray.init(
