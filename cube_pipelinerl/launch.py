@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from cube_pipelinerl.domain import CubeBenchmarkActor
+from cube_pipelinerl.domain import CubeBenchmarkActor, length_penalty
 from cube_pipelinerl.ray_worker_logging import CubeRayWorkerLogCollector
 from cube_pipelinerl.utils import check_local_cube_actor_resources
 from pipelinerl.metrics import SlidingWindowAggregator
@@ -154,13 +154,12 @@ def _launch_cube_benchmark_actors(
     cube_name = getattr(params, "name", "default")
     seed = int(getattr(params, "seed", cfg.seed))
     actor_num_cpus = float(getattr(cfg.actor, "cube_actor_num_cpus", 1.0))
-    worker_log_level = str(getattr(cfg.actor, "ray_worker_log_level", "ERROR"))
-    worker_litellm_log_level = str(getattr(cfg.actor, "ray_worker_litellm_log_level", "WARNING"))
 
     actors = []
     for idx in range(instances):
         actor_name = f"CUBE_{cube_name}_{idx}"
         actor = CubeBenchmarkActor.options(num_cpus=actor_num_cpus).remote(
+            cfg=cfg,
             benchmark_cfg=benchmark_cfg,
             agent_cfg=agent_cfg,
             cube_name=cube_name,
@@ -169,8 +168,6 @@ def _launch_cube_benchmark_actors(
             seed=seed,
             actor_name=actor_name,
             ray_worker_log_collector=ray_worker_log_collector,
-            ray_worker_log_level=worker_log_level,
-            litellm_log_level=worker_litellm_log_level,
         )
         actors.append(actor)
 
@@ -323,6 +320,20 @@ class CubeActorLoop:
             self.rollout_timeout_s = float(self.rollout_timeout_s)
         self.llm_kwargs = [_build_llm_kwargs(llm) for llm in llms]
         self.sliding_aggregator = SlidingWindowAggregator(window_size=int(cfg.actor.throughput_window_size))
+
+        ## Sanity check for difficulty-aware penalty config
+        self.dap_cfg = self.cfg.actor.difficulty_aware_penalty
+        if self.dap_cfg and self.dap_cfg.enabled:
+            assert self.dap_cfg.gamma >= 0, (
+                f"difficulty_aware_penalty.gamma must be >= 0, got {self.dap_cfg.gamma}"
+            )
+            failure_scale = getattr(self.dap_cfg, "failure_scale", 1.0)
+            assert 0 <= failure_scale <= 1, (
+                f"difficulty_aware_penalty.failure_scale must be in [0, 1], got {failure_scale}"
+            )
+        
+        self.buffer_tokens = 0
+        self.max_completion_tokens = self.cfg.llm.parameters.get("max_completion_tokens", None)
 
         self.total_published_samples = 0
         self.total_submitted_groups = 0
@@ -610,6 +621,48 @@ class CubeActorLoop:
         )
         return reason
 
+    def length_penalty_adjustment(self, rollout_results):
+        # --- Difficulty-aware length penalty adjustment ---
+        # Reduces the overlong penalty for SUCCESSFUL rollouts on hard problems,
+        # so the model can reason longer when it actually leads to solving the problem.
+        # Failed overlong rollouts keep the full penalty (failure_scale=1.0)
+        # to discourage degenerate long generation that doesn't lead to solutions.
+        # Hard cap guard: sequences that hit max_tokens without finishing always
+        # get full penalty, even if the rollout is marked successful.
+        if (
+            self.is_training
+            and self.dap_cfg
+            and self.dap_cfg.enabled
+            and self.buffer_tokens > 0
+            and self.max_completion_tokens is not None
+        ):
+            group_solve_rate = sum(r.metrics.success for r in rollout_results) / len(rollout_results)
+            gamma = self.dap_cfg.gamma
+            failure_scale = getattr(self.dap_cfg, "failure_scale", 1.0)
+            success_scale = group_solve_rate ** gamma
+            buffer_tokens = self.buffer_tokens
+
+            for r in rollout_results:
+                rollout_scale = success_scale if r.metrics.success else failure_scale
+                metrics_delta = 0.0
+                for text in r.training_texts:
+                    # Hard cap guard: if the sequence hit max_tokens without
+                    # finishing, always apply full penalty regardless of success
+                    if text.output_tokens >= self.max_completion_tokens and not text.finished:
+                        scale = 1.0
+                    else:
+                        scale = rollout_scale
+                    original_penalty = length_penalty(self.max_completion_tokens, text.output_tokens, buffer_tokens)
+                    adjusted_penalty = original_penalty * scale
+                    penalty_delta = adjusted_penalty - original_penalty
+                    text.reward += penalty_delta
+                    metrics_delta += penalty_delta
+                r.metrics.reward += metrics_delta
+                r._penalty_delta = metrics_delta
+        else:
+            for r in rollout_results:
+                r._penalty_delta = 0.0
+
     def step(self) -> str:
         from pipelinerl.rollouts import RolloutResult
 
@@ -735,6 +788,8 @@ class CubeActorLoop:
                     attempts=self.attempts,
                     data_writer=self.data_writer,
                 )
+
+                self.length_penalty_adjustment(group_results)
 
                 self._run_finished_groups += 1
                 self.total_finished_groups += 1

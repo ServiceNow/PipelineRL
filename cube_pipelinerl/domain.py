@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Any, TYPE_CHECKING
 
+from omegaconf import DictConfig
 import ray
 from cube_pipelinerl.ray_worker_logging import (
     configure_ray_worker_logging,
@@ -190,6 +191,14 @@ def make_training_text(llm_tokenizer: Any, llm_call: LLMCall) -> TrainingText:
         visual_features=visual_features,
     )
 
+def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
+    """
+    Compute the overlong penalty
+    """
+    if sequence_length > (max_length - buffer_tokens) and sequence_length <= max_length:
+        return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
+    return 0.
+
 @ray.remote(max_restarts=0, max_task_retries=0)
 class CubeBenchmarkActor:
     """Cube benchmark lifecycle + rollout execution actor.
@@ -205,6 +214,8 @@ class CubeBenchmarkActor:
     def __init__(
         self,
         *,
+        # do not save the ref to the whole cfg
+        cfg: DictConfig,
         benchmark_cfg: dict,
         agent_cfg: dict,
         cube_name: str,
@@ -213,8 +224,6 @@ class CubeBenchmarkActor:
         seed: int,
         actor_name: str,
         ray_worker_log_collector: Any | None = None,
-        ray_worker_log_level: str = "ERROR",
-        litellm_log_level: str = "WARNING",
     ):
         self._benchmark_cfg = benchmark_cfg
         self._agent_cfg = agent_cfg
@@ -222,13 +231,15 @@ class CubeBenchmarkActor:
         self._seed = int(seed)
         self._actor_name = actor_name
         self._ray_worker_log_collector = ray_worker_log_collector
-        self._ray_worker_log_level = ray_worker_log_level
-        self._litellm_log_level = litellm_log_level
+
+        worker_log_level = str(getattr(cfg.actor, "ray_worker_log_level", "ERROR"))
+        worker_litellm_log_level = str(getattr(cfg.actor, "ray_worker_litellm_log_level", "WARNING"))
+
         configure_ray_worker_logging(
             actor_name=self._actor_name,
             log_collector=self._ray_worker_log_collector,
-            log_level=self._ray_worker_log_level,
-            litellm_log_level=self._litellm_log_level,
+            log_level=worker_log_level,
+            litellm_log_level=worker_litellm_log_level,
         )
 
         self._ready = False
@@ -243,6 +254,10 @@ class CubeBenchmarkActor:
         self._runtime_context = None
         self._container_backend = None
         self._llm_tokenizer = None
+
+        ## Optional config for extra reward
+        self._buffer_tokens = int(getattr(cfg.actor, "buffer_tokens", 0))
+        self._discount_factor = float(getattr(cfg.actor, "discount_factor", 1.0))
 
         self._train_dataset_names = train_dataset_names
         self._test_dataset_names = test_dataset_names
@@ -416,6 +431,21 @@ class CubeBenchmarkActor:
                     training_text.reward = step_reward
                     training_text.finished = finished
                     training_texts.append(training_text)
+
+
+        # Apply extra rewards
+        total_output_tokens = sum(getattr(c, "output_tokens", 0) for c in training_texts)
+        llm_parameters = llm.get("parameters", {})
+        max_completion_tokens = int(llm_parameters.get("max_completion_tokens", 0))
+        if self._discount_factor != 1.0:
+            for t in training_texts:
+                t.reward *= self._discount_factor ** total_output_tokens
+
+        # length penalty
+        if self._buffer_tokens and max_completion_tokens > 0:
+            len_reward = length_penalty(max_completion_tokens, total_output_tokens, self._buffer_tokens)
+            for t in training_texts:
+                t.reward += len_reward
 
         if not training_texts:
             logger.warning(
