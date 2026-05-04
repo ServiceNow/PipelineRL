@@ -12,12 +12,14 @@ USER_PROMPT_TEMPLATE = (
     "</think>\n\n"
     "<solution>\n"
     "[Your SEARCH/REPLACE edits using this format:]\n\n"
+    "```\n"
     "### filename.py\n"
     "<<<<<<< SEARCH\n"
     "[exact code to find]\n"
     "=======\n"
     "[replacement code]\n"
     ">>>>>>> REPLACE\n"
+    "```\n"
     "</solution>\n\n"
     "IMPORTANT REQUIREMENTS:\n"
     "- Every SEARCH/REPLACE edit must use the exact format above\n"
@@ -64,66 +66,51 @@ def parse_edits(completion: str) -> List[dict]:
     """
     Parse SEARCH/REPLACE blocks from a model completion.
 
-    Each code block must start with '### filepath' and contain exactly one
-    <<<<<<< SEARCH / ======= / >>>>>>> REPLACE triple.
+    Each block is a '### filepath' line followed by a
+    <<<<<<< SEARCH / ======= / >>>>>>> REPLACE triple. Triple-backtick code
+    fences around the block are accepted but not required.
     Returns a list of {'file_path', 'search', 'replace'} dicts.
     """
-    edits = []
-    code_blocks = _extract_code_blocks(completion)
+    edits: List[dict] = []
+    lines = completion.split('\n')
+    n = len(lines)
+    i = 0
+    while i < n:
+        if '<<<<<<< SEARCH' not in lines[i]:
+            i += 1
+            continue
 
-    for block in code_blocks:
-        edit = _parse_single_block(block)
-        if edit is not None:
-            edits.append(edit)
+        # Walk back to the most recent '### filepath' line, but don't cross a
+        # previous '>>>>>>> REPLACE' marker (that path belongs to an earlier edit).
+        file_path = None
+        for j in range(i - 1, -1, -1):
+            if '>>>>>>> REPLACE' in lines[j]:
+                break
+            stripped = lines[j].strip()
+            if stripped.startswith('###'):
+                file_path = stripped[3:].strip()
+                break
+        if not file_path:
+            i += 1
+            continue
 
+        search_start = i + 1
+        sep = replace_end = None
+        for k in range(search_start, n):
+            if sep is None and '=======' in lines[k]:
+                sep = k
+            elif sep is not None and '>>>>>>> REPLACE' in lines[k]:
+                replace_end = k
+                break
+
+        if sep is None or replace_end is None:
+            i += 1
+            continue
+
+        edits.append({
+            'file_path': file_path,
+            'search': '\n'.join(lines[search_start:sep]),
+            'replace': '\n'.join(lines[sep + 1:replace_end]),
+        })
+        i = replace_end + 1
     return edits
-
-
-def _extract_code_blocks(text: str) -> List[str]:
-    blocks = []
-    in_block = False
-    current: List[str] = []
-    for line in text.split('\n'):
-        if line.strip().startswith('```'):
-            if in_block:
-                blocks.append('\n'.join(current))
-                current = []
-            in_block = not in_block
-        elif in_block:
-            current.append(line)
-    return blocks
-
-
-def _parse_single_block(block: str) -> dict | None:
-    lines = block.split('\n')
-
-    file_path = None
-    start_idx = 0
-    for i, line in enumerate(lines):
-        if line.strip().startswith('###'):
-            file_path = line.strip()[3:].strip()
-            start_idx = i + 1
-            break
-
-    if not file_path:
-        return None
-
-    search_start = search_end = replace_start = replace_end = None
-    for i, line in enumerate(lines[start_idx:], start=start_idx):
-        if '<<<<<<< SEARCH' in line:
-            search_start = i + 1
-        elif '=======' in line and search_start is not None and search_end is None:
-            search_end = i
-            replace_start = i + 1
-        elif '>>>>>>> REPLACE' in line and replace_start is not None:
-            replace_end = i
-            break
-
-    if None in (search_start, search_end, replace_start, replace_end):
-        return None
-
-    return {
-        'file_path': file_path,
-        'search': '\n'.join(lines[search_start:search_end]),
-        'replace': '\n'.join(lines[replace_start:replace_end]),
-    }
