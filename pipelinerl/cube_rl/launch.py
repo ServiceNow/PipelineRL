@@ -135,6 +135,9 @@ def _init_ray_runtime(cfg: DictConfig, owner_name: str, min_num_cpus: int = 1) -
 def _launch_cube_benchmark_actors(
     cfg: DictConfig,
     instances: int,
+    llm: dict[str, Any],
+    test_llm: dict[str, Any] | None = None,
+    llm_router: Any | None = None,
     ray_worker_log_collector: Any | None = None,
 ) -> list[Any]:
     from omegaconf import OmegaConf
@@ -167,6 +170,9 @@ def _launch_cube_benchmark_actors(
             test_dataset_names=cfg.test_dataset_names,
             seed=seed,
             actor_name=actor_name,
+            llm=llm,
+            test_llm=test_llm,
+            llm_router=llm_router,
             ray_worker_log_collector=ray_worker_log_collector,
         )
         actors.append(actor)
@@ -283,7 +289,6 @@ class CubeActorLoop:
         stats_writer: StreamWriter,
         scheduler_name: str,
         is_training: bool,
-        llm_router: Any | None = None,
     ) -> None:
         self.cfg = cfg
         self.llms = llms
@@ -309,9 +314,6 @@ class CubeActorLoop:
         if self.rollout_timeout_s is not None:
             self.rollout_timeout_s = float(self.rollout_timeout_s)
         self.llm_kwargs = [_build_llm_kwargs(llm) for llm in llms]
-        if llm_router is not None:
-            for llm_kwargs in self.llm_kwargs:
-                llm_kwargs["router"] = llm_router
         self.sliding_aggregator = SlidingWindowAggregator(window_size=int(cfg.actor.throughput_window_size))
 
         ## Sanity check for difficulty-aware penalty config
@@ -537,7 +539,7 @@ class CubeActorLoop:
         benchmark_actor = self.benchmark_actors[benchmark_actor_index]
         next_llm = 0
         model_version = int(self.trainer_state.propagated_weight_version or 0)
-        ref = benchmark_actor.rollout.remote(task_id=task_id, llm=self.llm_kwargs[next_llm])
+        ref = benchmark_actor.rollout.remote(task_id=task_id)
         self._pending[ref] = PendingRollout(
             group_id=group_id,
             task_id=task_id,
@@ -917,29 +919,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     benchmark_actors: list[Any] = []
     vllm_router = None
     try:
-        benchmark_actors = _launch_cube_benchmark_actors(
-            cfg,
-            instances=benchmark_instances,
-            ray_worker_log_collector=ray_worker_log_collector,
-        )
-        health_timeout = float(getattr(cfg.actor, "cube_health_timeout", 600.0))
-        _wait_for_cube_benchmark_actors(benchmark_actors, timeout_s=health_timeout)
-
         wait_for_inference_servers(llm_urls)
-
-        train_task_ids = ray.get(benchmark_actors[0].get_train_task_ids.remote())
-        test_task_ids = ray.get(benchmark_actors[0].get_test_task_ids.remote())
-
-        if cfg.train_subset:
-            train_task_ids = train_task_ids[cfg.train_subset.begin : cfg.train_subset.end]
-        if cfg.test_subset:
-            test_task_ids = test_task_ids[cfg.test_subset.begin : cfg.test_subset.end]
-
-        if not train_task_ids:
-            raise ValueError("Cube benchmark returned an empty train task list")
-
-        logger.info("Loaded %d train task IDs", len(train_task_ids))
-        logger.info("Loaded %d test task IDs", len(test_task_ids))
 
         trainer_state = TrainerState(exp_path)
         if cfg.debug.mode:
@@ -958,6 +938,31 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         )
         ray_vllm_router = RayVLLMRouter(vllm_router)
         logger.info("Started cube vLLM router: %s", ray.get(vllm_router.snapshot.remote()))
+
+        benchmark_actors = _launch_cube_benchmark_actors(
+            cfg,
+            instances=benchmark_instances,
+            llm=_build_llm_kwargs(train_llms[0]),
+            test_llm=_build_llm_kwargs(test_llms[0]),
+            llm_router=ray_vllm_router,
+            ray_worker_log_collector=ray_worker_log_collector,
+        )
+        health_timeout = float(getattr(cfg.actor, "cube_health_timeout", 600.0))
+        _wait_for_cube_benchmark_actors(benchmark_actors, timeout_s=health_timeout)
+
+        train_task_ids = ray.get(benchmark_actors[0].get_train_task_ids.remote())
+        test_task_ids = ray.get(benchmark_actors[0].get_test_task_ids.remote())
+
+        if cfg.train_subset:
+            train_task_ids = train_task_ids[cfg.train_subset.begin : cfg.train_subset.end]
+        if cfg.test_subset:
+            test_task_ids = test_task_ids[cfg.test_subset.begin : cfg.test_subset.end]
+
+        if not train_task_ids:
+            raise ValueError("Cube benchmark returned an empty train task list")
+
+        logger.info("Loaded %d train task IDs", len(train_task_ids))
+        logger.info("Loaded %d test task IDs", len(test_task_ids))
 
         data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
         stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
@@ -979,7 +984,6 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 stats_writer=stats_writer,
                 scheduler_name="cube_train_scheduler",
                 is_training=True,
-                llm_router=ray_vllm_router,
             )
             test_loop = CubeActorLoop(
                 cfg=cfg,
@@ -990,7 +994,6 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 stats_writer=test_stats_writer,
                 scheduler_name="cube_test_scheduler",
                 is_training=False,
-                llm_router=ray_vllm_router,
             )
 
             last_regular_eval = -1

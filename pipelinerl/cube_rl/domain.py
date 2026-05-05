@@ -29,8 +29,17 @@ def _copy_model(obj: Any) -> Any:
         return obj.model_copy(deep=True)
     return obj
 
-def _configure_agent_llm(agent_config: Any, llm: dict) -> None:
+def _inherit_agent_llm_config(agent_config: Any, llm: dict, llm_router: Any | None) -> None:
     llm_config = getattr(agent_config, "llm_config")
+    if llm_router is not None:
+        from cube_harness.llm import RoutedLLMConfig
+
+        if not isinstance(llm_config, RoutedLLMConfig):
+            llm_config_data = llm_config.model_dump()
+            llm_config_data.pop("_type", None)
+            llm_config = RoutedLLMConfig(**llm_config_data)
+            setattr(agent_config, "llm_config", llm_config)
+        llm_config.router = llm_router
 
     ## main config
     llm_config.api_base = llm["base_url"]
@@ -38,7 +47,7 @@ def _configure_agent_llm(agent_config: Any, llm: dict) -> None:
         llm_config.api_base += "/v1"
 
     llm_config.api_key = "EMPTY"
-    llm_config.model_name = llm["served_model_name"] or llm["model_name"]
+    llm_config.model_name = llm.get("served_model_name") or llm["model_name"]
     if not llm_config.model_name.startswith("openai/"):
         llm_config.model_name = f"openai/{llm_config.model_name}"
 
@@ -54,17 +63,6 @@ def _configure_agent_llm(agent_config: Any, llm: dict) -> None:
             setattr(llm_config, param_name, param_value)
         else:
             logger.warning("Cube-harness Agent LLM parameters does not have attribute '%s', skipping", param_name)
-
-    router = llm.get("router")
-    if router is not None:
-        from cube_harness.llm import RoutedLLMConfig
-
-        if not isinstance(llm_config, RoutedLLMConfig):
-            llm_config_data = llm_config.model_dump()
-            llm_config_data.pop("_type", None)
-            llm_config = RoutedLLMConfig(**llm_config_data)
-            setattr(agent_config, "llm_config", llm_config)
-        llm_config.router = router
 
 def _resolve_task_dataset_name(benchmark_obj: Any, task_config: Any) -> str:
     task_metadata = None
@@ -217,7 +215,7 @@ class CubeBenchmarkActor:
     Interface:
     - setup()
     - get_task_ids()
-    - rollout(task_id, llm)
+    - rollout(task_id)
     - health()
     - close()
     """
@@ -234,6 +232,9 @@ class CubeBenchmarkActor:
         test_dataset_names: list[str],
         seed: int,
         actor_name: str,
+        llm: dict[str, Any],
+        test_llm: dict[str, Any] | None = None,
+        llm_router: Any | None = None,
         ray_worker_log_collector: Any | None = None,
     ):
         self._benchmark_cfg = benchmark_cfg
@@ -241,6 +242,9 @@ class CubeBenchmarkActor:
         self._cube_name = cube_name
         self._seed = int(seed)
         self._actor_name = actor_name
+        self._train_llm = llm
+        self._test_llm = test_llm or llm
+        self._llm_router = llm_router
         self._ray_worker_log_collector = ray_worker_log_collector
 
         worker_log_level = str(getattr(cfg.actor, "ray_worker_log_level", "ERROR"))
@@ -283,8 +287,13 @@ class CubeBenchmarkActor:
 
             self._runtime_context = getattr(benchmark_obj, "_runtime_context", None)
             self._container_backend = getattr(benchmark_obj, "container_backend", None)
-
             agent_cfg_template = hydra.utils.instantiate(self._agent_cfg)
+
+            from pipelinerl.llm import TrainableLLM
+
+            temp_llm = TrainableLLM(**self._train_llm)
+            temp_llm.load_tokenizer()
+            self._llm_tokenizer = temp_llm.tokenizer
 
             all_task_configs = list(benchmark_obj.get_task_configs())
 
@@ -295,15 +304,20 @@ class CubeBenchmarkActor:
             for task_config in all_task_configs:
                 task_id = task_config.task_id
                 dataset_name = _resolve_task_dataset_name(benchmark_obj, task_config)
+                use_train_llm = dataset_name in self._train_dataset_names or dataset_name == ""
+                use_test_llm = not use_train_llm and dataset_name in self._test_dataset_names
+                task_llm = self._test_llm if use_test_llm else self._train_llm
+                agent_config = _copy_model(agent_cfg_template)
+                _inherit_agent_llm_config(agent_config, task_llm, self._llm_router)
                 task_by_id[task_config.task_id] = {
                     "task_config": _copy_model(task_config),
-                    "agent_config": _copy_model(agent_cfg_template),
+                    "agent_config": agent_config,
                     "domain": self._cube_name,
                     "dataset": dataset_name if dataset_name else self._cube_name,
                 }
-                if dataset_name in self._train_dataset_names or dataset_name == "":
+                if use_train_llm:
                     self._train_task_ids.append(task_id)
-                elif dataset_name in self._test_dataset_names:
+                elif use_test_llm:
                     self._test_task_ids.append(task_id)
                 else:
                     logger.warning(
@@ -336,9 +350,7 @@ class CubeBenchmarkActor:
     def get_test_task_ids(self) -> list[str]:
         return self._test_task_ids
 
-    def rollout(self, task_id: str, llm: dict) -> dict:
-        from pipelinerl.llm import TrainableLLM
-
+    def rollout(self, task_id: str) -> dict:
         rollout_log_context = start_worker_rollout_log_context(str(task_id))
         try:
             if not self._ready:
@@ -346,22 +358,18 @@ class CubeBenchmarkActor:
             if task_id not in self._task_by_id:
                 raise KeyError(f"Unknown task_id: {task_id}")
 
-            if self._llm_tokenizer is None:
-                temp_llm = TrainableLLM(**llm)
-                temp_llm.load_tokenizer()
-                self._llm_tokenizer = temp_llm.tokenizer
-
             base_task = self._task_by_id[task_id]
             task = {
                 "task_config": _copy_model(base_task["task_config"]),
                 "agent_config": _copy_model(base_task["agent_config"]),
                 "domain": base_task.get("domain", None),
                 "dataset": base_task.get("dataset", None),
+                "max_completion_tokens": base_task.get("max_completion_tokens", 0),
                 "runtime_context": self._runtime_context,
                 "container_backend": self._container_backend,
             }
 
-            result = self._rollout(task=_copy_model(task), llm=llm)
+            result = self._rollout(task=_copy_model(task))
             return result.model_dump()
         except Exception:
             logger.exception("%s rollout failed for task_id=%s", self._actor_name, task_id)
@@ -369,7 +377,7 @@ class CubeBenchmarkActor:
         finally:
             reset_worker_rollout_log_context(rollout_log_context)
 
-    def _rollout(self, task: dict, llm: dict) -> RolloutResult:
+    def _rollout(self, task: dict) -> RolloutResult:
         from cube_harness.episode import Episode, MAX_STEPS
         from cube.core import EnvironmentOutput
         from cube_harness.core import AgentOutput, TerminationReason
@@ -378,7 +386,6 @@ class CubeBenchmarkActor:
 
         task_config = task["task_config"]
         agent_config = task["agent_config"]
-        _configure_agent_llm(agent_config, llm)
         validate_per_step = False
 
         ep = Episode(
@@ -446,13 +453,12 @@ class CubeBenchmarkActor:
 
         # Apply extra rewards
         total_output_tokens = sum(getattr(c, "output_tokens", 0) for c in training_texts)
-        llm_parameters = llm.get("parameters", {})
-        max_completion_tokens = int(llm_parameters.get("max_completion_tokens", 0))
         if self._discount_factor != 1.0:
             for t in training_texts:
                 t.reward *= self._discount_factor ** total_output_tokens
 
         # length penalty
+        max_completion_tokens = int(agent_config['llm_config'].get('max_completion_tokens', 0) or 0)
         if self._buffer_tokens and max_completion_tokens > 0:
             len_reward = length_penalty(max_completion_tokens, total_output_tokens, self._buffer_tokens)
             for t in training_texts:
