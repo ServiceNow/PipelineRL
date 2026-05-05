@@ -5,7 +5,7 @@ from omegaconf import DictConfig
 
 os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
-from cube_pipelinerl.launch import run_actor_loop_ray
+from pipelinerl.cube_rl.launch import run_actor_loop_ray
 from pipelinerl.compat import patch_litellm_context_window_exception_for_pickle
 from pipelinerl.utils import better_crashing
 

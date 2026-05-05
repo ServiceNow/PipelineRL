@@ -6,7 +6,7 @@ from typing import Any, TYPE_CHECKING
 
 from omegaconf import DictConfig
 import ray
-from cube_pipelinerl.ray_worker_logging import (
+from pipelinerl.cube_rl.ray_worker_logging import (
     configure_ray_worker_logging,
     reset_worker_rollout_log_context,
     start_worker_rollout_log_context,

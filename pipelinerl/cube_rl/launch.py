@@ -12,10 +12,10 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from cube_pipelinerl.domain import CubeBenchmarkActor, length_penalty
-from cube_pipelinerl.ray_worker_logging import CubeRayWorkerLogCollector
-from cube_pipelinerl.routing import RayVLLMRouter, VLLMRouterActor
-from cube_pipelinerl.utils import check_local_cube_actor_resources
+from pipelinerl.cube_rl.domain import CubeBenchmarkActor, length_penalty
+from pipelinerl.cube_rl.ray_worker_logging import CubeRayWorkerLogCollector
+from pipelinerl.cube_rl.routing import RayVLLMRouter, VLLMRouterActor
+from pipelinerl.cube_rl.utils import check_local_cube_actor_resources
 from pipelinerl.metrics import SlidingWindowAggregator
 
 if TYPE_CHECKING:
