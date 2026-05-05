@@ -62,7 +62,7 @@ def build_tool_definitions() -> list[dict]:
                     "required": ["code"],
                 },
             },
-        },
+        }
     ]
 
 
@@ -156,6 +156,7 @@ class _ToolContext:
     final_answer: str | None = None
     submitted_final_answer: bool = False
     num_python_calls: int = 0
+    last_python_result: str | None = None
 
 
 ToolHandler = Callable[[object, _ToolContext], Awaitable[None]]
@@ -177,6 +178,7 @@ async def _handle_run_python_code(tc, ctx: _ToolContext) -> None:
     code = args.get("code") or args.get("python_code", "")
     result = await execute_python_sandbox(code, ctx.sandbox_endpoint, ctx.sandbox_timeout)
     ctx.num_python_calls += 1
+    ctx.last_python_result = result
     ctx.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
 
@@ -276,6 +278,8 @@ async def generate_tir_rollout(
     max_model_len = int(cfg.vllm_config.vllm_kwargs.get("max_model_len", 32000))
     min_generation_tokens = 256
 
+    terminate_reason = None
+
     for _turn in range(agent_max_loops):
         prompt = Prompt(messages=list(messages), tools=tools)
 
@@ -293,6 +297,7 @@ async def generate_tir_rollout(
                 "Prompt length %d leaves only %d tokens for generation (max_model_len=%d), stopping loop",
                 prompt_len, remaining, max_model_len,
             )
+            terminate_reason = "token_limit"
             break
         max_tokens_this_turn = min(configured_max_tokens, remaining)
         if max_tokens_this_turn < configured_max_tokens:
@@ -305,6 +310,7 @@ async def generate_tir_rollout(
         llm_calls.append(llm_call)
 
         if not llm_call.output.tool_calls:
+            terminate_reason = "no_action"
             break
 
         assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
@@ -320,10 +326,18 @@ async def generate_tir_rollout(
         if ctx.submitted_final_answer:
             break
 
+
+    if _turn == agent_max_loops - 1:
+        terminate_reason = "max_loops"
+    else:
+        terminate_reason = terminate_reason or "done"
+
+    finished = terminate_reason == "done"
+
     if ctx.final_answer is not None:
         prediction = ctx.final_answer
-    elif ctx.num_python_calls > 0:
-        prediction = ctx.messages[-1].get('content', '')
+    elif ctx.last_python_result is not None:
+        prediction = ctx.last_python_result
     else:
         prediction = ""
 
@@ -363,7 +377,7 @@ async def generate_tir_rollout(
 
     training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     for text in training_texts:
-        text.finished = ctx.submitted_final_answer
+        text.finished = finished
 
     latency = time.perf_counter() - start
 
@@ -374,7 +388,7 @@ async def generate_tir_rollout(
         no_answer=answer_status == "no_answer",
         num_python_calls=ctx.num_python_calls,
         num_steps=len(llm_calls),
-        overflow=not ctx.submitted_final_answer,
+        overflow=not finished,
     )
 
     return RolloutResult(
