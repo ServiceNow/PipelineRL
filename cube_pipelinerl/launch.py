@@ -14,6 +14,7 @@ import ray
 
 from cube_pipelinerl.domain import CubeBenchmarkActor, length_penalty
 from cube_pipelinerl.ray_worker_logging import CubeRayWorkerLogCollector
+from cube_pipelinerl.routing import RayVLLMRouter, VLLMRouterActor
 from cube_pipelinerl.utils import check_local_cube_actor_resources
 from pipelinerl.metrics import SlidingWindowAggregator
 
@@ -282,6 +283,7 @@ class CubeActorLoop:
         stats_writer: StreamWriter,
         scheduler_name: str,
         is_training: bool,
+        llm_router: Any | None = None,
     ) -> None:
         self.cfg = cfg
         self.llms = llms
@@ -299,25 +301,17 @@ class CubeActorLoop:
         if self.llm_max_rollouts < 1:
             raise ValueError("actor.llm_max_rollouts must be >= 1")
         # CubeBenchmarkActor rollout is currently blocking/synchronous, so keep per-actor
-        # concurrency at one and scale by actor count.
+        # concurrency at one and scale by actor count. LLM load is controlled by
+        # per-generation leases in the shared router, not by actor-to-LLM pinning.
         self.cube_actor_max_rollouts = 1
-        self.cube_actors_per_llm = self.llm_max_rollouts
-        expected_benchmark_actors = len(llms) * self.cube_actors_per_llm
-        if len(benchmark_actors) != expected_benchmark_actors:
-            raise ValueError(
-                f"Expected {expected_benchmark_actors} benchmark actors "
-                f"({len(llms)} llms * {self.cube_actors_per_llm} actors/llm), got {len(benchmark_actors)}"
-            )
-
-        self._llm_to_actor_indices = [
-            [llm_idx * self.cube_actors_per_llm + offset for offset in range(self.cube_actors_per_llm)]
-            for llm_idx in range(len(self.llms))
-        ]
-        self.max_pending = max(1, len(llms) * self.llm_max_rollouts)
+        self.max_pending = max(1, len(benchmark_actors))
         self.rollout_timeout_s = getattr(cfg.actor, "rollout_timeout", None)
         if self.rollout_timeout_s is not None:
             self.rollout_timeout_s = float(self.rollout_timeout_s)
         self.llm_kwargs = [_build_llm_kwargs(llm) for llm in llms]
+        if llm_router is not None:
+            for llm_kwargs in self.llm_kwargs:
+                llm_kwargs["router"] = llm_router
         self.sliding_aggregator = SlidingWindowAggregator(window_size=int(cfg.actor.throughput_window_size))
 
         ## Sanity check for difficulty-aware penalty config
@@ -362,10 +356,10 @@ class CubeActorLoop:
         self._trainer_version_to_publish: int | None = None
 
         logger.info(
-            "%s: initialized actor pools with %d llms, %d actors/llm, actor max rollouts=%d, llm max rollouts=%d",
+            "%s: initialized global actor pool with %d llms, %d benchmark actors, actor max rollouts=%d, vllm max inflight/server=%d",
             self.scheduler_name,
             len(self.llms),
-            self.cube_actors_per_llm,
+            len(self.benchmark_actors),
             self.cube_actor_max_rollouts,
             self.llm_max_rollouts,
         )
@@ -374,8 +368,8 @@ class CubeActorLoop:
     def is_running(self) -> bool:
         return self._is_running
 
-    def _select_benchmark_actor_index_for_llm(self, llm_index: int) -> int | None:
-        actor_indices = self._llm_to_actor_indices[llm_index]
+    def _select_benchmark_actor_index(self) -> int | None:
+        actor_indices = range(len(self.benchmark_actors))
         available_indices = [
             idx for idx in actor_indices if self._active_rollouts_by_actor[idx] < self.cube_actor_max_rollouts
         ]
@@ -534,14 +528,14 @@ class CubeActorLoop:
         self.init_stats()
 
     def _submit_one_rollout(self, *, group_id: int, task_id: str, rollout_index: int) -> bool:
-        next_llm = self._active_rollouts.index(min(self._active_rollouts))
-        if self._active_rollouts[next_llm] >= self.llm_max_rollouts:
+        if sum(self._active_rollouts_by_actor) >= len(self.benchmark_actors):
             return False
 
-        benchmark_actor_index = self._select_benchmark_actor_index_for_llm(next_llm)
+        benchmark_actor_index = self._select_benchmark_actor_index()
         if benchmark_actor_index is None:
             return False
         benchmark_actor = self.benchmark_actors[benchmark_actor_index]
+        next_llm = 0
         model_version = int(self.trainer_state.propagated_weight_version or 0)
         ref = benchmark_actor.rollout.remote(task_id=task_id, llm=self.llm_kwargs[next_llm])
         self._pending[ref] = PendingRollout(
@@ -896,9 +890,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     if llm_max_rollouts < 1:
         raise ValueError("actor.llm_max_rollouts must be >= 1")
     cube_actor_max_rollouts = 1
-    cube_actors_per_llm = llm_max_rollouts
-
-    benchmark_instances = len(llm_urls) * cube_actors_per_llm
+    benchmark_instances = len(llm_urls) * llm_max_rollouts
     actor_num_cpus = float(getattr(cfg.actor, "cube_actor_num_cpus", 1.0))
     required_ray_cpus = max(1, int(math.ceil(benchmark_instances * actor_num_cpus)))
     check_local_cube_actor_resources(
@@ -911,20 +903,19 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     ray_worker_log_collector = _launch_ray_worker_log_collector(cfg)
 
     logger.info(
-        "Cube actor scheduler uses llm_max_rollouts=%d; derived actors_per_llm=%d with fixed actor_max_rollouts=%d",
+        "Cube actor scheduler uses llm_max_rollouts=%d as per-vLLM generation capacity with fixed actor_max_rollouts=%d",
         llm_max_rollouts,
-        cube_actors_per_llm,
         cube_actor_max_rollouts,
     )
 
     logger.info(
-        "Launching %d cube benchmark actors for %d llm urls (actors_per_llm=%d, actor_num_cpus=%.2f)",
+        "Launching %d cube benchmark actors for %d llm urls (actor_num_cpus=%.2f)",
         benchmark_instances,
         len(llm_urls),
-        cube_actors_per_llm,
         actor_num_cpus,
     )
     benchmark_actors: list[Any] = []
+    vllm_router = None
     try:
         benchmark_actors = _launch_cube_benchmark_actors(
             cfg,
@@ -961,6 +952,12 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         actor_model_path = finetune_model_path if finetune_model_path.exists() else Path(cfg.model_path)
         train_llms = _build_train_llms(cfg, llm_urls, actor_model_path)
         test_llms = _build_test_llms(cfg, llm_urls, actor_model_path)
+        vllm_router = VLLMRouterActor.remote(
+            [_build_llm_kwargs(llm) for llm in train_llms],
+            max_inflight_per_server=llm_max_rollouts,
+        )
+        ray_vllm_router = RayVLLMRouter(vllm_router)
+        logger.info("Started cube vLLM router: %s", ray.get(vllm_router.snapshot.remote()))
 
         data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
         stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
@@ -982,6 +979,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 stats_writer=stats_writer,
                 scheduler_name="cube_train_scheduler",
                 is_training=True,
+                llm_router=ray_vllm_router,
             )
             test_loop = CubeActorLoop(
                 cfg=cfg,
@@ -992,6 +990,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 stats_writer=test_stats_writer,
                 scheduler_name="cube_test_scheduler",
                 is_training=False,
+                llm_router=ray_vllm_router,
             )
 
             last_regular_eval = -1
@@ -1056,6 +1055,12 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 logger.info("Killed Ray worker log collector")
             except Exception:
                 logger.exception("Failed to kill Ray worker log collector")
+        if vllm_router is not None:
+            try:
+                ray.kill(vllm_router, no_restart=True)
+                logger.info("Killed cube vLLM router")
+            except Exception:
+                logger.exception("Failed to kill cube vLLM router")
         if should_shutdown_ray and ray.is_initialized():
             try:
                 ray.shutdown()

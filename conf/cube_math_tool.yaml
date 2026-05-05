@@ -69,7 +69,7 @@ cube_params:
   agent:
     _target_: cube_harness.agents.tir.TirAgentConfig
     llm_config:
-      _target_: cube_harness.llm.LLMConfig
+      _target_: cube_harness.llm.RoutedLLMConfig
       model_name: ${vllm_config.vllm_kwargs.served_model_name}
       num_retries: 20
       extra_body:

@@ -55,6 +55,17 @@ def _configure_agent_llm(agent_config: Any, llm: dict) -> None:
         else:
             logger.warning("Cube-harness Agent LLM parameters does not have attribute '%s', skipping", param_name)
 
+    router = llm.get("router")
+    if router is not None:
+        from cube_harness.llm import RoutedLLMConfig
+
+        if not isinstance(llm_config, RoutedLLMConfig):
+            llm_config_data = llm_config.model_dump()
+            llm_config_data.pop("_type", None)
+            llm_config = RoutedLLMConfig(**llm_config_data)
+            setattr(agent_config, "llm_config", llm_config)
+        llm_config.router = router
+
 def _resolve_task_dataset_name(benchmark_obj: Any, task_config: Any) -> str:
     task_metadata = None
     benchmark_task_metadata = getattr(benchmark_obj, "task_metadata", None)
