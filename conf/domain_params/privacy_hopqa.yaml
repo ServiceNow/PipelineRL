@@ -1,5 +1,9 @@
 annotations_path: ${oc.env:PRIVACY_AGENT_ANNOTATIONS_PATH,.privacy_agent/inputs/annotations_2026-04-06.json}
 curated_path: ${oc.env:PRIVACY_AGENT_CURATED_PATH,.privacy_agent/inputs/curated_chains.jsonl}
+final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-05.jsonl}
+final_train_dataset_path: ${oc.env:PRIVACY_HOPQA_TRAIN_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/train.jsonl}
+final_val_dataset_path: ${oc.env:PRIVACY_HOPQA_VAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/val.jsonl}
+final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/test.jsonl}
 sample_size: 20
 max_examples: null
 task_data_root: ${oc.env:PRIVACY_AGENT_TASK_DATA_ROOT,.privacy_agent/inputs/tasks}

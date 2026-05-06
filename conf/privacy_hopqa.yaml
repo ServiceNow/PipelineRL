@@ -15,7 +15,7 @@ dataset_loader: pipelinerl.domains.privacy_hopqa.dataset.load_problems
 dataset_loader_params: ${privacy_hopqa}
 
 train_dataset_names:
-  - seed20
+  - ${privacy_hopqa.final_train_dataset_path}
 
 test_dataset_names:
-  - seed20
+  - ${privacy_hopqa.final_val_dataset_path}

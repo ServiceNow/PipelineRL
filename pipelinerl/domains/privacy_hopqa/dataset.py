@@ -9,6 +9,10 @@ from .paths import DEFAULT_ANNOTATIONS_PATH, DEFAULT_CURATED_CHAINS_PATH
 DOMAIN_NAME = "privacy_hopqa"
 DEFAULT_DATASET_NAME = "seed20"
 DEFAULT_SAMPLE_SIZE = 20
+DEFAULT_FINAL_DATASET_PATH = (
+    "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
+    "privacy_hopqa_finalized_2026-05-05.jsonl"
+)
 
 
 def _load_json(path: str | Path) -> Any:
@@ -63,6 +67,8 @@ def _flatten_problem(row: dict, idx: int, dataset_name: str) -> dict:
                 "hop_type": hop.get("hop_type"),
                 "question": hop.get("question", ""),
                 "answer": hop.get("answer", ""),
+                "accepted_answer_variants": list(hop.get("accepted_answer_variants") or [hop.get("answer", "")]),
+                "alternate_valid_answers": list(hop.get("alternate_valid_answers") or []),
                 "doc_id": hop.get("doc_id"),
             }
         )
@@ -80,6 +86,8 @@ def _flatten_problem(row: dict, idx: int, dataset_name: str) -> dict:
         "numbered_questions": chain.get("numbered_questions", ""),
         "global_question": chain.get("global_question", ""),
         "global_answer": chain.get("global_answer", ""),
+        "global_answer_variants": list(chain.get("global_answer_variants") or [chain.get("global_answer", "")]),
+        "global_alternate_valid_answers": list(chain.get("global_alternate_valid_answers") or []),
         "hops": hops,
         "n_hops": len(hops),
         "expected_doc_ids": [hop["doc_id"] for hop in hops if hop.get("doc_id")],
@@ -132,6 +140,7 @@ def load_problems(
     seed: int | None = None,
     annotations_path: str | Path | None = DEFAULT_ANNOTATIONS_PATH,
     curated_path: str | Path | None = DEFAULT_CURATED_CHAINS_PATH,
+    final_dataset_path: str | Path | None = DEFAULT_FINAL_DATASET_PATH,
     sample_size: int = DEFAULT_SAMPLE_SIZE,
     max_examples: int | None = None,
     **_: Any,
@@ -153,24 +162,27 @@ def load_problems(
             loaded = _load_from_materialized_jsonl(dataset_path)
         else:
             normalized_name = str(dataset_name).strip()
-            if normalized_name not in {DEFAULT_DATASET_NAME, "accepted20", "privacy_hopqa_seed20", "privacy_agent_seed20"}:
+            if normalized_name in {"final", "privacy_hopqa_final", "final1001"}:
+                loaded = _load_from_materialized_jsonl(final_dataset_path or DEFAULT_FINAL_DATASET_PATH)
+            elif normalized_name not in {DEFAULT_DATASET_NAME, "accepted20", "privacy_hopqa_seed20", "privacy_agent_seed20"}:
                 raise ValueError(
                     f"Unsupported privacy_hopqa dataset '{dataset_name}'. "
-                    f"Use '{DEFAULT_DATASET_NAME}' or pass a materialized JSONL file."
+                    f"Use '{DEFAULT_DATASET_NAME}', 'final', or pass a materialized JSONL file."
                 )
-            annotations_file, curated_file = _ensure_seed20_sources_exist(
-                annotations_path=annotations_path,
-                curated_path=curated_path,
-            )
-            selected_rows = _iter_selected_curated_rows(
-                annotations_path=annotations_file,
-                curated_path=curated_file,
-                sample_size=sample_size,
-            )
-            loaded = [
-                _flatten_problem(row=row, idx=next_id + offset, dataset_name=normalized_name)
-                for offset, row in enumerate(selected_rows)
-            ]
+            else:
+                annotations_file, curated_file = _ensure_seed20_sources_exist(
+                    annotations_path=annotations_path,
+                    curated_path=curated_path,
+                )
+                selected_rows = _iter_selected_curated_rows(
+                    annotations_path=annotations_file,
+                    curated_path=curated_file,
+                    sample_size=sample_size,
+                )
+                loaded = [
+                    _flatten_problem(row=row, idx=next_id + offset, dataset_name=normalized_name)
+                    for offset, row in enumerate(selected_rows)
+                ]
 
         for problem in loaded:
             if "id" not in problem:

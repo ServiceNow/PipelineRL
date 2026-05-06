@@ -32,18 +32,28 @@ def token_f1_score(predicted: str | None, truth: str | None) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def answers_match(predicted: str | None, truth: str | None, f1_threshold: float = 0.75) -> tuple[bool, float]:
+def _accepted_list(primary: str | None, variants: list | tuple | None = None, alternates: list | tuple | None = None) -> list[str]:
+    values: list[str] = []
+    for value in [primary, *(variants or []), *(alternates or [])]:
+        text = "" if value is None else str(value)
+        if text and normalize_answer(text) not in {normalize_answer(existing) for existing in values}:
+            values.append(text)
+    return values
+
+
+def answers_match(predicted: str | None, truth: str | list[str] | tuple[str, ...] | None, f1_threshold: float = 0.75) -> tuple[bool, float]:
+    del f1_threshold
     pred = normalize_answer(predicted)
-    gold = normalize_answer(truth)
-    if not pred or not gold:
-        score = float(pred == gold)
+    golds = list(truth) if isinstance(truth, (list, tuple)) else [truth]
+    normalized_golds = [normalize_answer(gold) for gold in golds if normalize_answer(gold)]
+    if not pred or not normalized_golds:
+        score = float(pred == "" and not normalized_golds)
         return bool(score), score
 
-    if pred == gold or gold in pred or pred in gold:
+    if pred in normalized_golds:
         return True, 1.0
 
-    score = token_f1_score(pred, gold)
-    return score >= f1_threshold, score
+    return False, 0.0
 
 
 def score_chain_answers(
@@ -57,14 +67,19 @@ def score_chain_answers(
     for hop in hops:
         hop_num = str(hop["hop_number"])
         predicted = answers.get(hop_num, "")
-        truth = hop.get("answer", "")
-        correct, match_score = answers_match(predicted, truth, f1_threshold=f1_threshold)
+        accepted_answers = _accepted_list(
+            hop.get("answer", ""),
+            hop.get("accepted_answer_variants"),
+            hop.get("alternate_valid_answers"),
+        )
+        correct, match_score = answers_match(predicted, accepted_answers, f1_threshold=f1_threshold)
         correct_count += int(correct)
         per_hop.append(
             {
                 "hop": int(hop_num),
                 "agent_answer": predicted,
-                "ground_truth": truth,
+                "ground_truth": hop.get("answer", ""),
+                "accepted_answers": accepted_answers,
                 "correct": correct,
                 "match_score": match_score,
                 "doc_id": hop.get("doc_id"),
@@ -73,9 +88,14 @@ def score_chain_answers(
 
     total_hops = max(len(hops), 1)
     final_key = "FINAL" if "FINAL" in answers else str(len(hops))
+    final_accepted_answers = _accepted_list(
+        problem.get("global_answer", ""),
+        problem.get("global_answer_variants"),
+        problem.get("global_alternate_valid_answers"),
+    )
     final_correct, final_match_score = answers_match(
         answers.get(final_key, ""),
-        problem.get("global_answer", ""),
+        final_accepted_answers,
         f1_threshold=f1_threshold,
     )
     chain_complete = all(answers.get(str(hop["hop_number"])) not in ("", "NOT_FOUND", None) for hop in hops)
@@ -89,6 +109,7 @@ def score_chain_answers(
         "reward": reward,
         "final_correct": final_correct,
         "final_match_score": final_match_score,
+        "final_accepted_answers": final_accepted_answers,
         "chain_complete": chain_complete,
         "f1_threshold": f1_threshold,
     }
