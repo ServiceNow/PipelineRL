@@ -438,7 +438,13 @@ Each resumed job must still use a fresh `world.run_id` (the new job's ID, not th
 
 ### 1. Container image
 
-Use image `registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis` — it bundles the redis server. In `~/.research-interactive-env`:
+To **use**: reference the prebuilt image
+```
+registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis
+```
+It bundles the redis server.
+
+To **build** (from the [`ServiceNow/research-interactive-toolkit`](https://github.com/ServiceNow/research-interactive-toolkit/tree/fml/pytorch_vllm014rc1) repo, branch `fml/pytorch_vllm014rc1` — SN-internal, link is gated): set `~/.research-interactive-env` and run the toolkit's build target.
 
 ```shell
 USE_ACCOUNT_REPO := 1
@@ -447,7 +453,7 @@ IMAGE_REVISION := 25.12-py3-vllm014rc1redis
 EAI_PROFILE := yul201
 ```
 
-The image is built from the `fml/pytorch_vllm014rc1` branch of [`ServiceNow/research-interactive-toolkit`](https://github.com/ServiceNow/research-interactive-toolkit/tree/fml/pytorch_vllm014rc1) (SN-internal repo). Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the toolkit branch adds vLLM 0.14.0rc1, redis, and the EAI helpers.
+Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the toolkit branch layers on vLLM 0.14.0rc1, redis, and the EAI helpers.
 
 ### 2. Clone + venv + editable installs
 

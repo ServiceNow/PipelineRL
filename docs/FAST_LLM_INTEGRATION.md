@@ -54,11 +54,15 @@ There is **no CI specific to the fast-llm path**. Unit tests in `tests/` exercis
 
 ### Image
 
-`registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis`
+**To use**, reference the prebuilt image directly:
 
-The image bundles the redis server (used by `streams=redis`).
+```
+registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis
+```
 
-Built from the `fml/pytorch_vllm014rc1` branch of [`ServiceNow/research-interactive-toolkit`](https://github.com/ServiceNow/research-interactive-toolkit/tree/fml/pytorch_vllm014rc1) (SN-internal repo, link is gated). Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the branch layers on vLLM 0.14.0rc1, redis, and the EAI helpers. To use it, set `~/.research-interactive-env`:
+It bundles the redis server (used by `streams=redis`).
+
+**To build it yourself** (e.g. when bumping the PyTorch / vLLM version — see open question 6 below): clone the [`ServiceNow/research-interactive-toolkit`](https://github.com/ServiceNow/research-interactive-toolkit/tree/fml/pytorch_vllm014rc1) repo (SN-internal, link is gated), check out branch `fml/pytorch_vllm014rc1`, then set `~/.research-interactive-env` and run the toolkit's build target:
 
 ```shell
 USE_ACCOUNT_REPO := 1
@@ -66,6 +70,8 @@ BASE_IMAGE := nvcr.io/nvidia/pytorch:25.12-py3
 IMAGE_REVISION := 25.12-py3-vllm014rc1redis
 EAI_PROFILE := yul201
 ```
+
+Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the branch layers on vLLM 0.14.0rc1, redis, and the EAI helpers.
 
 ### Steps
 
