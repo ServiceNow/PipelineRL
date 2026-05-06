@@ -29,17 +29,8 @@ def _copy_model(obj: Any) -> Any:
         return obj.model_copy(deep=True)
     return obj
 
-def _inherit_agent_llm_config(agent_config: Any, llm: dict, llm_router: Any | None) -> None:
+def set_agent_llm_config(agent_config: Any, llm: dict) -> None:
     llm_config = getattr(agent_config, "llm_config")
-    if llm_router is not None:
-        from cube_harness.llm import RoutedLLMConfig
-
-        if not isinstance(llm_config, RoutedLLMConfig):
-            llm_config_data = llm_config.model_dump()
-            llm_config_data.pop("_type", None)
-            llm_config = RoutedLLMConfig(**llm_config_data)
-            setattr(agent_config, "llm_config", llm_config)
-        llm_config.router = llm_router
 
     ## main config
     llm_config.api_base = llm["base_url"]
@@ -48,6 +39,7 @@ def _inherit_agent_llm_config(agent_config: Any, llm: dict, llm_router: Any | No
 
     llm_config.api_key = "EMPTY"
     llm_config.model_name = llm.get("served_model_name") or llm["model_name"]
+    llm_config.tokenizer_name = llm.get("tokenizer_name", llm_config.model_name)
     if not llm_config.model_name.startswith("openai/"):
         llm_config.model_name = f"openai/{llm_config.model_name}"
 
@@ -308,7 +300,7 @@ class CubeBenchmarkActor:
                 use_test_llm = not use_train_llm and dataset_name in self._test_dataset_names
                 task_llm = self._test_llm if use_test_llm else self._train_llm
                 agent_config = _copy_model(agent_cfg_template)
-                _inherit_agent_llm_config(agent_config, task_llm, self._llm_router)
+                set_agent_llm_config(agent_config, task_llm)
                 task_by_id[task_config.task_id] = {
                     "task_config": _copy_model(task_config),
                     "agent_config": agent_config,
@@ -364,7 +356,6 @@ class CubeBenchmarkActor:
                 "agent_config": _copy_model(base_task["agent_config"]),
                 "domain": base_task.get("domain", None),
                 "dataset": base_task.get("dataset", None),
-                "max_completion_tokens": base_task.get("max_completion_tokens", 0),
                 "runtime_context": self._runtime_context,
                 "container_backend": self._container_backend,
             }
@@ -386,6 +377,10 @@ class CubeBenchmarkActor:
 
         task_config = task["task_config"]
         agent_config = task["agent_config"]
+
+        agent_llm_config = getattr(agent_config, "llm_config")
+        agent_llm_config.router = self._llm_router
+
         validate_per_step = False
 
         ep = Episode(
@@ -458,7 +453,7 @@ class CubeBenchmarkActor:
                 t.reward *= self._discount_factor ** total_output_tokens
 
         # length penalty
-        max_completion_tokens = int(agent_config['llm_config'].get('max_completion_tokens', 0) or 0)
+        max_completion_tokens = int(getattr(agent_llm_config, 'max_completion_tokens', 0))
         if self._buffer_tokens and max_completion_tokens > 0:
             len_reward = length_penalty(max_completion_tokens, total_output_tokens, self._buffer_tokens)
             for t in training_texts:
