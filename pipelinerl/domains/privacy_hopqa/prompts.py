@@ -66,8 +66,9 @@ Recent Document-Reading Results For This Hop:
 {retry_block}
 
 Plan up to {max_parallel_retrieval_actions} retrieval actions that would best help answer the CURRENT hop.
-- These actions will retrieve candidate documents that may then be selected and read to answer the current hop
-- Think first about how to search for the necessary information, then return the retrieval actions
+These actions will retrieve candidate documents that may then be selected and read to answer the current hop.
+Think first about how to search for the necessary information, then return the retrieval actions.
+
 - It is good to try different phrasings in parallel when useful
 - Avoid exact repeats of recent searches unless you are intentionally refining them
 - Use only these action types: {', '.join(action_types)}
