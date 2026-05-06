@@ -6,8 +6,7 @@ defaults:
 
 seed: 42
 
-# use FP32 for lm_head computation in both training and inference.
-fp32_lm_head: true
+# layer name prefix for FP32 output-head computation.
 fp32_layer_prefix: "lm_head"  # "lm_head" | "output" | "embed_out" | "head"
 
 finetune:
@@ -58,7 +57,6 @@ test_llm:
     top_k: 50
 
 vllm_config:
-  quantization: null  # or bf16_last_layer_fp32
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
