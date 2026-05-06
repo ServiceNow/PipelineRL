@@ -350,6 +350,17 @@ PipelineRL is organized as a modular, Hydra-driven pipeline with 6 core componen
     - Pull a batch → call `rl_step(...)` (in `pipelinerl/finetune/rl/utils.py`) to compute policy-gradient (+ KL penalty if configured) → `optimizer.step()` → `lr_scheduler.step()`.
     - On rank 0, use `WeightUpdateManager.send_weight_update(version)` to gather model parameters, send `WeightUpdateRequest` to Actor LLMs (HTTP), broadcast tensors via NCCL, and write a `WeightUpdateSuccess` message to the update stream.
 
+#### Fast-LLM trainer path (preview)
+
+When `use_fast_llm: true` (default in `conf/math.yaml`), the DeepSpeed ZeRO-3 trainer above is replaced with [Fast-LLM](https://github.com/ServiceNow/Fast-LLM) (FSDP + sequence-data-parallel) and the per-step weight update over HTTP is replaced with a persistent NCCL broadcast group:
+
+- Trainer: `fast_llm train gpt` launched via torchrun (`pipelinerl/launch.py:run_finetune`); rank 0 also serves the broadcast `TCPStore`.
+- Fast-LLM's `StreamingTrainerCallback` gathers full-precision weights after each optimizer step and broadcasts them on a persistent NCCL group whose name is `WEIGHTS_BROADCAST_PG_NAME`.
+- vLLM workers join the same group via `vllm1.init_actor_update_group(...)` and copy parameters into the model in place.
+- Coordinated NCCL teardown (`pipelinerl/vllm1.py:484-547`) listens to a `training_finished` redis xadd from the trainer and destroys the process group on the vLLM side so `dist.destroy_process_group()` doesn't hang.
+
+This path is **WIP** — see [`docs/FAST_LLM_INTEGRATION.md`](docs/FAST_LLM_INTEGRATION.md) for known issues, configuration knobs, and example interactive-job scripts.
+
 ### 6. Verifier
 - Entrypoint: `pipelinerl/entrypoints/verifier.py`
 - Serves a FastAPI app with:
@@ -421,16 +432,25 @@ python -m pipelinerl.launch ... 'world.run_id=${MASTER_ADDR}'
 
 Each resumed job must still use a fresh `world.run_id` (the new job's ID, not the original one), so the pod IP exchange directory is always clean.
 
-# Install FastLLM+PipilineRL
-- use ` registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis` image which also includes redis server. In `~/.research-interactive-env`:
+# Install FastLLM+PipelineRL
+
+> **Status (2026-05-06):** This integration is WIP — see [`docs/FAST_LLM_INTEGRATION.md`](docs/FAST_LLM_INTEGRATION.md) for the full handover (architecture, known issues, TODO).
+
+### 1. Container image
+
+Use image `registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis` — it bundles the redis server. In `~/.research-interactive-env`:
+
 ```shell
 USE_ACCOUNT_REPO := 1
-BASE_IMAGE :=nvcr.io/nvidia/pytorch:25.12-py3
+BASE_IMAGE := nvcr.io/nvidia/pytorch:25.12-py3
 IMAGE_REVISION := 25.12-py3-vllm014rc1redis
 EAI_PROFILE := yul201
 ```
- 
-- in running interactive instance run like this to install both Fast-LLM and PipelineRL into the same `venv` locates at PipelineRL repo folder
+
+### 2. Clone + venv + editable installs
+
+Inside a running interactive instance, install both Fast-LLM and PipelineRL into a single venv at `PipelineRL/.venv`:
+
 ```shell
 git clone git@github.com:ServiceNow/Fast-LLM.git
 git clone git@github.com:ServiceNow/PipelineRL.git
@@ -440,14 +460,22 @@ cd PipelineRL
 source .venv/bin/activate
 export PIP_CONSTRAINT=""
 
+# Fast-LLM: GSPO branch is the one paired with the PipelineRL fast-llm branch
 cd ../Fast-LLM
 git submodule update --init --recursive
-git checkout jlp_pipeline_rl
+git checkout gspo
 pip install --no-cache-dir --no-build-isolation -e ".[CORE,OPTIONAL,HUGGINGFACE,SSM,VISION,GENERATION,STREAMING,DEV]" triton==3.5.1
 
+# PipelineRL: fast-llm branch
 cd ../PipelineRL
 git checkout fast-llm
 pip install --no-cache-dir -e ".[lora]"
 ```
+
+### 3. Known caveats
+
+- **`pyproject.toml:81-87`** — `[tool.uv]` overrides `transformers>=4.51.0` and `accelerate>=1.7.0` because `tapeagents==0.1.16` pins them lower; the `[tapeagents]` extra is **broken at runtime** until tapeagents bumps support. Track this as a TODO; do not enable `[tapeagents]` on the fast-llm path.
+- **`PIP_CONSTRAINT=""`** is required — the toolkit image sets a constraint file that conflicts with our pinned versions.
+- **Triton must be `==3.5.1`** — newer triton breaks the fast-llm GSPO kernels.
 
 
