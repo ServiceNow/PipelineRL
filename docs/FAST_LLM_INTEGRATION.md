@@ -253,41 +253,12 @@ Fast-LLM side (passed as `+fast_llm.<path>=value`):
 ### Reward lag vs DeepSpeed — lower `actor/reward_mean`
 
 - **Symptom:** Even with exact `grpo_new_logprobs` parity (DS step 50 = -0.105, fast-llm step 50 = -0.103), fast-llm's `actor/reward_mean` lags DS by 2–3 EMA points throughout training. By step 400, fast-llm's `no_answer_mean` is **51× DS** (3.1% vs 0.06%).
-- **Root cause (suspected):** Data pipeline staleness. DS uses `streams=files` (disk I/O paces actor vs trainer); fast-llm uses `streams=redis` with `maxlen=1_000_000` and no backpressure. Trainer consumes stale rollouts → model drifts toward longer chains-of-thought without converging to clean final answers.
-- **Investigations to try:**
-  - Implement `FileStreamingDataset` for fast-llm (mirror `RedisStreamingDataset`).
-  - Add redis backpressure via `+finetune.max_lag=N`.
-  - Run multiple seeds to bound stochastic variance.
+- **Root cause:** Unknown. The trained model receives identical gradients (newlp parity verified), so the gap is upstream of the trainer — most likely in the data pipeline or in run-to-run sampling variance. Needs investigation, not a known fix.
 - **Memory file:** `project_fastllm_reward_lag_after_gspo_fix.md`.
 
-### <a id="streams-files-not-supported"></a>`streams=files` not supported with `use_fast_llm=true`
+### <a id="streams-files-not-supported"></a>Current limitation: `streams=files` is not implemented for `use_fast_llm=true`
 
-- Fast-LLM only ships `RedisStreamingDataset`. Switching to files needs a new `FileStreamingDataset` class plus launcher branching on `cfg.streams.backend`.
-- **Memory file:** `project_streams_files_not_supported_fast_llm.md`.
-
-### Synchronized completion cascade — rollout stalls
-
-- **Symptom:** Periodic stall waves where `Running` queue depth in vLLM drops to 0 then surges (e.g. 74 → 245 active during a freeze).
-- **Root cause:** All N sequences in a batch start together after a stall and complete together → vLLM HTTP server builds N JSON responses synchronously holding the event loop; `process_b` then processes them back-to-back holding the GIL.
-- **Fix options:** async post-processing in `process_b`, vLLM streaming mode, or paced request dispatch.
-- **Memory file:** `project_stall_investigation.md`.
-
-### Data pipeline `xreadgroup(count=1)` inefficiency
-
-- **Site:** Fast-LLM `fast_llm/data/dataset/streaming.py:156-161` (`count=1`).
-- **Symptom:** As the model learns, sequences shorten (170 → 67 tokens/sample) and the trainer makes 2.5× more redis calls per MB of data. CPU time on the dataset thread grows.
-- **Fix:** change `count=1` → `count=16`.
-- **Memory file:** `project_data_pipeline_analysis.md`.
-
-### Fast-LLM step progress heartbeat missing
-
-- The fast-llm trainer doesn't log per-microbatch progress during a long step. Looks indistinguishable from a hang. Need a ~10 s periodic log from rank 0 in `fast_llm/engine/training/runner.py` showing `microbatches_done/total`.
-- **Memory file:** `project_fastllm_step_progress_logging.md`.
-
-### Data logging stash (Fast-LLM-side)
-
-- A diagnostic patch (`debug.log_data_pipeline` flag) that logs xreadgroup timings and per-stream depth is stashed at `/home/toolkit/fast_llm_data_logging_stash.patch`. Useful for debugging the redis backpressure issue but not yet committed.
-- **Memory file:** `project_data_logging_stash.md`.
+Not a bug, just a current limitation: Fast-LLM only ships `RedisStreamingDataset`, so this branch requires `streams=redis`. If you launch with `use_fast_llm=true streams=files` you'll get an error from the launcher. **Memory file:** `project_streams_files_not_supported_fast_llm.md`.
 
 ## 9. Testing
 
@@ -367,7 +338,5 @@ For shutdown semantics, **always** SIGINT the launch process (don't `kill -9` th
 ## 12. Open questions / decisions for the successor
 
 1. **Fix or compensate the actor overshoot?** Cleanest is to make the trainer signal "done" instead of the actor computing a target. Workaround is a constant safety multiplier in `actor.py:613`.
-2. **Implement `streams=files` for fast-llm or push redis backpressure?** Files mirror DS; backpressure is a smaller change. Decision affects whether the reward-lag investigation needs new code.
+2. **Reward lag root cause.** Need to identify where the gap comes from before deciding whether it's worth fixing on this branch.
 3. **Should the GSPO loss math fix (Fast-LLM PR #502) be merged before this PipelineRL PR?** Yes — this PR pins to the `gspo` branch by name; once `gspo` merges to Fast-LLM `main` we should rev this branch's install instructions to use `main`.
-4. **Step progress heartbeat — Fast-LLM side or PipelineRL side?** Belongs in Fast-LLM (rank 0 log every ~10 s in `runner.py`). Cheap to add.
-5. **Are the integration tests sufficient for CI, or do we want a reduced multi-node smoke that runs on a 2-GPU host?** Currently no CI exercises the broadcast path; this is the biggest gap.
