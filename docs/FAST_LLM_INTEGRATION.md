@@ -293,6 +293,18 @@ Both should hit the trainer's "Reached final step 2, stopping" / "Saving checkpo
 | fast-llm GSPO | `59f3b62f` | 0.166 | 0.173 | -0.171 | -0.162 | 0 |
 | DeepSpeed PPO | `084ef7d8` | 0.201 | 0.247 | -0.162 | -0.146 | 0 |
 
+### 400-step training curves: fast-llm GSPO vs DeepSpeed GSPO
+
+Comparing fast-llm `math_7b_4node_fastllm_gspo_20260505_122944` (the divisor² + SDP fix run) against DeepSpeed `math_7b_ds_fastllm_4node_20260428_135427` (matching GSPO config: `policy_loss=gspo`, `epsilon_low=3e-3`, 400 steps).
+
+**`new_logprobs` — fast-llm matches DS step-by-step** (the GSPO loss math fix is correct):
+
+![new_logprobs fast-llm vs DS](images/new_logprobs.png)
+
+**`actor/reward_mean` — fast-llm lags DS by ~2 points at step 400** (the open issue, root cause unknown):
+
+![reward_mean fast-llm vs DS](images/reward_mean.png)
+
 ## 10. Operations
 
 ### Where logs live
@@ -340,3 +352,5 @@ For shutdown semantics, **always** SIGINT the launch process (don't `kill -9` th
 1. **Fix or compensate the actor overshoot?** Cleanest is to make the trainer signal "done" instead of the actor computing a target. Workaround is a constant safety multiplier in `actor.py:613`.
 2. **Reward lag root cause.** Need to identify where the gap comes from before deciding whether it's worth fixing on this branch.
 3. **Should the GSPO loss math fix (Fast-LLM PR #502) be merged before this PipelineRL PR?** Yes — this PR pins to the `gspo` branch by name; once `gspo` merges to Fast-LLM `main` we should rev this branch's install instructions to use `main`.
+4. **Resolve the commented-out `pyproject.toml` overrides** (`pyproject.toml:81-87`). The `[tool.uv]` block force-overrides `transformers>=4.51.0` / `accelerate>=1.7.0` because `tapeagents==0.1.16` pins them lower; the `[tapeagents]` extra is broken at runtime as a result. Either bump tapeagents (when upstream supports newer libs) or drop the extra altogether on this branch.
+5. **Metric coverage gap on the fast-llm finetune side.** DS's finetune emits a richer set under `rl/*` — including `rl/ess` (effective sample size), `rl/loss`, `rl/ratio_ref_*`, `rl/clamp_log_ratio_*_indicator`, etc. Fast-llm currently emits `training.grpo_*` (ratio, kl, advantage, entropy, num_tokens, clipped fraction) but is missing several DS-side metrics. Diff the two metric sets and add the missing ones (start with `ess` — useful for diagnosing data/policy drift).
