@@ -447,6 +447,8 @@ IMAGE_REVISION := 25.12-py3-vllm014rc1redis
 EAI_PROFILE := yul201
 ```
 
+The image is built from the `fml/pytorch_vllm014rc1` branch of [`ServiceNow/research-interactive-toolkit`](https://github.com/ServiceNow/research-interactive-toolkit/tree/fml/pytorch_vllm014rc1) (SN-internal repo). Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the toolkit branch adds vLLM 0.14.0rc1, redis, and the EAI helpers.
+
 ### 2. Clone + venv + editable installs
 
 Inside a running interactive instance, install both Fast-LLM and PipelineRL into a single venv at `PipelineRL/.venv`:
