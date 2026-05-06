@@ -32,6 +32,12 @@ def build_hop_plan_prompt(
         task_context = f"Task Context:\n{task_context}\n"
 
     action_types = ["local_document_search"] if no_web else ["web_search", "local_document_search"]
+    initial_retrieval_guidance = (
+        "Recent search history and document-reading results are empty, so return at least one retrieval action. "
+        "Returning [] would leave the agent with no candidate documents to read."
+        if not (search_history or recent_reader_results)
+        else "Return [] only if the existing search history or document-reading results are enough for the next step and no additional retrieval is needed."
+    )
     retry_block = ""
     if retry_guidance:
         retry_block = f"""
@@ -60,9 +66,13 @@ Recent Document-Reading Results For This Hop:
 {retry_block}
 
 Plan up to {max_parallel_retrieval_actions} retrieval actions that would best help answer the CURRENT hop.
+- These actions will retrieve candidate documents that may then be selected and read to answer the current hop
+- Think first about how to search for the necessary information, then return the retrieval actions
 - It is good to try different phrasings in parallel when useful
 - Avoid exact repeats of recent searches unless you are intentionally refining them
 - Use only these action types: {', '.join(action_types)}
+- web_search searches online web pages
+- local_document_search searches local company files
 - Do not plan analysis, URL fetches, downloads, or enterprise tools
 
 Return a JSON array of actions in this format:
@@ -76,7 +86,7 @@ Return a JSON array of actions in this format:
   }}
 ]
 
-If no useful retrieval action remains, return [].
+{initial_retrieval_guidance}
 Return valid JSON only.
 """
 
