@@ -32,21 +32,6 @@ def build_hop_plan_prompt(
         task_context = f"Task Context:\n{task_context}\n"
 
     action_types = ["local_document_search"] if no_web else ["web_search", "local_document_search"]
-    local_search_guidance = """
-Action Type Meanings:
-- local_document_search searches the private/local task corpus for the named company. Use it for internal company-specific facts such as inventory, compliance, finance, infrastructure, policies, and operational details.
-"""
-    if not no_web:
-        local_search_guidance += (
-            "- web_search searches public/web evidence. Use it for public facts, laws, programs, states, public datasets, and non-company-specific facts.\n"
-        )
-    empty_history = not (search_history or recent_reader_results)
-    empty_plan_guidance = (
-        "Because this hop has no search history and no document-reading results yet, you MUST return 1 to "
-        f"{max_parallel_retrieval_actions} concrete retrieval actions. Do not return [] on the first planning attempt."
-        if empty_history
-        else "If prior retrieval attempts for this hop have clearly exhausted useful options, return []."
-    )
     retry_block = ""
     if retry_guidance:
         retry_block = f"""
@@ -80,20 +65,18 @@ Plan up to {max_parallel_retrieval_actions} retrieval actions that would best he
 - Use only these action types: {', '.join(action_types)}
 - Do not plan analysis, URL fetches, downloads, or enterprise tools
 
-{local_search_guidance}
-
 Return a JSON array of actions in this format:
 [
   {{
-    "type": "local_document_search",
-    "description": "Search local company documents for ...",
+    "type": "web_search",
+    "description": "Search for ...",
     "parameters": {{"query": "..."}},
     "priority": 0.8,
     "expected_output": "Candidate evidence for the current hop"
   }}
 ]
 
-{empty_plan_guidance}
+If no useful retrieval action remains, return [].
 Return valid JSON only.
 """
 
