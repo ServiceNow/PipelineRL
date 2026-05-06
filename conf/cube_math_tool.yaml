@@ -31,7 +31,6 @@ test_llm:
     max_completion_tokens: 16000
     temperature: 1.0
     top_p: 0.95
-    top_k: 50
 
 vllm_config:
   vllm_kwargs:
@@ -71,6 +70,7 @@ cube_params:
     llm_config:
       _target_: cube_harness.llm.RoutedLLMConfig
       model_name: ${vllm_config.vllm_kwargs.served_model_name}
+      tokenizer_name: ${model_path}
       timeout: 3600.0
       num_retries: 1
       extra_body:
