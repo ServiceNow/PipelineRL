@@ -303,18 +303,18 @@ pytest tests/test_actor_error_handling.py         # rollout retry
 
 These run on 1-3 GPUs (the helpers spawn TP=1 or TP=2 vLLM engines plus a fake trainer).
 
-### Multi-node smoke (4-node, 2-step)
+### 4-node test results
 
-For a quick verification that everything launches, edit one of the `submit_eai_*.sh` scripts to set `max_train_steps=2` and `train_iters=2` (fast-llm only) and submit it (see §"How to launch" below). Both should hit the trainer's "Reached final step 2, stopping" / "Saving checkpoint at iteration 2" log line within ~10 minutes of `RUNNING`. Revert the values back to 400 before committing.
+#### 2-step smoke (last verified 2026-05-06)
 
-### Last verified (2026-05-06)
+Quick "everything launches" verification — temporarily set `max_train_steps=2` (and `train_iters=2` for fast-llm) in the submit script, launch, and look for the trainer's "Reached final step 2, stopping" / "Saving checkpoint at iteration 2" log line within ~10 minutes of `RUNNING`. Revert to 400 before committing.
 
-| Smoke | Job ID | Step 1 grad_norm | Step 2 grad_norm | Step 1 newlp | Step 2 newlp | NaN |
+| Smoke | EAI Job | Step 1 grad_norm | Step 2 grad_norm | Step 1 newlp | Step 2 newlp | NaN |
 |---|---|---|---|---|---|---|
 | fast-llm GSPO | `59f3b62f` | 0.166 | 0.173 | -0.171 | -0.162 | 0 |
 | DeepSpeed PPO | `084ef7d8` | 0.201 | 0.247 | -0.162 | -0.146 | 0 |
 
-### 400-step training curves: fast-llm GSPO vs DeepSpeed GSPO
+#### 400-step training curves: fast-llm GSPO vs DeepSpeed GSPO
 
 Comparing fast-llm `math_7b_4node_fastllm_gspo_20260505_122944` (the divisor² + SDP fix run) against DeepSpeed `math_7b_ds_fastllm_4node_20260428_135427` (matching GSPO config: `policy_loss=gspo`, `epsilon_low=3e-3`, 400 steps).
 
@@ -326,41 +326,42 @@ Comparing fast-llm `math_7b_4node_fastllm_gspo_20260505_122944` (the divisor² +
 
 ![reward_mean fast-llm vs DS](images/reward_mean.png)
 
-### Personalize before running
+### How to run 4-node tests
 
-Both the example scripts and the production submit launchers default to Denis's setup. Before running, override these env vars (or edit the defaults in the scripts) to your own:
+#### Personalize
+
+Both submit launchers default to Denis's setup. Before running, override these env vars (or edit the defaults at the top of each script):
 
 | Env var | Default | What it is |
 |---|---|---|
 | `RESULTS_DIR` | `/mnt/shared/denis/math_7b_results` | Where outputs / checkpoints / logs land. Must be on a shared NFS readable by every node. |
 | `WANDB_ENTITY` | `denisko-se` | Your wandb entity (user or org). |
 | `WANDB_PROJECT` | `watermelon` | Your wandb project. |
-| `EAI_HOME_DATA` | `snow.home.denis_kocetkov` | Your EAI home data object (mounted at `/home/toolkit` inside the container). Submit-only. |
-| `EAI_SHARED_DATA` | `snow.research.afm.shared_fml` | Your shared NFS data object (mounted at `/mnt/shared`). Submit-only. |
+| `EAI_HOME_DATA` | `snow.home.denis_kocetkov` | Your EAI home data object (mounted at `/home/toolkit` inside the container). |
+| `EAI_SHARED_DATA` | `snow.research.afm.shared_fml` | Your shared NFS data object (mounted at `/mnt/shared`). |
 | `MODEL_PATH` | `/home/toolkit/Qwen2.5-7B` | Path to the base model checkpoint inside the container. |
-
-All five env vars apply to both `submit_eai_*.sh` scripts.
 
 The handover doc and PR description also mention `denisko-se/watermelon` runs and `/mnt/shared/denis/math_7b_results/` paths — those are pointers to Denis's historical runs and stay as-is for traceability; you don't need to edit them, just point your own runs to your own places.
 
-### Reproduction recipes
+#### Reproduction scripts
 
-The two `submit_eai_*.sh` scripts in the repo root are the canonical reproduction recipes for the charts above. Each submits a 4-replica × 8-GPU EAI batch job and matches the historical run config byte-for-byte.
+Two production launchers in the repo root reproduce the chart-baseline runs byte-for-byte. Each submits a 4-replica × 8-GPU EAI batch job.
 
 | Script | What it reproduces |
 |---|---|
 | [`submit_eai_math_7b_multinode.sh`](../submit_eai_math_7b_multinode.sh) | Fast-llm GSPO 400-step run — produced `math_7b_4node_fastllm_gspo_20260505_122944` (the chart's fast-llm curve). |
 | [`submit_eai_math_7b_multinode_ds_fastllm_branch.sh`](../submit_eai_math_7b_multinode_ds_fastllm_branch.sh) | DS GSPO 400-step run — produced `math_7b_ds_fastllm_4node_20260428_135427` (the chart's DS curve). |
 
-### How to launch
+#### Launch
 
 You launch these from inside an interactive EAI dev session (see §"Launching an interactive EAI dev session" above) — that's the dev/console environment. Each `bash submit_eai_*.sh 4` call submits a *separate* 4-node EAI batch job that runs the actual training; your interactive session is just the launch console and stays free.
 
 Prereqs:
+
 1. Fast-LLM + PipelineRL installed in a shared venv — see [§3 End-to-end install → "Steps"](#3-end-to-end-install) above (clones both repos, checks out `gspo` and `fast-llm` branches, editable-installs).
 2. `eai` CLI authenticated. Run `eai login` once if it isn't already.
 3. Wandb credentials configured for the entity in `WANDB_ENTITY` (`~/.netrc` or `wandb login`).
-4. The personalization env vars from §"Personalize before running" exported (or edit the defaults in the script).
+4. The personalization env vars above exported (or edit the defaults in the script).
 5. A 7B base model checkpoint at the path `MODEL_PATH` points to (default `/home/toolkit/Qwen2.5-7B`).
 
 ```bash
