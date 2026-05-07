@@ -73,16 +73,18 @@ EAI_PROFILE := yul201
 
 Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the branch layers on vLLM 0.14.0rc1, redis, and the EAI helpers.
 
-### Launching an interactive EAI job (prereq for the example scripts)
+### Launching an interactive EAI dev session
 
-The example scripts under `examples/interactive/` are meant to be run **from inside an interactive EAI session that has 4 nodes attached**. To start such a session:
+Interactive jobs are single-replica dev environments (typically 1-2 GPUs) — they're for editing code, running tests, and submitting production multi-node training jobs *from inside them*. They are **not** the 4-node training environment themselves.
 
-1. Clone the toolkit repo (one-time): `git clone git@github.com:ServiceNow/research-interactive-toolkit.git ~/code/research-interactive-toolkit`. For the vLLM 0.14.0rc1 image, check out branch `fml/pytorch_vllm014rc1`; for the future-bumped image, use whichever branch builds it.
-2. Configure `~/.research-interactive-env` per the block above (selects image revision and EAI profile).
-3. Launch and attach with VSCode Remote-SSH (full instructions in the toolkit README — `make launch`, then `eai job ls` to find your job, then connect via Remote-SSH).
-4. Inside the running interactive container, follow [§3 End-to-end install](#3-end-to-end-install) above to clone Fast-LLM + PipelineRL into the venv, then `bash examples/interactive/{fast_llm,ds}_4node.sh`.
+To start one:
 
-For multi-node interactive jobs (4 nodes × 8 GPUs needed for the chart-reproducing runs), bump `GPU`, `CPU`, `MEM` and add `--replicas 4` semantics in `~/.research-interactive-env` per the toolkit README's multi-replica instructions.
+1. Clone the toolkit repo (one-time): `git clone git@github.com:ServiceNow/research-interactive-toolkit.git ~/code/research-interactive-toolkit`. For the vLLM 0.14.0rc1 image, check out branch `fml/pytorch_vllm014rc1`.
+2. Configure `~/.research-interactive-env` per the block above (selects image revision and EAI profile, plus `CPU`/`GPU`/`MEM` for the dev environment — typically modest, e.g. `GPU := 2`).
+3. From the toolkit repo, run `make launch` and attach via VSCode Remote-SSH (full instructions in the toolkit README).
+4. Inside the running interactive container, follow [§3 End-to-end install](#3-end-to-end-install) → "Steps" to clone Fast-LLM + PipelineRL into the venv. From there you can submit 4-node training jobs with `bash submit_eai_math_7b_multinode.sh 4` (etc.) — see §"How to launch" below.
+
+The 4-node training jobs run in their own EAI batch jobs (not in your interactive session). You only need the interactive session as the launch console / dev env.
 
 ### Steps
 
@@ -303,14 +305,7 @@ These run on 1-3 GPUs (the helpers spawn TP=1 or TP=2 vLLM engines plus a fake t
 
 ### Multi-node smoke (4-node, 2-step)
 
-The interactive scripts under `examples/interactive/` run a 2-step smoke against the GSPO config (fast-llm) or the PPO config (DeepSpeed):
-
-```bash
-bash examples/interactive/fast_llm_4node.sh   # fast-llm + vLLM v1 + GSPO
-bash examples/interactive/ds_4node.sh         # DeepSpeed + vLLM v1 + PPO
-```
-
-Both should hit the trainer's "Reached final step 2, stopping" / "Saving checkpoint at iteration 2" log line within ~10 minutes of `RUNNING`. See those scripts for the prereqs and success criteria.
+For a quick verification that everything launches, edit one of the `submit_eai_*.sh` scripts to set `max_train_steps=2` and `train_iters=2` (fast-llm only) and submit it (see §"How to launch" below). Both should hit the trainer's "Reached final step 2, stopping" / "Saving checkpoint at iteration 2" log line within ~10 minutes of `RUNNING`. Revert the values back to 400 before committing.
 
 ### Last verified (2026-05-06)
 
@@ -344,35 +339,32 @@ Both the example scripts and the production submit launchers default to Denis's 
 | `EAI_SHARED_DATA` | `snow.research.afm.shared_fml` | Your shared NFS data object (mounted at `/mnt/shared`). Submit-only. |
 | `MODEL_PATH` | `/home/toolkit/Qwen2.5-7B` | Path to the base model checkpoint inside the container. |
 
-The two `EAI_*_DATA` knobs only matter for the `submit_eai_*.sh` scripts (they're passed to `eai job new --data`); the `examples/interactive/*.sh` scripts run inside an existing session and use whatever's already mounted.
+All five env vars apply to both `submit_eai_*.sh` scripts.
 
 The handover doc and PR description also mention `denisko-se/watermelon` runs and `/mnt/shared/denis/math_7b_results/` paths — those are pointers to Denis's historical runs and stay as-is for traceability; you don't need to edit them, just point your own runs to your own places.
 
 ### Reproduction recipes
 
-Two paths depending on whether you have an interactive EAI session running or want to submit a batch job:
+The two `submit_eai_*.sh` scripts in the repo root are the canonical reproduction recipes for the charts above. Each submits a 4-replica × 8-GPU EAI batch job and matches the historical run config byte-for-byte.
 
-| Where you run from | Script (in this repo) | What it does |
-|---|---|---|
-| **Inside interactive 4-node EAI session** | [`examples/interactive/fast_llm_4node.sh`](../examples/interactive/fast_llm_4node.sh) | Reproduces fast-llm side of the charts at `MAX_TRAIN_STEPS=400` (defaults to 2 for smoke). |
-| **Inside interactive 4-node EAI session** | [`examples/interactive/ds_4node.sh`](../examples/interactive/ds_4node.sh) | Reproduces DS GSPO side of the charts at `MAX_TRAIN_STEPS=400` (defaults to 2 for smoke). |
-| **Submit as standalone EAI batch job** | [`submit_eai_math_7b_multinode.sh`](../submit_eai_math_7b_multinode.sh) | Production fast-llm GSPO launcher. Calls `eai job new --replicas 4`. The exact script that produced `math_7b_4node_fastllm_gspo_20260505_122944` (the chart's fast-llm run). |
-| **Submit as standalone EAI batch job** | [`submit_eai_math_7b_multinode_ds_fastllm_branch.sh`](../submit_eai_math_7b_multinode_ds_fastllm_branch.sh) | Production DS GSPO launcher (DS trainer + vLLM v1, GSPO loss). The exact script that produced `math_7b_ds_fastllm_4node_20260428_135427` (the chart's DS run). |
+| Script | What it reproduces |
+|---|---|
+| [`submit_eai_math_7b_multinode.sh`](../submit_eai_math_7b_multinode.sh) | Fast-llm GSPO 400-step run — produced `math_7b_4node_fastllm_gspo_20260505_122944` (the chart's fast-llm curve). |
+| [`submit_eai_math_7b_multinode_ds_fastllm_branch.sh`](../submit_eai_math_7b_multinode_ds_fastllm_branch.sh) | DS GSPO 400-step run — produced `math_7b_ds_fastllm_4node_20260428_135427` (the chart's DS curve). |
 
-The `examples/interactive/*.sh` scripts are byte-equivalent to the `submit_eai_*.sh` ones modulo (a) they don't call `eai job new` (you supply your own session) and (b) defaults are smoke-friendly (`MAX_TRAIN_STEPS=2`). Override `MAX_TRAIN_STEPS=400` to reproduce the charts.
+### How to launch
 
-### How to launch (prereqs + commands)
-
-#### Path 1: production EAI batch job (recommended for full 400-step runs)
+You launch these from inside an interactive EAI dev session (see §"Launching an interactive EAI dev session" above) — that's the dev/console environment. Each `bash submit_eai_*.sh 4` call submits a *separate* 4-node EAI batch job that runs the actual training; your interactive session is just the launch console and stays free.
 
 Prereqs:
-1. `eai` CLI installed and authenticated on the machine you'll launch from. Run `eai login` once if it isn't already.
-2. Wandb credentials configured for the entity in `WANDB_ENTITY` (`~/.netrc` or `wandb login`).
-3. The personalization env vars from §"Personalize before running" exported (or edit the defaults in the script).
-4. A 7B base model checkpoint at the path `MODEL_PATH` points to (default `/home/toolkit/Qwen2.5-7B` — adjust if you cloned it somewhere else).
+1. Fast-LLM + PipelineRL installed in a shared venv — see [§3 End-to-end install → "Steps"](#3-end-to-end-install) above (clones both repos, checks out `gspo` and `fast-llm` branches, editable-installs).
+2. `eai` CLI authenticated. Run `eai login` once if it isn't already.
+3. Wandb credentials configured for the entity in `WANDB_ENTITY` (`~/.netrc` or `wandb login`).
+4. The personalization env vars from §"Personalize before running" exported (or edit the defaults in the script).
+5. A 7B base model checkpoint at the path `MODEL_PATH` points to (default `/home/toolkit/Qwen2.5-7B`).
 
 ```bash
-# fast-llm GSPO (32 GPUs, ~9-14 h wall clock for 400 steps)
+# fast-llm GSPO (4 replicas × 8 GPUs = 32 GPUs total, ~9-14 h wall clock for 400 steps)
 bash submit_eai_math_7b_multinode.sh 4
 
 # DS GSPO (same compute footprint)
@@ -381,25 +373,7 @@ bash submit_eai_math_7b_multinode_ds_fastllm_branch.sh 4
 
 Each call returns a job ID and queues a 4-replica × 8-GPU EAI job. The job creates `${RESULTS_DIR}/${EXP_NAME}/` with `launch.log`, `finetune/stdout_node*.log`, `actor/info.log`, `actor_vllm_*/{stdout,stderr}.log`, and a `wandb_config.yaml` with the resumable wandb run id. WandB run name is set via `+wandb.wandb_run_name=...` and includes the timestamp.
 
-To monitor: `eai job logs <job-id>` or tail the log files directly on the shared NFS mount. To stop early: `eai job kill <job-id>` (sends SIGINT — orchestrator does the coordinated NCCL teardown).
-
-#### Path 2: interactive EAI session (recommended for smoke / dev)
-
-Prereqs:
-1. Launch and attach to a 4-node interactive session — see §"Launching an interactive EAI job" above.
-2. Inside the session, install Fast-LLM + PipelineRL — see §3 "End-to-end install" → "Steps".
-3. Same personalization env vars as Path 1 (no `EAI_*_DATA` needed — those are submit-only).
-
-```bash
-# 2-step smoke (~10 min) to verify everything launches cleanly
-bash examples/interactive/fast_llm_4node.sh
-
-# Full 400-step chart-reproducing run
-MAX_TRAIN_STEPS=400 bash examples/interactive/fast_llm_4node.sh
-
-# Same for the DS GSPO baseline
-bash examples/interactive/ds_4node.sh                  # smoke
-MAX_TRAIN_STEPS=400 bash examples/interactive/ds_4node.sh   # full
+To monitor: `eai job logs <job-id>` or tail the log files directly on the shared NFS mount (`/mnt/shared/...`). To stop early: `eai job kill <job-id>` (sends SIGINT — orchestrator does the coordinated NCCL teardown).
 
 ## 10. Operations
 
