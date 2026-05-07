@@ -7,7 +7,15 @@
 # Run `eai login` before executing this script.
 
 IMAGE="registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis"
-RESULTS_DIR="/mnt/shared/denis/math_7b_results"
+
+# === PERSONALIZE THESE BEFORE RUNNING (or override via env vars) ===
+RESULTS_DIR="${RESULTS_DIR:-/mnt/shared/denis/math_7b_results}"          # your shared NFS results dir
+WANDB_ENTITY="${WANDB_ENTITY:-denisko-se}"                                # your wandb entity
+WANDB_PROJECT="${WANDB_PROJECT:-watermelon}"                              # your wandb project
+EAI_HOME_DATA="${EAI_HOME_DATA:-snow.home.denis_kocetkov}"                # your EAI home data object
+EAI_SHARED_DATA="${EAI_SHARED_DATA:-snow.research.afm.shared_fml}"        # your shared NFS data object
+# ===================================================================
+
 MODEL_PATH="${MODEL_PATH:-/home/toolkit/Qwen2.5-7B}"
 NODES="${1:-4}"
 TIMESTAMP="${2:-$(date +%Y%m%d_%H%M%S)}"
@@ -47,8 +55,8 @@ PYTHONHASHSEED=42 python -m pipelinerl.launch \
   '+finetune.rl.filter_zero_advantage_groups=true' \
   eval_every_n_versions=0 \
   wandb.wandb_workspace_root=${RESULTS_DIR} \
-  wandb.wandb_entity_name=denisko-se \
-  wandb.wandb_project_name=watermelon \
+  "wandb.wandb_entity_name=${WANDB_ENTITY}" \
+  "wandb.wandb_project_name=${WANDB_PROJECT}" \
   wandb.wandb_group=eai_math7b_fastllm_gspo \
   '+wandb.wandb_run_name=math7b_fastllm_gspo_${NODES}node_${TIMESTAMP}' \
   'vllm_config.vllm_kwargs.gpu-memory-utilization=0.85' \
@@ -109,8 +117,8 @@ eai job new \
   --mem 800 \
   --name "$JOB_NAME" \
   -i "$IMAGE" \
-  --data "snow.home.denis_kocetkov:/home/toolkit:rw" \
-  --data "snow.research.afm.shared_fml:/mnt/shared:rw" \
+  --data "${EAI_HOME_DATA}:/home/toolkit:rw" \
+  --data "${EAI_SHARED_DATA}:/mnt/shared:rw" \
   --env "HOME=/home/toolkit" \
   --env "GPUS_PER_NODE=8" \
   --env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" \

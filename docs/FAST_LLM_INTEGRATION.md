@@ -331,6 +331,23 @@ Comparing fast-llm `math_7b_4node_fastllm_gspo_20260505_122944` (the divisor² +
 
 ![reward_mean fast-llm vs DS](images/reward_mean.png)
 
+### Personalize before running
+
+Both the example scripts and the production submit launchers default to Denis's setup. Before running, override these env vars (or edit the defaults in the scripts) to your own:
+
+| Env var | Default | What it is |
+|---|---|---|
+| `RESULTS_DIR` | `/mnt/shared/denis/math_7b_results` | Where outputs / checkpoints / logs land. Must be on a shared NFS readable by every node. |
+| `WANDB_ENTITY` | `denisko-se` | Your wandb entity (user or org). |
+| `WANDB_PROJECT` | `watermelon` | Your wandb project. |
+| `EAI_HOME_DATA` | `snow.home.denis_kocetkov` | Your EAI home data object (mounted at `/home/toolkit` inside the container). Submit-only. |
+| `EAI_SHARED_DATA` | `snow.research.afm.shared_fml` | Your shared NFS data object (mounted at `/mnt/shared`). Submit-only. |
+| `MODEL_PATH` | `/home/toolkit/Qwen2.5-7B` | Path to the base model checkpoint inside the container. |
+
+The two `EAI_*_DATA` knobs only matter for the `submit_eai_*.sh` scripts (they're passed to `eai job new --data`); the `examples/interactive/*.sh` scripts run inside an existing session and use whatever's already mounted.
+
+The handover doc and PR description also mention `denisko-se/watermelon` runs and `/mnt/shared/denis/math_7b_results/` paths — those are pointers to Denis's historical runs and stay as-is for traceability; you don't need to edit them, just point your own runs to your own places.
+
 ### Reproduction recipes
 
 Two paths depending on whether you have an interactive EAI job or want to submit a batch job:
