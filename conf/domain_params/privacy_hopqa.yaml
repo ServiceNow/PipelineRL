@@ -1,6 +1,6 @@
 annotations_path: ${oc.env:PRIVACY_AGENT_ANNOTATIONS_PATH,.privacy_agent/inputs/annotations_2026-04-06.json}
 curated_path: ${oc.env:PRIVACY_AGENT_CURATED_PATH,.privacy_agent/inputs/curated_chains.jsonl}
-final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-05.jsonl}
+final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-07_answer_variants.jsonl}
 final_train_dataset_path: ${oc.env:PRIVACY_HOPQA_TRAIN_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/train.jsonl}
 final_val_dataset_path: ${oc.env:PRIVACY_HOPQA_VAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/val.jsonl}
 final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/test.jsonl}
@@ -15,7 +15,9 @@ use_remote_local_search: true
 use_remote_browsecomp: true
 capture_mode: all_calls
 answer_match_f1_threshold: 0.75
+reward_mode: all_hops_correct
 max_iterations: 12
+iteration_budget_per_hop: 3
 # Keep retries/fallback explicit: hidden generic local+web fallback changes
 # the source-selection policy and can mask whether the model learned the tool.
 hop_plan_attempts: 1

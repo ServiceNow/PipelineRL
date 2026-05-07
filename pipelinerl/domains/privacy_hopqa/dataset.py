@@ -11,7 +11,7 @@ DEFAULT_DATASET_NAME = "seed20"
 DEFAULT_SAMPLE_SIZE = 20
 DEFAULT_FINAL_DATASET_PATH = (
     "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
-    "privacy_hopqa_finalized_2026-05-05.jsonl"
+    "privacy_hopqa_finalized_2026-05-07_answer_variants.jsonl"
 )
 
 
@@ -187,7 +187,14 @@ def load_problems(
         for problem in loaded:
             if "id" not in problem:
                 problem["id"] = next_id
-            next_id = max(next_id, int(problem["id"])) + 1
+                next_id += 1
+            else:
+                try:
+                    next_id = max(next_id, int(problem["id"]) + 1)
+                except (TypeError, ValueError):
+                    # Materialized Privacy HopQA variants can use stable string ids.
+                    # `next_id` is only needed when later seed rows lack ids.
+                    pass
             problem.setdefault("domain", DOMAIN_NAME)
             problems.append(problem)
 

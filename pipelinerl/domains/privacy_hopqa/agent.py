@@ -364,7 +364,8 @@ class PrivacyHopQAAgent:
 
     def _next_iteration_cap(self) -> int:
         total_hops = max(len(self.hop_states), 1)
-        return min(self.settings.max_iterations, (2 * total_hops) + 2)
+        per_hop_budget = max(int(self.settings.iteration_budget_per_hop), 1)
+        return min(self.settings.max_iterations, per_hop_budget * total_hops)
 
     def _fallback_actions(self, hop: HopState, iteration: int) -> list[RetrievalActionRecord]:
         question = self._materialize_question(hop.question)
@@ -731,6 +732,7 @@ class PrivacyHopQAAgent:
             self._mark_selected_documents(hop, selected)
             return selected
         prompt = build_doc_choose_prompt(
+            numbered_questions=self.numbered_questions,
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
             resolved_answers=self._resolved_answers(),
@@ -778,6 +780,7 @@ class PrivacyHopQAAgent:
 
     async def _read_document(self, hop: HopState, candidate: CandidateDoc, iteration: int) -> ReaderResult:
         prompt = build_doc_reader_prompt(
+            numbered_questions=self.numbered_questions,
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
             resolved_answers=self._resolved_answers(),
@@ -934,6 +937,7 @@ class PrivacyHopQAAgent:
         unread_candidates: list[CandidateDoc],
     ) -> dict[str, Any]:
         prompt = build_hop_resolve_prompt(
+            numbered_questions=self.numbered_questions,
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
             resolved_answers=self._resolved_answers(),

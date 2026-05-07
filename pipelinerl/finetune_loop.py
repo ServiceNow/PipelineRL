@@ -737,7 +737,8 @@ def rl_finetuning_worker(
             logger.warning(f"Synchronization error: {e}. Continuing anyway...")
 
         optimizer_step_and_zero_grad()
-        lr_scheduler.step()
+        if not using_deepspeed:
+            lr_scheduler.step()
 
         metrics_dict = {}
         time_to_stop = training_metrics.completed_steps >= final_train_steps

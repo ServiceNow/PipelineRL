@@ -94,6 +94,7 @@ Return valid JSON only.
 
 def build_doc_choose_prompt(
     *,
+    numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
     resolved_answers: list[dict[str, Any]],
@@ -101,6 +102,9 @@ def build_doc_choose_prompt(
     choose_top_k: int,
 ) -> str:
     return f"""You are selecting which retrieved documents are worth reading closely for the current hop.
+
+Full Numbered Questions:
+{numbered_questions}
 
 Current Hop: {current_hop_number}
 Current Hop Question:
@@ -132,12 +136,16 @@ Return valid JSON only.
 
 def build_doc_reader_prompt(
     *,
+    numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
     resolved_answers: list[dict[str, Any]],
     document: dict[str, Any],
 ) -> str:
     return f"""You are reading one candidate document excerpt to see if it can answer the current hop.
+
+Full Numbered Questions:
+{numbered_questions}
 
 Current Hop: {current_hop_number}
 Current Hop Question:
@@ -148,6 +156,13 @@ Resolved Earlier Hops:
 
 Document:
 {_json_block(document)}
+
+Answer Format Guidance:
+- Answer only the current hop, not later hops
+- Follow the wording of the current hop question closely
+- Give the minimum information necessary to answer the current hop
+- Include units or descriptors only if the question asks for them or they are needed to avoid ambiguity
+- If this hop's answer will be used as input to a later hop, prefer the form that can be directly substituted into that later question
 
 Return JSON in this format:
 {{
@@ -166,6 +181,7 @@ Return valid JSON only.
 
 def build_hop_resolve_prompt(
     *,
+    numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
     resolved_answers: list[dict[str, Any]],
@@ -175,6 +191,9 @@ def build_hop_resolve_prompt(
     choose_top_k: int,
 ) -> str:
     return f"""Decide whether the current hop can now be answered.
+
+Full Numbered Questions:
+{numbered_questions}
 
 Current Hop: {current_hop_number}
 Current Hop Question:
@@ -191,6 +210,13 @@ Document-Reading Results:
 
 Unread Candidate Documents From The Current Retrieval Round:
 {_json_block(unread_candidate_cards or [])}
+
+Answer Format Guidance:
+- Answer only the current hop, not later hops
+- Follow the wording of the current hop question closely
+- Give the minimum information necessary to answer the current hop
+- Include units or descriptors only if the question asks for them or they are needed to avoid ambiguity
+- If this hop's answer will be used as input to a later hop, prefer the form that can be directly substituted into that later question
 
 Return JSON in this format:
 {{

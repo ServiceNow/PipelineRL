@@ -60,6 +60,7 @@ def score_chain_answers(
     problem: dict,
     answers: dict[str, str],
     f1_threshold: float = 0.75,
+    reward_mode: str = "all_hops_correct",
 ) -> dict:
     hops = list(problem.get("hops") or [])
     per_hop = []
@@ -99,13 +100,19 @@ def score_chain_answers(
         f1_threshold=f1_threshold,
     )
     chain_complete = all(answers.get(str(hop["hop_number"])) not in ("", "NOT_FOUND", None) for hop in hops)
-    reward = correct_count / total_hops
+    hop_accuracy = correct_count / total_hops
+    if reward_mode == "all_hops_correct":
+        reward = 1.0 if correct_count == len(hops) and len(hops) > 0 else 0.0
+    elif reward_mode == "hop_accuracy":
+        reward = hop_accuracy
+    else:
+        raise ValueError(f"unknown privacy_hopqa reward_mode: {reward_mode}")
 
     return {
         "per_hop": per_hop,
         "correct_hops": correct_count,
         "total_hops": len(hops),
-        "hop_accuracy": reward,
+        "hop_accuracy": hop_accuracy,
         "reward": reward,
         "final_correct": final_correct,
         "final_match_score": final_match_score,

@@ -172,6 +172,7 @@ async def _run_privacy_hopqa_rollout_async(
         problem,
         answers,
         f1_threshold=settings.answer_match_f1_threshold,
+        reward_mode=settings.reward_mode,
     )
     n_question_hops = int(problem.get("n_question_hops") or problem.get("n_hops") or len(problem.get("hops") or []))
     n_unique_docs = int(problem.get("n_unique_docs") or 0)
