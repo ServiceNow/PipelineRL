@@ -717,7 +717,11 @@ class ActorLoop:
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
         if self.cfg.wandb.use_wandb:
-            wandb.log({f"actor/{k}": v for k, v in stats.items()})
+            wandb_stats = {f"actor/{k}": v for k, v in stats.items()}
+            trainer_model_version = stats.get("trainer_model_version")
+            if isinstance(trainer_model_version, (int, float)):
+                wandb_stats["actor/wandb_step"] = trainer_model_version
+            wandb.log(wandb_stats)
         stats_writer.write(stats)
         self.init_stats()  # Reset stats for the next iteration
 
@@ -731,6 +735,7 @@ def run_actor_loop(cfg: DictConfig):
     exp_path = Path(cfg.output_dir)
     setup_logging(exp_path / "actor", "actor")
     logger.info(f"Current dir: {os.getcwd()}, experiment root dir: {cfg.output_dir}")
+    run = None
     if cfg.wandb.use_wandb:
         run = init_wandb(cfg, exp_path / "actor", flatten_dict_config(cfg))  # type: ignore
         if run is None:
@@ -813,43 +818,51 @@ def run_actor_loop(cfg: DictConfig):
 
     last_regular_eval = -1
     current_eval = -1
-    while True:
-        assert trainer_state.propagated_weight_version is not None
+    try:
+        while True:
+            assert trainer_state.propagated_weight_version is not None
 
-        # 1. Start a new test loop if needed
-        next_regular_eval = (
-            trainer_state.propagated_weight_version
-            if last_regular_eval == -1
-            else last_regular_eval + cfg.eval_every_n_versions
-        )
-        if (
-            cfg.eval_every_n_versions
-            and not cfg.debug.mode
-            and trainer_state.propagated_weight_version >= next_regular_eval
-            and test_dataset
-            and test_loop_run is None
-        ):
-            logger.info("Create test loop")
-            test_loop_run = test_loop.run(
-                dataset=test_dataset,
+            # 1. Start a new test loop if needed
+            next_regular_eval = (
+                trainer_state.propagated_weight_version
+                if last_regular_eval == -1
+                else last_regular_eval + cfg.eval_every_n_versions
             )
-            train_loop.is_scheduling_paused = True
-            current_eval = next_regular_eval
+            if (
+                cfg.eval_every_n_versions
+                and not cfg.debug.mode
+                and trainer_state.propagated_weight_version >= next_regular_eval
+                and test_dataset
+                and test_loop_run is None
+            ):
+                logger.info("Create test loop")
+                test_loop_run = test_loop.run(
+                    dataset=test_dataset,
+                )
+                train_loop.is_scheduling_paused = True
+                current_eval = next_regular_eval
 
-        # 2. If there is an active test loop, keep it running
-        if test_loop_run is not None:
+            # 2. If there is an active test loop, keep it running
+            if test_loop_run is not None:
+                try:
+                    _ = next(test_loop_run)
+                except StopIteration:
+                    # 2.1 If the test loop is finished, resume scheduling the training loop
+                    test_loop_run = None
+                    last_regular_eval = current_eval
+                    train_loop.is_scheduling_paused = False
+                    logger.info("Test loop finished")
+
+            # 3. Keep running the training loop
             try:
-                _ = next(test_loop_run)
+                _ = next(train_loop_run)
             except StopIteration:
-                # 2.1 If the test loop is finished, resume scheduling the training loop
-                test_loop_run = None
-                last_regular_eval = current_eval
-                train_loop.is_scheduling_paused = False
-                logger.info("Test loop finished")
-
-        # 3. Keep running the training loop
-        try:
-            _ = next(train_loop_run)
-        except StopIteration:
-            logger.info("Train loop finished")
-            break
+                logger.info("Train loop finished")
+                break
+    finally:
+        if run is not None:
+            try:
+                run.finish()
+                logger.info("Finished W&B run")
+            except Exception:
+                logger.exception("Failed to finish W&B run")
