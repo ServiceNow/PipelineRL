@@ -1,9 +1,14 @@
 #!/bin/bash
-# 4-node interactive smoke run: DeepSpeed ZeRO-3 trainer + vLLM v1 + PPO loss
+# 4-node interactive smoke run: DeepSpeed ZeRO-3 trainer + vLLM v1 + GSPO loss
 # -----------------------------------------------------------------------------
-# Mirrors submit_eai_math_7b_multinode_ds_vllm_v1.sh but runs in your current
-# shell instead of submitting an `eai job new`. Use this as the reference path
-# when comparing fast-llm behavior against the established DeepSpeed trainer.
+# This is the *reference* baseline for comparing fast-llm GSPO behavior against
+# DeepSpeed (the chart-set in docs/FAST_LLM_INTEGRATION.md compares this config
+# at MAX_TRAIN_STEPS=400 against the fast-llm GSPO 400-step run from 2026-05-05).
+#
+# Mirrors submit_eai_math_7b_multinode_ds_fastllm_branch.sh (the GSPO version of
+# the DS launcher) but runs in your current shell instead of submitting an
+# `eai job new`. To reproduce the comparison charts byte-for-byte, run with
+# `MAX_TRAIN_STEPS=400`.
 #
 # Prereqs (one-time, see ../../README.md "Install FastLLM+PipelineRL"):
 #   - Image: registry.toolkit-sp.yul201.service-now.com/snow.research.afm/
@@ -70,9 +75,9 @@ PYTHONHASHSEED=42 python -m pipelinerl.launch \
   force_restart=true \
   finetune.learning_rate=1e-6 \
   finetune.attempts=8 \
-  finetune.rl.policy_loss=ppo \
-  finetune.rl.epsilon_low=2e-2 \
-  finetune.rl.epsilon_high=2e-2 \
+  finetune.rl.policy_loss=gspo \
+  finetune.rl.epsilon_low=3e-3 \
+  finetune.rl.epsilon_high=4e-3 \
   '+finetune.rl.filter_zero_advantage_groups=true' \
   "finetune.max_train_steps=${MAX_TRAIN_STEPS}" \
   finetune.seq_length=20000 \

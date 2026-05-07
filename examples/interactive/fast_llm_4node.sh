@@ -1,6 +1,11 @@
 #!/bin/bash
 # 4-node interactive smoke run: fast-llm trainer + vLLM v1 + GSPO loss
 # -----------------------------------------------------------------------------
+# This is the fast-llm side of the comparison charts in
+# docs/FAST_LLM_INTEGRATION.md (the divisor² + SDP fix + temperature=0.7 +
+# fp32_lm_head=true config from the 2026-05-05 400-step run). To reproduce
+# the chart byte-for-byte run with `MAX_TRAIN_STEPS=400`.
+#
 # Mirrors submit_eai_math_7b_multinode.sh but runs in your current shell instead
 # of submitting an `eai job new`. Use this from inside an interactive EAI
 # session that already has 4 nodes attached.
