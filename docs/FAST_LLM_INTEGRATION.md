@@ -350,7 +350,7 @@ The handover doc and PR description also mention `denisko-se/watermelon` runs an
 
 ### Reproduction recipes
 
-Two paths depending on whether you have an interactive EAI job or want to submit a batch job:
+Two paths depending on whether you have an interactive EAI session running or want to submit a batch job:
 
 | Where you run from | Script (in this repo) | What it does |
 |---|---|---|
@@ -360,6 +360,46 @@ Two paths depending on whether you have an interactive EAI job or want to submit
 | **Submit as standalone EAI batch job** | [`submit_eai_math_7b_multinode_ds_fastllm_branch.sh`](../submit_eai_math_7b_multinode_ds_fastllm_branch.sh) | Production DS GSPO launcher (DS trainer + vLLM v1, GSPO loss). The exact script that produced `math_7b_ds_fastllm_4node_20260428_135427` (the chart's DS run). |
 
 The `examples/interactive/*.sh` scripts are byte-equivalent to the `submit_eai_*.sh` ones modulo (a) they don't call `eai job new` (you supply your own session) and (b) defaults are smoke-friendly (`MAX_TRAIN_STEPS=2`). Override `MAX_TRAIN_STEPS=400` to reproduce the charts.
+
+### How to launch (prereqs + commands)
+
+#### Path 1: production EAI batch job (recommended for full 400-step runs)
+
+Prereqs:
+1. `eai` CLI installed and authenticated on the machine you'll launch from. Run `eai login` once if it isn't already.
+2. Wandb credentials configured for the entity in `WANDB_ENTITY` (`~/.netrc` or `wandb login`).
+3. The personalization env vars from §"Personalize before running" exported (or edit the defaults in the script).
+4. A 7B base model checkpoint at the path `MODEL_PATH` points to (default `/home/toolkit/Qwen2.5-7B` — adjust if you cloned it somewhere else).
+
+```bash
+# fast-llm GSPO (32 GPUs, ~9-14 h wall clock for 400 steps)
+bash submit_eai_math_7b_multinode.sh 4
+
+# DS GSPO (same compute footprint)
+bash submit_eai_math_7b_multinode_ds_fastllm_branch.sh 4
+```
+
+Each call returns a job ID and queues a 4-replica × 8-GPU EAI job. The job creates `${RESULTS_DIR}/${EXP_NAME}/` with `launch.log`, `finetune/stdout_node*.log`, `actor/info.log`, `actor_vllm_*/{stdout,stderr}.log`, and a `wandb_config.yaml` with the resumable wandb run id. WandB run name is set via `+wandb.wandb_run_name=...` and includes the timestamp.
+
+To monitor: `eai job logs <job-id>` or tail the log files directly on the shared NFS mount. To stop early: `eai job kill <job-id>` (sends SIGINT — orchestrator does the coordinated NCCL teardown).
+
+#### Path 2: interactive EAI session (recommended for smoke / dev)
+
+Prereqs:
+1. Launch and attach to a 4-node interactive session — see §"Launching an interactive EAI job" above.
+2. Inside the session, install Fast-LLM + PipelineRL — see §3 "End-to-end install" → "Steps".
+3. Same personalization env vars as Path 1 (no `EAI_*_DATA` needed — those are submit-only).
+
+```bash
+# 2-step smoke (~10 min) to verify everything launches cleanly
+bash examples/interactive/fast_llm_4node.sh
+
+# Full 400-step chart-reproducing run
+MAX_TRAIN_STEPS=400 bash examples/interactive/fast_llm_4node.sh
+
+# Same for the DS GSPO baseline
+bash examples/interactive/ds_4node.sh                  # smoke
+MAX_TRAIN_STEPS=400 bash examples/interactive/ds_4node.sh   # full
 
 ## 10. Operations
 
