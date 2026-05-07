@@ -10,13 +10,14 @@
 # of submitting an `eai job new`. Use this from inside an interactive EAI
 # session that already has 4 nodes attached.
 #
-# Prereqs (one-time, see ../../README.md "Install FastLLM+PipelineRL"):
-#   - Image: registry.toolkit-sp.yul201.service-now.com/snow.research.afm/
-#            interactive-toolkit:25.12-py3-vllm014rc1redis
-#   - Fast-LLM checked out on the `gspo` branch, editable-installed in
-#     /home/toolkit/code/PipelineRL/.venv (alongside PipelineRL on `fast-llm`)
-#   - Qwen2.5-7B at /home/toolkit/Qwen2.5-7B
-#   - WandB credentials configured for the entity below
+# Prereqs (one-time, in this order):
+#   1. Launch an interactive 4-node EAI session — see
+#      docs/FAST_LLM_INTEGRATION.md §3 "Launching an interactive EAI job"
+#      (uses ServiceNow/research-interactive-toolkit `make launch`).
+#   2. Inside the session, install Fast-LLM (gspo branch) + PipelineRL
+#      (fast-llm branch) into a shared venv — see ../../README.md
+#      "Install FastLLM+PipelineRL".
+#   3. Qwen2.5-7B at /home/toolkit/Qwen2.5-7B and WandB credentials configured.
 #
 # Success looks like:
 #   - finetune/stdout_node0.log shows "[Rank 00] training @ step 1/N | ... | grad norm: 0.1-0.3"

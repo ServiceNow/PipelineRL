@@ -10,11 +10,13 @@
 # `eai job new`. To reproduce the comparison charts byte-for-byte, run with
 # `MAX_TRAIN_STEPS=400`.
 #
-# Prereqs (one-time, see ../../README.md "Install FastLLM+PipelineRL"):
-#   - Image: registry.toolkit-sp.yul201.service-now.com/snow.research.afm/
-#            interactive-toolkit:25.12-py3-vllm014rc1redis
-#   - PipelineRL editable-installed in /home/toolkit/code/PipelineRL/.venv
-#   - Qwen2.5-7B at /home/toolkit/Qwen2.5-7B
+# Prereqs (one-time, in this order):
+#   1. Launch an interactive 4-node EAI session — see
+#      docs/FAST_LLM_INTEGRATION.md §3 "Launching an interactive EAI job"
+#      (uses ServiceNow/research-interactive-toolkit `make launch`).
+#   2. Inside the session, install PipelineRL (fast-llm branch) into the
+#      venv — see ../../README.md "Install FastLLM+PipelineRL".
+#   3. Qwen2.5-7B at /home/toolkit/Qwen2.5-7B and WandB credentials configured.
 #
 # Success looks like:
 #   - finetune/stderr_node0.log shows

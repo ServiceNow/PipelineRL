@@ -73,6 +73,17 @@ EAI_PROFILE := yul201
 
 Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the branch layers on vLLM 0.14.0rc1, redis, and the EAI helpers.
 
+### Launching an interactive EAI job (prereq for the example scripts)
+
+The example scripts under `examples/interactive/` are meant to be run **from inside an interactive EAI session that has 4 nodes attached**. To start such a session:
+
+1. Clone the toolkit repo (one-time): `git clone git@github.com:ServiceNow/research-interactive-toolkit.git ~/code/research-interactive-toolkit`. For the vLLM 0.14.0rc1 image, check out branch `fml/pytorch_vllm014rc1`; for the future-bumped image, use whichever branch builds it.
+2. Configure `~/.research-interactive-env` per the block above (selects image revision and EAI profile).
+3. Launch and attach with VSCode Remote-SSH (full instructions in the toolkit README — `make launch`, then `eai job ls` to find your job, then connect via Remote-SSH).
+4. Inside the running interactive container, follow [§3 End-to-end install](#3-end-to-end-install) above to clone Fast-LLM + PipelineRL into the venv, then `bash examples/interactive/{fast_llm,ds}_4node.sh`.
+
+For multi-node interactive jobs (4 nodes × 8 GPUs needed for the chart-reproducing runs), bump `GPU`, `CPU`, `MEM` and add `--replicas 4` semantics in `~/.research-interactive-env` per the toolkit README's multi-replica instructions.
+
 ### Steps
 
 ```bash
@@ -319,6 +330,19 @@ Comparing fast-llm `math_7b_4node_fastllm_gspo_20260505_122944` (the divisor² +
 **`actor/reward_mean` — fast-llm lags DS by ~2 points at step 400** (the open issue, root cause unknown):
 
 ![reward_mean fast-llm vs DS](images/reward_mean.png)
+
+### Reproduction recipes
+
+Two paths depending on whether you have an interactive EAI job or want to submit a batch job:
+
+| Where you run from | Script (in this repo) | What it does |
+|---|---|---|
+| **Inside interactive 4-node EAI session** | [`examples/interactive/fast_llm_4node.sh`](../examples/interactive/fast_llm_4node.sh) | Reproduces fast-llm side of the charts at `MAX_TRAIN_STEPS=400` (defaults to 2 for smoke). |
+| **Inside interactive 4-node EAI session** | [`examples/interactive/ds_4node.sh`](../examples/interactive/ds_4node.sh) | Reproduces DS GSPO side of the charts at `MAX_TRAIN_STEPS=400` (defaults to 2 for smoke). |
+| **Submit as standalone EAI batch job** | [`submit_eai_math_7b_multinode.sh`](../submit_eai_math_7b_multinode.sh) | Production fast-llm GSPO launcher. Calls `eai job new --replicas 4`. The exact script that produced `math_7b_4node_fastllm_gspo_20260505_122944` (the chart's fast-llm run). |
+| **Submit as standalone EAI batch job** | [`submit_eai_math_7b_multinode_ds_fastllm_branch.sh`](../submit_eai_math_7b_multinode_ds_fastllm_branch.sh) | Production DS GSPO launcher (DS trainer + vLLM v1, GSPO loss). The exact script that produced `math_7b_ds_fastllm_4node_20260428_135427` (the chart's DS run). |
+
+The `examples/interactive/*.sh` scripts are byte-equivalent to the `submit_eai_*.sh` ones modulo (a) they don't call `eai job new` (you supply your own session) and (b) defaults are smoke-friendly (`MAX_TRAIN_STEPS=2`). Override `MAX_TRAIN_STEPS=400` to reproduce the charts.
 
 ## 10. Operations
 
