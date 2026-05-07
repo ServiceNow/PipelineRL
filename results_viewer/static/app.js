@@ -114,11 +114,11 @@ async function loadExperiments() {
 function renderExperimentList() {
   $("experimentList").innerHTML = state.experiments
     .map((exp) => {
-      const rows = Object.values(exp.topics).reduce((sum, topic) => sum + (topic.rows || 0), 0);
+      const streamFiles = Object.values(exp.topics).reduce((sum, topic) => sum + (topic.files || 0), 0);
       const active = exp.name === state.current ? " active" : "";
       return `<div class="experiment-item${active}" data-exp="${escapeHtml(exp.name)}">
         <strong>${escapeHtml(exp.name)}</strong>
-        <span>${rows} rows · ${escapeHtml(exp.path)}</span>
+        <span>${streamFiles} stream files · ${escapeHtml(exp.path)}</span>
       </div>`;
     })
     .join("");
@@ -351,13 +351,28 @@ function renderRollouts() {
         <td>${fmt(row.trace_steps, 0)} (${fmt(row.steps_min, 0)}-${fmt(row.steps_max, 0)})</td>
         <td>${tokens}</td>
         <td>${escapeHtml(row.group_id || row.dataset_name || row.domain || "")}</td>
-        <td>${escapeHtml(row.preview)}</td>
+        <td>${renderPreview(row)}</td>
       </tr>`;
     })
     .join("");
   document.querySelectorAll("#rolloutRows tr").forEach((node) => {
     node.addEventListener("click", () => loadDetail(Number(node.dataset.row)));
   });
+}
+
+function renderPreview(row) {
+  const parts = row.preview_parts || {};
+  const lines = [];
+  if (parts.user) lines.push(["User", parts.user]);
+  if (parts.system) lines.push(["System", parts.system]);
+  for (const [key, value] of Object.entries(parts)) {
+    if (!["user", "system", "raw"].includes(key)) lines.push([key, value]);
+  }
+  if (!lines.length && parts.raw) lines.push(["Preview", parts.raw]);
+  if (!lines.length) return escapeHtml(row.preview || "");
+  return `<div class="preview-parts">${lines
+    .map(([label, value]) => `<div class="preview-line"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value)}</div>`)
+    .join("")}</div>`;
 }
 
 async function loadDetail(rowIndex) {
@@ -401,7 +416,7 @@ function firstCall(attempts) {
 
 function renderAttempt(attempt) {
   const calls = attempt.calls || [];
-  return `<details class="call collapsible attempt" open>
+  return `<details class="call collapsible attempt">
     <summary class="call-head">
       <strong>Attempt ${fmt(attempt.rollout_index, 0)}</strong>
       <span>${calls.length} step${calls.length === 1 ? "" : "s"} · final reward ${fmt(attempt.reward_final)} · success ${fmt(attempt.success)}</span>
@@ -418,19 +433,80 @@ function renderCall(call, index) {
   for (const key of ["logprobs", "ref_logprobs", "input_ids", "labels"]) {
     if (call[key] && typeof call[key] === "object") arrays[key] = call[key];
   }
-  return `<details class="call collapsible step" ${index === 0 ? "open" : ""}>
+  const messageSections = renderMessageSections(call.text || "");
+  return `<details class="call collapsible step">
     <summary class="call-head">
       <strong>Step ${fmt(meta.step_index ?? index, 0)}</strong>
       <span>reward ${fmt(call.reward)} · prompt ${fmt(call.prompt_tokens, 0)} · output ${fmt(call.output_tokens, 0)} · finished ${fmt(call.finished)}</span>
     </summary>
     <div class="call-body">
-      <pre>${escapeHtml(call.text || "")}</pre>
+      ${messageSections}
       <h3 style="margin:14px 0 8px">Metadata</h3>
       <pre class="json-box">${escapeHtml(JSON.stringify(meta, null, 2))}</pre>
       <h3 style="margin:14px 0 8px">Arrays</h3>
       <pre class="json-box">${escapeHtml(JSON.stringify(arrays, null, 2))}</pre>
     </div>
   </details>`;
+}
+
+function renderMessageSections(text) {
+  const sections = parseChatSections(text);
+  if (!sections.length) {
+    return `<pre>${escapeHtml(text || "")}</pre>`;
+  }
+  return `<div class="message-list">${sections
+    .map(
+      (section) => `<details class="call collapsible message">
+        <summary class="call-head">
+          <strong>${escapeHtml(section.header)}</strong>
+          <span>${fmt(section.body.length, 0)} chars</span>
+        </summary>
+        <div class="call-body">
+          <pre>${escapeHtml(section.body)}</pre>
+        </div>
+      </details>`
+    )
+    .join("")}</div>`;
+}
+
+function parseChatSections(text) {
+  const start = "<|im_start|>";
+  const end = "<|im_end|>";
+  const sections = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const startIndex = text.indexOf(start, cursor);
+    if (startIndex === -1) break;
+    const contentStart = startIndex + start.length;
+    const endIndex = text.indexOf(end, contentStart);
+    if (endIndex === -1) break;
+    const raw = text.slice(contentStart, endIndex);
+    const parsed = splitChatSection(raw);
+    if (parsed.header || parsed.body) {
+      sections.push(parsed);
+    }
+    cursor = endIndex + end.length;
+  }
+  return sections;
+}
+
+function splitChatSection(raw) {
+  const trimmedStart = raw.replace(/^\s+/, "");
+  const newlineIndex = trimmedStart.search(/\r?\n/);
+  if (newlineIndex >= 0) {
+    return {
+      header: trimmedStart.slice(0, newlineIndex).trim() || "message",
+      body: trimmedStart.slice(newlineIndex).replace(/^\r?\n/, "").trim(),
+    };
+  }
+  const spaceIndex = trimmedStart.search(/\s/);
+  if (spaceIndex >= 0) {
+    return {
+      header: trimmedStart.slice(0, spaceIndex).trim() || "message",
+      body: trimmedStart.slice(spaceIndex).trim(),
+    };
+  }
+  return { header: trimmedStart.trim() || "message", body: "" };
 }
 
 function finiteNumbers(values) {

@@ -46,7 +46,7 @@ def create_app(results_root: Path) -> FastAPI:
         for exp in sorted(p for p in root().iterdir() if p.is_dir()):
             streams = exp / "streams"
             topics = {
-                topic: topic_summary(streams / topic)
+                topic: topic_summary(streams / topic, count_rows=False)
                 for topic in TOPICS
             }
             config = load_yaml(exp / "conf" / "exp_config.yaml") or load_yaml(exp / ".hydra" / "config.yaml")
@@ -170,14 +170,16 @@ def stream_files(topic_dir: Path) -> list[Path]:
     return sorted(topic_dir.glob("*/*/*.jsonl"))
 
 
-def topic_summary(topic_dir: Path, row_count_dir: Path | None = None) -> dict[str, Any]:
+def topic_summary(topic_dir: Path, row_count_dir: Path | None = None, count_rows: bool = True) -> dict[str, Any]:
     files = stream_files(topic_dir)
     row_files = stream_files(row_count_dir) if row_count_dir is not None else files
-    return {
+    summary = {
         "exists": topic_dir.exists(),
         "files": len(files),
-        "rows": total_lines(row_files),
     }
+    if count_rows:
+        summary["rows"] = total_lines(row_files)
+    return summary
 
 
 def summarize_stats_topic(files: list[Path]) -> dict[str, Any]:
@@ -329,7 +331,8 @@ def summarize_prompt_group(row: Any, file_index: int, row_index: int, stats_row:
         "output_tokens_mean": first_not_none(number_or_none(prompt_stats.get("output_tokens_mean")), mean([number_or_zero(call.get("output_tokens")) for call in calls])),
         "stats_row": row_index if prompt_stats else None,
         "finished_steps": sum(1 for call in calls if bool(call.get("finished"))),
-        "preview": compact_text(first.get("text") or "", 280),
+        "preview": rollout_preview(first.get("text") or ""),
+        "preview_parts": rollout_preview_parts(first.get("text") or ""),
         "metric_keys": sorted(metrics.keys()),
     }
 
@@ -417,6 +420,77 @@ def trim_large_arrays(value: Any) -> Any:
 def compact_text(text: str, limit: int) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "..."
+
+
+def rollout_preview(text: str) -> str:
+    parts_dict = rollout_preview_parts(text)
+    parts = []
+    if parts_dict.get("user"):
+        parts.append(f"User: {parts_dict['user']}")
+    if parts_dict.get("system"):
+        parts.append(f"System: {parts_dict['system']}")
+    if parts:
+        return " | ".join(parts)
+    return compact_text(text, 280)
+
+
+def rollout_preview_parts(text: str) -> dict[str, str]:
+    sections = parse_chat_sections(text)
+    if not sections:
+        return {"raw": compact_text(text, 280)}
+
+    system = first_section(sections, "system")
+    user = first_section(sections, "user")
+    parts = {}
+    if system:
+        parts["system"] = compact_text(system, 90)
+    if user:
+        parts["user"] = compact_text(user, 180)
+    if not parts:
+        header, body = sections[0]
+        parts[header.lower() or "message"] = compact_text(body, 240)
+    return parts
+
+
+def first_section(sections: list[tuple[str, str]], role: str) -> str | None:
+    for header, body in sections:
+        if header.lower() == role:
+            return body
+    return None
+
+
+def parse_chat_sections(text: str) -> list[tuple[str, str]]:
+    start_marker = "<|im_start|>"
+    end_marker = "<|im_end|>"
+    sections = []
+    cursor = 0
+    while cursor < len(text):
+        start = text.find(start_marker, cursor)
+        if start < 0:
+            break
+        content_start = start + len(start_marker)
+        end = text.find(end_marker, content_start)
+        if end < 0:
+            break
+        raw = text[content_start:end].lstrip()
+        header, body = split_chat_section(raw)
+        if header or body:
+            sections.append((header or "message", body))
+        cursor = end + len(end_marker)
+    return sections
+
+
+def split_chat_section(raw: str) -> tuple[str, str]:
+    newline_index = raw.find("\n")
+    carriage_index = raw.find("\r")
+    indexes = [idx for idx in (newline_index, carriage_index) if idx >= 0]
+    if indexes:
+        idx = min(indexes)
+        return raw[:idx].strip(), raw[idx:].lstrip("\r\n").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return raw.strip(), ""
 
 
 def is_number(value: Any) -> bool:

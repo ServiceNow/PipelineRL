@@ -309,6 +309,23 @@ tbody tr:hover {
   background: #f1f7f5;
 }
 
+.preview-parts {
+  display: grid;
+  gap: 4px;
+  min-width: 260px;
+}
+
+.preview-line {
+  color: #344055;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.preview-line strong {
+  color: #17202f;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -357,6 +374,19 @@ tbody tr:hover {
 
 .call.step {
   margin-bottom: 10px;
+}
+
+.call.message {
+  margin-bottom: 8px;
+}
+
+.message-list {
+  display: grid;
+  gap: 8px;
+}
+
+.message > .call-head {
+  background: #f3f6f9;
 }
 
 .call-head {
