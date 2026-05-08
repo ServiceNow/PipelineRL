@@ -77,9 +77,9 @@ def _coerce_log_level(level: Any, default: int = logging.ERROR) -> int:
 
 
 class _CubeRayWorkerLogForwardingHandler(logging.Handler):
-    def __init__(self, *, actor_name: str, collector: Any, level: int):
+    def __init__(self, *, worker_name: str, collector: Any, level: int):
         super().__init__(level=level)
-        self._actor_name = actor_name
+        self._worker_name = worker_name
         self._collector = collector
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -88,7 +88,7 @@ class _CubeRayWorkerLogForwardingHandler(logging.Handler):
             "entry_id": uuid.uuid4().hex,
             "rollout_id": _current_rollout_log_id.get(),
             "task_id": _current_task_id.get(),
-            "actor": self._actor_name,
+            "worker": self._worker_name,
             "logger": record.name,
             "level": record.levelname,
             "message": record.getMessage(),
@@ -112,7 +112,7 @@ def configure_noisy_worker_loggers(litellm_log_level: Any) -> None:
 
 def configure_ray_worker_logging(
     *,
-    actor_name: str,
+    worker_name: str,
     log_collector: Any | None,
     log_level: Any,
     litellm_log_level: Any,
@@ -132,7 +132,7 @@ def configure_ray_worker_logging(
             return
 
     handler = _CubeRayWorkerLogForwardingHandler(
-        actor_name=actor_name,
+        worker_name=worker_name,
         collector=log_collector,
         level=level,
     )

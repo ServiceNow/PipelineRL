@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 from omegaconf import DictConfig
@@ -23,6 +24,14 @@ if TYPE_CHECKING:
     from cube_harness.llm import LLMCall
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CubeRuntimeSpec:
+    cube_id: str
+    benchmark_cfg: dict[str, Any]
+    agent_cfg: dict[str, Any]
+    split: str
 
 def _copy_model(obj: Any) -> Any:
     if hasattr(obj, "model_copy"):
@@ -201,13 +210,12 @@ def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) ->
     return 0.
 
 @ray.remote(max_restarts=0, max_task_retries=0)
-class CubeBenchmarkActor:
-    """Cube benchmark lifecycle + rollout execution actor.
+class CubeBenchmarkWorker:
+    """Generic cube worker with lazy benchmark materialization.
 
     Interface:
     - setup()
-    - get_task_ids()
-    - rollout(task_id)
+    - rollout(cube_id, task_id)
     - health()
     - close()
     """
@@ -217,23 +225,25 @@ class CubeBenchmarkActor:
         *,
         # do not save the ref to the whole cfg
         cfg: DictConfig,
-        benchmark_cfg: dict,
-        agent_cfg: dict,
-        cube_name: str,
-        train_dataset_names: list[str],
-        test_dataset_names: list[str],
+        cube_specs: list[dict[str, Any]],
         seed: int,
-        actor_name: str,
+        worker_name: str,
         llm: dict[str, Any],
         test_llm: dict[str, Any] | None = None,
         llm_router: Any | None = None,
         ray_worker_log_collector: Any | None = None,
     ):
-        self._benchmark_cfg = benchmark_cfg
-        self._agent_cfg = agent_cfg
-        self._cube_name = cube_name
+        self._cube_specs = {
+            str(spec["cube_id"]): CubeRuntimeSpec(
+                cube_id=str(spec["cube_id"]),
+                benchmark_cfg=spec["benchmark_cfg"],
+                agent_cfg=spec["agent_cfg"],
+                split=str(spec["split"]),
+            )
+            for spec in cube_specs
+        }
         self._seed = int(seed)
-        self._actor_name = actor_name
+        self._worker_name = worker_name
         self._train_llm = llm
         self._test_llm = test_llm or llm
         self._llm_router = llm_router
@@ -243,7 +253,7 @@ class CubeBenchmarkActor:
         worker_litellm_log_level = str(getattr(cfg.actor, "ray_worker_litellm_log_level", "WARNING"))
 
         configure_ray_worker_logging(
-            actor_name=self._actor_name,
+            worker_name=self._worker_name,
             log_collector=self._ray_worker_log_collector,
             log_level=worker_log_level,
             litellm_log_level=worker_litellm_log_level,
@@ -252,11 +262,9 @@ class CubeBenchmarkActor:
         self._ready = False
         self._setup_error: str | None = None
 
+        self._current_cube_id: str | None = None
         self._benchmark = None
-        self._task_ids: list[str] = []
         self._task_by_id: dict[str, dict] = {}
-        self._train_task_ids: list[str] = []
-        self._test_task_ids: list[str] = []
 
         self._runtime_context = None
         self._container_backend = None
@@ -266,89 +274,79 @@ class CubeBenchmarkActor:
         self._buffer_tokens = int(getattr(cfg.actor, "buffer_tokens", 0))
         self._discount_factor = float(getattr(cfg.actor, "discount_factor", 1.0))
 
-        self._train_dataset_names = train_dataset_names
-        self._test_dataset_names = test_dataset_names
-
     def setup(self) -> dict[str, Any]:
-        import hydra
-
         try:
-            benchmark_obj = hydra.utils.instantiate(self._benchmark_cfg)
-            benchmark_obj.install()
-            benchmark_obj.setup()
-
-            self._runtime_context = getattr(benchmark_obj, "_runtime_context", None)
-            self._container_backend = getattr(benchmark_obj, "container_backend", None)
-            agent_cfg_template = hydra.utils.instantiate(self._agent_cfg)
-
             from pipelinerl.llm import TrainableLLM
 
             temp_llm = TrainableLLM(**self._train_llm)
             temp_llm.load_tokenizer()
             self._llm_tokenizer = temp_llm.tokenizer
-
-            all_task_configs = list(benchmark_obj.get_task_configs())
-
-            self._train_task_ids = []
-            self._test_task_ids = []
-            task_by_id: dict[str, dict] = {}
-
-            for task_config in all_task_configs:
-                task_id = task_config.task_id
-                dataset_name = _resolve_task_dataset_name(benchmark_obj, task_config)
-                use_train_llm = dataset_name in self._train_dataset_names or dataset_name == ""
-                use_test_llm = not use_train_llm and dataset_name in self._test_dataset_names
-                task_llm = self._test_llm if use_test_llm else self._train_llm
-                agent_config = _copy_model(agent_cfg_template)
-                set_agent_llm_config(agent_config, task_llm)
-                task_by_id[task_config.task_id] = {
-                    "task_config": _copy_model(task_config),
-                    "agent_config": agent_config,
-                    "domain": self._cube_name,
-                    "dataset": dataset_name if dataset_name else self._cube_name,
-                }
-                if use_train_llm:
-                    self._train_task_ids.append(task_id)
-                elif use_test_llm:
-                    self._test_task_ids.append(task_id)
-                else:
-                    logger.warning(
-                        "%s task_id %s has dataset '%s' which is not in train or test dataset lists, assigning to train by default",
-                        self._actor_name,
-                        task_id,
-                        dataset_name,
-                    )
-                    self._train_task_ids.append(task_id)
-        
-            self._task_by_id = task_by_id
-            self._task_ids = list(self._task_by_id.keys())
-            self._benchmark = benchmark_obj
             self._ready = True
             self._setup_error = None
-            logger.info("%s ready with %d tasks", self._actor_name, len(self._task_ids))
+            logger.info("%s ready with %d cube specs", self._worker_name, len(self._cube_specs))
             return self.health()
         except Exception as exc:
             self._ready = False
             self._setup_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("%s failed during setup", self._actor_name)
+            logger.exception("%s failed during setup", self._worker_name)
             raise
 
-    def get_task_ids(self) -> list[str]:
-        return list(self._task_ids)
+    def _close_current_cube(self) -> None:
+        if self._benchmark is not None:
+            try:
+                self._benchmark.close()
+            except Exception as exc:
+                logger.warning("%s failed to close cube %s: %s", self._worker_name, self._current_cube_id, exc)
+        self._current_cube_id = None
+        self._benchmark = None
+        self._task_by_id = {}
+        self._runtime_context = None
+        self._container_backend = None
 
-    def get_train_task_ids(self) -> list[str]:
-        return self._train_task_ids
+    def _prepare_cube(self, cube_id: str) -> None:
+        if self._current_cube_id == cube_id:
+            return
+        if cube_id not in self._cube_specs:
+            raise KeyError(f"Unknown cube_id: {cube_id}")
 
-    def get_test_task_ids(self) -> list[str]:
-        return self._test_task_ids
+        import hydra
 
-    def rollout(self, task_id: str) -> dict:
-        rollout_log_context = start_worker_rollout_log_context(str(task_id))
+        self._close_current_cube()
+        spec = self._cube_specs[cube_id]
+        benchmark_obj = hydra.utils.instantiate(spec.benchmark_cfg)
+        benchmark_obj.install()
+        benchmark_obj.setup()
+
+        self._runtime_context = getattr(benchmark_obj, "_runtime_context", None)
+        self._container_backend = getattr(benchmark_obj, "container_backend", None)
+        agent_cfg_template = hydra.utils.instantiate(spec.agent_cfg)
+        task_llm = self._test_llm if spec.split == "test" else self._train_llm
+
+        task_by_id: dict[str, dict] = {}
+        for task_config in benchmark_obj.get_task_configs():
+            agent_config = _copy_model(agent_cfg_template)
+            set_agent_llm_config(agent_config, task_llm)
+            dataset_name = _resolve_task_dataset_name(benchmark_obj, task_config)
+            task_by_id[task_config.task_id] = {
+                "task_config": _copy_model(task_config),
+                "agent_config": agent_config,
+                "domain": cube_id,
+                "dataset": cube_id if not dataset_name else f"{cube_id}/{dataset_name}",
+            }
+
+        self._current_cube_id = cube_id
+        self._benchmark = benchmark_obj
+        self._task_by_id = task_by_id
+        logger.info("%s prepared cube %s with %d tasks", self._worker_name, cube_id, len(task_by_id))
+
+    def rollout(self, *, cube_id: str, task_id: str) -> dict:
+        rollout_log_context = start_worker_rollout_log_context(f"{cube_id}:{task_id}")
         try:
             if not self._ready:
-                raise RuntimeError(f"{self._actor_name} not ready")
+                raise RuntimeError(f"{self._worker_name} not ready")
+            self._prepare_cube(cube_id)
             if task_id not in self._task_by_id:
-                raise KeyError(f"Unknown task_id: {task_id}")
+                raise KeyError(f"Unknown task_id for cube {cube_id}: {task_id}")
 
             base_task = self._task_by_id[task_id]
             task = {
@@ -363,7 +361,7 @@ class CubeBenchmarkActor:
             result = self._rollout(task=_copy_model(task))
             return result.model_dump()
         except Exception:
-            logger.exception("%s rollout failed for task_id=%s", self._actor_name, task_id)
+            logger.exception("%s rollout failed for cube_id=%s task_id=%s", self._worker_name, cube_id, task_id)
             raise
         finally:
             reset_worker_rollout_log_context(rollout_log_context)
@@ -486,16 +484,12 @@ class CubeBenchmarkActor:
 
     def health(self) -> dict[str, Any]:
         return {
-            "actor_name": self._actor_name,
+            "worker_name": self._worker_name,
             "ready": self._ready,
-            "n_tasks": len(self._task_ids),
-            "domain": self._cube_name,
+            "current_cube_id": self._current_cube_id,
+            "n_tasks": len(self._task_by_id),
             "error": self._setup_error,
         }
 
     def close(self) -> None:
-        if self._benchmark is not None:
-            try:
-                self._benchmark.close()
-            except Exception as exc:
-                logger.warning("%s failed to close benchmark: %s", self._actor_name, exc)
+        self._close_current_cube()

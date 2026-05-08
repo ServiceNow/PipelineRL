@@ -74,11 +74,11 @@ def effective_logical_cpus() -> float:
     return max(1.0, logical_cpus)
 
 
-def check_local_cube_actor_resources(
+def check_local_cube_worker_resources(
     cfg: Any,
     *,
     instances: int,
-    actor_num_cpus: float,
+    worker_num_cpus: float,
     required_ray_cpus: int,
 ) -> None:
     guard = get_cube_resource_guard(cfg)
@@ -88,9 +88,9 @@ def check_local_cube_actor_resources(
     logical_cpus = effective_logical_cpus()
     if float(required_ray_cpus) > logical_cpus:
         raise ValueError(
-            "Cube Ray actor configuration requires more CPU slots than this node appears to have: "
+            "Cube Ray worker configuration requires more CPU slots than this node appears to have: "
             f"required_ray_cpus={required_ray_cpus}, effective_logical_cpus={logical_cpus:.2f}, "
-            f"instances={instances}, actor_num_cpus={actor_num_cpus}. "
+            f"instances={instances}, worker_num_cpus={worker_num_cpus}. "
             "Reduce actor.cube_workers or actor.cube_workers_num_cpus, or run on a node with more CPUs."
         )
 
@@ -112,9 +112,9 @@ def check_local_cube_actor_resources(
 
     if estimated_memory_gb > allowed_total_gb:
         raise ValueError(
-            "Cube Ray actor configuration is likely to exceed safe node memory. "
+            "Cube Ray worker configuration is likely to exceed safe node memory. "
             f"Estimated requirement is {estimated_memory_gb:.2f} GiB "
-            f"({instances} actors * {actor_memory_gb:.2f} GiB + {memory_overhead_gb:.2f} GiB overhead), "
+            f"({instances} workers * {actor_memory_gb:.2f} GiB + {memory_overhead_gb:.2f} GiB overhead), "
             f"but this node has {total_memory_gb:.2f} GiB total and the configured threshold allows "
             f"{allowed_total_gb:.2f} GiB. Reduce actor.cube_workers, reduce the number of actor vLLMs, "
             "or increase cube_params.resource_guard.memory_usage_threshold only if you know the estimate is conservative."
@@ -122,7 +122,7 @@ def check_local_cube_actor_resources(
 
     if estimated_memory_gb > available_memory_gb:
         raise ValueError(
-            "Cube Ray actor configuration is likely to exceed currently available node memory. "
+            "Cube Ray worker configuration is likely to exceed currently available node memory. "
             f"Estimated requirement is {estimated_memory_gb:.2f} GiB, but only "
             f"{available_memory_gb:.2f} GiB is currently available. "
             "Free memory, reduce actor.cube_workers, or lower cube_params.resource_guard.actor_memory_gb "

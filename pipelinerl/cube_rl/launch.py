@@ -12,10 +12,12 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from pipelinerl.cube_rl.domain import CubeBenchmarkActor, length_penalty
+from pipelinerl.cube_rl.domain import CubeBenchmarkWorker, length_penalty
 from pipelinerl.cube_rl.ray_worker_logging import CubeRayWorkerLogCollector
+from pipelinerl.cube_rl.registry import CubeTaskRef, build_cube_registry
 from pipelinerl.cube_rl.routing import RayVLLMRouter, VLLMRouterActor
-from pipelinerl.cube_rl.utils import check_local_cube_actor_resources
+from pipelinerl.cube_rl.utils import check_local_cube_worker_resources
+from pipelinerl.cube_rl.worker_pool import select_worker_for_cube
 from pipelinerl.metrics import SlidingWindowAggregator
 
 if TYPE_CHECKING:
@@ -34,10 +36,10 @@ def BREAKPOINT():
 @dataclass
 class PendingRollout:
     group_id: int
-    task_id: str
+    task: CubeTaskRef
     rollout_index: int
     llm_index: int
-    benchmark_actor_index: int
+    worker_index: int
     model_version: int
 
 
@@ -68,14 +70,14 @@ def _log_ray_cpu_capacity(owner_name: str, required_num_cpus: int) -> None:
     cluster_cpu_capacity = float(ray.cluster_resources().get("CPU", 0.0))
     if cluster_cpu_capacity + 1e-6 < float(required_num_cpus):
         logger.warning(
-            "%s: Ray cluster CPU capacity %.2f is lower than required %.2f for cube benchmark actors",
+            "%s: Ray cluster CPU capacity %.2f is lower than required %.2f for cube workers",
             owner_name,
             cluster_cpu_capacity,
             float(required_num_cpus),
         )
     else:
         logger.info(
-            "%s: Ray cluster CPU capacity %.2f satisfies required %.2f for cube benchmark actors",
+            "%s: Ray cluster CPU capacity %.2f satisfies required %.2f for cube workers",
             owner_name,
             cluster_cpu_capacity,
             float(required_num_cpus),
@@ -132,64 +134,48 @@ def _init_ray_runtime(cfg: DictConfig, owner_name: str, min_num_cpus: int = 1) -
     return True
 
 
-def _launch_cube_benchmark_actors(
+def _launch_cube_workers(
     cfg: DictConfig,
     instances: int,
+    cube_specs: list[dict[str, Any]],
     llm: dict[str, Any],
     test_llm: dict[str, Any] | None = None,
     llm_router: Any | None = None,
     ray_worker_log_collector: Any | None = None,
 ) -> list[Any]:
-    from omegaconf import OmegaConf
-
     if instances < 1:
-        raise ValueError("cube benchmark actor instance count must be >= 1")
+        raise ValueError("cube worker instance count must be >= 1")
+    seed = int(getattr(cfg.get("cube_params", {}), "seed", cfg.seed))
+    worker_num_cpus = float(getattr(cfg.actor, "cube_workers_num_cpus", 1.0))
 
-    params = cfg.get("cube_params", None)
-    if params is None:
-        raise ValueError("cube actor launcher requires cube_params")
-
-    benchmark_cfg = OmegaConf.to_container(params.benchmark, resolve=True)
-    agent_cfg = OmegaConf.to_container(params.agent, resolve=True)
-    if not isinstance(benchmark_cfg, dict) or not isinstance(agent_cfg, dict):
-        raise ValueError("cube_params.benchmark and .agent must resolve to dictionaries")
-
-    cube_name = getattr(params, "name", "default")
-    seed = int(getattr(params, "seed", cfg.seed))
-    actor_num_cpus = float(getattr(cfg.actor, "cube_workers_num_cpus", 1.0))
-
-    actors = []
+    workers = []
     for idx in range(instances):
-        actor_name = f"CUBE_{cube_name}_{idx}"
-        actor = CubeBenchmarkActor.options(num_cpus=actor_num_cpus).remote(
+        worker_name = f"CUBE_WORKER_{idx}"
+        worker = CubeBenchmarkWorker.options(num_cpus=worker_num_cpus).remote(
             cfg=cfg,
-            benchmark_cfg=benchmark_cfg,
-            agent_cfg=agent_cfg,
-            cube_name=cube_name,
-            train_dataset_names=cfg.train_dataset_names,
-            test_dataset_names=cfg.test_dataset_names,
+            cube_specs=cube_specs,
             seed=seed,
-            actor_name=actor_name,
+            worker_name=worker_name,
             llm=llm,
             test_llm=test_llm,
             llm_router=llm_router,
             ray_worker_log_collector=ray_worker_log_collector,
         )
-        actors.append(actor)
+        workers.append(worker)
 
-    ray.get([actor.setup.remote() for actor in actors])
-    return actors
+    ray.get([worker.setup.remote() for worker in workers])
+    return workers
 
 
-def _wait_for_cube_benchmark_actors(actors: list[Any], timeout_s: float) -> None:
+def _wait_for_cube_workers(workers: list[Any], timeout_s: float) -> None:
     deadline = time.time() + max(1.0, timeout_s)
     while True:
-        states = ray.get([actor.health.remote() for actor in actors])
+        states = ray.get([worker.health.remote() for worker in workers])
         if all(state.get("ready", False) for state in states):
-            logger.info("All cube benchmark actors are ready")
+            logger.info("All cube workers are ready")
             return
         if time.time() >= deadline:
-            raise TimeoutError(f"Timed out waiting for cube benchmark actors: {states}")
+            raise TimeoutError(f"Timed out waiting for cube workers: {states}")
         time.sleep(1.0)
 
 
@@ -283,7 +269,7 @@ class CubeActorLoop:
         *,
         cfg: DictConfig,
         llms: list[TrainableLLM],
-        benchmark_actors: list[Any],
+        cube_workers: list[Any],
         trainer_state: TrainerState,
         data_writer: StreamWriter,
         stats_writer: StreamWriter,
@@ -292,7 +278,7 @@ class CubeActorLoop:
     ) -> None:
         self.cfg = cfg
         self.llms = llms
-        self.benchmark_actors = benchmark_actors
+        self.cube_workers = cube_workers
         self.trainer_state = trainer_state
         self.data_writer = data_writer
         self.stats_writer = stats_writer
@@ -305,10 +291,10 @@ class CubeActorLoop:
         self.llm_max_rollouts = int(cfg.actor.llm_max_rollouts)
         if self.llm_max_rollouts < 1:
             raise ValueError("actor.llm_max_rollouts must be >= 1")
-        # CubeBenchmarkActor rollout is currently blocking/synchronous, so keep per-actor
-        # concurrency at one and scale by actor count. LLM load is controlled by
-        # per-generation leases in the shared router, not by actor-to-LLM pinning.
-        self.cube_actor_max_rollouts = 1
+        # CubeBenchmarkWorker rollout is currently blocking/synchronous, so keep per-worker
+        # concurrency at one and scale by worker count. LLM load is controlled by
+        # per-generation leases in the shared router, not by worker-to-LLM pinning.
+        self.cube_worker_max_rollouts = 1
         self.max_pending = max(1, len(self.llms) * self.llm_max_rollouts)
         self.rollout_timeout_s = getattr(cfg.actor, "rollout_timeout", None)
         if self.rollout_timeout_s is not None:
@@ -336,12 +322,13 @@ class CubeActorLoop:
         self.init_stats()
 
         self._is_running = False
-        self._task_ids: list[str] = []
+        self._tasks: list[CubeTaskRef] = []
         self._expected_groups = -1
         self._pending: dict[Any, PendingRollout] = {}
-        self._retry_rollouts: deque[tuple[int, str, int]] = deque()
+        self._retry_rollouts: deque[tuple[int, CubeTaskRef, int]] = deque()
         self._active_rollouts: list[int] = [0] * len(self.llms)
-        self._active_rollouts_by_actor: list[int] = [0] * len(self.benchmark_actors)
+        self._active_rollouts_by_worker: list[int] = [0] * len(self.cube_workers)
+        self._current_cube_by_worker: list[str | None] = [None] * len(self.cube_workers)
         self._group_rollouts: dict[int, list[RolloutResult]] = {}
         self._started_rollouts = 0
         self._finished_rollouts = 0
@@ -349,21 +336,21 @@ class CubeActorLoop:
         self._run_finished_groups = 0
         self._group_id = -1
         self._group_rollout_index = self.attempts
-        self._current_task_id = ""
+        self._current_task: CubeTaskRef | None = None
         self._next_task_index = 0
         self._loop_start_time = 0.0
         self._last_logged = 0.0
         self._stop_reason = "completed"
         self._last_trainer_version = 0
         self._trainer_version_to_publish: int | None = None
-        self._allowed_benchmark_actor_indices: list[int] | None = None
+        self._allowed_worker_indices: list[int] | None = None
 
         logger.info(
-            "%s: initialized global actor pool with %d llms, %d benchmark actors, actor max rollouts=%d, vllm max inflight/server=%d, max pending rollouts=%d",
+            "%s: initialized global worker pool with %d llms, %d workers, worker max rollouts=%d, vllm max inflight/server=%d, max pending rollouts=%d",
             self.scheduler_name,
             len(self.llms),
-            len(self.benchmark_actors),
-            self.cube_actor_max_rollouts,
+            len(self.cube_workers),
+            self.cube_worker_max_rollouts,
             self.llm_max_rollouts,
             self.max_pending,
         )
@@ -372,36 +359,37 @@ class CubeActorLoop:
     def is_running(self) -> bool:
         return self._is_running
 
-    def set_allowed_benchmark_actor_indices(self, indices: list[int] | None) -> None:
+    def set_allowed_worker_indices(self, indices: list[int] | None) -> None:
         if indices is None:
-            self._allowed_benchmark_actor_indices = None
+            self._allowed_worker_indices = None
             return
         cleaned = sorted(set(int(idx) for idx in indices))
         if not cleaned:
-            raise ValueError("allowed benchmark actor indices cannot be empty")
-        max_index = len(self.benchmark_actors) - 1
+            raise ValueError("allowed worker indices cannot be empty")
+        max_index = len(self.cube_workers) - 1
         invalid = [idx for idx in cleaned if idx < 0 or idx > max_index]
         if invalid:
-            raise ValueError(f"invalid benchmark actor indices: {invalid}")
-        self._allowed_benchmark_actor_indices = cleaned
+            raise ValueError(f"invalid worker indices: {invalid}")
+        self._allowed_worker_indices = cleaned
 
-    def _allowed_benchmark_actor_indices_or_all(self) -> list[int]:
-        if self._allowed_benchmark_actor_indices is not None:
-            return self._allowed_benchmark_actor_indices
-        return list(range(len(self.benchmark_actors)))
+    def _allowed_worker_indices_or_all(self) -> list[int]:
+        if self._allowed_worker_indices is not None:
+            return self._allowed_worker_indices
+        return list(range(len(self.cube_workers)))
 
-    def _max_pending_for_allowed_actors(self) -> int:
-        allowed_actor_capacity = len(self._allowed_benchmark_actor_indices_or_all()) * self.cube_actor_max_rollouts
-        return max(1, min(self.max_pending, allowed_actor_capacity))
+    def _max_pending_for_allowed_workers(self) -> int:
+        allowed_worker_capacity = len(self._allowed_worker_indices_or_all()) * self.cube_worker_max_rollouts
+        return max(1, min(self.max_pending, allowed_worker_capacity))
 
-    def _select_benchmark_actor_index(self) -> int | None:
-        actor_indices = self._allowed_benchmark_actor_indices_or_all()
-        available_indices = [
-            idx for idx in actor_indices if self._active_rollouts_by_actor[idx] < self.cube_actor_max_rollouts
-        ]
-        if not available_indices:
-            return None
-        return min(available_indices, key=lambda idx: (self._active_rollouts_by_actor[idx], idx))
+    def _select_worker_index(self, cube_id: str) -> int | None:
+        worker_indices = self._allowed_worker_indices_or_all()
+        return select_worker_for_cube(
+            cube_id=cube_id,
+            candidate_indices=worker_indices,
+            active_rollouts_by_worker=self._active_rollouts_by_worker,
+            worker_max_rollouts=self.cube_worker_max_rollouts,
+            current_cube_by_worker=self._current_cube_by_worker,
+        )
 
     def init_stats(self) -> None:
         self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -553,47 +541,49 @@ class CubeActorLoop:
         self.stats_writer.write(stats)
         self.init_stats()
 
-    def _submit_one_rollout(self, *, group_id: int, task_id: str, rollout_index: int) -> bool:
-        actor_indices = self._allowed_benchmark_actor_indices_or_all()
-        if sum(self._active_rollouts_by_actor[idx] for idx in actor_indices) >= self._max_pending_for_allowed_actors():
+    def _submit_one_rollout(self, *, group_id: int, task: CubeTaskRef, rollout_index: int) -> bool:
+        worker_indices = self._allowed_worker_indices_or_all()
+        if sum(self._active_rollouts_by_worker[idx] for idx in worker_indices) >= self._max_pending_for_allowed_workers():
             return False
 
-        benchmark_actor_index = self._select_benchmark_actor_index()
-        if benchmark_actor_index is None:
+        worker_index = self._select_worker_index(task.cube_id)
+        if worker_index is None:
             return False
-        benchmark_actor = self.benchmark_actors[benchmark_actor_index]
+        worker = self.cube_workers[worker_index]
         next_llm = 0
         model_version = int(self.trainer_state.propagated_weight_version or 0)
-        ref = benchmark_actor.rollout.remote(task_id=task_id)
+        ref = worker.rollout.remote(cube_id=task.cube_id, task_id=task.task_id)
         self._pending[ref] = PendingRollout(
             group_id=group_id,
-            task_id=task_id,
+            task=task,
             rollout_index=rollout_index,
             llm_index=next_llm,
-            benchmark_actor_index=benchmark_actor_index,
+            worker_index=worker_index,
             model_version=model_version,
         )
         self._active_rollouts[next_llm] += 1
-        self._active_rollouts_by_actor[benchmark_actor_index] += 1
+        self._active_rollouts_by_worker[worker_index] += 1
+        self._current_cube_by_worker[worker_index] = task.cube_id
         self._started_rollouts += 1
         return True
 
-    def start(self, *, task_ids: list[str], scheduler_name: str | None = None) -> str:
+    def start(self, *, tasks: list[CubeTaskRef], scheduler_name: str | None = None) -> str:
         if scheduler_name:
             self.scheduler_name = scheduler_name
-        if not task_ids:
+        if not tasks:
             logger.info("%s: no tasks available; skipping", self.scheduler_name)
             return "no_tasks"
         if self._is_running:
             return "running"
 
         assert self.trainer_state.propagated_weight_version is not None
-        self._task_ids = task_ids
-        self._expected_groups = -1 if self.is_training else len(task_ids)
+        self._tasks = tasks
+        self._expected_groups = -1 if self.is_training else len(tasks)
         self._pending = {}
         self._retry_rollouts = deque()
         self._active_rollouts = [0] * len(self.llms)
-        self._active_rollouts_by_actor = [0] * len(self.benchmark_actors)
+        self._active_rollouts_by_worker = [0] * len(self.cube_workers)
+        self._current_cube_by_worker = [None] * len(self.cube_workers)
         self._group_rollouts = {}
         self._started_rollouts = 0
         self._finished_rollouts = 0
@@ -601,7 +591,7 @@ class CubeActorLoop:
         self._run_finished_groups = 0
         self._group_id = -1
         self._group_rollout_index = self.attempts
-        self._current_task_id = ""
+        self._current_task = None
         self._next_task_index = 0
         self._loop_start_time = time.time()
         self._last_logged = time.time()
@@ -694,12 +684,12 @@ class CubeActorLoop:
             self._trainer_version_to_publish = self._last_trainer_version
             self._last_trainer_version = int(self.trainer_state.propagated_weight_version or 0)
         
-        while len(self._pending) < self._max_pending_for_allowed_actors():
+        while len(self._pending) < self._max_pending_for_allowed_workers():
             if self._retry_rollouts:
-                group_id, task_id, rollout_index = self._retry_rollouts[0]
+                group_id, task, rollout_index = self._retry_rollouts[0]
                 if not self._submit_one_rollout(
                     group_id=group_id,
-                    task_id=task_id,
+                    task=task,
                     rollout_index=rollout_index,
                 ):
                     break
@@ -711,30 +701,31 @@ class CubeActorLoop:
                     break
                 if self._group_rollout_index == self.attempts:
                     self._group_id += 1
-                    self._current_task_id = random.choice(self._task_ids)
+                    self._current_task = random.choice(self._tasks)
                     self._group_rollouts[self._group_id] = []
                     self._group_rollout_index = 0
                     self._run_submitted_groups += 1
                     self.total_submitted_groups += 1
+                assert self._current_task is not None
                 if not self._submit_one_rollout(
                     group_id=self._group_id,
-                    task_id=self._current_task_id,
+                    task=self._current_task,
                     rollout_index=self._group_rollout_index,
                 ):
                     break
                 self._group_rollout_index += 1
             else:
-                if self._next_task_index >= len(self._task_ids):
+                if self._next_task_index >= len(self._tasks):
                     break
                 self._group_id += 1
-                task_id = self._task_ids[self._next_task_index]
+                task = self._tasks[self._next_task_index]
                 self._next_task_index += 1
                 self._group_rollouts[self._group_id] = []
                 self._run_submitted_groups += 1
                 self.total_submitted_groups += 1
                 if not self._submit_one_rollout(
                     group_id=self._group_id,
-                    task_id=task_id,
+                    task=task,
                     rollout_index=0,
                 ):
                     break
@@ -745,7 +736,7 @@ class CubeActorLoop:
                 return "running"
             if self.is_training and trainer_finished:
                 return self._finish("trainer_finished")
-            if (not self.is_training) and self._next_task_index >= len(self._task_ids):
+            if (not self.is_training) and self._next_task_index >= len(self._tasks):
                 return self._finish("completed")
             time.sleep(0.01)
             return "running"
@@ -771,7 +762,7 @@ class CubeActorLoop:
         for ref in done_refs:
             info = self._pending.pop(ref)
             self._active_rollouts[info.llm_index] -= 1
-            self._active_rollouts_by_actor[info.benchmark_actor_index] -= 1
+            self._active_rollouts_by_worker[info.worker_index] -= 1
 
             rollout_result = RolloutResult.model_validate(ray.get(ref))
             rollout_result.model_version = info.model_version
@@ -780,14 +771,15 @@ class CubeActorLoop:
             if not rollout_result.training_texts:
                 logger.warning(
                     "Dropping empty rollout result and retrying: scheduler=%s group_id=%s "
-                    "task_id=%s rollout_index=%s model_version=%s",
+                    "cube_id=%s task_id=%s rollout_index=%s model_version=%s",
                     self.scheduler_name,
                     full_group_id,
-                    info.task_id,
+                    info.task.cube_id,
+                    info.task.task_id,
                     info.rollout_index,
                     info.model_version,
                 )
-                self._retry_rollouts.append((info.group_id, info.task_id, info.rollout_index))
+                self._retry_rollouts.append((info.group_id, info.task, info.rollout_index))
                 continue
 
             for step_index, sample in enumerate(rollout_result.training_texts):
@@ -859,11 +851,11 @@ class CubeActorLoop:
     def run(
         self,
         *,
-        task_ids: list[str],
+        tasks: list[CubeTaskRef],
         scheduler_name: str | None = None,
         stop_when_model_version_at_least: int | None = None,
     ) -> str:
-        status = self.start(task_ids=task_ids, scheduler_name=scheduler_name)
+        status = self.start(tasks=tasks, scheduler_name=scheduler_name)
         if status in {"no_tasks", "completed", "trainer_finished"}:
             return status
 
@@ -916,36 +908,36 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     llm_max_rollouts = int(cfg.actor.llm_max_rollouts)
     if llm_max_rollouts < 1:
         raise ValueError("actor.llm_max_rollouts must be >= 1")
-    cube_actor_max_rollouts = 1
+    cube_worker_max_rollouts = 1
     cube_workers = int(cfg.actor.cube_workers)
     if cube_workers < 1:
         raise ValueError("actor.cube_workers must be >= 1")
-    benchmark_instances = cube_workers
-    actor_num_cpus = float(getattr(cfg.actor, "cube_workers_num_cpus", 1.0))
-    required_ray_cpus = max(1, int(math.ceil(benchmark_instances * actor_num_cpus)))
-    check_local_cube_actor_resources(
+    worker_instances = cube_workers
+    worker_num_cpus = float(getattr(cfg.actor, "cube_workers_num_cpus", 1.0))
+    required_ray_cpus = max(1, int(math.ceil(worker_instances * worker_num_cpus)))
+    check_local_cube_worker_resources(
         cfg,
-        instances=benchmark_instances,
-        actor_num_cpus=actor_num_cpus,
+        instances=worker_instances,
+        worker_num_cpus=worker_num_cpus,
         required_ray_cpus=required_ray_cpus,
     )
-    should_shutdown_ray = _init_ray_runtime(cfg, owner_name="cube_actor", min_num_cpus=required_ray_cpus)
+    should_shutdown_ray = _init_ray_runtime(cfg, owner_name="cube_worker", min_num_cpus=required_ray_cpus)
     ray_worker_log_collector = _launch_ray_worker_log_collector(cfg)
 
     logger.info(
-        "Cube actor scheduler uses llm_max_rollouts=%d as per-vLLM generation capacity, cube_workers=%d, fixed actor_max_rollouts=%d",
+        "Cube scheduler uses llm_max_rollouts=%d as per-vLLM generation capacity, cube_workers=%d, fixed worker_max_rollouts=%d",
         llm_max_rollouts,
         cube_workers,
-        cube_actor_max_rollouts,
+        cube_worker_max_rollouts,
     )
 
     logger.info(
-        "Launching %d cube benchmark actors for %d llm urls (actor_num_cpus=%.2f)",
-        benchmark_instances,
+        "Launching %d cube workers for %d llm urls (worker_num_cpus=%.2f)",
+        worker_instances,
         len(llm_urls),
-        actor_num_cpus,
+        worker_num_cpus,
     )
-    benchmark_actors: list[Any] = []
+    cube_workers: list[Any] = []
     vllm_router = None
     try:
         wait_for_inference_servers(llm_urls)
@@ -961,6 +953,8 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         actor_model_path = finetune_model_path if finetune_model_path.exists() else Path(cfg.model_path)
         train_llms = _build_train_llms(cfg, llm_urls, actor_model_path)
         test_llms = _build_test_llms(cfg, llm_urls, actor_model_path)
+        cube_registry = build_cube_registry(cfg)
+        cube_runtime_specs = cube_registry.runtime_payloads()
         vllm_router = VLLMRouterActor.remote(
             [_build_llm_kwargs(llm) for llm in train_llms],
             max_inflight_per_server=llm_max_rollouts,
@@ -968,30 +962,31 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         ray_vllm_router = RayVLLMRouter(vllm_router)
         logger.info("Started cube vLLM router: %s", ray.get(vllm_router.snapshot.remote()))
 
-        benchmark_actors = _launch_cube_benchmark_actors(
+        cube_workers = _launch_cube_workers(
             cfg,
-            instances=benchmark_instances,
+            instances=worker_instances,
+            cube_specs=cube_runtime_specs,
             llm=_build_llm_kwargs(train_llms[0]),
             test_llm=_build_llm_kwargs(test_llms[0]),
             llm_router=ray_vllm_router,
             ray_worker_log_collector=ray_worker_log_collector,
         )
         health_timeout = float(getattr(cfg.actor, "cube_health_timeout", 600.0))
-        _wait_for_cube_benchmark_actors(benchmark_actors, timeout_s=health_timeout)
+        _wait_for_cube_workers(cube_workers, timeout_s=health_timeout)
 
-        train_task_ids = ray.get(benchmark_actors[0].get_train_task_ids.remote())
-        test_task_ids = ray.get(benchmark_actors[0].get_test_task_ids.remote())
+        train_tasks = list(cube_registry.train_tasks)
+        test_tasks = list(cube_registry.test_tasks)
 
         if cfg.train_subset:
-            train_task_ids = train_task_ids[cfg.train_subset.begin : cfg.train_subset.end]
+            train_tasks = train_tasks[cfg.train_subset.begin : cfg.train_subset.end]
         if cfg.test_subset:
-            test_task_ids = test_task_ids[cfg.test_subset.begin : cfg.test_subset.end]
+            test_tasks = test_tasks[cfg.test_subset.begin : cfg.test_subset.end]
 
-        if not train_task_ids:
+        if not train_tasks:
             raise ValueError("Cube benchmark returned an empty train task list")
 
-        logger.info("Loaded %d train task IDs", len(train_task_ids))
-        logger.info("Loaded %d test task IDs", len(test_task_ids))
+        logger.info("Loaded %d train cube task refs", len(train_tasks))
+        logger.info("Loaded %d test cube task refs", len(test_tasks))
 
         data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
         stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
@@ -1007,7 +1002,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             train_loop = CubeActorLoop(
                 cfg=cfg,
                 llms=train_llms,
-                benchmark_actors=benchmark_actors,
+                cube_workers=cube_workers,
                 trainer_state=trainer_state,
                 data_writer=data_writer,
                 stats_writer=stats_writer,
@@ -1017,7 +1012,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             test_loop = CubeActorLoop(
                 cfg=cfg,
                 llms=test_llms,
-                benchmark_actors=benchmark_actors,
+                cube_workers=cube_workers,
                 trainer_state=trainer_state,
                 data_writer=test_data_writer,
                 stats_writer=test_stats_writer,
@@ -1029,32 +1024,32 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             current_eval = -1
             test_loop_active = False
             eval_every_n_versions = int(getattr(cfg, "eval_every_n_versions", 0) or 0)
-            eval_test_actor_fraction = float(getattr(cfg.actor, "cube_eval_workers_fraction", 1.0))
-            eval_test_actor_fraction = min(1.0, max(0.0, eval_test_actor_fraction))
-            all_actor_indices = list(range(len(benchmark_actors)))
-            if len(all_actor_indices) <= 1:
-                eval_test_actor_indices = all_actor_indices
-                eval_train_actor_indices = all_actor_indices
+            eval_test_worker_fraction = float(getattr(cfg.actor, "cube_eval_workers_fraction", 1.0))
+            eval_test_worker_fraction = min(1.0, max(0.0, eval_test_worker_fraction))
+            all_worker_indices = list(range(len(cube_workers)))
+            if len(all_worker_indices) <= 1:
+                eval_test_worker_indices = all_worker_indices
+                eval_train_worker_indices = all_worker_indices
             else:
-                test_actor_count = math.ceil(len(all_actor_indices) * eval_test_actor_fraction)
-                test_actor_count = min(len(all_actor_indices) - 1, max(1, test_actor_count))
-                eval_test_actor_indices = all_actor_indices[-test_actor_count:]
-                eval_train_actor_indices = all_actor_indices[:-test_actor_count]
+                test_worker_count = math.ceil(len(all_worker_indices) * eval_test_worker_fraction)
+                test_worker_count = min(len(all_worker_indices) - 1, max(1, test_worker_count))
+                eval_test_worker_indices = all_worker_indices[-test_worker_count:]
+                eval_train_worker_indices = all_worker_indices[:-test_worker_count]
             logger.info(
-                "Cube eval actor split: %d train actors, %d test actors, fraction=%.3f",
-                len(eval_train_actor_indices),
-                len(eval_test_actor_indices),
-                eval_test_actor_fraction,
+                "Cube eval worker split: %d train workers, %d test workers, fraction=%.3f",
+                len(eval_train_worker_indices),
+                len(eval_test_worker_indices),
+                eval_test_worker_fraction,
             )
 
-            train_loop.start(task_ids=train_task_ids)
+            train_loop.start(tasks=train_tasks)
             while True:
                 next_regular_eval = (
                     int(trainer_state.propagated_weight_version or 0)
                     if last_regular_eval == -1
                     else last_regular_eval + eval_every_n_versions
                 )
-                should_eval = eval_every_n_versions > 0 and not cfg.debug.mode and bool(test_task_ids)
+                should_eval = eval_every_n_versions > 0 and not cfg.debug.mode and bool(test_tasks)
 
                 if (
                     should_eval
@@ -1063,10 +1058,10 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 ):
                     current_eval = next_regular_eval
                     logger.info("Starting cube test loop for model version %s", current_eval)
-                    train_loop.set_allowed_benchmark_actor_indices(eval_train_actor_indices)
-                    test_loop.set_allowed_benchmark_actor_indices(eval_test_actor_indices)
+                    train_loop.set_allowed_worker_indices(eval_train_worker_indices)
+                    test_loop.set_allowed_worker_indices(eval_test_worker_indices)
                     test_status = test_loop.start(
-                        task_ids=test_task_ids,
+                        tasks=test_tasks,
                         scheduler_name=f"cube_test_scheduler_v{current_eval}",
                     )
                     test_loop_active = test_status == "running"
@@ -1074,16 +1069,16 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                         train_loop.is_scheduling_paused = True
                     else:
                         last_regular_eval = current_eval
-                        train_loop.set_allowed_benchmark_actor_indices(None)
-                        test_loop.set_allowed_benchmark_actor_indices(None)
+                        train_loop.set_allowed_worker_indices(None)
+                        test_loop.set_allowed_worker_indices(None)
 
                 if test_loop_active:
                     test_status = test_loop.step()
                     if test_status == "completed":
                         test_loop_active = False
                         last_regular_eval = current_eval
-                        train_loop.set_allowed_benchmark_actor_indices(None)
-                        test_loop.set_allowed_benchmark_actor_indices(None)
+                        train_loop.set_allowed_worker_indices(None)
+                        test_loop.set_allowed_worker_indices(None)
                         train_loop.is_scheduling_paused = False
 
                 train_status = train_loop.step()
@@ -1098,18 +1093,18 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 logger.exception("Failed to finish W&B run")
         signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
-        if benchmark_actors:
+        if cube_workers:
             try:
-                ray.get([w.close.remote() for w in benchmark_actors])
-                logger.info("Closed cube benchmark actors")
+                ray.get([w.close.remote() for w in cube_workers])
+                logger.info("Closed cube workers")
             except Exception:
-                logger.exception("Failed to close cube benchmark actors")
-        for actor in benchmark_actors:
+                logger.exception("Failed to close cube workers")
+        for worker in cube_workers:
             try:
-                ray.kill(actor, no_restart=True)
-                logger.info("Killed cube benchmark actor: %s", actor)
+                ray.kill(worker, no_restart=True)
+                logger.info("Killed cube worker: %s", worker)
             except Exception:
-                logger.exception("Failed to kill cube benchmark actor: %s", actor)
+                logger.exception("Failed to kill cube worker: %s", worker)
         if ray_worker_log_collector is not None:
             try:
                 ray.get(ray_worker_log_collector.close.remote())
