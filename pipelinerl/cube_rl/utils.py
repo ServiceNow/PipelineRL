@@ -91,7 +91,7 @@ def check_local_cube_actor_resources(
             "Cube Ray actor configuration requires more CPU slots than this node appears to have: "
             f"required_ray_cpus={required_ray_cpus}, effective_logical_cpus={logical_cpus:.2f}, "
             f"instances={instances}, actor_num_cpus={actor_num_cpus}. "
-            "Reduce actor.llm_max_rollouts or actor.cube_actor_num_cpus, or run on a node with more CPUs."
+            "Reduce actor.cube_workers or actor.cube_workers_num_cpus, or run on a node with more CPUs."
         )
 
     actor_memory_gb = float(getattr(guard, "actor_memory_gb", 1.25))
@@ -116,7 +116,7 @@ def check_local_cube_actor_resources(
             f"Estimated requirement is {estimated_memory_gb:.2f} GiB "
             f"({instances} actors * {actor_memory_gb:.2f} GiB + {memory_overhead_gb:.2f} GiB overhead), "
             f"but this node has {total_memory_gb:.2f} GiB total and the configured threshold allows "
-            f"{allowed_total_gb:.2f} GiB. Reduce actor.llm_max_rollouts, reduce the number of actor vLLMs, "
+            f"{allowed_total_gb:.2f} GiB. Reduce actor.cube_workers, reduce the number of actor vLLMs, "
             "or increase cube_params.resource_guard.memory_usage_threshold only if you know the estimate is conservative."
         )
 
@@ -125,6 +125,6 @@ def check_local_cube_actor_resources(
             "Cube Ray actor configuration is likely to exceed currently available node memory. "
             f"Estimated requirement is {estimated_memory_gb:.2f} GiB, but only "
             f"{available_memory_gb:.2f} GiB is currently available. "
-            "Free memory, reduce actor.llm_max_rollouts, or lower cube_params.resource_guard.actor_memory_gb "
+            "Free memory, reduce actor.cube_workers, or lower cube_params.resource_guard.actor_memory_gb "
             "if measured actors are smaller on this workload."
         )

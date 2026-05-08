@@ -12,7 +12,9 @@ ray_local_mode: false
 actor:
   launcher: ray
   ray_num_cpus: null
-  cube_actor_num_cpus: 1.0
+  cube_workers_num_cpus: 1.0
+  cube_eval_workers_fraction: 0.5
+  cube_workers: 128
   llm_max_rollouts: 128
   ray_worker_log_enabled: true
   ray_worker_log_path: null

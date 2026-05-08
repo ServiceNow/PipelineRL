@@ -156,7 +156,7 @@ def _launch_cube_benchmark_actors(
 
     cube_name = getattr(params, "name", "default")
     seed = int(getattr(params, "seed", cfg.seed))
-    actor_num_cpus = float(getattr(cfg.actor, "cube_actor_num_cpus", 1.0))
+    actor_num_cpus = float(getattr(cfg.actor, "cube_workers_num_cpus", 1.0))
 
     actors = []
     for idx in range(instances):
@@ -309,7 +309,7 @@ class CubeActorLoop:
         # concurrency at one and scale by actor count. LLM load is controlled by
         # per-generation leases in the shared router, not by actor-to-LLM pinning.
         self.cube_actor_max_rollouts = 1
-        self.max_pending = max(1, len(benchmark_actors))
+        self.max_pending = max(1, len(self.llms) * self.llm_max_rollouts)
         self.rollout_timeout_s = getattr(cfg.actor, "rollout_timeout", None)
         if self.rollout_timeout_s is not None:
             self.rollout_timeout_s = float(self.rollout_timeout_s)
@@ -356,22 +356,46 @@ class CubeActorLoop:
         self._stop_reason = "completed"
         self._last_trainer_version = 0
         self._trainer_version_to_publish: int | None = None
+        self._allowed_benchmark_actor_indices: list[int] | None = None
 
         logger.info(
-            "%s: initialized global actor pool with %d llms, %d benchmark actors, actor max rollouts=%d, vllm max inflight/server=%d",
+            "%s: initialized global actor pool with %d llms, %d benchmark actors, actor max rollouts=%d, vllm max inflight/server=%d, max pending rollouts=%d",
             self.scheduler_name,
             len(self.llms),
             len(self.benchmark_actors),
             self.cube_actor_max_rollouts,
             self.llm_max_rollouts,
+            self.max_pending,
         )
 
     @property
     def is_running(self) -> bool:
         return self._is_running
 
+    def set_allowed_benchmark_actor_indices(self, indices: list[int] | None) -> None:
+        if indices is None:
+            self._allowed_benchmark_actor_indices = None
+            return
+        cleaned = sorted(set(int(idx) for idx in indices))
+        if not cleaned:
+            raise ValueError("allowed benchmark actor indices cannot be empty")
+        max_index = len(self.benchmark_actors) - 1
+        invalid = [idx for idx in cleaned if idx < 0 or idx > max_index]
+        if invalid:
+            raise ValueError(f"invalid benchmark actor indices: {invalid}")
+        self._allowed_benchmark_actor_indices = cleaned
+
+    def _allowed_benchmark_actor_indices_or_all(self) -> list[int]:
+        if self._allowed_benchmark_actor_indices is not None:
+            return self._allowed_benchmark_actor_indices
+        return list(range(len(self.benchmark_actors)))
+
+    def _max_pending_for_allowed_actors(self) -> int:
+        allowed_actor_capacity = len(self._allowed_benchmark_actor_indices_or_all()) * self.cube_actor_max_rollouts
+        return max(1, min(self.max_pending, allowed_actor_capacity))
+
     def _select_benchmark_actor_index(self) -> int | None:
-        actor_indices = range(len(self.benchmark_actors))
+        actor_indices = self._allowed_benchmark_actor_indices_or_all()
         available_indices = [
             idx for idx in actor_indices if self._active_rollouts_by_actor[idx] < self.cube_actor_max_rollouts
         ]
@@ -530,7 +554,8 @@ class CubeActorLoop:
         self.init_stats()
 
     def _submit_one_rollout(self, *, group_id: int, task_id: str, rollout_index: int) -> bool:
-        if sum(self._active_rollouts_by_actor) >= len(self.benchmark_actors):
+        actor_indices = self._allowed_benchmark_actor_indices_or_all()
+        if sum(self._active_rollouts_by_actor[idx] for idx in actor_indices) >= self._max_pending_for_allowed_actors():
             return False
 
         benchmark_actor_index = self._select_benchmark_actor_index()
@@ -669,7 +694,7 @@ class CubeActorLoop:
             self._trainer_version_to_publish = self._last_trainer_version
             self._last_trainer_version = int(self.trainer_state.propagated_weight_version or 0)
         
-        while len(self._pending) < self.max_pending:
+        while len(self._pending) < self._max_pending_for_allowed_actors():
             if self._retry_rollouts:
                 group_id, task_id, rollout_index = self._retry_rollouts[0]
                 if not self._submit_one_rollout(
@@ -806,19 +831,19 @@ class CubeActorLoop:
                 )
                 should_publish_test_stats = (not self.is_training) and self._run_finished_groups == self._expected_groups
                 if should_publish_train_stats or should_publish_test_stats:
-                    loop_stats = {
-                        "published_samples": self.total_published_samples,
-                        "submitted_groups": self.total_submitted_groups,
-                        "finished_groups": self.total_finished_groups,
-                        "pending_rollouts": len(self._pending),
-                        "active_rollouts": sum(self._active_rollouts),
-                        "time_since_start": time.time() - self._loop_start_time,
-                    }
                     if self.is_training:
+                        loop_stats = {
+                            "published_samples": self.total_published_samples,
+                            "submitted_groups": self.total_submitted_groups,
+                            "finished_groups": self.total_finished_groups,
+                            "pending_rollouts": len(self._pending),
+                            "active_rollouts": sum(self._active_rollouts),
+                            "time_since_start": time.time() - self._loop_start_time,
+                        }
                         loop_stats["trainer_model_version"] = self._trainer_version_to_publish
                         self._trainer_version_to_publish = None
                     else:
-                        loop_stats["trainer_model_version"] = self._last_trainer_version
+                        loop_stats = {"trainer_model_version": self._last_trainer_version}
                     self.publish_stats(loop_stats)
 
         if (
@@ -892,8 +917,11 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     if llm_max_rollouts < 1:
         raise ValueError("actor.llm_max_rollouts must be >= 1")
     cube_actor_max_rollouts = 1
-    benchmark_instances = len(llm_urls) * llm_max_rollouts
-    actor_num_cpus = float(getattr(cfg.actor, "cube_actor_num_cpus", 1.0))
+    cube_workers = int(cfg.actor.cube_workers)
+    if cube_workers < 1:
+        raise ValueError("actor.cube_workers must be >= 1")
+    benchmark_instances = cube_workers
+    actor_num_cpus = float(getattr(cfg.actor, "cube_workers_num_cpus", 1.0))
     required_ray_cpus = max(1, int(math.ceil(benchmark_instances * actor_num_cpus)))
     check_local_cube_actor_resources(
         cfg,
@@ -905,8 +933,9 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     ray_worker_log_collector = _launch_ray_worker_log_collector(cfg)
 
     logger.info(
-        "Cube actor scheduler uses llm_max_rollouts=%d as per-vLLM generation capacity with fixed actor_max_rollouts=%d",
+        "Cube actor scheduler uses llm_max_rollouts=%d as per-vLLM generation capacity, cube_workers=%d, fixed actor_max_rollouts=%d",
         llm_max_rollouts,
+        cube_workers,
         cube_actor_max_rollouts,
     )
 
@@ -997,35 +1026,69 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             )
 
             last_regular_eval = -1
+            current_eval = -1
+            test_loop_active = False
             eval_every_n_versions = int(getattr(cfg, "eval_every_n_versions", 0) or 0)
+            eval_test_actor_fraction = float(getattr(cfg.actor, "cube_eval_workers_fraction", 1.0))
+            eval_test_actor_fraction = min(1.0, max(0.0, eval_test_actor_fraction))
+            all_actor_indices = list(range(len(benchmark_actors)))
+            if len(all_actor_indices) <= 1:
+                eval_test_actor_indices = all_actor_indices
+                eval_train_actor_indices = all_actor_indices
+            else:
+                test_actor_count = math.ceil(len(all_actor_indices) * eval_test_actor_fraction)
+                test_actor_count = min(len(all_actor_indices) - 1, max(1, test_actor_count))
+                eval_test_actor_indices = all_actor_indices[-test_actor_count:]
+                eval_train_actor_indices = all_actor_indices[:-test_actor_count]
+            logger.info(
+                "Cube eval actor split: %d train actors, %d test actors, fraction=%.3f",
+                len(eval_train_actor_indices),
+                len(eval_test_actor_indices),
+                eval_test_actor_fraction,
+            )
 
+            train_loop.start(task_ids=train_task_ids)
             while True:
-                if _is_trainer_finished(cfg, trainer_state):
-                    break
                 next_regular_eval = (
                     int(trainer_state.propagated_weight_version or 0)
                     if last_regular_eval == -1
                     else last_regular_eval + eval_every_n_versions
                 )
                 should_eval = eval_every_n_versions > 0 and not cfg.debug.mode and bool(test_task_ids)
-                train_stop_version = next_regular_eval if should_eval else None
 
-                train_loop.is_scheduling_paused = False
-                stop_reason = train_loop.run(
-                    task_ids=train_task_ids,
-                    stop_when_model_version_at_least=train_stop_version,
-                )
-                if stop_reason == "trainer_finished":
-                    break
-
-                if stop_reason == "eval_boundary" and should_eval:
-                    eval_version = next_regular_eval
-                    logger.info("Starting cube test loop for model version %s", eval_version)
-                    _ = test_loop.run(
+                if (
+                    should_eval
+                    and int(trainer_state.propagated_weight_version or 0) >= next_regular_eval
+                    and not test_loop_active
+                ):
+                    current_eval = next_regular_eval
+                    logger.info("Starting cube test loop for model version %s", current_eval)
+                    train_loop.set_allowed_benchmark_actor_indices(eval_train_actor_indices)
+                    test_loop.set_allowed_benchmark_actor_indices(eval_test_actor_indices)
+                    test_status = test_loop.start(
                         task_ids=test_task_ids,
-                        scheduler_name=f"cube_test_scheduler_v{eval_version}",
+                        scheduler_name=f"cube_test_scheduler_v{current_eval}",
                     )
-                    last_regular_eval = eval_version
+                    test_loop_active = test_status == "running"
+                    if test_loop_active:
+                        train_loop.is_scheduling_paused = True
+                    else:
+                        last_regular_eval = current_eval
+                        train_loop.set_allowed_benchmark_actor_indices(None)
+                        test_loop.set_allowed_benchmark_actor_indices(None)
+
+                if test_loop_active:
+                    test_status = test_loop.step()
+                    if test_status == "completed":
+                        test_loop_active = False
+                        last_regular_eval = current_eval
+                        train_loop.set_allowed_benchmark_actor_indices(None)
+                        test_loop.set_allowed_benchmark_actor_indices(None)
+                        train_loop.is_scheduling_paused = False
+
+                train_status = train_loop.step()
+                if train_status == "trainer_finished":
+                    break
     finally:
         if run is not None:
             try:
