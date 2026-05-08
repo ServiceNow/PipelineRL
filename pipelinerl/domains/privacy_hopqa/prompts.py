@@ -8,6 +8,17 @@ def _json_block(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
+ANSWER_FORMAT_GUIDANCE = """Answer Format Guidance:
+- Answer only the current hop, not later hops
+- Your answer will be string-matched against accepted answer variants, so output the answer unit only
+- Use fewer than 5 words whenever possible; only exceed this for a longer proper name or required title
+- Give the minimum words necessary to answer the question
+- Include units or descriptors only if the question asks for them or they are needed to avoid ambiguity
+- Do not answer with a full sentence
+- Example: for "What percentage of river miles had bacteria exceeding EPA's recreational benchmark?", answer "20%", not "20% of river miles had bacteria exceeding EPA's recreational benchmark"
+- If this hop's answer will be used as input to a later hop, prefer the form that can be directly substituted into that later question"""
+
+
 def build_hop_plan_prompt(
     *,
     numbered_questions: str,
@@ -157,12 +168,7 @@ Resolved Earlier Hops:
 Document:
 {_json_block(document)}
 
-Answer Format Guidance:
-- Answer only the current hop, not later hops
-- Follow the wording of the current hop question closely
-- Give the minimum information necessary to answer the current hop
-- Include units or descriptors only if the question asks for them or they are needed to avoid ambiguity
-- If this hop's answer will be used as input to a later hop, prefer the form that can be directly substituted into that later question
+{ANSWER_FORMAT_GUIDANCE}
 
 Return JSON in this format:
 {{
@@ -211,12 +217,7 @@ Document-Reading Results:
 Unread Candidate Documents From The Current Retrieval Round:
 {_json_block(unread_candidate_cards or [])}
 
-Answer Format Guidance:
-- Answer only the current hop, not later hops
-- Follow the wording of the current hop question closely
-- Give the minimum information necessary to answer the current hop
-- Include units or descriptors only if the question asks for them or they are needed to avoid ambiguity
-- If this hop's answer will be used as input to a later hop, prefer the form that can be directly substituted into that later question
+{ANSWER_FORMAT_GUIDANCE}
 
 Return JSON in this format:
 {{
