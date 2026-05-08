@@ -60,7 +60,6 @@ mm_processor_kwargs:
 
 # Override vLLM config for multimodal support
 vllm_config:
-  use_v1: true
   vllm_kwargs:
     max-num-seqs: 64
     max-num-batched-tokens: 32768
