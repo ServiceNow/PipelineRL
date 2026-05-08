@@ -825,7 +825,7 @@ def run_actor_loop(cfg: DictConfig):
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
             chat_template_kwargs=cfg.llm.get("chat_template_kwargs", {}),
-            mm_processor_kwargs=cfg.get("mm_processor_kwargs", {}),
+            mm_processor_kwargs=cfg.llm.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]
@@ -837,7 +837,7 @@ def run_actor_loop(cfg: DictConfig):
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
             chat_template_kwargs=cfg.test_llm.get("chat_template_kwargs", {}),
-            mm_processor_kwargs=cfg.get("mm_processor_kwargs", {}),
+            mm_processor_kwargs=cfg.test_llm.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]

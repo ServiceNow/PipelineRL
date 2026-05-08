@@ -16,11 +16,17 @@ llm:
   parameters:
     max_tokens: 2048
     temperature: 0.7
+  # Processor configuration for vision-language models (shared between training and inference)
+  mm_processor_kwargs:
+    min_pixels: 784  # 28*28
+    max_pixels: 1003520  # 1280*28*28
+    use_fast: true
 
 test_llm:
   parameters:
     max_tokens: 2048
     temperature: 0.7
+  mm_processor_kwargs: ${llm.mm_processor_kwargs}
 
 actor:
   rollout_policy: pipelinerl.domains.chartqa.generate_chartqa_rollout
@@ -48,15 +54,10 @@ test_dataset_names:
   - chartqa_test
 
 # Use vision-language model for multimodal support
-model_path: Qwen/Qwen2.5-VL-3B-Instruct
+model_path: Qwen/Qwen3-VL-4B-Instruct
+# model_path: Qwen/Qwen2.5-VL-3B-Instruct
 
 eval_every_n_versions: 12500
-
-# Processor configuration for vision-language models (shared between training and inference)
-mm_processor_kwargs:
-  min_pixels: 784  # 28*28
-  max_pixels: 1003520  # 1280*28*28
-  use_fast: true
 
 # Override vLLM config for multimodal support
 vllm_config:

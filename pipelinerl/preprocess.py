@@ -419,7 +419,7 @@ def run_preprocessing_loop(
             model_name=cfg.finetune.config_name,
             tokenizer_name=cfg.finetune.config_name,
             parameters=cfg.llm.parameters,
-            mm_processor_kwargs=cfg.get("mm_processor_kwargs", {}),
+            mm_processor_kwargs=cfg.llm.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]
