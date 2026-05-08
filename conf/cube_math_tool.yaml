@@ -57,52 +57,59 @@ preprocess:
   shared_memory_entry_size: 1000000000
 
 cube_params:
-  name: tir
   resource_guard:
     actor_memory_gb: 1.25
     memory_overhead_gb: 8.0
     memory_usage_threshold: 0.90
-  benchmark:
-    _target_: math_tool_use.benchmark.MathToolUseBenchmark
-    default_tool_config:
-      _target_: math_tool_use.tool.MathToolUseToolConfig
-      sandbox_endpoint: http://dns-24e3447c-506e-4b21-92df-156e18db5087-sandboxfusion
-  agent:
-    _target_: cube_harness.agents.tir.TirAgentConfig
-    llm_config:
-      _target_: cube_harness.llm.RoutedLLMConfig
-      model_name: ${vllm_config.vllm_kwargs.served_model_name}
-      tokenizer_name: ${model_path}
-      timeout: 3600.0
-      num_retries: 1
-      extra_body:
-        return_token_ids: true
-    system_prompt: |
-      You are a math-focused AI Agent. Solve problems by combining clear symbolic reasoning
-      with short, deterministic Python code.
-      Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
-      Always present the final answer in LaTeX \boxed{}.
-      Do not express emotions or opinions about user questions.
-
-      Workflow:
-      1. Draft a brief plan in plain text.
-      2. Execute one run_python_code call to compute or verify the result.
-      3. Finalize by calling MathAnswer with the LaTeX-formatted answer.
-
-      Python execution policy (run_python_code):
-      - Use Python strictly for pure computation to verify and validate the final answer.
-      - No network, file system, OS or environment access.
-      - Keep snippets minimal and self-contained; print only the final result.
-
-      Validation:
-      - Cross-check results (alternative derivation, invariants, higher precision) before finalizing.
-      - If execution fails, propose the minimal fix and retry.
-      Always verify with run_python_code before invoking MathAnswer.
-    max_actions: 3
   seed: ${seed}
+  cubes:
+    - id: open_reasoner_zero_57k
+      split: train
+      dataset_name: open_reasoner_zero_57k
+      benchmark: &math_tool_benchmark
+        _target_: math_tool_use.benchmark.MathToolUseBenchmark
+        default_tool_config:
+          _target_: math_tool_use.tool.MathToolUseToolConfig
+          sandbox_endpoint: http://dns-24e3447c-506e-4b21-92df-156e18db5087-sandboxfusion
+      agent: &tir_agent
+        _target_: cube_harness.agents.tir.TirAgentConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          timeout: 3600.0
+          num_retries: 1
+          extra_body:
+            return_token_ids: true
+        system_prompt: |
+          You are a math-focused AI Agent. Solve problems by combining clear symbolic reasoning
+          with short, deterministic Python code.
+          Keep your replies concise and direct. Prioritize clarity and avoid over-elaboration.
+          Always present the final answer in LaTeX \boxed{}.
+          Do not express emotions or opinions about user questions.
 
-train_dataset_names:
-  - open_reasoner_zero_57k
-  - open_reasoner_zero_extended_72k
-test_dataset_names:
-  - aime_2025
+          Workflow:
+          1. Draft a brief plan in plain text.
+          2. Execute one run_python_code call to compute or verify the result.
+          3. Finalize by calling MathAnswer with the LaTeX-formatted answer.
+
+          Python execution policy (run_python_code):
+          - Use Python strictly for pure computation to verify and validate the final answer.
+          - No network, file system, OS or environment access.
+          - Keep snippets minimal and self-contained; print only the final result.
+
+          Validation:
+          - Cross-check results (alternative derivation, invariants, higher precision) before finalizing.
+          - If execution fails, propose the minimal fix and retry.
+          Always verify with run_python_code before invoking MathAnswer.
+        max_actions: 3
+    - id: open_reasoner_zero_extended_72k
+      split: train
+      dataset_name: open_reasoner_zero_extended_72k
+      benchmark: *math_tool_benchmark
+      agent: *tir_agent
+    - id: aime_2025
+      split: test
+      dataset_name: aime_2025
+      benchmark: *math_tool_benchmark
+      agent: *tir_agent
