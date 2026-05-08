@@ -132,6 +132,19 @@ async def schedule_rollouts(
     """
     loop = asyncio.get_running_loop()
 
+    # Diagnostic logging (Process B side) – enabled by debug.log_data_pipeline
+    _pb_log_file = None
+    if cfg.debug.get("log_data_pipeline", False):
+        import json as _json_b
+        import pathlib as _pathlib_b
+        _log_dir_b = _pathlib_b.Path(cfg.output_dir) / "actor" / "data_pipeline_log"
+        _log_dir_b.mkdir(parents=True, exist_ok=True)
+        # Use scheduler_name to distinguish multiple workers
+        _safe_name = scheduler_name.replace(" ", "_").replace("/", "_").replace(",", "")
+        _pb_log_file = open(_log_dir_b / f"process_b_{_safe_name}.jsonl", "a")
+    _pb_problem_queue_empty_count = 0
+    _pb_llm_busy_count = 0
+
     # Track active tasks per LLM
     active_rollouts = [0] * len(llms)
     started_rollouts = 0
@@ -145,6 +158,7 @@ async def schedule_rollouts(
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
     retryable_rollout_exceptions = (
         aiohttp.ServerTimeoutError,
+        aiohttp.ServerDisconnectedError,
         asyncio.TimeoutError,
         TimeoutError,
         RetryableAbortedCompletionError,
@@ -180,7 +194,7 @@ async def schedule_rollouts(
         llm_index: int,
         session: aiohttp.ClientSession,
     ):
-        nonlocal started_rollouts, finished_rollouts
+        nonlocal started_rollouts, finished_rollouts, _pb_problem_queue_empty_count, _pb_llm_busy_count
         try:
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
@@ -192,21 +206,35 @@ async def schedule_rollouts(
                     break
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:
-                    is_retryable = isinstance(exc, retryable_rollout_exceptions)
-                    can_retry = max_rollout_retries < 0 or retry_count < max_rollout_retries
-                    if is_retryable and can_retry and not is_trainer_finished():
-                        retry_count += 1
-                        backoff_s = min(retry_max_delay_s, retry_initial_delay_s * (2 ** (retry_count - 1)))
-                        if retry_count == 1 or retry_count % 10 == 0:
-                            logger.warning(
-                                f"{scheduler_name}: rollout {group_id}/{rollout_index} failed with "
-                                f"{exc.__class__.__name__}, retry {retry_count}"
-                            )
-                        await asyncio.sleep(backoff_s)
-                        continue
-                    handle_rollout_exception(exc)
-                    return
+                except aiohttp.ClientResponseError as http_exc:
+                    if 400 <= http_exc.status < 500:
+                        logger.warning(
+                            f"Rollout failed with HTTP {http_exc.status} for group {group_id}, "
+                            f"skipping this rollout: {http_exc.message}"
+                        )
+                        rollout_result = RolloutResult(
+                            training_texts=[],
+                            metrics=BaseMetrics(reward=0.0, success=False, no_error=False, no_answer=True),
+                            latency=0.0,
+                        )
+                        break
+                    exc = http_exc
+                except Exception as exc_:
+                    exc = exc_
+                is_retryable = isinstance(exc, retryable_rollout_exceptions)
+                can_retry = max_rollout_retries < 0 or retry_count < max_rollout_retries
+                if is_retryable and can_retry and not is_trainer_finished():
+                    retry_count += 1
+                    backoff_s = min(retry_max_delay_s, retry_initial_delay_s * (2 ** (retry_count - 1)))
+                    if retry_count == 1 or retry_count % 10 == 0:
+                        logger.warning(
+                            f"{scheduler_name}: rollout {group_id}/{rollout_index} failed with "
+                            f"{exc.__class__.__name__}, retry {retry_count}"
+                        )
+                    await asyncio.sleep(backoff_s)
+                    continue
+                handle_rollout_exception(exc)
+                return
             rollout_result.model_version = model_version
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
@@ -219,10 +247,35 @@ async def schedule_rollouts(
                 sample.group_id = full_group_id
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
-                # This is blocking call, but there's just one other thread reading from this queue.
-                random.shuffle(group_rollouts[group_id])
-                result_queue.put(group_rollouts[group_id])
+                # Filter out empty results (failed rollouts with no training data)
+                valid_results = [r for r in group_rollouts[group_id] if r.training_texts]
+                if not valid_results:
+                    logger.warning(
+                        f"Dropping group {group_id}: all {attempts} rollouts failed "
+                        f"(no training samples produced)"
+                    )
+                    del group_rollouts[group_id]
+                    finished_rollouts += 1
+                    return
+                random.shuffle(valid_results)
                 del group_rollouts[group_id]
+                _t_put_start = time.monotonic()
+                await asyncio.get_event_loop().run_in_executor(None, result_queue.put, valid_results)
+                _put_duration = time.monotonic() - _t_put_start
+                if _pb_log_file is not None:
+                    _pb_log_file.write(_json_b.dumps({
+                        "wall": time.time(),
+                        "event": "put",
+                        "put_blocked_s": _put_duration,
+                        "result_queue_depth_after": result_queue.qsize(),
+                        "active_rollouts": sum(active_rollouts),
+                        "groups_in_progress": len(group_rollouts),
+                        "problem_queue_empty_since_last": _pb_problem_queue_empty_count,
+                        "llm_busy_since_last": _pb_llm_busy_count,
+                    }) + "\n")
+                    _pb_log_file.flush()
+                    _pb_problem_queue_empty_count = 0
+                    _pb_llm_busy_count = 0
             finished_rollouts += 1
         except Exception as e:
             handle_rollout_exception(e)
@@ -259,6 +312,7 @@ async def schedule_rollouts(
                     problem = problem_queue.get(block=False)
                 except Empty:
                     # give some quality time for other couroutines to work
+                    _pb_problem_queue_empty_count += 1
                     await asyncio.sleep(0.01)
                     continue
                 group_id += 1
@@ -268,6 +322,7 @@ async def schedule_rollouts(
             next_llm = active_rollouts.index(min(active_rollouts))
             if active_rollouts[next_llm] == cfg.actor.llm_max_rollouts:
                 # all llms are busy, wait for one to finish
+                _pb_llm_busy_count += 1
                 await asyncio.sleep(0.01)
                 continue
             active_rollouts[next_llm] += 1
@@ -284,6 +339,8 @@ async def schedule_rollouts(
             )
             group_rollout_index += 1
     logger.info("Rollout scheduler finished")
+    if _pb_log_file is not None:
+        _pb_log_file.close()
 
 
 def rollout_maker_entrypoint(
@@ -294,7 +351,7 @@ def rollout_maker_entrypoint(
     llms: list[TrainableLLM],
     scheduler_name: str,
 ):
-    trainer_state = TrainerState(Path(cfg.output_dir))
+    trainer_state = TrainerState(Path(cfg.output_dir), use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode:
         trainer_state.propagated_weight_version = 0
     else:
@@ -476,6 +533,16 @@ class ActorLoop:
         published_samples = 0
         submitted_groups = 0
         finished_groups = 0
+
+        # Diagnostic logging setup (enabled by debug.log_data_pipeline)
+        _pipeline_log_file = None
+        if self.is_training and self.cfg.debug.get("log_data_pipeline", False):
+            import json as _json
+            import pathlib as _pathlib
+            _log_dir = _pathlib.Path(self.cfg.output_dir) / "actor" / "data_pipeline_log"
+            _log_dir.mkdir(parents=True, exist_ok=True)
+            _pipeline_log_file = open(_log_dir / "process_a.jsonl", "a")
+        _last_publish_wall = None  # wall clock of last successful publish
         expected_rollouts = -1 if self.is_training else len(dataset)
         if expected_rollouts > 0:
             logger.info(f"Will stop after {expected_rollouts} rollouts")
@@ -583,14 +650,16 @@ class ActorLoop:
                 except queue.Empty:
                     continue
 
+                _t_got = time.monotonic()
+
                 if isinstance(rollout_results, Exception):
                     logger.error("Stop actor loop due to error")
                     raise rollout_results
 
                 assert isinstance(rollout_results, list)
                 assert isinstance(rollout_results[0], RolloutResult)
-                assert len(rollout_results) == attempts, (
-                    f"Expected {attempts} rollouts, got {len(rollout_results)}"
+                assert 0 < len(rollout_results) <= attempts, (
+                    f"Expected 1-{attempts} rollouts, got {len(rollout_results)}"
                 )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
@@ -649,7 +718,9 @@ class ActorLoop:
                 for r in rollout_results:
                     for text in r.training_texts:
                         all_text_dumps.append(text.model_dump())
+                _t_before_redis = time.monotonic()
                 data_stream_writer.write(all_text_dumps)
+                _t_after_redis = time.monotonic()
                 in_progress = submitted_groups - finished_groups
                 logger.info(
                     f"Published {group_samples} {'train' if self.is_training else 'test'} samples"
@@ -663,10 +734,12 @@ class ActorLoop:
                 time_to_publish_train_stats = (
                     self.is_training
                     and trainer_version_to_publish is not None
-                ) or self.debug_mode 
+                ) or self.debug_mode
                 time_to_publish_test_stats = finished_groups == expected_rollouts
 
                 # Publish stats at every new model version or if all tapes are finished
+                _t_before_stats = None
+                _t_after_stats = None
                 if time_to_publish_train_stats or time_to_publish_test_stats:
                     if self.is_training:
                         loop_stats = {
@@ -674,7 +747,7 @@ class ActorLoop:
                             "problem_queue_size": self.problem_queue.qsize(),
                             "result_queue_size": self.result_queue.qsize(),
                             "finished_groups": finished_groups,
-                            "trainer_model_version": trainer_version_to_publish, 
+                            "trainer_model_version": trainer_version_to_publish,
                             "time_since_start": time.time() - loop_start_time,
                         }
                         trainer_version_to_publish = None
@@ -683,15 +756,37 @@ class ActorLoop:
                             "trainer_model_version": last_trainer_version
                             }
 
+                    _t_before_stats = time.monotonic()
                     self.publish_stats(
                         stats_writer=stats_writer,
                         loop_stats=loop_stats,
                     )
+                    _t_after_stats = time.monotonic()
+
+                if _pipeline_log_file is not None:
+                    _now = time.monotonic()
+                    _entry = {
+                        "wall": time.time(),
+                        "finished_groups": finished_groups,
+                        "result_queue_depth": self.result_queue.qsize(),
+                        "inter_publish_gap_s": _t_got - _last_publish_wall if _last_publish_wall is not None else None,
+                        "process_s": _t_before_redis - _t_got,
+                        "redis_write_s": _t_after_redis - _t_before_redis,
+                        "stats_write_s": (_t_after_stats - _t_before_stats) if _t_before_stats is not None else None,
+                        "total_cycle_s": _now - _t_got,
+                        "group_samples": group_samples,
+                    }
+                    _pipeline_log_file.write(_json.dumps(_entry) + "\n")
+                    _pipeline_log_file.flush()
+                _last_publish_wall = _t_got
 
 
                 if finished_groups == expected_rollouts:
                     logger.info(f"Finished {expected_rollouts} rollouts, stopping actor loop")
                     break
+
+        if _pipeline_log_file is not None:
+            _pipeline_log_file.close()
 
     def publish_stats(self, stats_writer: StreamWriter, loop_stats: Dict):
         split_name = "test_" if not self.is_training else ""
@@ -842,7 +937,7 @@ def run_actor_loop(cfg: DictConfig):
 
     wait_for_inference_servers(llm_urls)
     wait_for_environments(cfg)
-    trainer_state = TrainerState(exp_path)
+    trainer_state = TrainerState(exp_path, use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode:
         trainer_state.debug_mode_init()
     else:
