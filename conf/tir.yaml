@@ -41,9 +41,13 @@ rewards:
 environments:
   - key: math
     mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
     _target_: pipelinerl.domains.math.MathEnvironment
 environment_key: math
 dataset_loader: pipelinerl.domains.math.load_datasets
+
+world:
+  env_replicas_per_actor: 1
 
 train_dataset_names:
   - open_reasoner_zero_57k
