@@ -22,7 +22,7 @@ from .resources import (
     get_static_local_index,
 )
 
-from .agent import PrivacyHopQAAgent
+from .agent import PrivacyHopQAAgent, is_helper_infrastructure_error
 from .llm_adapter import PrivacyHopQALLMAdapter, is_llm_infrastructure_error
 from .reward import score_chain_answers
 from .settings import PrivacyHopQASettings
@@ -157,7 +157,7 @@ async def _run_privacy_hopqa_rollout_async(
         docs_read = sum(len(hop.get("selected_doc_ids", [])) for hop in agent_result.hop_states)
         iterations_used = int(report_metadata.get("iterations_used") or 0)
     except Exception as exc:
-        if is_llm_infrastructure_error(exc):
+        if is_llm_infrastructure_error(exc) or is_helper_infrastructure_error(exc):
             raise
         logger.exception("privacy_hopqa rollout failed for chain %s", problem.get("chain_id"))
         error = str(exc)

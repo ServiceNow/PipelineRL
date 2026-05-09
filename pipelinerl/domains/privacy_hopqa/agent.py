@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import aiohttp
+
 from .llm_adapter import PrivacyHopQALLMAdapter, is_llm_infrastructure_error
 from .prompts import (
     build_doc_choose_prompt,
@@ -21,6 +23,7 @@ from .prompts import (
     build_hop_resolve_prompt,
 )
 from .reporting import build_deterministic_report, parse_answer_lines
+from .reward import normalize_answer
 from .settings import PrivacyHopQASettings
 from .timeline import write_timeline_artifacts
 from .utils import extract_json
@@ -28,11 +31,131 @@ from .utils import extract_json
 logger = logging.getLogger(__name__)
 
 
+class PrivacyHopQAHelperInfrastructureError(TimeoutError):
+    """Retrieval-helper transport/server failure that should retry the rollout."""
+
+
+def is_helper_infrastructure_error(exc: BaseException) -> bool:
+    """Return true for helper transport/server failures, not invalid retrieval plans."""
+    if isinstance(exc, PrivacyHopQAHelperInfrastructureError):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status == 429 or exc.status >= 500
+    if isinstance(
+        exc,
+        (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerTimeoutError,
+            asyncio.TimeoutError,
+            TimeoutError,
+        ),
+    ):
+        return True
+    text = str(exc).lower()
+    return "server disconnected" in text or "connection reset" in text
+
+
 def _truncate(text: str, limit: int) -> str:
     value = str(text or "")
     if len(value) <= limit:
         return value
     return value[:limit].rstrip() + "..."
+
+
+_LEGACY_RETRIEVAL_CONTEXT_MODES = {"legacy", "legacy_prefix", "document_prefix", "prefix"}
+_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whose",
+    "why",
+    "with",
+}
+
+
+def _uses_legacy_retrieval_context(mode: str) -> bool:
+    return str(mode or "").strip().lower() in _LEGACY_RETRIEVAL_CONTEXT_MODES
+
+
+def _query_terms(query: str) -> set[str]:
+    terms = set(re.findall(r"[a-z0-9][a-z0-9._-]*", query.lower()))
+    return {term for term in terms if len(term) > 2 and term not in _QUERY_STOPWORDS}
+
+
+def _window_spans(text: str, window_chars: int, overlap_chars: int) -> list[tuple[int, int]]:
+    if not text:
+        return [(0, 0)]
+    window_chars = max(1, int(window_chars))
+    overlap_chars = max(0, min(int(overlap_chars), window_chars - 1))
+    step = max(1, window_chars - overlap_chars)
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + window_chars)
+        spans.append((start, end))
+        if end >= len(text):
+            break
+        start += step
+    return spans
+
+
+def _query_match_score(query: str, text: str) -> int:
+    terms = _query_terms(query)
+    if not terms or not text:
+        return 0
+    lower = text.lower()
+    return sum(1 for term in terms if term in lower)
+
+
+def _query_snippet(text: str, query: str, limit: int) -> str:
+    if not text:
+        return ""
+    terms = sorted(_query_terms(query), key=len, reverse=True)
+    lower = text.lower()
+    pos = -1
+    for term in terms:
+        pos = lower.find(term)
+        if pos >= 0:
+            break
+    if pos < 0:
+        return _truncate(text, limit)
+    half = max(1, limit // 2)
+    start = max(0, pos - half)
+    end = min(len(text), start + limit)
+    start = max(0, end - limit)
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+    return snippet
 
 
 def _normalize_query(text: str) -> str:
@@ -49,6 +172,18 @@ def _clamp_confidence(value: Any, default: float = 0.0) -> float:
 
 def _normalize_answer(value: str | None) -> str:
     return " ".join(str(value or "").strip().lower().split())
+
+
+def _dedupe_strings(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        key = normalize_answer(text)
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
 
 
 def _current_timestamp() -> float:
@@ -105,18 +240,35 @@ class CandidateDoc:
             self.title = other.title
 
     def as_card(self, chooser_chars: int) -> dict[str, Any]:
-        return {
+        snippet = str(self.metadata.get("snippet") or self.excerpt)
+        card = {
             "doc_id": self.doc_id,
             "source": self.source,
             "title": self.title,
             "best_rank": self.rank,
             "hit_count": len(self.queries),
             "top_queries": self.queries[:2],
-            "snippet": _truncate(self.excerpt, chooser_chars),
+            "snippet": _truncate(snippet, chooser_chars),
         }
+        parent_doc_id = self.metadata.get("parent_doc_id")
+        if parent_doc_id and parent_doc_id != self.doc_id:
+            card["parent_doc_id"] = parent_doc_id
+        for key in (
+            "evidence_window_id",
+            "window_index",
+            "window_count",
+            "window_char_start",
+            "window_char_end",
+            "retrieval_context_mode",
+            "retrieval_chunk_chars",
+            "retrieval_chunk_overlap_chars",
+        ):
+            if key in self.metadata:
+                card[key] = self.metadata[key]
+        return card
 
     def as_reader_input(self, excerpt_chars: int) -> dict[str, Any]:
-        return {
+        document = {
             "doc_id": self.doc_id,
             "source": self.source,
             "title": self.title,
@@ -124,6 +276,22 @@ class CandidateDoc:
             "queries": self.queries,
             "excerpt": _truncate(self.excerpt, excerpt_chars),
         }
+        parent_doc_id = self.metadata.get("parent_doc_id")
+        if parent_doc_id and parent_doc_id != self.doc_id:
+            document["parent_doc_id"] = parent_doc_id
+        for key in (
+            "evidence_window_id",
+            "window_index",
+            "window_count",
+            "window_char_start",
+            "window_char_end",
+            "retrieval_context_mode",
+            "retrieval_chunk_chars",
+            "retrieval_chunk_overlap_chars",
+        ):
+            if key in self.metadata:
+                document[key] = self.metadata[key]
+        return document
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -140,6 +308,10 @@ class ReaderResult:
     justification: str
     confidence: float
     missing_information: str
+    parent_doc_id: str | None = None
+    evidence_window_id: str | None = None
+    window_index: int | None = None
+    window_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -149,9 +321,14 @@ class ReaderResult:
 class HopState:
     hop_number: int
     question: str
+    canonical_answer: str = ""
+    accepted_answer_variants: list[str] = field(default_factory=list)
+    alternate_valid_answers: list[str] = field(default_factory=list)
     status: str = "pending"
     attempts: int = 0
     answer: str | None = None
+    answer_for_context: str | None = None
+    matched_accepted_variant: bool = False
     justification: str | None = None
     confidence: float = 0.0
     resolution_reason: str | None = None
@@ -201,7 +378,24 @@ class PrivacyHopQAAgent:
         self.numbered_questions = numbered_questions
         self.company_name = company_name
         self.company_description = company_description
-        self.hop_states = [HopState(hop_number=int(hop["hop_number"]), question=str(hop.get("question") or "")) for hop in hops]
+        self.hop_states = []
+        for hop in hops:
+            canonical_answer = str(hop.get("answer") or "").strip()
+            self.hop_states.append(
+                HopState(
+                    hop_number=int(hop["hop_number"]),
+                    question=str(hop.get("question") or ""),
+                    canonical_answer=canonical_answer,
+                    accepted_answer_variants=_dedupe_strings(
+                        [
+                            canonical_answer,
+                            *(hop.get("accepted_answer_variants") or []),
+                            *(hop.get("alternate_valid_answers") or []),
+                        ]
+                    ),
+                    alternate_valid_answers=_dedupe_strings(hop.get("alternate_valid_answers") or []),
+                )
+            )
         self.helper_client = helper_client
         self.static_local_index = static_local_index
         self.browsecomp_tool = browsecomp_tool
@@ -214,6 +408,19 @@ class PrivacyHopQAAgent:
         self.prompt_dir = self.run_root / "prompts"
         self.prompt_dir.mkdir(parents=True, exist_ok=True)
         self._run_started_at = _current_timestamp()
+
+    def _uses_legacy_retrieval_context(self) -> bool:
+        return _uses_legacy_retrieval_context(self.settings.retrieval_context_mode)
+
+    def _browsecomp_request_chars(self) -> int:
+        if self._uses_legacy_retrieval_context():
+            return self.settings.browsecomp_max_chars
+        return max(self.settings.browsecomp_max_chars, self.settings.retrieval_source_chars)
+
+    def _reader_excerpt_chars(self) -> int:
+        if self._uses_legacy_retrieval_context():
+            return self.settings.reader_excerpt_chars
+        return max(self.settings.reader_excerpt_chars, self.settings.reader_window_chars)
 
     def _elapsed_s(self) -> float:
         return _current_timestamp() - self._run_started_at
@@ -318,23 +525,33 @@ class PrivacyHopQAAgent:
             "parse_errors_by_stage": parse_by_stage,
         }
 
-    def _resolved_answers(self) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
+    def _answer_matches_accepted_variant(self, hop: HopState, answer: str | None) -> bool:
+        predicted = normalize_answer(answer)
+        if not predicted:
+            return False
+        return any(predicted == normalize_answer(value) for value in hop.accepted_answer_variants)
+
+    def _context_answer_for_raw(self, hop: HopState, answer: str | None) -> str:
+        raw = str(answer or "").strip()
+        if self._answer_matches_accepted_variant(hop, raw) and hop.canonical_answer:
+            return hop.canonical_answer
+        return raw
+
+    def _answer_for_context(self, hop: HopState) -> str:
+        return str(hop.answer_for_context or hop.answer or "").strip()
+
+    def _current_answers_so_far(self) -> str:
+        lines: list[str] = []
         for hop in self.hop_states:
             if hop.answer:
-                rows.append(
-                    {
-                        "hop_number": hop.hop_number,
-                        "question": hop.question,
-                        "answer": hop.answer,
-                        "justification": hop.justification or "",
-                        "confidence": round(hop.confidence, 3),
-                    }
-                )
-        return rows
+                context_answer = self._answer_for_context(hop)
+                lines.append(f"({hop.hop_number}) {hop.answer}")
+                if context_answer and _normalize_answer(context_answer) != _normalize_answer(hop.answer):
+                    lines.append(f"    For references to ({hop.hop_number}), use: {context_answer}")
+        return "\n".join(lines) if lines else "None yet."
 
     def _materialize_question(self, question: str) -> str:
-        resolved = {str(hop.hop_number): hop.answer for hop in self.hop_states if hop.answer}
+        resolved = {str(hop.hop_number): self._answer_for_context(hop) for hop in self.hop_states if hop.answer}
 
         def replace(match: re.Match[str]) -> str:
             key = match.group(1)
@@ -405,7 +622,7 @@ class PrivacyHopQAAgent:
                 numbered_questions=self.numbered_questions,
                 current_hop_number=hop.hop_number,
                 current_hop_question=self._materialize_question(hop.question),
-                resolved_answers=self._resolved_answers(),
+                current_answers_so_far=self._current_answers_so_far(),
                 search_history=self._recent_search_history(hop),
                 recent_reader_results=self._recent_reader_results(hop),
                 company_name=self.company_name,
@@ -419,7 +636,13 @@ class PrivacyHopQAAgent:
                 prompt_name = f"{prompt_name}_attempt{plan_attempt + 1}"
             self._save_prompt(prompt_name, prompt)
             try:
-                response = await self.llm_adapter.generate_text(prompt, log_name="hop_plan")
+                response = await self.llm_adapter.generate_text(
+                    prompt,
+                    log_name="hop_plan",
+                    max_tokens=self.settings.hop_plan_max_tokens,
+                    max_context_tokens=self.settings.generation_context_limit_tokens,
+                    context_margin_tokens=self.settings.generation_context_margin_tokens,
+                )
                 payload = extract_json(response)
             except Exception as exc:
                 if is_llm_infrastructure_error(exc):
@@ -519,7 +742,7 @@ class PrivacyHopQAAgent:
                 query=query,
                 task_id=self.task_id,
                 k=self.settings.retrieval_top_k,
-                max_chars=self.settings.browsecomp_max_chars,
+                max_chars=self._browsecomp_request_chars(),
             )
         if self.browsecomp_tool is None:
             return []
@@ -560,15 +783,100 @@ class PrivacyHopQAAgent:
             rank=rank,
             queries=[query],
             search_action_ids=[action_id],
-            metadata={"source": hit.get("source"), "raw_docid": hit.get("raw_docid")},
+            metadata={
+                "source": hit.get("source"),
+                "raw_docid": hit.get("raw_docid"),
+                "parent_doc_id": doc_id or f"web_missing_{action_id}_{rank}",
+                "retrieval_context_mode": "legacy_prefix",
+            },
         )
+
+    def _candidates_from_web_hit(self, hit: dict[str, Any], *, query: str, action_id: str, rank: int) -> list[CandidateDoc]:
+        if self._uses_legacy_retrieval_context():
+            return [self._candidate_from_web_hit(hit, query=query, action_id=action_id, rank=rank)]
+
+        parent_doc_id = str(hit.get("docid") or hit.get("doc_id") or "") or f"web_missing_{action_id}_{rank}"
+        url = str(hit.get("url") or "")
+        title = url or parent_doc_id or "web document"
+        source_text = str(hit.get("text") or "")
+        score = hit.get("score")
+        numeric_score = float(score) if score is not None else None
+        spans = _window_spans(
+            source_text,
+            window_chars=self.settings.reader_window_chars,
+            overlap_chars=self.settings.reader_window_overlap_chars,
+        )
+        total_windows = len(spans)
+        retrieval_spans = _window_spans(
+            source_text,
+            window_chars=self.settings.retrieval_chunk_chars,
+            overlap_chars=self.settings.retrieval_chunk_overlap_chars,
+        )
+        window_scores = [0 for _span in spans]
+        for chunk_start, chunk_end in retrieval_spans:
+            chunk_score = _query_match_score(query, source_text[chunk_start:chunk_end])
+            for index, (start, end) in enumerate(spans):
+                if chunk_start < end and chunk_end > start:
+                    window_scores[index] = max(window_scores[index], chunk_score)
+        scored_spans = [
+            (window_scores[index], index, start, end)
+            for index, (start, end) in enumerate(spans)
+        ]
+        max_windows = max(1, self.settings.max_windows_per_parent)
+        if len(scored_spans) > max_windows:
+            keep = {
+                index
+                for _score, index, _start, _end in sorted(scored_spans, key=lambda item: (-item[0], item[1]))[
+                    :max_windows
+                ]
+            }
+            scored_spans = [item for item in scored_spans if item[1] in keep]
+
+        candidates: list[CandidateDoc] = []
+        for match_score, index, start, end in scored_spans:
+            evidence_id = f"{parent_doc_id}#w{index + 1:02d}of{total_windows:02d}"
+            window_text = source_text[start:end]
+            candidates.append(
+                CandidateDoc(
+                    doc_id=evidence_id,
+                    source="web",
+                    title=title,
+                    locator=url,
+                    excerpt=window_text,
+                    score=(numeric_score if numeric_score is not None else 0.0) + (match_score / 1000.0),
+                    rank=rank,
+                    queries=[query],
+                    search_action_ids=[action_id],
+                    metadata={
+                        "source": hit.get("source"),
+                        "raw_docid": hit.get("raw_docid"),
+                        "parent_doc_id": parent_doc_id,
+                        "evidence_window_id": evidence_id,
+                        "retrieval_context_mode": str(self.settings.retrieval_context_mode),
+                        "window_index": index + 1,
+                        "window_count": total_windows,
+                        "window_char_start": start,
+                        "window_char_end": end,
+                        "source_text_chars": len(source_text),
+                        "query_match_score": match_score,
+                        "retrieval_chunk_chars": self.settings.retrieval_chunk_chars,
+                        "retrieval_chunk_overlap_chars": self.settings.retrieval_chunk_overlap_chars,
+                        "snippet": _query_snippet(
+                            window_text,
+                            query,
+                            max(self.settings.chooser_excerpt_chars * 4, self.settings.chooser_excerpt_chars),
+                        ),
+                    },
+                )
+            )
+        return candidates
 
     def _candidate_from_local_hit(self, hit: dict[str, Any], *, query: str, action_id: str, rank: int) -> CandidateDoc:
         metadata = dict(hit.get("metadata") or {})
         file_path = str(metadata.get("file_path") or metadata.get("original_path") or "")
         title = Path(file_path).name if file_path else str(hit.get("doc_id") or "local document")
         score = hit.get("similarity_score", hit.get("relevance_score"))
-        excerpt = _truncate(str(hit.get("content") or hit.get("preview") or ""), self.settings.reader_excerpt_chars)
+        excerpt = _truncate(str(hit.get("content") or hit.get("preview") or ""), self._reader_excerpt_chars())
         return CandidateDoc(
             doc_id=str(hit.get("doc_id") or f"local_missing_{action_id}_{rank}"),
             source="local",
@@ -579,7 +887,11 @@ class PrivacyHopQAAgent:
             rank=rank,
             queries=[query],
             search_action_ids=[action_id],
-            metadata={"file_path": file_path, "folder_path": metadata.get("folder_path")},
+            metadata={
+                "file_path": file_path,
+                "folder_path": metadata.get("folder_path"),
+                "parent_doc_id": str(hit.get("doc_id") or f"local_missing_{action_id}_{rank}"),
+            },
         )
 
     async def _execute_retrieval_action(
@@ -590,16 +902,17 @@ class PrivacyHopQAAgent:
         try:
             if action.type == "web_search":
                 raw_hits = await self._web_hits(query)
-                candidates = [
-                    self._candidate_from_web_hit(hit, query=query, action_id=action.id, rank=rank)
-                    for rank, hit in enumerate(raw_hits, start=1)
-                ]
+                candidates = []
+                for rank, hit in enumerate(raw_hits, start=1):
+                    candidates.extend(self._candidates_from_web_hit(hit, query=query, action_id=action.id, rank=rank))
                 output = {
                     "tool": "browsecomp_search",
                     "query": query,
                     "success": True,
                     "data_retrieved": bool(raw_hits),
                     "results_count": len(raw_hits),
+                    "candidate_count": len(candidates),
+                    "retrieval_context_mode": str(self.settings.retrieval_context_mode),
                     "results": [candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in candidates],
                 }
             else:
@@ -628,8 +941,15 @@ class PrivacyHopQAAgent:
                 "query": query,
                 "result_count": len(candidates),
                 "top_doc_ids": [candidate.doc_id for candidate in candidates[:3]],
+                "top_parent_doc_ids": [
+                    str(candidate.metadata.get("parent_doc_id") or candidate.doc_id) for candidate in candidates[:3]
+                ],
             }
         except Exception as exc:
+            if is_helper_infrastructure_error(exc):
+                raise PrivacyHopQAHelperInfrastructureError(
+                    f"Retrieval helper failure for {action.type} action {action.id}: {exc}"
+                ) from exc
             action.status = "failed"
             action.error = str(exc)
             action.execution_time = self._elapsed_s() - start_s
@@ -669,6 +989,7 @@ class PrivacyHopQAAgent:
                 "query": query,
                 "result_count": history_entry.get("result_count", 0),
                 "top_doc_ids": history_entry.get("top_doc_ids", []),
+                "top_parent_doc_ids": history_entry.get("top_parent_doc_ids", []),
             },
         )
         return action, candidates, history_entry
@@ -735,14 +1056,20 @@ class PrivacyHopQAAgent:
             numbered_questions=self.numbered_questions,
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
-            resolved_answers=self._resolved_answers(),
+            current_answers_so_far=self._current_answers_so_far(),
             candidate_cards=[candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in candidates],
             choose_top_k=self.settings.choose_top_k,
         )
         self._save_prompt(f"doc_choose_iter{iteration}_hop{hop.hop_number}", prompt)
         started = self._elapsed_s()
         try:
-            response = await self.llm_adapter.generate_text(prompt, log_name="doc_choose")
+            response = await self.llm_adapter.generate_text(
+                prompt,
+                log_name="doc_choose",
+                max_tokens=self.settings.doc_choose_max_tokens,
+                max_context_tokens=self.settings.generation_context_limit_tokens,
+                context_margin_tokens=self.settings.generation_context_margin_tokens,
+            )
             payload = extract_json(response)
         except Exception as exc:
             if is_llm_infrastructure_error(exc):
@@ -783,13 +1110,19 @@ class PrivacyHopQAAgent:
             numbered_questions=self.numbered_questions,
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
-            resolved_answers=self._resolved_answers(),
-            document=candidate.as_reader_input(self.settings.reader_excerpt_chars),
+            current_answers_so_far=self._current_answers_so_far(),
+            document=candidate.as_reader_input(self._reader_excerpt_chars()),
         )
         self._save_prompt(f"doc_read_iter{iteration}_hop{hop.hop_number}_{candidate.doc_id.replace('/', '_')}", prompt)
         start_s = self._elapsed_s()
         try:
-            response = await self.llm_adapter.generate_text(prompt, log_name="doc_read")
+            response = await self.llm_adapter.generate_text(
+                prompt,
+                log_name="doc_read",
+                max_tokens=self.settings.doc_read_max_tokens,
+                max_context_tokens=self.settings.generation_context_limit_tokens,
+                context_margin_tokens=self.settings.generation_context_margin_tokens,
+            )
             payload = extract_json(response)
             can_answer = bool(payload.get("can_answer"))
             proposed_answer = str(payload.get("proposed_answer") or "").strip()
@@ -806,6 +1139,10 @@ class PrivacyHopQAAgent:
                 justification=justification,
                 confidence=_clamp_confidence(payload.get("confidence"), default=0.0),
                 missing_information=str(payload.get("missing_information") or "").strip(),
+                parent_doc_id=str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
+                evidence_window_id=str(candidate.metadata.get("evidence_window_id") or candidate.doc_id),
+                window_index=candidate.metadata.get("window_index"),
+                window_count=candidate.metadata.get("window_count"),
             )
         except Exception as exc:
             if is_llm_infrastructure_error(exc):
@@ -830,6 +1167,10 @@ class PrivacyHopQAAgent:
                 justification="",
                 confidence=0.0,
                 missing_information=str(exc),
+                parent_doc_id=str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
+                evidence_window_id=str(candidate.metadata.get("evidence_window_id") or candidate.doc_id),
+                window_index=candidate.metadata.get("window_index"),
+                window_count=candidate.metadata.get("window_count"),
             )
         end_s = self._elapsed_s()
         self._record_event(
@@ -842,6 +1183,9 @@ class PrivacyHopQAAgent:
                 "hop_number": hop.hop_number,
                 "iteration": iteration,
                 "doc_id": candidate.doc_id,
+                "parent_doc_id": str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
+                "window_index": candidate.metadata.get("window_index"),
+                "window_count": candidate.metadata.get("window_count"),
                 "source": candidate.source,
                 "title": candidate.title,
                 "can_answer": result.can_answer,
@@ -940,7 +1284,7 @@ class PrivacyHopQAAgent:
             numbered_questions=self.numbered_questions,
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
-            resolved_answers=self._resolved_answers(),
+            current_answers_so_far=self._current_answers_so_far(),
             search_history=self._recent_search_history(hop),
             reader_results=[result.to_dict() for result in reader_results],
             unread_candidate_cards=[candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in unread_candidates],
@@ -949,7 +1293,13 @@ class PrivacyHopQAAgent:
         self._save_prompt(f"hop_resolve_iter{iteration}_hop{hop.hop_number}", prompt)
         started = self._elapsed_s()
         try:
-            response = await self.llm_adapter.generate_text(prompt, log_name="hop_resolve")
+            response = await self.llm_adapter.generate_text(
+                prompt,
+                log_name="hop_resolve",
+                max_tokens=self.settings.hop_resolve_max_tokens,
+                max_context_tokens=self.settings.generation_context_limit_tokens,
+                context_margin_tokens=self.settings.generation_context_margin_tokens,
+            )
             payload = extract_json(response)
             if not isinstance(payload, dict):
                 payload = {}
@@ -971,6 +1321,20 @@ class PrivacyHopQAAgent:
             logger.warning("hop resolver failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)
             self._record_error(stage="hop_resolve", hop_number=hop.hop_number, iteration=iteration, exc=exc)
             resolution = self._fallback_resolution(reader_results)
+        if resolution.get("answered"):
+            positive_read_ids = {
+                result.doc_id for result in reader_results if result.can_answer and result.proposed_answer.strip()
+            }
+            if not resolution.get("answer") or not positive_read_ids:
+                resolution = {
+                    "answered": False,
+                    "answer": "",
+                    "justification": "",
+                    "confidence": 0.0,
+                    "reason": "Resolver attempted to answer without a positive document read.",
+                    "next_step": "read_more" if unread_candidates else "search_more",
+                    "selected_doc_ids": [],
+                }
         ended = self._elapsed_s()
         self._record_event(
             stage="hop_resolve",
@@ -990,8 +1354,9 @@ class PrivacyHopQAAgent:
         )
         if resolution["answered"] and resolution["justification"]:
             cited_doc_ids = {reader.doc_id for reader in reader_results if reader.doc_id in resolution["justification"]}
-            if not cited_doc_ids and reader_results:
-                resolution["justification"] = f"{resolution['justification']} [DOC:{reader_results[0].doc_id}]".strip()
+            positive_readers = [reader for reader in reader_results if reader.can_answer and reader.proposed_answer.strip()]
+            if not cited_doc_ids and positive_readers:
+                resolution["justification"] = f"{resolution['justification']} [DOC:{positive_readers[0].doc_id}]".strip()
         if resolution["answered"]:
             resolution["next_step"] = "done"
             resolution["selected_doc_ids"] = []
@@ -1076,7 +1441,10 @@ class PrivacyHopQAAgent:
             resolution = await self._work_candidate_pool(hop, iteration, candidates)
             hop.resolution_reason = resolution.get("reason") or ""
             if resolution.get("answered") and resolution.get("answer"):
-                hop.answer = str(resolution.get("answer") or "").strip()
+                raw_answer = str(resolution.get("answer") or "").strip()
+                hop.answer = raw_answer
+                hop.matched_accepted_variant = self._answer_matches_accepted_variant(hop, raw_answer)
+                hop.answer_for_context = self._context_answer_for_raw(hop, raw_answer)
                 hop.justification = str(resolution.get("justification") or "").strip()
                 hop.confidence = _clamp_confidence(resolution.get("confidence"), default=0.0)
                 hop.status = "answered"

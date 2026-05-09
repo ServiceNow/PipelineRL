@@ -11,6 +11,12 @@ local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,.privacy_agent/local_i
 local_index_mmap_mode: r
 helper_service_url: ${oc.env:PRIVACY_AGENT_HELPER_URL, null}
 helper_timeout_s: 30.0
+generation_context_limit_tokens: 16384
+generation_context_margin_tokens: 128
+hop_plan_max_tokens: 1024
+doc_choose_max_tokens: 1024
+doc_read_max_tokens: 768
+hop_resolve_max_tokens: 1024
 use_remote_local_search: true
 use_remote_browsecomp: true
 capture_mode: all_calls
@@ -28,6 +34,16 @@ choose_top_k: 3
 max_candidate_cards: 20
 chooser_excerpt_chars: 120
 reader_excerpt_chars: 2500
+# New default: retrieve parent docs, then expose larger selectable evidence
+# windows to the chooser/reader. Revert to the original prefix-only behavior
+# with: privacy_hopqa.retrieval_context_mode=legacy_prefix
+retrieval_context_mode: windowed_evidence
+retrieval_source_chars: 128000
+retrieval_chunk_chars: 4000
+retrieval_chunk_overlap_chars: 800
+reader_window_chars: 16000
+reader_window_overlap_chars: 1000
+max_windows_per_parent: 4
 max_history_entries: 10
 local_search_threshold: 0.0
 semantic_threshold: 0.7

@@ -117,14 +117,25 @@ class PrivacyHopQALLMAdapter:
         }
         logger.info("privacy_hopqa llm call summary: %s", json.dumps(record, sort_keys=True))
 
-    async def _run_generation(self, prompt: Prompt, requested_model: str | None) -> LLMCall:
+    async def _run_generation(
+        self,
+        prompt: Prompt,
+        requested_model: str | None,
+        *,
+        parameters_override: dict[str, Any] | None = None,
+    ) -> LLMCall:
         if requested_model and requested_model != self.llm.model_name:
             raise ValueError(
                 "privacy_hopqa routes domain calls through the rollout LLM. "
                 f"Requested model '{requested_model}' does not match rollout model '{self.llm.model_name}'."
             )
         try:
-            return await llm_async_generate(self.llm, prompt, self.session)
+            return await llm_async_generate(
+                self.llm,
+                prompt,
+                self.session,
+                parameters_override=parameters_override,
+            )
         except Exception as exc:
             if is_llm_infrastructure_error(exc):
                 # Let PipelineRL's actor fail-fast path handle dead vLLM shards.
@@ -133,14 +144,45 @@ class PrivacyHopQALLMAdapter:
                 ) from exc
             raise
 
-    async def generate_text(self, prompt: str, *, model: str | None = None, log_name: str = "llm") -> str:
+    async def generate_text(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        log_name: str = "llm",
+        max_tokens: int | None = None,
+        max_context_tokens: int | None = None,
+        context_margin_tokens: int = 0,
+    ) -> str:
         prompt_text = str(prompt)
         prompt_obj = Prompt(messages=[{"role": "user", "content": prompt_text}])
         estimated_prompt_tokens = max(0, self.llm.count_tokens(prompt_obj.messages))
         self._log_prompt_summary(log_name=log_name, prompt_tokens=estimated_prompt_tokens)
+        parameters_override: dict[str, Any] = {}
+        if max_tokens is not None:
+            requested_max_tokens = max(1, int(max_tokens))
+            safe_max_tokens = requested_max_tokens
+            if max_context_tokens is not None:
+                remaining_tokens = int(max_context_tokens) - estimated_prompt_tokens - int(context_margin_tokens)
+                safe_max_tokens = min(requested_max_tokens, max(1, remaining_tokens))
+                if safe_max_tokens < requested_max_tokens:
+                    logger.warning(
+                        "privacy_hopqa capped %s max_tokens from %s to %s for prompt_tokens=%s context_limit=%s margin=%s",
+                        log_name,
+                        requested_max_tokens,
+                        safe_max_tokens,
+                        estimated_prompt_tokens,
+                        int(max_context_tokens),
+                        int(context_margin_tokens),
+                    )
+            parameters_override["max_tokens"] = safe_max_tokens
 
         try:
-            llm_call = await self._run_generation(prompt_obj, requested_model=model)
+            llm_call = await self._run_generation(
+                prompt_obj,
+                requested_model=model,
+                parameters_override=parameters_override or None,
+            )
         except Exception as exc:
             exc_text = str(exc).lower()
             if "maximum context length" in exc_text or "requested" in exc_text or "context" in exc_text:

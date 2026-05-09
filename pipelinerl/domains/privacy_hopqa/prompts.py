@@ -24,7 +24,7 @@ def build_hop_plan_prompt(
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
-    resolved_answers: list[dict[str, Any]],
+    current_answers_so_far: str,
     search_history: list[dict[str, Any]],
     recent_reader_results: list[dict[str, Any]],
     company_name: str | None,
@@ -62,12 +62,12 @@ Please try again and return a usable retrieval plan for the current hop.
 Full Numbered Questions:
 {numbered_questions}
 
+Current Answers So Far:
+{current_answers_so_far}
+
 {task_context}Current Hop: {current_hop_number}
 Current Hop Question:
 {current_hop_question}
-
-Resolved Earlier Hops:
-{_json_block(resolved_answers or [])}
 
 Recent Search History For This Hop:
 {_json_block(search_history or [])}
@@ -108,33 +108,36 @@ def build_doc_choose_prompt(
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
-    resolved_answers: list[dict[str, Any]],
+    current_answers_so_far: str,
     candidate_cards: list[dict[str, Any]],
     choose_top_k: int,
 ) -> str:
-    return f"""You are selecting which retrieved documents are worth reading closely for the current hop.
+    return f"""You are selecting which retrieved evidence windows are worth reading closely for the current hop.
+Each candidate ID may refer to a window from a larger parent document. Multiple windows can share the same parent_doc_id.
 
 Full Numbered Questions:
 {numbered_questions}
+
+Current Answers So Far:
+{current_answers_so_far}
 
 Current Hop: {current_hop_number}
 Current Hop Question:
 {current_hop_question}
 
-Resolved Earlier Hops:
-{_json_block(resolved_answers or [])}
-
-Candidate Documents:
+Candidate Evidence Windows:
 {_json_block(candidate_cards)}
 
-Select up to {choose_top_k} document IDs to read next.
+Select up to {choose_top_k} candidate doc_id values to read next.
 - It is okay to choose fewer than {choose_top_k}
-- If one document looks decisive, choosing just that one is fine
-- Prefer documents most likely to directly answer the current hop
-- Avoid documents that look redundant with each other
-- `best_rank` means the best retrieval rank this doc achieved across the search batch
-- `hit_count` means how many different retrieval queries returned this doc
-- `top_queries` are example phrasings that retrieved the doc and may help indicate why it matched
+- If one evidence window looks decisive, choosing just that one is fine
+- Prefer evidence windows most likely to directly answer the current hop
+- Avoid windows that look redundant with each other
+- `parent_doc_id` identifies the original document when the candidate is a window
+- `window_index` and `window_count` show where a window sits inside its parent document
+- `best_rank` means the best retrieval rank this candidate achieved across the search batch
+- `hit_count` means how many different retrieval queries returned this candidate
+- `top_queries` are example phrasings that retrieved the candidate and may help indicate why it matched
 
 Return JSON in this format:
 {{
@@ -150,22 +153,22 @@ def build_doc_reader_prompt(
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
-    resolved_answers: list[dict[str, Any]],
+    current_answers_so_far: str,
     document: dict[str, Any],
 ) -> str:
-    return f"""You are reading one candidate document excerpt to see if it can answer the current hop.
+    return f"""You are reading one candidate evidence window to see if it can answer the current hop.
 
 Full Numbered Questions:
 {numbered_questions}
+
+Current Answers So Far:
+{current_answers_so_far}
 
 Current Hop: {current_hop_number}
 Current Hop Question:
 {current_hop_question}
 
-Resolved Earlier Hops:
-{_json_block(resolved_answers or [])}
-
-Document:
+Evidence Window:
 {_json_block(document)}
 
 {ANSWER_FORMAT_GUIDANCE}
@@ -179,8 +182,8 @@ Return JSON in this format:
   "missing_information": ""
 }}
 
-If the excerpt is insufficient, set "can_answer" to false and explain what is missing.
-Do not use knowledge outside the provided document excerpt.
+If the evidence window is insufficient, set "can_answer" to false and explain what is missing.
+Do not use knowledge outside the provided evidence window.
 Return valid JSON only.
 """
 
@@ -190,7 +193,7 @@ def build_hop_resolve_prompt(
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
-    resolved_answers: list[dict[str, Any]],
+    current_answers_so_far: str,
     search_history: list[dict[str, Any]],
     reader_results: list[dict[str, Any]],
     unread_candidate_cards: list[dict[str, Any]],
@@ -201,12 +204,12 @@ def build_hop_resolve_prompt(
 Full Numbered Questions:
 {numbered_questions}
 
+Current Answers So Far:
+{current_answers_so_far}
+
 Current Hop: {current_hop_number}
 Current Hop Question:
 {current_hop_question}
-
-Resolved Earlier Hops:
-{_json_block(resolved_answers or [])}
 
 Recent Search History:
 {_json_block(search_history or [])}
@@ -214,7 +217,7 @@ Recent Search History:
 Document-Reading Results:
 {_json_block(reader_results or [])}
 
-Unread Candidate Documents From The Current Retrieval Round:
+Unread Candidate Evidence Windows From The Current Retrieval Round:
 {_json_block(unread_candidate_cards or [])}
 
 {ANSWER_FORMAT_GUIDANCE}
@@ -234,6 +237,7 @@ If you would like to mark this hop as answered, set:
 - "answered" to true
 - "next_step" to "done"
 - "selected_doc_ids" to []
+- Only do this when at least one Document-Reading Result has "can_answer": true and directly supports the answer
 
 If you would like to read more documents from the unread candidate list above, set:
 - "answered" to false
