@@ -548,6 +548,8 @@ class PrivacyHopQAAgent:
                 lines.append(f"({hop.hop_number}) {hop.answer}")
                 if context_answer and _normalize_answer(context_answer) != _normalize_answer(hop.answer):
                     lines.append(f"    For references to ({hop.hop_number}), use: {context_answer}")
+                if hop.justification:
+                    lines.append(f"    Justification: {_truncate(hop.justification, 420)}")
         return "\n".join(lines) if lines else "None yet."
 
     def _materialize_question(self, question: str) -> str:
