@@ -1065,9 +1065,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                         scheduler_name=f"cube_test_scheduler_v{current_eval}",
                     )
                     test_loop_active = test_status == "running"
-                    if test_loop_active:
-                        train_loop.is_scheduling_paused = True
-                    else:
+                    if not test_loop_active:
                         last_regular_eval = current_eval
                         train_loop.set_allowed_worker_indices(None)
                         test_loop.set_allowed_worker_indices(None)
@@ -1079,7 +1077,6 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                         last_regular_eval = current_eval
                         train_loop.set_allowed_worker_indices(None)
                         test_loop.set_allowed_worker_indices(None)
-                        train_loop.is_scheduling_paused = False
 
                 train_status = train_loop.step()
                 if train_status == "trainer_finished":
