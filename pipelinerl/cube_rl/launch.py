@@ -344,6 +344,34 @@ class CubeActorLoop:
         self._last_trainer_version = 0
         self._trainer_version_to_publish: int | None = None
         self._allowed_worker_indices: list[int] | None = None
+        self.max_lag = self.cfg.finetune.max_lag if self.is_training else None
+        self.groups_per_update: int | None = None
+        self.can_submit_before_update = math.inf
+        if self.max_lag is not None:
+            total_batch_size = self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
+            total_update_size = (
+                math.ceil(self.cfg.finetune.weight_update_interval / total_batch_size) * total_batch_size
+            )
+            if total_batch_size % self.attempts != 0:
+                logger.warning(
+                    "Trying to submit the exact right number of groups for this batch. "
+                    "The attempt number %s ideally should divide total batch size %s",
+                    self.attempts,
+                    total_batch_size,
+                )
+            self.groups_per_update = math.ceil(total_update_size / self.attempts)
+            lag_groups = math.ceil(self.max_lag / self.attempts)
+            self.can_submit_before_update = lag_groups + self.groups_per_update
+            logger.info(
+                "Sync RL mode on, can submit %d groups for each update, that makes %d samples per update",
+                self.groups_per_update,
+                self.groups_per_update * self.attempts,
+            )
+            logger.info(
+                "Max lag is %s samples, that makes %d additional starting chunks",
+                self.max_lag,
+                lag_groups,
+            )
 
         logger.info(
             "%s: initialized global worker pool with %d llms, %d workers, worker max rollouts=%d, vllm max inflight/server=%d, max pending rollouts=%d",
@@ -681,6 +709,9 @@ class CubeActorLoop:
 
         trainer_finished = _is_trainer_finished(self.cfg, self.trainer_state)
         if self.is_training and int(self.trainer_state.propagated_weight_version or 0) > self._last_trainer_version:
+            if self.max_lag is not None:
+                assert self.groups_per_update is not None
+                self.can_submit_before_update += self.groups_per_update
             self._trainer_version_to_publish = self._last_trainer_version
             self._last_trainer_version = int(self.trainer_state.propagated_weight_version or 0)
         
@@ -700,6 +731,9 @@ class CubeActorLoop:
                 if trainer_finished or self.is_scheduling_paused:
                     break
                 if self._group_rollout_index == self.attempts:
+                    blocked_by_lag = self.total_submitted_groups >= self.can_submit_before_update
+                    if blocked_by_lag:
+                        break
                     self._group_id += 1
                     self._current_task = random.choice(self._tasks)
                     self._group_rollouts[self._group_id] = []
