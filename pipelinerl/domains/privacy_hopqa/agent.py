@@ -662,6 +662,7 @@ class PrivacyHopQAAgent:
                 (entry.get("type", ""), _normalize_query(entry.get("query", "")))
                 for entry in self._recent_search_history(hop)
             }
+            tried_local_for_hop = any(entry.get("type") == "local_document_search" for entry in hop.search_history)
             invalid_count = 0
             duplicate_count = 0
             for idx, raw in enumerate(raw_actions[: self.settings.max_parallel_retrieval_actions]):
@@ -695,6 +696,19 @@ class PrivacyHopQAAgent:
                         expected_output=str(raw.get("expected_output") or "Candidate evidence"),
                     )
                 )
+            if records and not tried_local_for_hop and not any(record.type == "local_document_search" for record in records):
+                local_query = self._materialize_question(hop.question).strip()
+                local_key = ("local_document_search", _normalize_query(local_query))
+                if local_query and local_key not in seen_recent:
+                    bootstrap_local = RetrievalActionRecord(
+                        id=f"iter{iteration}_local_bootstrap",
+                        type="local_document_search",
+                        description=f"Search local company documents for hop {hop.hop_number}",
+                        parameters={"query": local_query},
+                        priority=1.0,
+                        expected_output="Candidate local evidence for the current hop",
+                    )
+                    records = [bootstrap_local, *records[: self.settings.max_parallel_retrieval_actions - 1]]
             if records:
                 planned_actions = records
                 break

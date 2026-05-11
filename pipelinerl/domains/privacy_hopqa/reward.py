@@ -42,7 +42,6 @@ def _accepted_list(primary: str | None, variants: list | tuple | None = None, al
 
 
 def answers_match(predicted: str | None, truth: str | list[str] | tuple[str, ...] | None, f1_threshold: float = 0.75) -> tuple[bool, float]:
-    del f1_threshold
     pred = normalize_answer(predicted)
     golds = list(truth) if isinstance(truth, (list, tuple)) else [truth]
     normalized_golds = [normalize_answer(gold) for gold in golds if normalize_answer(gold)]
@@ -50,10 +49,11 @@ def answers_match(predicted: str | None, truth: str | list[str] | tuple[str, ...
         score = float(pred == "" and not normalized_golds)
         return bool(score), score
 
-    if pred in normalized_golds:
+    if any(pred == gold or gold in pred or pred in gold for gold in normalized_golds):
         return True, 1.0
 
-    return False, 0.0
+    best_score = max(token_f1_score(pred, gold) for gold in normalized_golds)
+    return best_score >= f1_threshold, best_score
 
 
 def score_chain_answers(

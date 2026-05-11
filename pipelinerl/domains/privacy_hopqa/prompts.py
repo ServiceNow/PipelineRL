@@ -85,6 +85,8 @@ Think first about how to search for the necessary information, then return the r
 - Use only these action types: {', '.join(action_types)}
 - web_search searches online web pages
 - local_document_search searches local company files
+- If the hop depends on company-specific, internal, operational, or task-context facts, include a local_document_search
+- Do not spend an entire early hop on web_search only when local company files may contain the answer
 - Do not plan analysis, URL fetches, downloads, or enterprise tools
 
 Return a JSON array of actions in this format:
