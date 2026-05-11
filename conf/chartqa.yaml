@@ -17,9 +17,11 @@ llm:
     max_tokens: 2048
     temperature: 0.7
   # Processor configuration for vision-language models (shared between training and inference)
+  # Defaults are for Qwen3-VL (patch=16, merge=2 -> effective 32x32 per visual token).
+  # For Qwen2.5-VL (effective 28x28 per visual token), use: min_pixels=784, max_pixels=1003520.
   mm_processor_kwargs:
-    min_pixels: 784  # 28*28
-    max_pixels: 1003520  # 1280*28*28
+    min_pixels: 1024  # 32*32
+    max_pixels: 1310720  # 1280*32*32
     use_fast: true
 
 test_llm:
@@ -37,11 +39,11 @@ actor:
     Please analyze the chart step by step and put your final answer within \\boxed{{}}.
   llm_max_rollouts: 16
   shared_memory_entry_size: 2000000000
-  max_stream_size: 10000
+  max_stream_size: 1000
 
 preprocess:
   shared_memory_entry_size: 2000000000
-  max_stream_size: 10000
+  max_stream_size: 1000
 
 environment: null
 
@@ -65,4 +67,5 @@ vllm_config:
     max-num-seqs: 64
     max-num-batched-tokens: 32768
     max_model_len: 8000
-    mm-processor-kwargs: '{"min_pixels": 784, "max_pixels": 1003520, "use_fast": true}' # 28*28 to 1280*28*28
+    # Qwen3-VL defaults (effective 32x32 per visual token); for Qwen2.5-VL use min_pixels=784, max_pixels=1003520
+    mm-processor-kwargs: '{"min_pixels": 1024, "max_pixels": 1310720, "use_fast": true}' # 32*32 to 1280*32*32
