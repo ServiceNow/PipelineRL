@@ -12,6 +12,7 @@ from typing import List, TextIO
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+from pipelinerl.cube_rl.ray_cluster import configure_actor_ray_address, launch_ray_cluster_node
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import SingleStreamSpec, connect_to_redis, read_stream, set_streams_backend, write_to_streams
 from pipelinerl.utils import terminate_with_children
@@ -477,7 +478,7 @@ def clean_up(exp_dir, force_restart):
 
 
 def is_service_process(proc: LaunchedProcess) -> bool:
-    return proc.kind in {"actor_llm", "preprocessor_llm", "environment"}
+    return proc.kind in {"actor_llm", "preprocessor_llm", "environment", "ray_cluster"}
 
 
 def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False):
@@ -620,6 +621,7 @@ def main(cfg: DictConfig):
     setup_logging(log_file)
     world_map = WorldMap(cfg, verbose=True)
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
+    configure_actor_ray_address(cfg, world_map)
 
     group = str(exp_dir)
     root = cfg.wandb.wandb_workspace_root
@@ -679,6 +681,11 @@ def main(cfg: DictConfig):
             if (msg := next(stream.read())) != init_msg:
                 raise ValueError(f"Expected {init_msg}, got {msg}")
         logger.info(f"Orchestrator {world_map.my_rank} heard that the exp folder is ready.")
+
+    processes.extend(
+        LaunchedProcess(kind="ray_cluster", handle=proc)
+        for proc in launch_ray_cluster_node(cfg, world_map, exp_dir)
+    )
 
     if cfg.debug.mode == "finetune":
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
