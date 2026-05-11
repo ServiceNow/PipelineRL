@@ -974,14 +974,11 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     cube_workers: list[Any] = []
     vllm_router = None
     try:
-        wait_for_inference_servers(llm_urls)
-
         trainer_state = TrainerState(exp_path)
         if cfg.debug.mode:
             trainer_state.propagated_weight_version = 0
         else:
             trainer_state.start_listening()
-            trainer_state.wait_for_model_version()
 
         finetune_model_path = exp_path / "finetune" / "current"
         actor_model_path = finetune_model_path if finetune_model_path.exists() else Path(cfg.model_path)
@@ -1007,6 +1004,13 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         )
         health_timeout = float(getattr(cfg.actor, "cube_health_timeout", 600.0))
         _wait_for_cube_workers(cube_workers, timeout_s=health_timeout)
+
+        logger.info("Cube workers are ready; waiting for actor inference servers before scheduling rollouts")
+        wait_for_inference_servers(llm_urls)
+
+        if not cfg.debug.mode:
+            logger.info("Cube workers are ready; waiting for initial trainer model version before scheduling rollouts")
+            trainer_state.wait_for_model_version()
 
         train_tasks = list(cube_registry.train_tasks)
         test_tasks = list(cube_registry.test_tasks)
