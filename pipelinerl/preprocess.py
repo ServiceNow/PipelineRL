@@ -8,10 +8,10 @@ import queue
 import threading
 import time
 from functools import partial
-from multiprocessing import Process, Queue
+from multiprocessing import Process
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
 from typing import List
 
 import datasets
@@ -150,7 +150,7 @@ def preprocess_dataset(
         entry = dict(data[i])
         for k, v in preprocess(data[i]).items():
             entry[k] = v
-        dataset.append(entry)        
+        dataset.append(entry)
     for entry in dataset:
         entry["model_version"] = entry["metadata"]["model_version"]
         entry["rollout_index"] = entry["metadata"]["rollout_index"]
@@ -510,7 +510,7 @@ def run_preprocessing_loop(
                             raw_chunk = raw_chunk_queue.get(timeout=0.001)
                             if isinstance(raw_chunk, Exception):
                                 raise raw_chunk
-                            
+
                             # Put chunk in the input queue for workers
                             input_queue.put(raw_chunk)
                             submitted_chunks += 1
