@@ -192,8 +192,13 @@ class RedisStreamReader(StreamReader):
                 assert stream_name.decode("utf-8") == self._stream_name
                 assert isinstance(result, list) and len(result) == 1
                 entry_id, entry = result[0]
-                if int(entry[b"index"].decode("utf-8")) != self._index:
-                    raise ValueError(f"Index mismatch: expected {self._index}, got {entry['index']}")
+                entry_index = int(entry[b"index"].decode("utf-8"))
+                if entry_index != self._index:
+                    raise ValueError(
+                        f"Index mismatch on stream {self._stream_name}: expected {self._index}, got {entry_index} "
+                        f"(gap of {entry_index - self._index} entries — likely Redis trimmed unread entries; "
+                        f"raise actor.max_stream_size or set max_lag to throttle the producer)"
+                    )
                 self._last_id = entry_id
                 self._index += 1
                 yield pickle.loads(entry[b"data"])
