@@ -4,6 +4,33 @@ from pathlib import Path
 from typing import Any
 
 import psutil
+import ray
+
+
+def is_expected_ray_shutdown(exc: BaseException) -> bool:
+    if not isinstance(exc, (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError)):
+        return False
+    message = str(exc)
+    return "terminated expectedly" in message and "received SIGTERM" in message
+
+
+def close_ray_actor_best_effort(actor: Any, logger: Any, actor_name: str, *, timeout: float = 2.0) -> None:
+    try:
+        ray.get(actor.close.remote(), timeout=timeout)
+        logger.info("Closed %s: %s", actor_name, actor)
+    except Exception as exc:
+        if is_expected_ray_shutdown(exc):
+            logger.info("%s already gone during shutdown: %s", actor_name, actor)
+        else:
+            logger.exception("Failed to close %s: %s", actor_name, actor)
+
+
+def kill_ray_actor_best_effort(actor: Any, logger: Any, actor_name: str) -> None:
+    try:
+        ray.kill(actor, no_restart=True)
+        logger.info("Killed %s: %s", actor_name, actor)
+    except Exception:
+        logger.exception("Failed to kill %s: %s", actor_name, actor)
 
 
 def get_cube_resource_guard(cfg: Any) -> Any:

@@ -16,7 +16,12 @@ from pipelinerl.cube_rl.domain import CubeBenchmarkWorker, length_penalty
 from pipelinerl.cube_rl.ray_worker_logging import CubeRayWorkerLogCollector
 from pipelinerl.cube_rl.registry import CubeTaskRef, build_cube_registry
 from pipelinerl.cube_rl.routing import RayVLLMRouter, VLLMRouterActor
-from pipelinerl.cube_rl.utils import check_local_cube_worker_resources
+from pipelinerl.cube_rl.utils import (
+    check_local_cube_worker_resources,
+    close_ray_actor_best_effort,
+    is_expected_ray_shutdown,
+    kill_ray_actor_best_effort,
+)
 from pipelinerl.cube_rl.worker_pool import select_worker_for_cube
 from pipelinerl.metrics import SlidingWindowAggregator
 
@@ -32,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 def BREAKPOINT():
     import pdb;pdb.set_trace()
+
 
 @dataclass
 class PendingRollout:
@@ -1108,15 +1114,21 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                         train_loop.set_allowed_worker_indices(None)
                         test_loop.set_allowed_worker_indices(None)
 
-                if test_loop_active:
-                    test_status = test_loop.step()
-                    if test_status == "completed":
-                        test_loop_active = False
-                        last_regular_eval = current_eval
-                        train_loop.set_allowed_worker_indices(None)
-                        test_loop.set_allowed_worker_indices(None)
+                try:
+                    if test_loop_active:
+                        test_status = test_loop.step()
+                        if test_status == "completed":
+                            test_loop_active = False
+                            last_regular_eval = current_eval
+                            train_loop.set_allowed_worker_indices(None)
+                            test_loop.set_allowed_worker_indices(None)
 
-                train_status = train_loop.step()
+                    train_status = train_loop.step()
+                except Exception as exc:
+                    if is_expected_ray_shutdown(exc):
+                        logger.info("Stopping Cube actor loop because a Ray worker node is shutting down")
+                        break
+                    raise
                 if train_status == "trainer_finished":
                     break
     finally:
@@ -1128,35 +1140,15 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 logger.exception("Failed to finish W&B run")
         signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
-        if cube_workers:
-            try:
-                ray.get([w.close.remote() for w in cube_workers])
-                logger.info("Closed cube workers")
-            except Exception:
-                logger.exception("Failed to close cube workers")
         for worker in cube_workers:
-            try:
-                ray.kill(worker, no_restart=True)
-                logger.info("Killed cube worker: %s", worker)
-            except Exception:
-                logger.exception("Failed to kill cube worker: %s", worker)
+            close_ray_actor_best_effort(worker, logger, "cube worker")
+        for worker in cube_workers:
+            kill_ray_actor_best_effort(worker, logger, "cube worker")
         if ray_worker_log_collector is not None:
-            try:
-                ray.get(ray_worker_log_collector.close.remote())
-                logger.info("Closed Ray worker log collector")
-            except Exception:
-                logger.exception("Failed to close Ray worker log collector")
-            try:
-                ray.kill(ray_worker_log_collector, no_restart=True)
-                logger.info("Killed Ray worker log collector")
-            except Exception:
-                logger.exception("Failed to kill Ray worker log collector")
+            close_ray_actor_best_effort(ray_worker_log_collector, logger, "Ray worker log collector")
+            kill_ray_actor_best_effort(ray_worker_log_collector, logger, "Ray worker log collector")
         if vllm_router is not None:
-            try:
-                ray.kill(vllm_router, no_restart=True)
-                logger.info("Killed cube vLLM router")
-            except Exception:
-                logger.exception("Failed to kill cube vLLM router")
+            kill_ray_actor_best_effort(vllm_router, logger, "cube vLLM router")
         if should_shutdown_ray and ray.is_initialized():
             try:
                 ray.shutdown()
