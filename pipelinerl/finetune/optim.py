@@ -12,6 +12,9 @@ def get_grouped_params(
 ):
     params_with_wd, params_without_wd = [], []
     for n, p in model.named_parameters():
+        # Skip frozen parameters
+        if not p.requires_grad:
+            continue
         if any(nd in n for nd in no_decay):
             params_without_wd.append(p)
         else:

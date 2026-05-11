@@ -70,11 +70,11 @@ class PipelineBatchEncoding(BaseModel):
     is_packed: bool = False 
     seq_boundaries: torch.IntTensor | None = None  # Required when seq_packing=True
     
-    # Visual feature fields (optional, for multimodal models)
-    pixel_values: torch.FloatTensor | None = None
-    image_grid_thw: torch.LongTensor | None = None
+    # Visual features (optional, for multimodal models)
+    # Dict containing model-specific visual features (e.g., pixel_values, image_grid_thw, image_sizes)
+    visual_features: dict[str, torch.Tensor] | None = None
     
-    @field_validator('input_ids', 'attention_mask', 'labels', 'position_ids', 'image_grid_thw', 'segment_ids', mode='before')
+    @field_validator('input_ids', 'attention_mask', 'labels', 'position_ids', 'segment_ids', mode='before')
     @classmethod
     def convert_to_long_tensor(cls, v: List[int] | torch.Tensor | None) -> torch.LongTensor | None:
         """Handle initialization of long tensors from different types."""
@@ -95,9 +95,8 @@ class PipelineBatchEncoding(BaseModel):
         if isinstance(v, torch.Tensor):
             return v.int() # type: ignore
         return torch.tensor(v, dtype=torch.int)
-    
-    # TODO: am i needed?
-    @field_validator('rewards', 'advantages', 'ref_logprobs', 'old_logprobs', 'group_tokens', 'num_labels', 'overflow', 'pixel_values', mode='before')
+
+    @field_validator('rewards', 'advantages', 'ref_logprobs', 'old_logprobs', 'group_tokens', 'num_labels', 'overflow', mode='before')
     @classmethod
     def convert_to_float_tensor(cls, v: List[float] | torch.Tensor | None) -> torch.FloatTensor | None:
         """Handle initialization of float tensors from different types."""
@@ -111,10 +110,16 @@ class PipelineBatchEncoding(BaseModel):
     
     def to_device(self, device: Union[str, torch.device]) -> 'PipelineBatchEncoding':
         """Move all tensors to the specified device and return updated instance."""
-        for field_name in self.model_fields:
+        for field_name in type(self).model_fields:
             field_value = getattr(self, field_name)
             if isinstance(field_value, torch.Tensor):
                 setattr(self, field_name, field_value.to(device))
+            elif isinstance(field_value, dict):
+                setattr(
+                    self, 
+                    field_name, 
+                    {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in field_value.items()}
+                )
         return self
     
     @classmethod
@@ -173,8 +178,7 @@ class PipelineBatchEncoding(BaseModel):
                 "is_packed": self.is_packed,
                 "padding": self.padding,
                 "seq_boundaries": self.seq_boundaries,
-                "pixel_values": self.pixel_values, 
-                "image_grid_thw": self.image_grid_thw
+                "visual_features": self.visual_features
             }
             slices.append(PipelineBatchEncoding(**result))
         return slices

@@ -535,7 +535,7 @@ class ActorLoop:
 
         logger.info(f"Start {'train' if self.is_training else 'test'} actor loop")
         with (
-            write_to_streams(self.data_stream, "a") as data_stream_writer,
+            write_to_streams(self.data_stream, "a", max_stream_size=self.cfg.actor.max_stream_size) as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
         ):
             while True:
@@ -825,6 +825,7 @@ def run_actor_loop(cfg: DictConfig):
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
             chat_template_kwargs=cfg.llm.get("chat_template_kwargs", {}),
+            mm_processor_kwargs=cfg.llm.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]
@@ -836,6 +837,7 @@ def run_actor_loop(cfg: DictConfig):
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
             chat_template_kwargs=cfg.test_llm.get("chat_template_kwargs", {}),
+            mm_processor_kwargs=cfg.test_llm.get("mm_processor_kwargs", {}),
         )
         for url in llm_urls
     ]

@@ -3,6 +3,8 @@ data: null
 model_class: causal-language-modeling
 # Model name or path of model to be trained.
 config_name: ${..model_path}
+# Freeze vision tower for vision-language models (only applicable for vision2seq-language-modeling)
+freeze_vision_tower: false
 # Optimizer type, supported: adamw_torch, adafactor, cpuadam, lion
 optim: adamw_torch
 # use half precision training, full bf16 without mixed precision copies at all
