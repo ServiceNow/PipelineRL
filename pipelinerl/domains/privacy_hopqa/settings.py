@@ -63,24 +63,31 @@ class PrivacyHopQASettings:
     use_remote_browsecomp: bool = True
     capture_mode: str = "all_calls"
     answer_match_f1_threshold: float = 0.75
+    answer_match_mode: str = "exact_or_f1"
     reward_mode: str = "all_hops_correct"
     max_iterations: int = 12
     iteration_budget_per_hop: int = 3
     hop_plan_attempts: int = 1
     enable_generic_retrieval_fallback: bool = False
+    enable_local_search_bootstrap: bool = False
     max_parallel_retrieval_actions: int = 3
     retrieval_top_k: int = 5
-    choose_top_k: int = 3
+    choose_top_k: int = 6
     max_candidate_cards: int = 20
-    chooser_excerpt_chars: int = 120
+    chooser_excerpt_chars: int = 500
     reader_excerpt_chars: int = 2500
     retrieval_context_mode: str = "windowed_evidence"
-    retrieval_source_chars: int = 128000
+    retrieval_source_chars: int = 0
     retrieval_chunk_chars: int = 4000
     retrieval_chunk_overlap_chars: int = 800
     reader_window_chars: int = 16000
     reader_window_overlap_chars: int = 1000
-    max_windows_per_parent: int = 4
+    max_windows_per_parent: int = 0
+    large_parent_window_policy: str = "top_with_neighbors"
+    read_all_windows_max_count: int = 5
+    large_parent_top_windows: int = 4
+    large_parent_neighbor_windows: int = 1
+    large_parent_max_read_windows: int = 0
     max_history_entries: int = 10
     local_search_threshold: float = 0.0
     semantic_threshold: float = 0.7
@@ -98,7 +105,7 @@ class PrivacyHopQASettings:
     verbose: bool = False
     no_web: bool = False
     parallel_searches: bool = True
-    max_parallel_doc_reads: int = 3
+    max_parallel_doc_reads: int = 6
 
     @classmethod
     def from_cfg(cls, cfg: DictConfig | Mapping[str, Any] | None) -> "PrivacyHopQASettings":
@@ -123,24 +130,31 @@ class PrivacyHopQASettings:
             use_remote_browsecomp=bool(data.get("use_remote_browsecomp", True)),
             capture_mode=str(data.get("capture_mode", "all_calls")),
             answer_match_f1_threshold=float(data.get("answer_match_f1_threshold", 0.75)),
+            answer_match_mode=str(data.get("answer_match_mode", "exact_or_f1")),
             reward_mode=str(data.get("reward_mode", "all_hops_correct")),
             max_iterations=int(data.get("max_iterations", 12)),
             iteration_budget_per_hop=int(data.get("iteration_budget_per_hop", 3)),
             hop_plan_attempts=int(data.get("hop_plan_attempts", 1)),
             enable_generic_retrieval_fallback=bool(data.get("enable_generic_retrieval_fallback", False)),
+            enable_local_search_bootstrap=bool(data.get("enable_local_search_bootstrap", False)),
             max_parallel_retrieval_actions=int(data.get("max_parallel_retrieval_actions", 3)),
             retrieval_top_k=int(data.get("retrieval_top_k", 5)),
-            choose_top_k=int(data.get("choose_top_k", 3)),
+            choose_top_k=int(data.get("choose_top_k", 6)),
             max_candidate_cards=int(data.get("max_candidate_cards", 20)),
-            chooser_excerpt_chars=int(data.get("chooser_excerpt_chars", 120)),
+            chooser_excerpt_chars=int(data.get("chooser_excerpt_chars", 500)),
             reader_excerpt_chars=int(data.get("reader_excerpt_chars", 2500)),
             retrieval_context_mode=str(data.get("retrieval_context_mode", "windowed_evidence")),
-            retrieval_source_chars=int(data.get("retrieval_source_chars", 128000)),
+            retrieval_source_chars=int(data.get("retrieval_source_chars", 0)),
             retrieval_chunk_chars=int(data.get("retrieval_chunk_chars", 4000)),
             retrieval_chunk_overlap_chars=int(data.get("retrieval_chunk_overlap_chars", 800)),
             reader_window_chars=int(data.get("reader_window_chars", 16000)),
             reader_window_overlap_chars=int(data.get("reader_window_overlap_chars", 1000)),
-            max_windows_per_parent=int(data.get("max_windows_per_parent", 4)),
+            max_windows_per_parent=int(data.get("max_windows_per_parent", 0)),
+            large_parent_window_policy=str(data.get("large_parent_window_policy", "top_with_neighbors")),
+            read_all_windows_max_count=int(data.get("read_all_windows_max_count", 5)),
+            large_parent_top_windows=int(data.get("large_parent_top_windows", 4)),
+            large_parent_neighbor_windows=int(data.get("large_parent_neighbor_windows", 1)),
+            large_parent_max_read_windows=int(data.get("large_parent_max_read_windows", 0)),
             max_history_entries=int(data.get("max_history_entries", 10)),
             local_search_threshold=float(data.get("local_search_threshold", 0.0)),
             semantic_threshold=float(data.get("semantic_threshold", 0.7)),
@@ -158,7 +172,7 @@ class PrivacyHopQASettings:
             verbose=bool(data.get("verbose", False)),
             no_web=bool(data.get("no_web", False)),
             parallel_searches=bool(data.get("parallel_searches", True)),
-            max_parallel_doc_reads=int(data.get("max_parallel_doc_reads", 3)),
+            max_parallel_doc_reads=int(data.get("max_parallel_doc_reads", 6)),
         )
 
     def dataset_loader_kwargs(self) -> dict[str, Any]:

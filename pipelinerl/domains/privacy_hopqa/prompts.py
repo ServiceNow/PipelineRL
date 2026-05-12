@@ -113,9 +113,13 @@ def build_doc_choose_prompt(
     current_answers_so_far: str,
     candidate_cards: list[dict[str, Any]],
     choose_top_k: int,
+    read_all_windows_max_count: int,
+    large_parent_top_windows: int,
+    large_parent_neighbor_windows: int,
 ) -> str:
-    return f"""You are selecting which retrieved evidence windows are worth reading closely for the current hop.
-Each candidate ID may refer to a window from a larger parent document. Multiple windows can share the same parent_doc_id.
+    return f"""You are selecting which retrieved parent documents are worth reading closely for the current hop.
+Each candidate ID is a parent document ID. If you select a parent document with at most {read_all_windows_max_count} available evidence windows, all of those windows will be read.
+For larger parent documents, the harness reads the {large_parent_top_windows} highest-scoring evidence windows plus {large_parent_neighbor_windows} neighboring window on each side first. If those windows are insufficient, request more reads from that same parent document in the resolver step.
 
 Full Numbered Questions:
 {numbered_questions}
@@ -127,18 +131,17 @@ Current Hop: {current_hop_number}
 Current Hop Question:
 {current_hop_question}
 
-Candidate Evidence Windows:
+Candidate Parent Documents:
 {_json_block(candidate_cards)}
 
-Select up to {choose_top_k} candidate doc_id values to read next.
+Select up to {choose_top_k} parent document doc_id values to read next.
 - It is okay to choose fewer than {choose_top_k}
-- If one evidence window looks decisive, choosing just that one is fine
-- Prefer evidence windows most likely to directly answer the current hop
-- Avoid windows that look redundant with each other
-- `parent_doc_id` identifies the original document when the candidate is a window
-- `window_index` and `window_count` show where a window sits inside its parent document
+- If one parent document looks decisive, choosing just that one is fine
+- Prefer parent documents most likely to directly answer the current hop
+- Avoid parent documents that look redundant with each other
+- `matched_window_count` is how many retrieved windows are available from this parent document
+- `total_window_count` is how many evidence windows the full parent document was split into
 - `best_rank` means the best retrieval rank this candidate achieved across the search batch
-- `hit_count` means how many different retrieval queries returned this candidate
 - `top_queries` are example phrasings that retrieved the candidate and may help indicate why it matched
 
 Return JSON in this format:
@@ -173,6 +176,8 @@ Current Hop Question:
 Evidence Window:
 {_json_block(document)}
 
+If the evidence is in a table, list, or compact row, first match the requested row/entity/date and the requested column or quantity type. Do not propose an adjacent value that answers a nearby but different quantity.
+
 {ANSWER_FORMAT_GUIDANCE}
 
 Return JSON in this format:
@@ -203,6 +208,12 @@ def build_hop_resolve_prompt(
 ) -> str:
     return f"""Decide whether the current hop can now be answered.
 
+The document reader has already seen each selected evidence window in full.
+Use the compact Document-Reading Results below as the reader's extracted answer, confidence, and citation evidence.
+If those results are insufficient or conflict, ask to read more unread parent documents rather than guessing.
+When reader results conflict, prefer the result whose justification most directly matches the current hop's requested entity, date, and quantity type. Do not select a high-confidence result if its justification answers a nearby but different question.
+For large parent documents, the unread list may include the same parent document again because only its most relevant evidence windows were read first.
+
 Full Numbered Questions:
 {numbered_questions}
 
@@ -216,10 +227,10 @@ Current Hop Question:
 Recent Search History:
 {_json_block(search_history or [])}
 
-Document-Reading Results:
+Compact Document-Reading Results:
 {_json_block(reader_results or [])}
 
-Unread Candidate Evidence Windows From The Current Retrieval Round:
+Unread Candidate Parent Documents From The Current Retrieval Round (compact cards; select parent doc_id values to read more):
 {_json_block(unread_candidate_cards or [])}
 
 {ANSWER_FORMAT_GUIDANCE}
@@ -244,7 +255,7 @@ If you would like to mark this hop as answered, set:
 If you would like to read more documents from the unread candidate list above, set:
 - "answered" to false
 - "next_step" to "read_more"
-- "selected_doc_ids" to up to {choose_top_k} unread doc IDs
+- "selected_doc_ids" to up to {choose_top_k} unread parent document IDs
 
 If you would like the agent to search again instead of reading more from this batch, set:
 - "answered" to false

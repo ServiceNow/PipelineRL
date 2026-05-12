@@ -20,6 +20,10 @@ class PrivacyHopQALLMInfrastructureError(RuntimeError):
     """Inference service failure that should be handled by PipelineRL, not the agent."""
 
 
+class PrivacyHopQAContextLengthError(ValueError):
+    """Prompt is too large for the configured rollout model context."""
+
+
 def is_llm_infrastructure_error(exc: BaseException) -> bool:
     """Return true for rollout-LLM transport/server failures, not bad model outputs."""
     if isinstance(exc, PrivacyHopQALLMInfrastructureError):
@@ -163,7 +167,21 @@ class PrivacyHopQALLMAdapter:
             requested_max_tokens = max(1, int(max_tokens))
             safe_max_tokens = requested_max_tokens
             if max_context_tokens is not None:
-                remaining_tokens = int(max_context_tokens) - estimated_prompt_tokens - int(context_margin_tokens)
+                context_limit = int(max_context_tokens)
+                margin = int(context_margin_tokens)
+                remaining_tokens = context_limit - estimated_prompt_tokens - margin
+                if remaining_tokens <= 0:
+                    logger.warning(
+                        "privacy_hopqa skipped %s generation because prompt_tokens=%s exceeds context_limit=%s margin=%s",
+                        log_name,
+                        estimated_prompt_tokens,
+                        context_limit,
+                        margin,
+                    )
+                    raise PrivacyHopQAContextLengthError(
+                        f"{log_name} prompt has {estimated_prompt_tokens} tokens, leaving no room in "
+                        f"context limit {context_limit} with margin {margin}"
+                    )
                 safe_max_tokens = min(requested_max_tokens, max(1, remaining_tokens))
                 if safe_max_tokens < requested_max_tokens:
                     logger.warning(
@@ -172,8 +190,8 @@ class PrivacyHopQALLMAdapter:
                         requested_max_tokens,
                         safe_max_tokens,
                         estimated_prompt_tokens,
-                        int(max_context_tokens),
-                        int(context_margin_tokens),
+                        context_limit,
+                        margin,
                     )
             parameters_override["max_tokens"] = safe_max_tokens
 

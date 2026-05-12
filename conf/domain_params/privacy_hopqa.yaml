@@ -21,6 +21,7 @@ use_remote_local_search: true
 use_remote_browsecomp: true
 capture_mode: all_calls
 answer_match_f1_threshold: 0.75
+answer_match_mode: exact_or_f1
 reward_mode: all_hops_correct
 max_iterations: 12
 iteration_budget_per_hop: 3
@@ -28,22 +29,33 @@ iteration_budget_per_hop: 3
 # the source-selection policy and can mask whether the model learned the tool.
 hop_plan_attempts: 1
 enable_generic_retrieval_fallback: false
+enable_local_search_bootstrap: false
 max_parallel_retrieval_actions: 3
 retrieval_top_k: 5
-choose_top_k: 3
+choose_top_k: 6
+# Interpreted as max parent documents. In windowed mode, all evidence windows
+# from those parent documents remain available to choose/read.
 max_candidate_cards: 20
-chooser_excerpt_chars: 120
+chooser_excerpt_chars: 500
 reader_excerpt_chars: 2500
 # New default: retrieve parent docs, then expose larger selectable evidence
 # windows to the chooser/reader. Revert to the original prefix-only behavior
 # with: privacy_hopqa.retrieval_context_mode=legacy_prefix
 retrieval_context_mode: windowed_evidence
-retrieval_source_chars: 128000
+retrieval_source_chars: 0
 retrieval_chunk_chars: 4000
 retrieval_chunk_overlap_chars: 800
 reader_window_chars: 16000
 reader_window_overlap_chars: 1000
-max_windows_per_parent: 4
+max_windows_per_parent: 0
+# Parent documents with more than read_all_windows_max_count evidence windows
+# are read in query-relevant batches instead of expanding every window at once.
+# Set large_parent_window_policy=all to restore full-parent expansion.
+large_parent_window_policy: top_with_neighbors
+read_all_windows_max_count: 5
+large_parent_top_windows: 4
+large_parent_neighbor_windows: 1
+large_parent_max_read_windows: 0
 max_history_entries: 10
 local_search_threshold: 0.0
 semantic_threshold: 0.7
@@ -61,4 +73,4 @@ log_prompts: false
 verbose: false
 no_web: false
 parallel_searches: true
-max_parallel_doc_reads: 3
+max_parallel_doc_reads: 6

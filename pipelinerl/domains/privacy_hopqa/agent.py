@@ -58,6 +58,8 @@ def is_helper_infrastructure_error(exc: BaseException) -> bool:
 
 def _truncate(text: str, limit: int) -> str:
     value = str(text or "")
+    if int(limit) <= 0:
+        return ""
     if len(value) <= limit:
         return value
     return value[:limit].rstrip() + "..."
@@ -186,6 +188,187 @@ def _dedupe_strings(values: list[Any]) -> list[str]:
     return out
 
 
+def _compact_reader_result_dict(raw: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "doc_id",
+        "source",
+        "title",
+        "locator",
+        "can_answer",
+        "proposed_answer",
+        "confidence",
+    ):
+        if key in raw:
+            value = raw[key]
+            if key in {"title", "locator"}:
+                value = _truncate(str(value), 180)
+            compact[key] = value
+    justification = str(raw.get("justification") or "").strip()
+    if justification:
+        compact["justification"] = _truncate(justification, 600)
+    missing = str(raw.get("missing_information") or "").strip()
+    if missing:
+        compact["missing_information"] = _truncate(missing, 240)
+    metadata = raw.get("metadata")
+    if isinstance(metadata, dict):
+        useful_metadata = {
+            key: metadata[key]
+            for key in ("parent_doc_id", "window_index", "window_count", "best_rank", "hit_count", "top_queries")
+            if key in metadata
+        }
+        if useful_metadata:
+            compact["metadata"] = useful_metadata
+    return compact
+
+
+def _resolver_reader_result(result: "ReaderResult") -> dict[str, Any]:
+    return _compact_reader_result_dict(result.to_dict())
+
+
+def _resolver_candidate_card(candidate: "CandidateDoc", excerpt_chars: int) -> dict[str, Any]:
+    excerpt_chars = max(0, int(excerpt_chars))
+    card = candidate.as_card(max(1, excerpt_chars))
+    compact: dict[str, Any] = {}
+    for key in (
+        "doc_id",
+        "source",
+        "title",
+        "locator",
+        "score",
+        "rank",
+        "parent_doc_id",
+        "window_index",
+        "window_count",
+        "best_rank",
+        "hit_count",
+        "top_queries",
+    ):
+        if key in card:
+            value = card[key]
+            if key in {"title", "locator", "parent_doc_id"}:
+                value = _truncate(str(value), 180)
+            elif key == "top_queries" and isinstance(value, list):
+                value = [_truncate(str(item), 100) for item in value[:2]]
+            compact[key] = value
+    excerpt = str(card.get("excerpt") or "").strip()
+    if excerpt_chars > 0 and excerpt:
+        compact["snippet"] = _truncate(excerpt, excerpt_chars)
+    return compact
+
+
+def _candidate_parent_id(candidate: "CandidateDoc") -> str:
+    return str(candidate.metadata.get("parent_doc_id") or candidate.doc_id)
+
+
+def _candidate_parent_groups(candidates: list["CandidateDoc"]) -> dict[str, list["CandidateDoc"]]:
+    groups: dict[str, list["CandidateDoc"]] = {}
+    for candidate in candidates:
+        groups.setdefault(_candidate_parent_id(candidate), []).append(candidate)
+    return groups
+
+
+def _candidate_window_index(candidate: "CandidateDoc") -> int:
+    value = candidate.metadata.get("window_index")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _candidate_window_count(candidate: "CandidateDoc") -> int:
+    value = candidate.metadata.get("window_count")
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _candidate_query_match_score(candidate: "CandidateDoc") -> int:
+    value = candidate.metadata.get("query_match_score")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_rank_score_key(candidate: "CandidateDoc") -> tuple[int, float, str]:
+    score = candidate.score if candidate.score is not None else -1.0
+    return (candidate.rank, -float(score), candidate.doc_id)
+
+
+def _parent_candidate_card(candidates: list["CandidateDoc"], excerpt_chars: int) -> dict[str, Any]:
+    first = candidates[0]
+    parent_doc_id = _candidate_parent_id(first)
+    best = min(
+        candidates,
+        key=lambda candidate: (
+            candidate.rank,
+            -(candidate.score if candidate.score is not None else -1.0),
+            candidate.doc_id,
+        ),
+    )
+    top_queries: list[str] = []
+    for candidate in candidates:
+        for query in candidate.queries:
+            if query not in top_queries:
+                top_queries.append(query)
+            if len(top_queries) >= 2:
+                break
+        if len(top_queries) >= 2:
+            break
+    total_window_count = max(int(candidate.metadata.get("window_count") or 1) for candidate in candidates)
+    card = {
+        "doc_id": parent_doc_id,
+        "candidate_type": "parent_document",
+        "source": first.source,
+        "title": _truncate(first.title, 180),
+        "locator": _truncate(first.locator, 180),
+        "best_rank": min(candidate.rank for candidate in candidates),
+        "best_score": max((candidate.score for candidate in candidates if candidate.score is not None), default=None),
+        "matched_window_count": len(candidates),
+        "total_window_count": total_window_count,
+        "top_queries": [_truncate(query, 100) for query in top_queries],
+        "representative_window_id": best.doc_id,
+    }
+    snippet = str(best.metadata.get("snippet") or best.excerpt).strip()
+    if excerpt_chars > 0 and snippet:
+        card["snippet"] = _truncate(snippet, excerpt_chars)
+    return card
+
+
+def _candidate_cards_for_prompt(
+    candidates: list["CandidateDoc"],
+    preferred_excerpt_chars: int,
+    *,
+    max_cards: int | None = None,
+) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    parent_items = list(_candidate_parent_groups(candidates).items())
+    if max_cards is not None and int(max_cards) > 0:
+        parent_items = parent_items[: int(max_cards)]
+    target_snippet_chars = 4000
+    excerpt_chars = min(
+        max(int(preferred_excerpt_chars), 0),
+        max(16, target_snippet_chars // max(len(parent_items), 1)),
+    )
+    return [_parent_candidate_card(group, excerpt_chars) for _parent_id, group in parent_items]
+
+
+def _reader_results_for_resolver(results: list["ReaderResult"]) -> list["ReaderResult"]:
+    positives = [result for result in results if result.can_answer and result.proposed_answer.strip()]
+    recent = results[-12:]
+    ordered: list["ReaderResult"] = []
+    seen: set[str] = set()
+    for result in [*positives[-12:], *recent]:
+        key = result.doc_id
+        if key not in seen:
+            seen.add(key)
+            ordered.append(result)
+    return ordered[-24:]
+
+
 def _current_timestamp() -> float:
     return time.perf_counter()
 
@@ -274,7 +457,7 @@ class CandidateDoc:
             "title": self.title,
             "locator": self.locator,
             "queries": self.queries,
-            "excerpt": _truncate(self.excerpt, excerpt_chars),
+            "excerpt": self.excerpt,
         }
         parent_doc_id = self.metadata.get("parent_doc_id")
         if parent_doc_id and parent_doc_id != self.doc_id:
@@ -324,6 +507,9 @@ class HopState:
     canonical_answer: str = ""
     accepted_answer_variants: list[str] = field(default_factory=list)
     alternate_valid_answers: list[str] = field(default_factory=list)
+    gold_doc_id: str | None = None
+    gold_doc_ref: str | None = None
+    hop_type: str | None = None
     status: str = "pending"
     attempts: int = 0
     answer: str | None = None
@@ -337,6 +523,10 @@ class HopState:
     reader_results: list[dict[str, Any]] = field(default_factory=list)
     candidate_doc_ids: list[str] = field(default_factory=list)
     candidate_cards: list[dict[str, Any]] = field(default_factory=list)
+    gold_parent_retrieved_before_trim: bool = False
+    gold_parent_retrieved: bool = False
+    gold_parent_read: bool = False
+    gold_candidate_doc_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -394,6 +584,9 @@ class PrivacyHopQAAgent:
                         ]
                     ),
                     alternate_valid_answers=_dedupe_strings(hop.get("alternate_valid_answers") or []),
+                    gold_doc_id=(str(hop.get("doc_id")).strip() if hop.get("doc_id") else None),
+                    gold_doc_ref=(str(hop.get("doc_ref")).strip() if hop.get("doc_ref") else None),
+                    hop_type=(str(hop.get("hop_type")).strip() if hop.get("hop_type") else None),
                 )
             )
         self.helper_client = helper_client
@@ -405,6 +598,7 @@ class PrivacyHopQAAgent:
         self._errors_by_stage: Counter[str] = Counter()
         self._errors_by_kind: Counter[str] = Counter()
         self._errors_by_stage_kind: dict[str, Counter[str]] = defaultdict(Counter)
+        self._retrieval_stats: dict[str, int] = {}
         self.prompt_dir = self.run_root / "prompts"
         self.prompt_dir.mkdir(parents=True, exist_ok=True)
         self._run_started_at = _current_timestamp()
@@ -415,6 +609,8 @@ class PrivacyHopQAAgent:
     def _browsecomp_request_chars(self) -> int:
         if self._uses_legacy_retrieval_context():
             return self.settings.browsecomp_max_chars
+        if self.settings.retrieval_source_chars <= 0:
+            return 0
         return max(self.settings.browsecomp_max_chars, self.settings.retrieval_source_chars)
 
     def _reader_excerpt_chars(self) -> int:
@@ -525,6 +721,46 @@ class PrivacyHopQAAgent:
             "parse_errors_by_stage": parse_by_stage,
         }
 
+    def _inc_retrieval_stat(self, key: str, value: int = 1) -> None:
+        self._retrieval_stats[key] = int(self._retrieval_stats.get(key, 0)) + int(value)
+
+    def _max_retrieval_stat(self, key: str, value: int) -> None:
+        self._retrieval_stats[key] = max(int(self._retrieval_stats.get(key, 0)), int(value))
+
+    def _retrieval_summary(self) -> dict[str, Any]:
+        gold_hops = [hop for hop in self.hop_states if hop.gold_doc_id]
+        gold_hop_count = len(gold_hops)
+        gold_parent_retrieved_before_trim = sum(1 for hop in gold_hops if hop.gold_parent_retrieved_before_trim)
+        gold_parent_retrieved = sum(1 for hop in gold_hops if hop.gold_parent_retrieved)
+        gold_parent_read = sum(1 for hop in gold_hops if hop.gold_parent_read)
+
+        def _rate(numerator: int, denominator: int) -> float:
+            return float(numerator) / float(denominator) if denominator else 0.0
+
+        selected_windows_read = int(self._retrieval_stats.get("selected_windows_read", 0))
+        selected_parent_windows_available = int(self._retrieval_stats.get("selected_parent_windows_available", 0))
+        large_parent_windows_read = int(self._retrieval_stats.get("large_parent_windows_read", 0))
+        large_parent_windows_available = int(self._retrieval_stats.get("large_parent_windows_available", 0))
+        summary = {
+            **{key: int(value) for key, value in sorted(self._retrieval_stats.items())},
+            "gold_parent_hops": gold_hop_count,
+            "gold_parent_retrieved_before_trim_hops": gold_parent_retrieved_before_trim,
+            "gold_parent_retrieved_hops": gold_parent_retrieved,
+            "gold_parent_read_hops": gold_parent_read,
+            "gold_parent_retrieved_before_trim_rate": _rate(gold_parent_retrieved_before_trim, gold_hop_count),
+            "gold_parent_retrieved_rate": _rate(gold_parent_retrieved, gold_hop_count),
+            "gold_parent_read_rate": _rate(gold_parent_read, gold_hop_count),
+            "gold_parent_missed_after_trim_hops": sum(
+                1 for hop in gold_hops if hop.gold_parent_retrieved_before_trim and not hop.gold_parent_retrieved
+            ),
+            "gold_parent_retrieved_not_read_hops": sum(
+                1 for hop in gold_hops if hop.gold_parent_retrieved and not hop.gold_parent_read
+            ),
+            "selected_window_read_ratio": _rate(selected_windows_read, selected_parent_windows_available),
+            "large_parent_window_read_ratio": _rate(large_parent_windows_read, large_parent_windows_available),
+        }
+        return summary
+
     def _answer_matches_accepted_variant(self, hop: HopState, answer: str | None) -> bool:
         predicted = normalize_answer(answer)
         if not predicted:
@@ -571,7 +807,11 @@ class PrivacyHopQAAgent:
         return hop.search_history[-self.settings.max_history_entries :]
 
     def _recent_reader_results(self, hop: HopState) -> list[dict[str, Any]]:
-        return hop.reader_results[-self.settings.max_history_entries :]
+        return [
+            _compact_reader_result_dict(result)
+            for result in hop.reader_results[-self.settings.max_history_entries :]
+            if isinstance(result, dict)
+        ]
 
     def _unread_candidates(self, hop: HopState, candidates: list[CandidateDoc]) -> list[CandidateDoc]:
         return [candidate for candidate in candidates if candidate.doc_id not in hop.selected_doc_ids]
@@ -580,6 +820,116 @@ class PrivacyHopQAAgent:
         for doc in selected:
             if doc.doc_id not in hop.selected_doc_ids:
                 hop.selected_doc_ids.append(doc.doc_id)
+            if hop.gold_doc_id and _candidate_parent_id(doc) == hop.gold_doc_id:
+                hop.gold_parent_read = True
+                if doc.doc_id not in hop.gold_candidate_doc_ids:
+                    hop.gold_candidate_doc_ids.append(doc.doc_id)
+
+    def _select_windows_for_parent_read(self, group: list[CandidateDoc]) -> list[CandidateDoc]:
+        if not group:
+            return []
+        ordered_by_index = sorted(group, key=lambda candidate: (_candidate_window_index(candidate), candidate.doc_id))
+        policy = str(self.settings.large_parent_window_policy or "top_with_neighbors").strip().lower()
+        full_window_count = max(_candidate_window_count(candidate) for candidate in group)
+        read_all_threshold = max(0, int(self.settings.read_all_windows_max_count))
+        if policy in {"all", "read_all", "legacy"}:
+            return ordered_by_index
+        if read_all_threshold <= 0 or full_window_count <= read_all_threshold or len(group) <= read_all_threshold:
+            return ordered_by_index
+
+        top_windows = max(1, int(self.settings.large_parent_top_windows))
+        neighbor_windows = max(0, int(self.settings.large_parent_neighbor_windows))
+        by_index = {_candidate_window_index(candidate): candidate for candidate in group}
+        ranked = sorted(
+            group,
+            key=lambda candidate: (
+                -_candidate_query_match_score(candidate),
+                candidate.rank,
+                -(candidate.score if candidate.score is not None else -1.0),
+                _candidate_window_index(candidate),
+                candidate.doc_id,
+            ),
+        )
+        keep_indices: set[int] = set()
+        for candidate in ranked[:top_windows]:
+            center = _candidate_window_index(candidate)
+            for index in range(center - neighbor_windows, center + neighbor_windows + 1):
+                if index in by_index:
+                    keep_indices.add(index)
+        if not keep_indices:
+            keep_indices = {_candidate_window_index(candidate) for candidate in ranked[:top_windows]}
+        selected = [by_index[index] for index in sorted(keep_indices)]
+        max_read_windows = int(self.settings.large_parent_max_read_windows)
+        if max_read_windows > 0 and len(selected) > max_read_windows:
+            selected = sorted(
+                selected,
+                key=lambda candidate: (
+                    -_candidate_query_match_score(candidate),
+                    *_candidate_rank_score_key(candidate),
+                    _candidate_window_index(candidate),
+                ),
+            )[:max_read_windows]
+            selected = sorted(selected, key=lambda candidate: (_candidate_window_index(candidate), candidate.doc_id))
+        return selected
+
+    def _expand_selected_parent_documents(
+        self,
+        parent_groups: dict[str, list[CandidateDoc]],
+        selected_parent_ids: list[str],
+        *,
+        hop: HopState,
+        iteration: int,
+        selection_stage: str,
+    ) -> tuple[list[CandidateDoc], dict[str, Any]]:
+        selected: list[CandidateDoc] = []
+        per_parent: list[dict[str, Any]] = []
+        read_all_threshold = max(0, int(self.settings.read_all_windows_max_count))
+        for parent_id in selected_parent_ids:
+            group = parent_groups.get(parent_id) or []
+            if not group:
+                continue
+            full_window_count = max(_candidate_window_count(candidate) for candidate in group)
+            chosen = self._select_windows_for_parent_read(group)
+            selected.extend(chosen)
+            is_large_parent = full_window_count > read_all_threshold and str(self.settings.large_parent_window_policy).lower() not in {"all", "read_all", "legacy"}
+            record = {
+                "parent_doc_id": parent_id,
+                "available_windows": len(group),
+                "total_windows": full_window_count,
+                "selected_windows": len(chosen),
+                "selected_window_ids": [candidate.doc_id for candidate in chosen],
+                "selected_window_indices": [_candidate_window_index(candidate) for candidate in chosen],
+                "large_parent_window_limited": bool(is_large_parent and len(chosen) < len(group)),
+            }
+            per_parent.append(record)
+            self._inc_retrieval_stat("selected_parent_docs", 1)
+            self._inc_retrieval_stat("selected_parent_windows_available", len(group))
+            self._inc_retrieval_stat("selected_windows_read", len(chosen))
+            self._max_retrieval_stat("max_selected_parent_windows_available", len(group))
+            self._max_retrieval_stat("max_selected_parent_windows_read", len(chosen))
+            if is_large_parent:
+                self._inc_retrieval_stat("large_parent_docs_selected", 1)
+                self._inc_retrieval_stat("large_parent_windows_available", len(group))
+                self._inc_retrieval_stat("large_parent_windows_read", len(chosen))
+                if len(chosen) < len(group):
+                    self._inc_retrieval_stat("large_parent_docs_limited", 1)
+
+        meta = {
+            "hop_number": hop.hop_number,
+            "iteration": iteration,
+            "selection_stage": selection_stage,
+            "window_policy": str(self.settings.large_parent_window_policy),
+            "read_all_windows_max_count": int(self.settings.read_all_windows_max_count),
+            "large_parent_top_windows": int(self.settings.large_parent_top_windows),
+            "large_parent_neighbor_windows": int(self.settings.large_parent_neighbor_windows),
+            "selected_parent_doc_ids": selected_parent_ids,
+            "selected_doc_ids": [doc.doc_id for doc in selected],
+            "selected_parent_window_details": per_parent,
+            "selected_parent_windows_available": sum(item["available_windows"] for item in per_parent),
+            "selected_windows_read": len(selected),
+            "large_parent_docs_selected": sum(1 for item in per_parent if item["large_parent_window_limited"]),
+        }
+        return selected, meta
 
     def _next_iteration_cap(self) -> int:
         total_hops = max(len(self.hop_states), 1)
@@ -696,7 +1046,12 @@ class PrivacyHopQAAgent:
                         expected_output=str(raw.get("expected_output") or "Candidate evidence"),
                     )
                 )
-            if records and not tried_local_for_hop and not any(record.type == "local_document_search" for record in records):
+            if (
+                self.settings.enable_local_search_bootstrap
+                and records
+                and not tried_local_for_hop
+                and not any(record.type == "local_document_search" for record in records)
+            ):
                 local_query = self._materialize_question(hop.question).strip()
                 local_key = ("local_document_search", _normalize_query(local_query))
                 if local_query and local_key not in seen_recent:
@@ -787,7 +1142,7 @@ class PrivacyHopQAAgent:
         doc_id = str(hit.get("docid") or hit.get("doc_id") or "")
         url = str(hit.get("url") or "")
         title = url or doc_id or "web document"
-        excerpt = _truncate(str(hit.get("text") or ""), self.settings.reader_excerpt_chars)
+        excerpt = str(hit.get("text") or "")
         score = hit.get("score")
         return CandidateDoc(
             doc_id=doc_id or f"web_missing_{action_id}_{rank}",
@@ -838,8 +1193,8 @@ class PrivacyHopQAAgent:
             (window_scores[index], index, start, end)
             for index, (start, end) in enumerate(spans)
         ]
-        max_windows = max(1, self.settings.max_windows_per_parent)
-        if len(scored_spans) > max_windows:
+        max_windows = int(self.settings.max_windows_per_parent)
+        if max_windows > 0 and len(scored_spans) > max_windows:
             keep = {
                 index
                 for _score, index, _start, _end in sorted(scored_spans, key=lambda item: (-item[0], item[1]))[
@@ -892,7 +1247,7 @@ class PrivacyHopQAAgent:
         file_path = str(metadata.get("file_path") or metadata.get("original_path") or "")
         title = Path(file_path).name if file_path else str(hit.get("doc_id") or "local document")
         score = hit.get("similarity_score", hit.get("relevance_score"))
-        excerpt = _truncate(str(hit.get("content") or hit.get("preview") or ""), self._reader_excerpt_chars())
+        excerpt = str(hit.get("content") or hit.get("preview") or "")
         return CandidateDoc(
             doc_id=str(hit.get("doc_id") or f"local_missing_{action_id}_{rank}"),
             source="local",
@@ -1041,28 +1396,68 @@ class PrivacyHopQAAgent:
             candidates_by_doc.values(),
             key=lambda doc: (doc.rank, -(doc.score if doc.score is not None else -1.0), doc.doc_id),
         )
-        trimmed = ordered[: self.settings.max_candidate_cards]
+        max_parent_docs = int(self.settings.max_candidate_cards)
+        if max_parent_docs > 0:
+            parent_order: list[str] = []
+            seen_parents: set[str] = set()
+            for candidate in ordered:
+                parent_doc_id = str(candidate.metadata.get("parent_doc_id") or candidate.doc_id)
+                if parent_doc_id not in seen_parents:
+                    seen_parents.add(parent_doc_id)
+                    parent_order.append(parent_doc_id)
+            kept_parents = set(parent_order[:max_parent_docs])
+            trimmed = [
+                candidate
+                for candidate in ordered
+                if str(candidate.metadata.get("parent_doc_id") or candidate.doc_id) in kept_parents
+            ]
+        else:
+            trimmed = ordered
         hop.candidate_doc_ids = [candidate.doc_id for candidate in trimmed]
         hop.candidate_cards = [candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in trimmed]
+        before_trim_parent_ids = {_candidate_parent_id(candidate) for candidate in ordered}
+        after_trim_parent_ids = {_candidate_parent_id(candidate) for candidate in trimmed}
+        if hop.gold_doc_id:
+            if hop.gold_doc_id in before_trim_parent_ids:
+                hop.gold_parent_retrieved_before_trim = True
+            if hop.gold_doc_id in after_trim_parent_ids:
+                hop.gold_parent_retrieved = True
+            for candidate in trimmed:
+                if _candidate_parent_id(candidate) == hop.gold_doc_id and candidate.doc_id not in hop.gold_candidate_doc_ids:
+                    hop.gold_candidate_doc_ids.append(candidate.doc_id)
+        self._inc_retrieval_stat("candidate_windows_before_parent_trim", len(ordered))
+        self._inc_retrieval_stat("candidate_windows_after_parent_trim", len(trimmed))
+        self._inc_retrieval_stat("candidate_parent_docs_before_parent_trim", len(before_trim_parent_ids))
+        self._inc_retrieval_stat("candidate_parent_docs_after_parent_trim", len(after_trim_parent_ids))
         return trimmed
 
     async def _choose_documents(self, hop: HopState, candidates: list[CandidateDoc], iteration: int) -> list[CandidateDoc]:
         if not candidates:
             return []
-        if len(candidates) <= self.settings.choose_top_k:
-            selected = list(candidates)
+        parent_groups = _candidate_parent_groups(candidates)
+        parent_ids = list(parent_groups)
+        if len(parent_ids) <= self.settings.choose_top_k:
+            selected_parent_ids = parent_ids[: self.settings.choose_top_k]
+            selected, selection_meta = self._expand_selected_parent_documents(
+                parent_groups,
+                selected_parent_ids,
+                hop=hop,
+                iteration=iteration,
+                selection_stage="initial_auto",
+            )
             now = self._elapsed_s()
             self._record_event(
                 stage="doc_choose",
                 lane="choose",
-                label=f"H{hop.hop_number} choose docs (skipped)",
+                label=f"H{hop.hop_number} choose parent docs (skipped)",
                 start_s=now,
                 end_s=now,
                 meta={
                     "hop_number": hop.hop_number,
                     "iteration": iteration,
                     "candidate_count": len(candidates),
-                    "selected_doc_ids": [doc.doc_id for doc in selected],
+                    "parent_candidate_count": len(parent_ids),
+                    **selection_meta,
                     "skipped": True,
                 },
             )
@@ -1073,8 +1468,11 @@ class PrivacyHopQAAgent:
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
             current_answers_so_far=self._current_answers_so_far(),
-            candidate_cards=[candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in candidates],
+            candidate_cards=_candidate_cards_for_prompt(candidates, self.settings.chooser_excerpt_chars),
             choose_top_k=self.settings.choose_top_k,
+            read_all_windows_max_count=self.settings.read_all_windows_max_count,
+            large_parent_top_windows=self.settings.large_parent_top_windows,
+            large_parent_neighbor_windows=self.settings.large_parent_neighbor_windows,
         )
         self._save_prompt(f"doc_choose_iter{iteration}_hop{hop.hop_number}", prompt)
         started = self._elapsed_s()
@@ -1094,28 +1492,43 @@ class PrivacyHopQAAgent:
             self._record_error(stage="doc_choose", hop_number=hop.hop_number, iteration=iteration, exc=exc)
             payload = {}
         selected_ids = payload.get("selected_doc_ids") if isinstance(payload, dict) else None
-        valid_ids = {candidate.doc_id for candidate in candidates}
+        valid_parent_ids = set(parent_ids)
         normalized_ids: list[str] = []
         if isinstance(selected_ids, list):
             for raw_id in selected_ids:
                 doc_id = str(raw_id)
-                if doc_id in valid_ids and doc_id not in normalized_ids:
+                if doc_id in valid_parent_ids and doc_id not in normalized_ids:
                     normalized_ids.append(doc_id)
+                    continue
+                for candidate in candidates:
+                    if candidate.doc_id == doc_id:
+                        parent_id = _candidate_parent_id(candidate)
+                        if parent_id not in normalized_ids:
+                            normalized_ids.append(parent_id)
+                        break
         if not normalized_ids:
-            normalized_ids = [candidate.doc_id for candidate in candidates[: self.settings.choose_top_k]]
-        selected = [candidate for candidate in candidates if candidate.doc_id in normalized_ids][: self.settings.choose_top_k]
+            normalized_ids = parent_ids[: self.settings.choose_top_k]
+        selected_parent_ids = normalized_ids[: self.settings.choose_top_k]
+        selected, selection_meta = self._expand_selected_parent_documents(
+            parent_groups,
+            selected_parent_ids,
+            hop=hop,
+            iteration=iteration,
+            selection_stage="initial_model",
+        )
         ended = self._elapsed_s()
         self._record_event(
             stage="doc_choose",
             lane="choose",
-            label=f"H{hop.hop_number} choose docs",
+            label=f"H{hop.hop_number} choose parent docs",
             start_s=started,
             end_s=ended,
             meta={
                 "hop_number": hop.hop_number,
                 "iteration": iteration,
                 "candidate_count": len(candidates),
-                "selected_doc_ids": [doc.doc_id for doc in selected],
+                "parent_candidate_count": len(parent_ids),
+                **selection_meta,
             },
         )
         self._mark_selected_documents(hop, selected)
@@ -1265,6 +1678,45 @@ class PrivacyHopQAAgent:
             "selected_doc_ids": [],
         }
 
+    def _stored_reader_results(self, hop: HopState) -> list[ReaderResult]:
+        results: list[ReaderResult] = []
+        for item in hop.reader_results:
+            if not isinstance(item, dict):
+                continue
+            doc_id = str(item.get("doc_id") or "").strip()
+            if not doc_id:
+                continue
+            results.append(
+                ReaderResult(
+                    doc_id=doc_id,
+                    source=str(item.get("source") or ""),
+                    title=str(item.get("title") or ""),
+                    locator=str(item.get("locator") or ""),
+                    can_answer=bool(item.get("can_answer")),
+                    proposed_answer=str(item.get("proposed_answer") or ""),
+                    justification=str(item.get("justification") or ""),
+                    confidence=_clamp_confidence(item.get("confidence"), default=0.0),
+                    missing_information=str(item.get("missing_information") or ""),
+                    parent_doc_id=str(item.get("parent_doc_id") or "") or None,
+                    evidence_window_id=str(item.get("evidence_window_id") or "") or None,
+                    window_index=item.get("window_index") if isinstance(item.get("window_index"), int) else None,
+                    window_count=item.get("window_count") if isinstance(item.get("window_count"), int) else None,
+                )
+            )
+        return results
+
+    def _apply_resolution_to_hop(self, hop: HopState, resolution: dict[str, Any]) -> bool:
+        if not (resolution.get("answered") and resolution.get("answer")):
+            return False
+        raw_answer = str(resolution.get("answer") or "").strip()
+        hop.answer = raw_answer
+        hop.matched_accepted_variant = self._answer_matches_accepted_variant(hop, raw_answer)
+        hop.answer_for_context = self._context_answer_for_raw(hop, raw_answer)
+        hop.justification = str(resolution.get("justification") or "").strip()
+        hop.confidence = _clamp_confidence(resolution.get("confidence"), default=0.0)
+        hop.status = "answered"
+        return True
+
     def _select_followup_documents(
         self,
         hop: HopState,
@@ -1273,19 +1725,32 @@ class PrivacyHopQAAgent:
     ) -> list[CandidateDoc]:
         if not unread_candidates:
             return []
-        valid_ids = {candidate.doc_id for candidate in unread_candidates}
+        parent_groups = _candidate_parent_groups(unread_candidates)
+        valid_parent_ids = set(parent_groups)
         raw_ids = resolution.get("selected_doc_ids")
         normalized_ids: list[str] = []
         if isinstance(raw_ids, list):
             for raw_id in raw_ids:
                 doc_id = str(raw_id)
-                if doc_id in valid_ids and doc_id not in normalized_ids:
+                if doc_id in valid_parent_ids and doc_id not in normalized_ids:
                     normalized_ids.append(doc_id)
+                    continue
+                for candidate in unread_candidates:
+                    if candidate.doc_id == doc_id:
+                        parent_id = _candidate_parent_id(candidate)
+                        if parent_id not in normalized_ids:
+                            normalized_ids.append(parent_id)
+                        break
         if not normalized_ids:
-            normalized_ids = [candidate.doc_id for candidate in unread_candidates[: self.settings.choose_top_k]]
-        selected = [
-            candidate for candidate in unread_candidates if candidate.doc_id in normalized_ids
-        ][: self.settings.choose_top_k]
+            normalized_ids = list(parent_groups)[: self.settings.choose_top_k]
+        selected_parent_ids = normalized_ids[: self.settings.choose_top_k]
+        selected, _selection_meta = self._expand_selected_parent_documents(
+            parent_groups,
+            selected_parent_ids,
+            hop=hop,
+            iteration=-1,
+            selection_stage="followup_model",
+        )
         self._mark_selected_documents(hop, selected)
         return selected
 
@@ -1302,8 +1767,12 @@ class PrivacyHopQAAgent:
             current_hop_question=self._materialize_question(hop.question),
             current_answers_so_far=self._current_answers_so_far(),
             search_history=self._recent_search_history(hop),
-            reader_results=[result.to_dict() for result in reader_results],
-            unread_candidate_cards=[candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in unread_candidates],
+            reader_results=[_resolver_reader_result(result) for result in _reader_results_for_resolver(reader_results)],
+            unread_candidate_cards=_candidate_cards_for_prompt(
+                unread_candidates,
+                self.settings.chooser_excerpt_chars,
+                max_cards=80,
+            ),
             choose_top_k=self.settings.choose_top_k,
         )
         self._save_prompt(f"hop_resolve_iter{iteration}_hop{hop.hop_number}", prompt)
@@ -1408,7 +1877,7 @@ class PrivacyHopQAAgent:
             }
 
         selected = await self._choose_documents(hop, unread_candidates, iteration)
-        cumulative_reader_results: list[ReaderResult] = []
+        cumulative_reader_results: list[ReaderResult] = self._stored_reader_results(hop)
         resolution = {
             "answered": False,
             "answer": "",
@@ -1449,6 +1918,13 @@ class PrivacyHopQAAgent:
             hop.attempts += 1
             retrieval_actions = await self._plan_retrieval_actions(hop, iteration)
             if not retrieval_actions:
+                prior_reader_results = self._stored_reader_results(hop)
+                if prior_reader_results:
+                    resolution = await self._resolve_hop(hop, iteration, prior_reader_results, [])
+                    hop.resolution_reason = resolution.get("reason") or ""
+                    if self._apply_resolution_to_hop(hop, resolution):
+                        stalled = False
+                        continue
                 hop.status = "pending"
                 hop.resolution_reason = "No usable retrieval plan was produced for this hop in this iteration."
                 stalled = True
@@ -1456,14 +1932,7 @@ class PrivacyHopQAAgent:
             candidates = await self._run_retrieval_actions(retrieval_actions, hop, iteration)
             resolution = await self._work_candidate_pool(hop, iteration, candidates)
             hop.resolution_reason = resolution.get("reason") or ""
-            if resolution.get("answered") and resolution.get("answer"):
-                raw_answer = str(resolution.get("answer") or "").strip()
-                hop.answer = raw_answer
-                hop.matched_accepted_variant = self._answer_matches_accepted_variant(hop, raw_answer)
-                hop.answer_for_context = self._context_answer_for_raw(hop, raw_answer)
-                hop.justification = str(resolution.get("justification") or "").strip()
-                hop.confidence = _clamp_confidence(resolution.get("confidence"), default=0.0)
-                hop.status = "answered"
+            if self._apply_resolution_to_hop(hop, resolution):
                 stalled = False
             else:
                 hop.status = "pending"
@@ -1492,6 +1961,7 @@ class PrivacyHopQAAgent:
         )
 
         error_summary = self._error_summary()
+        retrieval_summary = self._retrieval_summary()
         summary = {
             "task_id": self.task_id,
             "chain_id": self.llm_adapter.chain_id,
@@ -1506,6 +1976,7 @@ class PrivacyHopQAAgent:
             "prompt_tokens": self.llm_adapter.total_prompt_tokens,
             "output_tokens": self.llm_adapter.total_output_tokens,
             "total_tokens": self.llm_adapter.total_prompt_tokens + self.llm_adapter.total_output_tokens,
+            "retrieval_summary": retrieval_summary,
             **error_summary,
         }
         trace = {
@@ -1532,6 +2003,7 @@ class PrivacyHopQAAgent:
         report_metadata = {
             **summary,
             "error_summary": error_summary,
+            "retrieval_summary": retrieval_summary,
             "trace_path": str(trace_path),
             "timeline_html": timeline_paths["html_path"],
             "report_path": str(report_path),
