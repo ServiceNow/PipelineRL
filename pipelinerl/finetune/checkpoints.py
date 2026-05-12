@@ -151,6 +151,15 @@ def load_processor(config_name):
 def load_model(args, model_class, current_dir):
     get_accelerator().wait_for_everyone()
 
+    try:
+        has_deprecated_fp32_lm_head = "fp32_lm_head" in args
+    except TypeError:
+        has_deprecated_fp32_lm_head = hasattr(args, "fp32_lm_head")
+    if has_deprecated_fp32_lm_head:
+        raise ValueError(
+            "fp32_lm_head is no longer configurable; PipelineRL always uses FP32 output-head logits"
+        )
+
     assert not (
         os.path.exists(current_dir / "pytorch_model.bin")
         and os.path.exists(current_dir / "pytorch_model.bin.index.json")
@@ -200,10 +209,9 @@ def load_model(args, model_class, current_dir):
 
     model = model_cls.from_pretrained(model_to_load, **loading_args)
 
-    # apply FP32 fix to lm_head for numerical precision
-    if getattr(args, "fp32_lm_head", False):
-        layer_prefix = getattr(args, "fp32_layer_prefix", "lm_head")
-        model = apply_fp32_lm_head(model, layer_prefix=layer_prefix)
+    # Always use FP32 output-head logits to match the vLLM inference path.
+    layer_prefix = getattr(args, "fp32_layer_prefix", "lm_head")
+    model = apply_fp32_lm_head(model, layer_prefix=layer_prefix)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(
