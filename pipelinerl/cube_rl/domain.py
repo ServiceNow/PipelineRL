@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from omegaconf import DictConfig
@@ -273,6 +275,12 @@ class CubeBenchmarkWorker:
         ## Optional config for extra reward
         self._buffer_tokens = int(getattr(cfg.actor, "buffer_tokens", 0))
         self._discount_factor = float(getattr(cfg.actor, "discount_factor", 1.0))
+        artifact_cfg = getattr(getattr(cfg, "cube_params", {}), "rollout_artifacts", None)
+        self._persist_rollout_artifacts = bool(getattr(artifact_cfg, "enabled", False)) if artifact_cfg else False
+        artifact_dir = getattr(artifact_cfg, "path", None) if artifact_cfg else None
+        self._rollout_artifact_dir = (
+            Path(artifact_dir) if artifact_dir else Path(cfg.output_dir) / "actor" / "rollout_artifacts"
+        )
 
     def setup(self) -> dict[str, Any]:
         try:
@@ -393,6 +401,8 @@ class CubeBenchmarkWorker:
             container_backend=self._container_backend,
         )
         trajectory = ep.run()
+        if self._persist_rollout_artifacts:
+            self._write_rollout_artifact(trajectory, task)
         logger.info(f"Trajectory completed due to {trajectory.termination_reason}")
         agent_outputs = [
             step.output
@@ -437,10 +447,29 @@ class CubeBenchmarkWorker:
                             step_reward = float(j.reward)
                             break
                 
-                for call in step_output.llm_calls:
+                for call_i, call in enumerate(step_output.llm_calls):
                     training_text = make_training_text(self._llm_tokenizer, call)
                     training_text.reward = step_reward
                     training_text.finished = finished
+                    training_text.metadata.update(call.metadata or {})
+                    training_text.metadata.update(
+                        {
+                            "llm_call_id": call.id,
+                            "llm_call_tag": call.tag,
+                            "cube_id": task.get("domain"),
+                            "task_id": getattr(task_config, "task_id", None),
+                            "trajectory_id": trajectory.id,
+                            "agent_step_index": step_i,
+                            "llm_call_index": call_i,
+                            "dataset_name": task.get("dataset"),
+                            "termination_reason": str(trajectory.termination_reason),
+                            "finish_reason": call.finish_reason,
+                            "final_reward": final_reward,
+                            "step_reward": step_reward,
+                            "llm_prompt_tokens": call.prompt_tokens,
+                            "llm_output_tokens": call.output_tokens,
+                        }
+                    )
                     training_texts.append(training_text)
 
 
@@ -481,6 +510,46 @@ class CubeBenchmarkWorker:
             dataset_name=task["dataset"],
             domain=task["domain"],
         )
+
+    def _write_rollout_artifact(self, trajectory: Any, task: dict) -> None:
+        from cube_harness.core import AgentOutput
+
+        try:
+            self._rollout_artifact_dir.mkdir(parents=True, exist_ok=True)
+            llm_calls = []
+            for step_i, step in enumerate(trajectory.steps):
+                if not isinstance(step.output, AgentOutput):
+                    continue
+                for call_i, call in enumerate(step.output.llm_calls):
+                    llm_calls.append(
+                        {
+                            "step_index": step_i,
+                            "llm_call_index": call_i,
+                            "llm_call_id": call.id,
+                            "tag": call.tag,
+                            "timestamp": call.timestamp,
+                            "prompt_tokens": call.prompt_tokens,
+                            "output_tokens": call.output_tokens,
+                            "finish_reason": call.finish_reason,
+                            "metadata": call.metadata,
+                        }
+                    )
+
+            payload = {
+                "trajectory_id": trajectory.id,
+                "cube_id": task.get("domain"),
+                "dataset_name": task.get("dataset"),
+                "task_id": getattr(task.get("task_config"), "task_id", None),
+                "termination_reason": str(trajectory.termination_reason),
+                "reward_info": trajectory.reward_info,
+                "summary_stats": trajectory.summary_stats,
+                "n_steps": len(trajectory.steps),
+                "llm_calls": llm_calls,
+            }
+            artifact_path = self._rollout_artifact_dir / f"{self._worker_name}_{trajectory.id}_{time.time_ns()}.json"
+            artifact_path.write_text(json.dumps(payload, indent=2, default=str))
+        except Exception:
+            logger.exception("%s failed to write rollout artifact for %s", self._worker_name, trajectory.id)
 
     def health(self) -> dict[str, Any]:
         return {

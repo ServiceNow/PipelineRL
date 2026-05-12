@@ -160,6 +160,9 @@ function renderSummary() {
     ["train success", topics.actor?.success_rate, "success_rate"],
     ["test success", topics.actor_test?.success_rate, "success_rate"],
     ["train reward", topics.actor?.reward_mean],
+    ["vLLM requests", topics.actor?.vllm_requests],
+    ["vLLM errors", topics.actor?.vllm_errors],
+    ["vLLM suppressed", topics.actor?.vllm_suppressed],
     ["train attempts", topics.actor?.attempts],
     ["train trace steps", topics.actor?.trace_steps],
   ];
@@ -171,7 +174,15 @@ function renderSummary() {
 async function loadTrainingStats() {
   const topic = $("trainingStatsTopic").value;
   state.trainingStats = await api(`/api/experiments/${encodeURIComponent(state.current)}/stats/${topic}?max_points=1000`);
-  const preferred = ["success_mean", "reward_mean", "latency_mean", "output_tokens_mean", "published_samples"];
+  const preferred = [
+    "success_mean",
+    "reward_mean",
+    "latency_mean",
+    "output_tokens_mean",
+    "published_samples",
+    "vllm_router/server_0/requests",
+    "vllm_router/server_0/latency_ema",
+  ];
   const keys = state.trainingStats.numeric_keys;
   const current = $("trainingMetricSelect").value;
   $("trainingMetricSelect").innerHTML = keys.map((key) => `<option value="${escapeHtml(key)}">${escapeHtml(key)}</option>`).join("");
@@ -182,7 +193,17 @@ async function loadTrainingStats() {
 
 function updateVisibleRolloutStats() {
   const rows = state.rollouts?.rows || [];
-  const preferred = ["success_rate", "reward_mean", "reward_max", "attempts", "trace_steps", "output_tokens_mean"];
+  const preferred = [
+    "success_rate",
+    "reward_mean",
+    "reward_max",
+    "attempts",
+    "trace_steps",
+    "output_tokens_mean",
+    "llm_latency_mean",
+    "vllm_lease_wait_mean",
+    "routed_calls",
+  ];
   const keys = visibleRolloutMetricKeys(rows);
   const current = $("metricSelect").value;
   $("metricSelect").innerHTML = keys.map((key) => `<option value="${escapeHtml(key)}">${escapeHtml(key)}</option>`).join("");
@@ -220,6 +241,10 @@ function aggregateVisibleRollouts(rows) {
     trace_steps: sumNumber(rows.map((row) => row.trace_steps)),
     prompt_tokens_mean: avg(rows.map((row) => row.prompt_tokens_mean)),
     output_tokens_mean: avg(rows.map((row) => row.output_tokens_mean)),
+    llm_latency_mean: avg(rows.map((row) => row.llm_latency_mean)),
+    vllm_lease_wait_mean: avg(rows.map((row) => row.vllm_lease_wait_mean)),
+    vllm_server_count: avg(rows.map((row) => row.vllm_server_count)),
+    routed_calls: sumNumber(rows.map((row) => row.routed_calls)),
   };
 }
 
@@ -343,6 +368,7 @@ function renderRollouts() {
       const outcome = row.success === true ? "ok" : row.success === false ? "fail" : "na";
       const label = row.success_rate !== null && row.success_rate !== undefined ? fmtMetric("success_rate", row.success_rate) : row.success === true ? "success" : row.success === false ? "failure" : "n/a";
       const tokens = `${fmt(row.prompt_tokens_mean, 0)} / ${fmt(row.output_tokens_mean, 0)}`;
+      const route = routeSummary(row);
       return `<tr data-row="${row.row_index}">
         <td>${row.row_index}</td>
         <td><span class="pill ${outcome}">${label}</span></td>
@@ -350,6 +376,7 @@ function renderRollouts() {
         <td>${fmt(row.attempts, 0)}</td>
         <td>${fmt(row.trace_steps, 0)} (${fmt(row.steps_min, 0)}-${fmt(row.steps_max, 0)})</td>
         <td>${tokens}</td>
+        <td>${route}</td>
         <td>${escapeHtml(row.group_id || row.dataset_name || row.domain || "")}</td>
         <td>${renderPreview(row)}</td>
       </tr>`;
@@ -358,6 +385,13 @@ function renderRollouts() {
   document.querySelectorAll("#rolloutRows tr").forEach((node) => {
     node.addEventListener("click", () => loadDetail(Number(node.dataset.row)));
   });
+}
+
+function routeSummary(row) {
+  const servers = Array.isArray(row.vllm_servers) && row.vllm_servers.length ? `s${row.vllm_servers.join(",")}` : "n/a";
+  const latency = row.llm_latency_mean !== null && row.llm_latency_mean !== undefined ? `${fmt(row.llm_latency_mean)}s` : "n/a";
+  const wait = row.vllm_lease_wait_mean !== null && row.vllm_lease_wait_mean !== undefined ? `${fmt(row.vllm_lease_wait_mean)}s wait` : "n/a";
+  return `<div class="route-summary"><strong>${escapeHtml(servers)}</strong><span>${latency} · ${wait}</span></div>`;
 }
 
 function renderPreview(row) {
@@ -392,12 +426,17 @@ async function loadDetail(rowIndex) {
       ${renderStatsCards(group.prompt_stats, 48, true)}`
     : "";
   const metrics = group.metrics ? `<pre class="json-box">${escapeHtml(JSON.stringify(group.metrics, null, 2))}</pre>` : "";
+  const routeGroup = groupSummary(attempts);
   $("detail").innerHTML = `
     <div class="kv-grid">
       <div class="kv"><span>dataset</span><strong>${escapeHtml(group.dataset_name || "n/a")}</strong></div>
       <div class="kv"><span>domain</span><strong>${escapeHtml(group.domain || "n/a")}</strong></div>
       <div class="kv"><span>group</span><strong>${escapeHtml(group.group_id || firstCall(attempts)?.group_id || "n/a")}</strong></div>
       <div class="kv"><span>latency</span><strong>${fmt(group.latency)}</strong></div>
+      <div class="kv"><span>routed calls</span><strong>${fmt(routeGroup.routedCalls, 0)}</strong></div>
+      <div class="kv"><span>vLLM servers</span><strong>${escapeHtml(routeGroup.servers || "n/a")}</strong></div>
+      <div class="kv"><span>LLM latency mean</span><strong>${fmt(routeGroup.llmLatency)}s</strong></div>
+      <div class="kv"><span>lease wait mean</span><strong>${fmt(routeGroup.leaseWait)}s</strong></div>
     </div>
     ${promptStats}
     <h3 style="margin:16px 0 8px">Actor Row Metrics</h3>
@@ -405,6 +444,18 @@ async function loadDetail(rowIndex) {
     <h3 style="margin:16px 0 8px">Attempts</h3>
     ${attempts.map(renderAttempt).join("")}
   `;
+}
+
+function groupSummary(attempts) {
+  const calls = attempts.flatMap((attempt) => attempt.calls || []);
+  const metas = calls.map((call) => call.metadata || {}).filter((meta) => typeof meta === "object");
+  const servers = Array.from(new Set(metas.map((meta) => meta.vllm_server_id).filter((value) => value !== undefined && value !== null))).sort();
+  return {
+    routedCalls: metas.filter((meta) => meta.route_id).length,
+    servers: servers.length ? servers.map((server) => `s${server}`).join(", ") : "",
+    llmLatency: avg(metas.map((meta) => meta.llm_latency_s)),
+    leaseWait: avg(metas.map((meta) => meta.vllm_lease_wait_s)),
+  };
 }
 
 function firstCall(attempts) {
@@ -419,7 +470,7 @@ function renderAttempt(attempt) {
   return `<details class="call collapsible attempt">
     <summary class="call-head">
       <strong>Attempt ${fmt(attempt.rollout_index, 0)}</strong>
-      <span>${calls.length} step${calls.length === 1 ? "" : "s"} · final reward ${fmt(attempt.reward_final)} · success ${fmt(attempt.success)}</span>
+      <span>${calls.length} step${calls.length === 1 ? "" : "s"} · final reward ${fmt(attempt.reward_final)} · success ${fmt(attempt.success)} · LLM ${fmt(attempt.llm_latency_mean)}s · wait ${fmt(attempt.vllm_lease_wait_mean)}s</span>
     </summary>
     <div class="call-body">
       ${calls.map(renderCall).join("")}
@@ -434,10 +485,11 @@ function renderCall(call, index) {
     if (call[key] && typeof call[key] === "object") arrays[key] = call[key];
   }
   const messageSections = renderMessageSections(call.text || "");
+  const route = meta.route_id ? ` · route ${escapeHtml(String(meta.route_id))} · server ${escapeHtml(String(meta.vllm_server_id ?? "n/a"))}` : "";
   return `<details class="call collapsible step">
     <summary class="call-head">
       <strong>Step ${fmt(meta.step_index ?? index, 0)}</strong>
-      <span>reward ${fmt(call.reward)} · prompt ${fmt(call.prompt_tokens, 0)} · output ${fmt(call.output_tokens, 0)} · finished ${fmt(call.finished)}</span>
+      <span>reward ${fmt(call.reward)} · prompt ${fmt(call.prompt_tokens, 0)} · output ${fmt(call.output_tokens, 0)} · LLM ${fmt(meta.llm_latency_s)}s · wait ${fmt(meta.vllm_lease_wait_s)}s · finished ${fmt(call.finished)}${route}</span>
     </summary>
     <div class="call-body">
       ${messageSections}

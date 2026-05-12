@@ -281,6 +281,7 @@ class CubeActorLoop:
         stats_writer: StreamWriter,
         scheduler_name: str,
         is_training: bool,
+        vllm_router: Any | None = None,
     ) -> None:
         self.cfg = cfg
         self.llms = llms
@@ -290,6 +291,7 @@ class CubeActorLoop:
         self.stats_writer = stats_writer
         self.scheduler_name = scheduler_name
         self.is_training = is_training
+        self.vllm_router = vllm_router
         self.debug_mode = bool(cfg.debug.mode)
         self.is_scheduling_paused = False
 
@@ -546,6 +548,29 @@ class CubeActorLoop:
             | {f"{split_name}model_version_{k}": v for k, v in calculate_stats(self.model_versions_list).items()}
         )
         stats |= loop_stats
+        if self.vllm_router is not None:
+            try:
+                router_snapshot = ray.get(self.vllm_router.snapshot.remote(), timeout=2.0)
+                for server in router_snapshot.get("servers", []):
+                    server_id = server.get("server_id")
+                    prefix = f"{split_name}vllm_router/server_{server_id}"
+                    for key in (
+                        "inflight",
+                        "active_tokens",
+                        "latency_ema",
+                        "errors",
+                        "requests",
+                        "suppressed",
+                        "suppressed_remaining_s",
+                    ):
+                        value = server.get(key)
+                        if isinstance(value, (bool, int, float)):
+                            stats[f"{prefix}/{key}"] = value
+                stats[f"{split_name}vllm_router/max_inflight_per_server"] = router_snapshot.get(
+                    "max_inflight_per_server", 0
+                )
+            except Exception:
+                logger.exception("%s: failed to collect vLLM router stats", self.scheduler_name)
 
         total_domain_samples = sum(self.domain_counts.values())
         if total_domain_samples:
@@ -835,13 +860,12 @@ class CubeActorLoop:
                 group_results = self._group_rollouts.pop(info.group_id)
                 if self.attempts > 1:
                     random.shuffle(group_results)
+                self.length_penalty_adjustment(group_results)
                 group_samples = _write_group_result(
                     rollout_results=group_results,
                     attempts=self.attempts,
                     data_writer=self.data_writer,
                 )
-
-                self.length_penalty_adjustment(group_results)
 
                 self._run_finished_groups += 1
                 self.total_finished_groups += 1
@@ -1052,6 +1076,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 stats_writer=stats_writer,
                 scheduler_name="cube_train_scheduler",
                 is_training=True,
+                vllm_router=vllm_router,
             )
             test_loop = CubeActorLoop(
                 cfg=cfg,
@@ -1062,6 +1087,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 stats_writer=test_stats_writer,
                 scheduler_name="cube_test_scheduler",
                 is_training=False,
+                vllm_router=vllm_router,
             )
 
             last_regular_eval = -1

@@ -55,6 +55,7 @@ class RayVLLMRouter:
 
     def acquire(self, config: Any, prompt: Any) -> LLMRouteLease:
         estimated_tokens = estimate_prompt_tokens(prompt) + int(getattr(config, "max_completion_tokens", 0) or 0)
+        wait_started_at = time.perf_counter()
         while True:
             lease = ray.get(self._router_actor.try_acquire.remote(estimated_tokens=estimated_tokens))
             if lease is not None:
@@ -63,6 +64,14 @@ class RayVLLMRouter:
                     api_base=lease["api_base"],
                     api_key=lease["api_key"],
                     model_name=lease["model_name"],
+                    metadata={
+                        "route_id": lease["route_id"],
+                        "vllm_server_id": lease["server_id"],
+                        "vllm_api_base": lease["api_base"],
+                        "vllm_model_name": lease["model_name"],
+                        "vllm_estimated_tokens": estimated_tokens,
+                        "vllm_lease_wait_s": time.perf_counter() - wait_started_at,
+                    },
                 )
             time.sleep(self._poll_interval_s)
 
@@ -110,15 +119,28 @@ class VLLMRouterActor:
         self._active_tokens = [0 for _ in self._routes]
         self._latency_ema = [0.0 for _ in self._routes]
         self._errors = [0 for _ in self._routes]
+        self._requests = [0 for _ in self._routes]
+        self._suppressed_until = [0.0 for _ in self._routes]
         self._leases: dict[str, tuple[int, float, int]] = {}
         self._lease_ids = itertools.count()
+        self._error_suppression_threshold = 3
+        self._suppression_cooldown_s = 30.0
 
     def try_acquire(self, estimated_tokens: int = 0) -> dict[str, Any] | None:
+        now = time.time()
         eligible = [
             route.server_id
             for route in self._routes
             if self._inflight[route.server_id] < self._max_inflight
+            and self._suppressed_until[route.server_id] <= now
         ]
+        if not eligible:
+            # If every server is suppressed, prefer slow progress over a hard stall.
+            eligible = [
+                route.server_id
+                for route in self._routes
+                if self._inflight[route.server_id] < self._max_inflight
+            ]
         if not eligible:
             return None
 
@@ -136,6 +158,7 @@ class VLLMRouterActor:
         token_load = max(1, int(estimated_tokens or 1))
         self._inflight[server_id] += 1
         self._active_tokens[server_id] += token_load
+        self._requests[server_id] += 1
         self._leases[route_id] = (server_id, time.perf_counter(), token_load)
         return {
             "route_id": route_id,
@@ -166,8 +189,14 @@ class VLLMRouterActor:
         self._latency_ema[server_id] = latency if previous <= 0 else previous * 0.9 + latency * 0.1
         if errored:
             self._errors[server_id] += 1
+            if self._errors[server_id] >= self._error_suppression_threshold:
+                self._suppressed_until[server_id] = time.time() + self._suppression_cooldown_s
+        else:
+            self._errors[server_id] = 0
+            self._suppressed_until[server_id] = 0.0
 
     def snapshot(self) -> dict[str, Any]:
+        now = time.time()
         return {
             "max_inflight_per_server": self._max_inflight,
             "servers": [
@@ -178,6 +207,9 @@ class VLLMRouterActor:
                     "active_tokens": self._active_tokens[route.server_id],
                     "latency_ema": self._latency_ema[route.server_id],
                     "errors": self._errors[route.server_id],
+                    "requests": self._requests[route.server_id],
+                    "suppressed": self._suppressed_until[route.server_id] > now,
+                    "suppressed_remaining_s": max(0.0, self._suppressed_until[route.server_id] - now),
                 }
                 for route in self._routes
             ],

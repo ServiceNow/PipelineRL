@@ -197,6 +197,9 @@ def summarize_actor_topic_from_stats(actor_files: list[Path], stats_files: list[
     base["success_rate"] = mean([number_or_none(row.get("success_mean")) for row in stats_rows if isinstance(row, dict)])
     base["reward_mean"] = mean([number_or_none(row.get("reward_mean")) for row in stats_rows if isinstance(row, dict)])
     base["latency_mean"] = mean([number_or_none(row.get("latency_mean")) for row in stats_rows if isinstance(row, dict)])
+    base["vllm_requests"] = latest_sum_by_suffix(stats_rows, "/requests")
+    base["vllm_errors"] = latest_sum_by_suffix(stats_rows, "/errors")
+    base["vllm_suppressed"] = latest_sum_by_suffix(stats_rows, "/suppressed")
     base["attempts"] = None
     base["trace_steps"] = None
     return base
@@ -296,6 +299,7 @@ def summarize_prompt_group(row: Any, file_index: int, row_index: int, stats_row:
     group = normalize_prompt_group(row, stats_row=stats_row)
     attempts = group.get("attempts", [])
     calls = [call for attempt in attempts for call in attempt.get("calls", []) if isinstance(call, dict)]
+    call_metadata = [call.get("metadata", {}) for call in calls if isinstance(call.get("metadata"), dict)]
     metrics = group.get("metrics", {}) if isinstance(group.get("metrics"), dict) else {}
     first = calls[0] if calls else {}
     rewards = [number_or_none(call.get("reward")) for call in calls]
@@ -308,6 +312,13 @@ def summarize_prompt_group(row: Any, file_index: int, row_index: int, stats_row:
     success_rate = mean(successes) if successes else (1.0 if explicit_success is True else 0.0 if explicit_success is False else None)
     attempt_indices = [attempt["rollout_index"] for attempt in attempts]
     step_counts = [len(attempt.get("calls", [])) for attempt in attempts]
+    vllm_server_ids = sorted(
+        {
+            str(meta.get("vllm_server_id"))
+            for meta in call_metadata
+            if meta.get("vllm_server_id") is not None
+        }
+    )
     return {
         "file_index": file_index,
         "row_index": row_index,
@@ -329,6 +340,12 @@ def summarize_prompt_group(row: Any, file_index: int, row_index: int, stats_row:
         "steps_max": max(step_counts) if step_counts else None,
         "prompt_tokens_mean": first_not_none(number_or_none(prompt_stats.get("prompt_tokens_mean")), mean([number_or_zero(call.get("prompt_tokens")) for call in calls])),
         "output_tokens_mean": first_not_none(number_or_none(prompt_stats.get("output_tokens_mean")), mean([number_or_zero(call.get("output_tokens")) for call in calls])),
+        "llm_latency_mean": mean([number_or_none(meta.get("llm_latency_s")) for meta in call_metadata]),
+        "vllm_lease_wait_mean": mean([number_or_none(meta.get("vllm_lease_wait_s")) for meta in call_metadata]),
+        "vllm_estimated_tokens_mean": mean([number_or_none(meta.get("vllm_estimated_tokens")) for meta in call_metadata]),
+        "vllm_server_count": len(vllm_server_ids),
+        "vllm_servers": vllm_server_ids,
+        "routed_calls": sum(1 for meta in call_metadata if meta.get("route_id")),
         "stats_row": row_index if prompt_stats else None,
         "finished_steps": sum(1 for call in calls if bool(call.get("finished"))),
         "preview": rollout_preview(first.get("text") or ""),
@@ -385,6 +402,20 @@ def group_calls_by_attempt(training_texts: list[Any]) -> list[dict[str, Any]]:
                 "reward_mean": mean(rewards),
                 "reward_final": rewards[-1] if rewards else None,
                 "success": any(reward > 0 for reward in rewards) if rewards else None,
+                "llm_latency_mean": mean(
+                    [
+                        number_or_none(call.get("metadata", {}).get("llm_latency_s"))
+                        for call in calls
+                        if isinstance(call.get("metadata"), dict)
+                    ]
+                ),
+                "vllm_lease_wait_mean": mean(
+                    [
+                        number_or_none(call.get("metadata", {}).get("vllm_lease_wait_s"))
+                        for call in calls
+                        if isinstance(call.get("metadata"), dict)
+                    ]
+                ),
                 "calls": calls,
             }
         )
@@ -400,7 +431,10 @@ def filter_rollouts(rows: list[dict[str, Any]], q: str, success: str) -> list[di
         out = [
             r
             for r in out
-            if q in " ".join(str(r.get(k) or "") for k in ("dataset_name", "domain", "group_id", "preview")).lower()
+            if q
+            in " ".join(
+                str(r.get(k) or "") for k in ("dataset_name", "domain", "group_id", "preview", "vllm_servers")
+            ).lower()
         ]
     return out
 
@@ -523,3 +557,20 @@ def first_not_none(*values: Any) -> Any:
 def mean(values: list[Any]) -> float | None:
     nums = [float(v) for v in values if is_number(v) or isinstance(v, bool)]
     return sum(nums) / len(nums) if nums else None
+
+
+def latest_sum_by_suffix(rows: list[Any], suffix: str) -> float | None:
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        values = [scalar_or_none(value) for key, value in row.items() if str(key).endswith(suffix)]
+        values = [value for value in values if value is not None]
+        if values:
+            return sum(values)
+    return None
+
+
+def scalar_or_none(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    return number_or_none(value)

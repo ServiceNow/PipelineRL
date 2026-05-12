@@ -282,7 +282,7 @@ button {
 table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 860px;
+  min-width: 980px;
 }
 
 th,
@@ -324,6 +324,21 @@ tbody tr:hover {
 
 .preview-line strong {
   color: #17202f;
+}
+
+.route-summary {
+  display: grid;
+  gap: 3px;
+  min-width: 110px;
+}
+
+.route-summary strong {
+  font-size: 12px;
+}
+
+.route-summary span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .pill {
