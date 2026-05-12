@@ -18,10 +18,16 @@ dataset_loader_params:
 
 # HuggingFace Hub dataset IDs (or local disk paths).
 # Append ":split" to restrict to a specific split, e.g. SWE-bench/SWE-smith-py:train
+# NOTE: SWE-smith and SWE-bench_Verified do not ship with gold_file_contents —
+# run the preprocessor once per dataset before training, e.g.:
+#   python -m pipelinerl.domains.swe.swe_preprocessor --config-name=swe/preprocess \
+#     hf_dataset_name=SWE-bench/SWE-bench_Verified hf_split_name=test \
+#     dataset_path=/your/output/path repo_path=/your/repos/cache
+# then point the entry below at the resulting dataset_path on disk.
 train_dataset_names:
-  - SWE-bench/SWE-smith-py
+  - SWE-bench/SWE-smith
 test_dataset_names:
-  - SWE-bench/SWE-smith-py
+  - SWE-bench/SWE-bench_Verified
 
 finetune:
   seq_length: 24000
