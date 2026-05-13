@@ -186,7 +186,6 @@ def rl_step(
     model_inputs = {
         "input_ids": batch.input_ids,
         "attention_mask": batch.attention_mask,
-        "labels": batch.labels,
     }
     if batch.is_packed:
         model_inputs["position_ids"] = batch.position_ids
