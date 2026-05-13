@@ -82,7 +82,7 @@ Recent Document-Reading Results For This Hop:
 
 Plan up to {max_parallel_retrieval_actions} retrieval actions that would best help answer the CURRENT hop.
 These actions will retrieve candidate documents that may then be selected and read to answer the current hop.
-Think first about how to search for the necessary information, then return the retrieval actions.
+Think first step by step about how to search for the necessary information, then return the retrieval actions.
 
 - It is good to try different phrasings in parallel when useful
 - Avoid exact repeats of recent searches unless you are intentionally refining them
@@ -92,6 +92,8 @@ Think first about how to search for the necessary information, then return the r
 - Previously useful documents were helpful on earlier hops and may be retried by the harness, but they are not evidence for the current hop until read for this hop
 - If the hop depends on company-specific, internal, operational, or task-context facts, include a local_document_search
 - Do not spend an entire early hop on web_search only when local company files may contain the answer
+- Returning [] is acceptable only when the current hop already has enough current-hop search history, positive document-reading results, or previously useful documents to proceed without new retrieval
+- If current-hop search history and document-reading results are empty, returning [] is invalid; output at least one concrete search action
 - Do not plan analysis, URL fetches, downloads, or enterprise tools
 
 Return a JSON array of actions in this format:
@@ -196,6 +198,7 @@ Document titles and source labels can identify the work, show, report, organizat
 If the evidence directly states or strongly implies the answer, set "can_answer" to true. This includes extracting a component from a stated value, date, range, amount, or entity when the current hop asks for that component.
 Do not refuse merely because the evidence uses a synonym, an abbreviation, title context, or does not repeat every word in the question.
 In the justification, explicitly include the date/time/entity context that proves the answer is for the requested target, using title, date/front matter, or locator context when needed.
+When the evidence contains exact supporting wording, quote the shortest relevant span, table cell, row fragment, or sentence fragment in the justification. Keep the quote short; do not paste long passages.
 Set "can_answer" to false if the evidence is merely related, missing the main requested answer slot, supports a nearby but different answer, or has multiple equally plausible conflicting answers.
 Use high confidence only for directly supported answers. If confidence would be below 0.75 because the evidence is genuinely ambiguous or missing the target, set "can_answer" to false and explain what is missing.
 
@@ -205,7 +208,7 @@ Return JSON in this format:
 {{
   "can_answer": true,
   "proposed_answer": "short answer",
-  "justification": "1-2 sentences using only this document and citing [DOC:{document['doc_id']}]",
+  "justification": "1-3 sentences using only this document, quoting the shortest supporting span when available, and citing [DOC:{document['doc_id']}]",
   "confidence": 0.82,
   "missing_information": ""
 }}
@@ -236,6 +239,7 @@ When reader results conflict, prefer the result whose justification most directl
 A negative reader result from a different evidence window is not a conflict if it only says that window lacks the answer. Prefer a positive reader result when its justification directly supports the current hop.
 If exactly one positive reader result directly supports the current hop, answer from that result even if other windows are negative or unrelated.
 If multiple positive reader results disagree, compare their justifications against the current hop's requested row/entity/date and quantity type; do not prefer a nearby value just because it appears in more windows.
+When answering, carry forward the shortest exact supporting span from the best reader justification when one is available, plus the [DOC:...] citation.
 Never create an answer from a negative reader result. If every reader result has can_answer=false, either read more or search more; if no more evidence is available, report that the answer is not supported.
 For large parent documents, the unread list may include the same parent document again because only its most relevant evidence windows were read first.
 If the unread candidate list is empty, no more documents can be read from the current retrieval batch. In that terminal case, do not set "next_step" to "read_more"; either answer from the best directly supported positive reader result or set "next_step" to "search_more" with a concrete reason for what evidence is still missing.
@@ -265,7 +269,7 @@ Return JSON in this format:
 {{
   "answered": true,
   "answer": "short answer",
-  "justification": "1-2 sentences citing the best supporting [DOC:...] references",
+  "justification": "1-3 sentences quoting the shortest supporting span when available and citing the best supporting [DOC:...] references",
   "confidence": 0.9,
   "reason": "why this is enough, or what is still missing",
   "next_step": "done",
