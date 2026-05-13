@@ -13,10 +13,10 @@ helper_service_url: ${oc.env:PRIVACY_AGENT_HELPER_URL, null}
 helper_timeout_s: 30.0
 generation_context_limit_tokens: 16384
 generation_context_margin_tokens: 128
-hop_plan_max_tokens: 1024
-doc_choose_max_tokens: 1024
-doc_read_max_tokens: 768
-hop_resolve_max_tokens: 1024
+hop_plan_max_tokens: 4096
+doc_choose_max_tokens: 4096
+doc_read_max_tokens: 4096
+hop_resolve_max_tokens: 4096
 use_remote_local_search: true
 use_remote_browsecomp: true
 capture_mode: all_calls
