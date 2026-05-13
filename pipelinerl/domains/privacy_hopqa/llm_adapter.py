@@ -50,6 +50,8 @@ class CapturedLLMCall:
     llm_call: LLMCall
     log_name: str
     requested_model: str | None
+    hop_number: int | None = None
+    iteration: int | None = None
 
 
 class PrivacyHopQALLMAdapter:
@@ -157,6 +159,8 @@ class PrivacyHopQALLMAdapter:
         max_tokens: int | None = None,
         max_context_tokens: int | None = None,
         context_margin_tokens: int = 0,
+        hop_number: int | None = None,
+        iteration: int | None = None,
     ) -> str:
         prompt_text = str(prompt)
         prompt_obj = Prompt(messages=[{"role": "user", "content": prompt_text}])
@@ -227,6 +231,8 @@ class PrivacyHopQALLMAdapter:
                     llm_call=llm_call,
                     log_name=log_name,
                     requested_model=model,
+                    hop_number=hop_number,
+                    iteration=iteration,
                 )
             )
 
@@ -251,6 +257,8 @@ class PrivacyHopQALLMAdapter:
                     **base_metadata,
                     "captured_call_index": idx,
                     "log_name": captured.log_name,
+                    "hop_number": captured.hop_number,
+                    "iteration": captured.iteration,
                     "requested_model": captured.requested_model,
                     "capture_mode": self.capture_mode,
                 }

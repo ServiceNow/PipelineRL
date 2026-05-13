@@ -101,6 +101,8 @@ rl:
   epsilon_low: 2e-2
   epsilon_high: 2e-2
   use_advantages: true
+  step_reward_advantages: false
+  pad_step_rewards_for_advantage: false
   relu_log_p_weights: false
   clamp_log_ratio_ref_new_value: 5
   temperature: ${...llm.parameters.temperature}

@@ -25,6 +25,14 @@ capture_mode: all_calls
 answer_match_f1_threshold: 0.75
 answer_match_mode: exact_or_f1
 reward_mode: all_hops_correct
+# Training texts use the rollout outcome by default. Experimental stepwise mode:
+# training_reward_mode=prefix_progress gives each captured call
+# prefix_correct_hops_so_far / total_hops, while stop_after_incorrect_hop=true
+# ends the rollout after the first resolved wrong hop without injecting gold.
+# Use together with finetune.rl.step_reward_advantages=true and
+# finetune.rl.pad_step_rewards_for_advantage=true.
+training_reward_mode: outcome
+stop_after_incorrect_hop: false
 max_iterations: 21
 iteration_budget_per_hop: 3
 # Keep retries/fallback explicit: hidden generic local+web fallback changes

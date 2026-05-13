@@ -1133,6 +1133,8 @@ class PrivacyHopQAAgent:
                     max_tokens=self.settings.hop_plan_max_tokens,
                     max_context_tokens=self.settings.generation_context_limit_tokens,
                     context_margin_tokens=self.settings.generation_context_margin_tokens,
+                    hop_number=hop.hop_number,
+                    iteration=iteration,
                 )
                 payload = extract_json(response)
             except Exception as exc:
@@ -1630,6 +1632,8 @@ class PrivacyHopQAAgent:
                 max_tokens=self.settings.doc_choose_max_tokens,
                 max_context_tokens=self.settings.generation_context_limit_tokens,
                 context_margin_tokens=self.settings.generation_context_margin_tokens,
+                hop_number=hop.hop_number,
+                iteration=iteration,
             )
             payload = extract_json(response)
         except Exception as exc:
@@ -1698,6 +1702,8 @@ class PrivacyHopQAAgent:
                 max_tokens=self.settings.doc_read_max_tokens,
                 max_context_tokens=self.settings.generation_context_limit_tokens,
                 context_margin_tokens=self.settings.generation_context_margin_tokens,
+                hop_number=hop.hop_number,
+                iteration=iteration,
             )
             payload = extract_json(response)
             proposed_answer = str(payload.get("proposed_answer") or "").strip()
@@ -1939,6 +1945,26 @@ class PrivacyHopQAAgent:
         hop.status = "answered"
         return True
 
+    def _should_stop_after_incorrect_hop(self, hop: HopState, iteration: int) -> bool:
+        if not self.settings.stop_after_incorrect_hop or hop.matched_accepted_variant:
+            return False
+        now_s = self._elapsed_s()
+        self._record_event(
+            stage="stop",
+            lane="stop",
+            label=f"H{hop.hop_number} incorrect; stop rollout",
+            start_s=now_s,
+            end_s=now_s,
+            meta={
+                "hop_number": hop.hop_number,
+                "iteration": iteration,
+                "answer": hop.answer,
+                "matched_accepted_variant": hop.matched_accepted_variant,
+                "reason": "stop_after_incorrect_hop",
+            },
+        )
+        return True
+
     def _select_followup_documents(
         self,
         hop: HopState,
@@ -2006,6 +2032,8 @@ class PrivacyHopQAAgent:
                 max_tokens=self.settings.hop_resolve_max_tokens,
                 max_context_tokens=self.settings.generation_context_limit_tokens,
                 context_margin_tokens=self.settings.generation_context_margin_tokens,
+                hop_number=hop.hop_number,
+                iteration=iteration,
             )
             payload = extract_json(response)
             if not isinstance(payload, dict):
@@ -2132,6 +2160,7 @@ class PrivacyHopQAAgent:
         max_iterations = self._next_iteration_cap()
         iterations_used = 0
         stalled = False
+        stopped_after_incorrect_hop = False
         for iteration in range(max_iterations):
             hop = self._current_hop()
             if hop is None:
@@ -2150,6 +2179,9 @@ class PrivacyHopQAAgent:
                     if self._apply_resolution_to_hop(hop, resolution):
                         self._remember_useful_documents(hop, resolution, self._stored_reader_results(hop))
                         stalled = False
+                        if self._should_stop_after_incorrect_hop(hop, iteration):
+                            stopped_after_incorrect_hop = True
+                            break
                         continue
                 if prior_reader_results:
                     resolution = await self._resolve_hop(hop, iteration, prior_reader_results, [])
@@ -2158,6 +2190,9 @@ class PrivacyHopQAAgent:
                     if self._apply_resolution_to_hop(hop, resolution):
                         self._remember_useful_documents(hop, resolution, prior_reader_results)
                         stalled = False
+                        if self._should_stop_after_incorrect_hop(hop, iteration):
+                            stopped_after_incorrect_hop = True
+                            break
                         continue
                 hop.status = "pending"
                 if prior_resolution_reason:
@@ -2172,6 +2207,9 @@ class PrivacyHopQAAgent:
             if self._apply_resolution_to_hop(hop, resolution):
                 self._remember_useful_documents(hop, resolution, self._stored_reader_results(hop))
                 stalled = False
+                if self._should_stop_after_incorrect_hop(hop, iteration):
+                    stopped_after_incorrect_hop = True
+                    break
             else:
                 hop.status = "pending"
                 if not candidates:
@@ -2216,6 +2254,7 @@ class PrivacyHopQAAgent:
             "output_tokens": self.llm_adapter.total_output_tokens,
             "total_tokens": self.llm_adapter.total_prompt_tokens + self.llm_adapter.total_output_tokens,
             "retrieval_summary": retrieval_summary,
+            "stopped_after_incorrect_hop": stopped_after_incorrect_hop,
             **error_summary,
         }
         trace = {

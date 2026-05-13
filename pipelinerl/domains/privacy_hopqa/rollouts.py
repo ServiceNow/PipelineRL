@@ -35,6 +35,15 @@ class PrivacyHopQAMetrics(BaseMetrics):
     correct_hops: int = 0
     total_hops: int = 0
     hop_accuracy: float = 0.0
+    raw_hop_accuracy: float = 0.0
+    conditional_correct_hops: int = 0
+    evaluable_hops: int = 0
+    blocked_hops: int = 0
+    conditional_hop_accuracy: float = 0.0
+    prefix_correct_hops: int = 0
+    prefix_hop_accuracy: float = 0.0
+    first_incorrect_hop: int | None = None
+    strict_chain_success: bool = False
     final_correct: bool = False
     chain_complete: bool = False
     n_question_hops: int = 0
@@ -109,6 +118,55 @@ def _build_run_paths(cfg: DictConfig, problem: dict) -> tuple[Path, Path]:
     workspace_dir = root / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     return root, workspace_dir
+
+
+def _prefix_progress_by_hop(score: dict) -> dict[str, dict[str, float | int | bool]]:
+    per_hop = sorted(score.get("per_hop") or [], key=lambda item: int(item.get("hop") or 0))
+    total_hops = max(1, len(per_hop))
+    prefix_correct = 0
+    prefix_intact = True
+    progress: dict[str, dict[str, float | int | bool]] = {}
+    for hop_score in per_hop:
+        hop_num = str(hop_score.get("hop"))
+        hop_correct = bool(hop_score.get("correct"))
+        if prefix_intact and hop_correct:
+            prefix_correct += 1
+        else:
+            prefix_intact = False
+        progress[hop_num] = {
+            "reward": prefix_correct / total_hops,
+            "prefix_correct_hops": prefix_correct,
+            "hop_correct": hop_correct,
+            "prefix_intact": prefix_intact,
+        }
+    return progress
+
+
+def _assign_training_rewards(training_texts: list, score: dict, training_reward_mode: str) -> None:
+    outcome_reward = float(score["reward"])
+    prefix_progress = _prefix_progress_by_hop(score)
+    for trace in training_texts:
+        privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
+        hop_number = privacy_meta.get("hop_number")
+        hop_progress = prefix_progress.get(str(hop_number)) if hop_number is not None else None
+        if training_reward_mode == "outcome":
+            reward = outcome_reward
+        elif training_reward_mode == "prefix_progress":
+            reward = float((hop_progress or {}).get("reward", outcome_reward))
+        else:
+            raise ValueError(f"unknown privacy_hopqa training_reward_mode: {training_reward_mode}")
+        trace.reward = reward
+        privacy_meta.update(
+            {
+                "training_reward_mode": training_reward_mode,
+                "training_reward": reward,
+                "outcome_reward": outcome_reward,
+                "prefix_progress_reward": float((hop_progress or {}).get("reward", outcome_reward)),
+                "prefix_correct_hops": int((hop_progress or {}).get("prefix_correct_hops", 0)),
+                "hop_correct": bool((hop_progress or {}).get("hop_correct", False)),
+                "prefix_intact": bool((hop_progress or {}).get("prefix_intact", False)),
+            }
+        )
 
 
 async def generate_privacy_hopqa_rollout(
@@ -305,8 +363,7 @@ async def _run_privacy_hopqa_rollout_async(
         "retrieval_summary": retrieval_summary,
     }
     training_texts = adapter.make_training_texts(group_id=group_id, base_metadata=base_metadata)
-    for trace in training_texts:
-        trace.reward = score["reward"]
+    _assign_training_rewards(training_texts, score, settings.training_reward_mode)
 
     metrics = PrivacyHopQAMetrics(
         reward=reward_value,
@@ -316,6 +373,15 @@ async def _run_privacy_hopqa_rollout_async(
         correct_hops=score["correct_hops"],
         total_hops=score["total_hops"],
         hop_accuracy=score["hop_accuracy"],
+        raw_hop_accuracy=score["raw_hop_accuracy"],
+        conditional_correct_hops=score["conditional_correct_hops"],
+        evaluable_hops=score["evaluable_hops"],
+        blocked_hops=score["blocked_hops"],
+        conditional_hop_accuracy=score["conditional_hop_accuracy"],
+        prefix_correct_hops=score["prefix_correct_hops"],
+        prefix_hop_accuracy=score["prefix_hop_accuracy"],
+        first_incorrect_hop=score["first_incorrect_hop"],
+        strict_chain_success=bool(score["strict_chain_success"]),
         final_correct=bool(score["final_correct"]),
         chain_complete=bool(score["chain_complete"]),
         n_question_hops=n_question_hops,

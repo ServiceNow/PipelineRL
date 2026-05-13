@@ -66,6 +66,8 @@ class PrivacyHopQASettings:
     answer_match_f1_threshold: float = 0.75
     answer_match_mode: str = "exact_or_f1"
     reward_mode: str = "all_hops_correct"
+    training_reward_mode: str = "outcome"
+    stop_after_incorrect_hop: bool = False
     max_iterations: int = 21
     iteration_budget_per_hop: int = 3
     hop_plan_attempts: int = 1
@@ -134,6 +136,8 @@ class PrivacyHopQASettings:
             answer_match_f1_threshold=float(data.get("answer_match_f1_threshold", 0.75)),
             answer_match_mode=str(data.get("answer_match_mode", "exact_or_f1")),
             reward_mode=str(data.get("reward_mode", "all_hops_correct")),
+            training_reward_mode=str(data.get("training_reward_mode", "outcome")),
+            stop_after_incorrect_hop=bool(data.get("stop_after_incorrect_hop", False)),
             max_iterations=int(data.get("max_iterations", 21)),
             iteration_budget_per_hop=int(data.get("iteration_budget_per_hop", 3)),
             hop_plan_attempts=int(data.get("hop_plan_attempts", 1)),
