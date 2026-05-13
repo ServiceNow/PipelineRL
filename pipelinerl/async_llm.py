@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import logging
 
 import aiohttp
@@ -14,6 +15,37 @@ from pipelinerl.processor_factory import get_processor
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
+
+
+class RetryableLLMResponseError(aiohttp.ClientPayloadError):
+    """Raised when an LLM server returns a transiently invalid response body."""
+
+    def __init__(self, message: str, *, status: int | None = None, body: str | None = None):
+        self.status = status
+        self.body = body
+        super().__init__(message)
+
+
+def _preview_response_body(body: str | None, limit: int = 1000) -> str:
+    if body is None:
+        return "<unavailable>"
+    if len(body) <= limit:
+        return body
+    return body[:limit] + "...<truncated>"
+
+
+def _raise_invalid_llm_response(
+    reason: str,
+    *,
+    status: int | None = None,
+    body: str | None = None,
+) -> None:
+    preview = _preview_response_body(body)
+    raise RetryableLLMResponseError(
+        f"Invalid LLM response ({reason}); status={status}; body={preview!r}",
+        status=status,
+        body=body,
+    )
 
 
 def extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
@@ -52,6 +84,27 @@ def _to_plain_obj(value):
     if isinstance(value, (list, tuple)):
         return [_to_plain_obj(item) for item in value]
     return value
+
+
+def normalize_chat_template_messages(messages: list) -> list[dict]:
+    normalized = []
+    for message in messages:
+        if isinstance(message, dict):
+            message_dict = dict(message)
+        elif hasattr(message, "model_dump"):
+            message_dict = message.model_dump(exclude_none=True)
+        elif hasattr(message, "dict"):
+            message_dict = message.dict(exclude_none=True)
+        else:
+            message_dict = {
+                key: getattr(message, key)
+                for key in ("role", "content", "tool_calls", "reasoning_content")
+                if hasattr(message, key)
+            }
+
+        message_dict.setdefault("reasoning_content", None)
+        normalized.append(_to_plain_obj(message_dict))
+    return normalized
 
 
 async def llm_async_generate(
@@ -93,7 +146,7 @@ async def llm_async_generate(
         data["tools"] = _to_plain_obj(prompt.tools)
 
     if max_tokens_override is not None:
-        data["max_tokens"] = max_tokens_override
+        data["max_completion_tokens"] = max_tokens_override
 
     # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
     payload = _to_plain_obj({**extra_parameters, **data})
@@ -103,11 +156,41 @@ async def llm_async_generate(
         headers=headers,
         ssl=False,
     ) as response:
+        response_text = await response.text()
         if not response.ok:
-            error_text = await response.text()
-            logger.error(f"Failed to get completion: {error_text}")
+            logger.error(f"Failed to get completion: {response_text}")
             response.raise_for_status()
-        data = await response.json()
+        try:
+            data = json.loads(response_text)
+        except json.JSONDecodeError:
+            logger.exception(
+                "Failed to decode LLM response JSON: status=%s body=%r",
+                response.status,
+                _preview_response_body(response_text),
+            )
+            _raise_invalid_llm_response(
+                "response body is not valid JSON",
+                status=response.status,
+                body=response_text,
+            )
+
+    if data is None:
+        logger.warning(
+            "LLM server returned JSON null: status=%s body=%r",
+            response.status,
+            _preview_response_body(response_text),
+        )
+        _raise_invalid_llm_response(
+            "response body is JSON null",
+            status=response.status,
+            body=response_text,
+        )
+    if not isinstance(data, dict):
+        _raise_invalid_llm_response(
+            f"expected JSON object, got {type(data).__name__}",
+            status=response.status,
+            body=response_text,
+        )
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -136,8 +219,17 @@ async def llm_async_generate(
                         logger.error(e)
         finish_reason = data["choices"][0].get("finish_reason")
     except Exception:
-        logger.exception(f"Failed to parse llm response: {data}")
-        raise
+        logger.exception(
+            "Failed to parse LLM response: status=%s body=%r parsed=%r",
+            response.status,
+            _preview_response_body(response_text),
+            data,
+        )
+        _raise_invalid_llm_response(
+            "response does not match OpenAI chat completion schema",
+            status=response.status,
+            body=response_text,
+        )
 
     output = LLMOutput(content=content or "")
     if raw_tool_calls:
@@ -170,10 +262,11 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             }
             for tc in llm_call.output.tool_calls
         ]
-    full_messages = llm_call.prompt.messages + [assistant_msg]
+    prompt_messages = normalize_chat_template_messages(llm_call.prompt.messages)
+    full_messages = prompt_messages + [assistant_msg]
 
     if hasattr(llm_call.prompt, "messages"):
-        images = extract_images_from_messages(llm_call.prompt.messages)
+        images = extract_images_from_messages(prompt_messages)
         if images:
             use_processor = True
 
@@ -184,7 +277,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         try:
             # Apply chat template using processor for proper image token handling
             prompt_text = processor.apply_chat_template(
-                llm_call.prompt.messages,
+                prompt_messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -198,7 +291,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             # Process prompt with images to get token IDs with image placeholders
             prompt_inputs = processor(
                 text=processor.apply_chat_template(
-                    llm_call.prompt.messages, tokenize=False, add_generation_prompt=True
+                    prompt_messages, tokenize=False, add_generation_prompt=True
                 ),
                 images=images,
                 return_tensors=None,
@@ -223,7 +316,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     else:
         tools_kwarg = {"tools": llm_call.prompt.tools} if llm_call.prompt.tools else {}
         prompt_text = llm.tokenizer.apply_chat_template(
-            conversation=llm_call.prompt.messages,
+            conversation=prompt_messages,
             tokenize=False,
             add_generation_prompt=True,
             **tools_kwarg,
@@ -234,7 +327,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             **tools_kwarg,
         )
         prompt_token_ids = llm.tokenizer.apply_chat_template(
-            llm_call.prompt.messages,
+            prompt_messages,
             add_special_tokens=True,
             add_generation_prompt=True,
             **tools_kwarg,
@@ -287,4 +380,3 @@ def make_training_texts_from_llm_calls(
     if reward is not None:
         training_texts = apply_rollout_reward(training_texts, reward)
     return training_texts
-

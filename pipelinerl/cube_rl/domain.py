@@ -1,0 +1,564 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+from omegaconf import DictConfig
+import ray
+from pipelinerl.cube_rl.ray_worker_logging import (
+    configure_ray_worker_logging,
+    reset_worker_rollout_log_context,
+    start_worker_rollout_log_context,
+)
+from pipelinerl.rollouts import BaseMetrics, RolloutResult, TrainingText
+from pipelinerl.async_llm import (
+    MASKED_TOKEN_ID,
+    extract_images_from_messages,
+    get_processor,
+    normalize_chat_template_messages,
+)
+
+if TYPE_CHECKING:
+    from cube_harness.llm import LLMCall
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CubeRuntimeSpec:
+    cube_id: str
+    benchmark_cfg: dict[str, Any]
+    agent_cfg: dict[str, Any]
+    split: str
+
+def _copy_model(obj: Any) -> Any:
+    if hasattr(obj, "model_copy"):
+        return obj.model_copy(deep=True)
+    return obj
+
+def set_agent_llm_config(agent_config: Any, llm: dict) -> None:
+    llm_config = getattr(agent_config, "llm_config")
+
+    ## main config
+    llm_config.api_base = llm["base_url"]
+    if not llm_config.api_base.endswith("/v1"):
+        llm_config.api_base += "/v1"
+
+    llm_config.api_key = "EMPTY"
+    llm_config.model_name = llm.get("served_model_name") or llm["model_name"]
+    llm_config.tokenizer_name = llm.get("tokenizer_name", llm_config.model_name)
+    if not llm_config.model_name.startswith("openai/"):
+        llm_config.model_name = f"openai/{llm_config.model_name}"
+
+    llm_config.logprobs = llm['collect_logprobs']
+    if llm_config.logprobs:
+        llm_config.include_stop_str_in_output = True
+        llm_config.skip_special_tokens = False
+
+    # parameters config
+    llm_parameters = llm.get("parameters", {})
+    for param_name, param_value in llm_parameters.items():
+        if hasattr(llm_config, param_name):
+            setattr(llm_config, param_name, param_value)
+        else:
+            logger.warning("Cube-harness Agent LLM parameters does not have attribute '%s', skipping", param_name)
+
+def _resolve_task_dataset_name(benchmark_obj: Any, task_config: Any) -> str:
+    task_metadata = None
+    benchmark_task_metadata = getattr(benchmark_obj, "task_metadata", None)
+    if isinstance(benchmark_task_metadata, dict):
+        task_metadata = benchmark_task_metadata.get(task_config.task_id)
+
+    if task_metadata is not None:
+        extra_info = getattr(task_metadata, "extra_info", None)
+        if isinstance(extra_info, dict):
+            dataset_name = extra_info.get("dataset")
+            if dataset_name:
+                return str(dataset_name)
+
+    return ""
+
+def make_training_text(llm_tokenizer: Any, llm_call: LLMCall) -> TrainingText:
+    # Extract visual features if present
+    images = []
+    use_processor = False
+    visual_features = None
+    assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
+    if llm_call.output.tool_calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in llm_call.output.tool_calls
+        ]
+    prompt_messages = normalize_chat_template_messages(llm_call.prompt.messages)
+    full_messages = prompt_messages + [assistant_msg]
+
+    if hasattr(llm_call.prompt, "messages"):
+        images = extract_images_from_messages(prompt_messages)
+        if images:
+            use_processor = True
+
+    if use_processor:
+        # Use processor for vision-language models
+        processor = get_processor(llm.model_name)
+
+        try:
+            # Apply chat template using processor for proper image token handling
+            prompt_text = processor.apply_chat_template(
+                prompt_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            # Create full conversation with assistant response
+            text = processor.apply_chat_template(
+                full_messages,
+                tokenize=False,
+            )
+
+            # Process prompt with images to get token IDs with image placeholders
+            prompt_inputs = processor(
+                text=processor.apply_chat_template(
+                    prompt_messages, tokenize=False, add_generation_prompt=True
+                ),
+                images=images,
+                return_tensors=None,
+            )
+
+            # prompt_inputs["input_ids"] is a list of list
+            prompt_token_ids = prompt_inputs["input_ids"][0]
+
+            # Process images to get visual features
+            processed = processor(
+                text=[prompt_text], images=images, padding=True, return_tensors=None
+            )
+            visual_features = {
+                key: value
+                for key, value in processed.items()
+                if isinstance(value, np.ndarray)
+                and key not in ["input_ids", "attention_mask"]
+            }
+
+        except Exception as e:
+            raise ValueError(f"Failed to process with vision-language processor: {e}")
+    else:
+        tools_kwarg = {"tools": llm_call.prompt.tools} if llm_call.prompt.tools else {}
+        prompt_text = llm_tokenizer.apply_chat_template(
+            conversation=prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **tools_kwarg,
+        )
+        
+        text = llm_tokenizer.apply_chat_template(
+            full_messages,
+            tokenize=False,
+            **tools_kwarg,
+        )
+        prompt_token_ids = llm_tokenizer.apply_chat_template(
+            prompt_messages,
+            add_special_tokens=True,
+            add_generation_prompt=True,
+            **tools_kwarg,
+        )
+
+    output_text = text[len(prompt_text) :]
+
+    tokenizer = processor.tokenizer if use_processor else llm_tokenizer
+
+    if tokenizer.bos_token and text.startswith(tokenizer.bos_token):
+        text = text[len(tokenizer.bos_token) :]
+
+    if not llm_call.logprobs:
+        raise ValueError("Logprobs are required to make training data for RL")
+
+    # We add the exact token ids and logprobs to "training_text" to ensure inference/training consistency
+    labels = llm_call.completion_token_ids
+    logprobs = llm_call.logprobs
+    input_ids = prompt_token_ids + labels
+    # Apply masking to input tokens that aren't generated
+    labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
+
+    prompt_tokens = llm_call.prompt_tokens
+    output_tokens = llm_call.output_tokens
+
+    return TrainingText(
+        text=text,
+        n_predicted=len(output_text),
+        input_ids=input_ids,
+        labels=labels,
+        logprobs=logprobs,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        visual_features=visual_features,
+    )
+
+def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
+    """
+    Compute the overlong penalty
+    """
+    if sequence_length > (max_length - buffer_tokens) and sequence_length <= max_length:
+        return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
+    return 0.
+
+@ray.remote(max_restarts=0, max_task_retries=0)
+class CubeBenchmarkWorker:
+    """Generic cube worker with lazy benchmark materialization.
+
+    Interface:
+    - setup()
+    - rollout(cube_id, task_id)
+    - health()
+    - close()
+    """
+
+    def __init__(
+        self,
+        *,
+        # do not save the ref to the whole cfg
+        cfg: DictConfig,
+        cube_specs: list[dict[str, Any]],
+        seed: int,
+        worker_name: str,
+        llm: dict[str, Any],
+        test_llm: dict[str, Any] | None = None,
+        llm_router: Any | None = None,
+        ray_worker_log_collector: Any | None = None,
+    ):
+        self._cube_specs = {
+            str(spec["cube_id"]): CubeRuntimeSpec(
+                cube_id=str(spec["cube_id"]),
+                benchmark_cfg=spec["benchmark_cfg"],
+                agent_cfg=spec["agent_cfg"],
+                split=str(spec["split"]),
+            )
+            for spec in cube_specs
+        }
+        self._seed = int(seed)
+        self._worker_name = worker_name
+        self._train_llm = llm
+        self._test_llm = test_llm or llm
+        self._llm_router = llm_router
+        self._ray_worker_log_collector = ray_worker_log_collector
+
+        worker_log_level = str(getattr(cfg.actor, "ray_worker_log_level", "ERROR"))
+        worker_litellm_log_level = str(getattr(cfg.actor, "ray_worker_litellm_log_level", "WARNING"))
+
+        configure_ray_worker_logging(
+            worker_name=self._worker_name,
+            log_collector=self._ray_worker_log_collector,
+            log_level=worker_log_level,
+            litellm_log_level=worker_litellm_log_level,
+        )
+
+        self._ready = False
+        self._setup_error: str | None = None
+
+        self._current_cube_id: str | None = None
+        self._benchmark = None
+        self._task_by_id: dict[str, dict] = {}
+
+        self._runtime_context = None
+        self._container_backend = None
+        self._llm_tokenizer = None
+
+        ## Optional config for extra reward
+        self._buffer_tokens = int(getattr(cfg.actor, "buffer_tokens", 0))
+        self._discount_factor = float(getattr(cfg.actor, "discount_factor", 1.0))
+        artifact_cfg = getattr(getattr(cfg, "cube_params", {}), "rollout_artifacts", None)
+        self._persist_rollout_artifacts = bool(getattr(artifact_cfg, "enabled", False)) if artifact_cfg else False
+        artifact_dir = getattr(artifact_cfg, "path", None) if artifact_cfg else None
+        self._rollout_artifact_dir = (
+            Path(artifact_dir) if artifact_dir else Path(cfg.output_dir) / "actor" / "rollout_artifacts"
+        )
+
+    def setup(self) -> dict[str, Any]:
+        try:
+            from pipelinerl.llm import TrainableLLM
+
+            temp_llm = TrainableLLM(**self._train_llm)
+            temp_llm.load_tokenizer()
+            self._llm_tokenizer = temp_llm.tokenizer
+            self._ready = True
+            self._setup_error = None
+            logger.info("%s ready with %d cube specs", self._worker_name, len(self._cube_specs))
+            return self.health()
+        except Exception as exc:
+            self._ready = False
+            self._setup_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("%s failed during setup", self._worker_name)
+            raise
+
+    def _close_current_cube(self) -> None:
+        if self._benchmark is not None:
+            try:
+                self._benchmark.close()
+            except Exception as exc:
+                logger.warning("%s failed to close cube %s: %s", self._worker_name, self._current_cube_id, exc)
+        self._current_cube_id = None
+        self._benchmark = None
+        self._task_by_id = {}
+        self._runtime_context = None
+        self._container_backend = None
+
+    def _prepare_cube(self, cube_id: str) -> None:
+        if self._current_cube_id == cube_id:
+            return
+        if cube_id not in self._cube_specs:
+            raise KeyError(f"Unknown cube_id: {cube_id}")
+
+        import hydra
+
+        self._close_current_cube()
+        spec = self._cube_specs[cube_id]
+        benchmark_obj = hydra.utils.instantiate(spec.benchmark_cfg)
+        benchmark_obj.install()
+        benchmark_obj.setup()
+
+        self._runtime_context = getattr(benchmark_obj, "_runtime_context", None)
+        self._container_backend = getattr(benchmark_obj, "container_backend", None)
+        agent_cfg_template = hydra.utils.instantiate(spec.agent_cfg)
+        task_llm = self._test_llm if spec.split == "test" else self._train_llm
+
+        task_by_id: dict[str, dict] = {}
+        for task_config in benchmark_obj.get_task_configs():
+            agent_config = _copy_model(agent_cfg_template)
+            set_agent_llm_config(agent_config, task_llm)
+            dataset_name = _resolve_task_dataset_name(benchmark_obj, task_config)
+            task_by_id[task_config.task_id] = {
+                "task_config": _copy_model(task_config),
+                "agent_config": agent_config,
+                "domain": cube_id,
+                "dataset": cube_id if not dataset_name else f"{cube_id}/{dataset_name}",
+            }
+
+        self._current_cube_id = cube_id
+        self._benchmark = benchmark_obj
+        self._task_by_id = task_by_id
+        logger.info("%s prepared cube %s with %d tasks", self._worker_name, cube_id, len(task_by_id))
+
+    def rollout(self, *, cube_id: str, task_id: str) -> dict:
+        rollout_log_context = start_worker_rollout_log_context(f"{cube_id}:{task_id}")
+        try:
+            if not self._ready:
+                raise RuntimeError(f"{self._worker_name} not ready")
+            self._prepare_cube(cube_id)
+            if task_id not in self._task_by_id:
+                raise KeyError(f"Unknown task_id for cube {cube_id}: {task_id}")
+
+            base_task = self._task_by_id[task_id]
+            task = {
+                "task_config": _copy_model(base_task["task_config"]),
+                "agent_config": _copy_model(base_task["agent_config"]),
+                "domain": base_task.get("domain", None),
+                "dataset": base_task.get("dataset", None),
+                "runtime_context": self._runtime_context,
+                "container_backend": self._container_backend,
+            }
+
+            result = self._rollout(task=_copy_model(task))
+            return result.model_dump()
+        except Exception:
+            logger.exception("%s rollout failed for cube_id=%s task_id=%s", self._worker_name, cube_id, task_id)
+            raise
+        finally:
+            reset_worker_rollout_log_context(rollout_log_context)
+
+    def _rollout(self, task: dict) -> RolloutResult:
+        from cube_harness.episode import Episode, MAX_STEPS
+        from cube.core import EnvironmentOutput
+        from cube_harness.core import AgentOutput, TerminationReason
+
+        start = time.perf_counter()
+
+        task_config = task["task_config"]
+        agent_config = task["agent_config"]
+
+        agent_llm_config = getattr(agent_config, "llm_config")
+        agent_llm_config.router = self._llm_router
+
+        validate_per_step = False
+
+        ep = Episode(
+            id=0,
+            output_dir="",
+            agent_config=agent_config,
+            task_config=task_config,
+            exp_name="default",
+            max_steps=MAX_STEPS,
+            persist_episode=False,
+            runtime_context=self._runtime_context,
+            container_backend=self._container_backend,
+        )
+        trajectory = ep.run()
+        if self._persist_rollout_artifacts:
+            self._write_rollout_artifact(trajectory, task)
+        logger.info(f"Trajectory completed due to {trajectory.termination_reason}")
+        agent_outputs = [
+            step.output
+            for step in trajectory.steps
+            if isinstance(step.output, AgentOutput)
+        ]
+        agent_llm_calls = sum(len(output.llm_calls) for output in agent_outputs)
+        agent_errors = [output.error for output in agent_outputs if output.error is not None]
+        if agent_errors:
+            logger.error(
+                "Cube rollout agent error: task_id=%s termination=%s steps=%d "
+                "agent_outputs=%d llm_calls=%d error=%s",
+                getattr(task_config, "task_id", None),
+                trajectory.termination_reason,
+                len(trajectory.steps),
+                len(agent_outputs),
+                agent_llm_calls,
+                agent_errors[-1],
+            )
+
+        # last step is always an EnvironmentOutput since Episode._run_loop() ends with evaluate method.
+        last_step = trajectory.steps[-1].output
+        if not isinstance(last_step, EnvironmentOutput):
+            raise ValueError(f"""Last step is always an EnvironmentOutput
+                              since Episode._run_loop() ends with evaluate method., got {type(last_step)}""")
+        last_step_info = last_step.info
+
+        final_reward = trajectory.reward_info['reward']
+        finished = trajectory.termination_reason == TerminationReason.ENV_DONE
+        training_texts = []
+        # trajectory.steps contain a list of AgentOutput/EnvironmentOutput objects in the order they were executed. \\
+        # Within an AgentOutput there is a list of llm_calls. for each llm_call \\
+        # we want to capture a training example, and assign it a reward value. If validate_per_step is True, we instead \\ 
+        # assign each llm_call the reward of the EnvironmentOutput that immediately follows it, which allows for per-step rewards if the task provides them. Otherwise, we assign all calls the final reward of the trajectory.
+        for step_i, step in enumerate(trajectory.steps):
+            step_output = step.output
+            if isinstance(step_output, AgentOutput):
+                step_reward = final_reward
+                if validate_per_step:
+                    for j in trajectory.steps[step_i + 1:]:
+                        if isinstance(j, EnvironmentOutput):
+                            step_reward = float(j.reward)
+                            break
+                
+                for call_i, call in enumerate(step_output.llm_calls):
+                    training_text = make_training_text(self._llm_tokenizer, call)
+                    training_text.reward = step_reward
+                    training_text.finished = finished
+                    training_text.metadata.update(call.metadata or {})
+                    training_text.metadata.update(
+                        {
+                            "llm_call_id": call.id,
+                            "llm_call_tag": call.tag,
+                            "cube_id": task.get("domain"),
+                            "task_id": getattr(task_config, "task_id", None),
+                            "trajectory_id": trajectory.id,
+                            "agent_step_index": step_i,
+                            "llm_call_index": call_i,
+                            "dataset_name": task.get("dataset"),
+                            "termination_reason": str(trajectory.termination_reason),
+                            "finish_reason": call.finish_reason,
+                            "final_reward": final_reward,
+                            "step_reward": step_reward,
+                            "llm_prompt_tokens": call.prompt_tokens,
+                            "llm_output_tokens": call.output_tokens,
+                        }
+                    )
+                    training_texts.append(training_text)
+
+
+        # Apply extra rewards
+        total_output_tokens = sum(getattr(c, "output_tokens", 0) for c in training_texts)
+        if self._discount_factor != 1.0:
+            for t in training_texts:
+                t.reward *= self._discount_factor ** total_output_tokens
+
+        # length penalty
+        max_completion_tokens = int(getattr(agent_llm_config, 'max_completion_tokens', 0))
+        if self._buffer_tokens and max_completion_tokens > 0:
+            len_reward = length_penalty(max_completion_tokens, total_output_tokens, self._buffer_tokens)
+            for t in training_texts:
+                t.reward += len_reward
+
+        if not training_texts:
+            logger.warning(
+                "Cube rollout produced empty training_texts: task_id=%s termination=%s "
+                "steps=%d agent_outputs=%d llm_calls=%d summary=%s",
+                getattr(task_config, "task_id", None),
+                trajectory.termination_reason,
+                len(trajectory.steps),
+                len(agent_outputs),
+                agent_llm_calls,
+                trajectory.summary_stats,
+            )
+
+        latency = time.perf_counter() - start
+        profiling = last_step_info.pop("profiling", {})
+        metrics_kwargs = {'reward': final_reward, 'num_steps': len(training_texts), **last_step_info}
+        metrics = BaseMetrics(**metrics_kwargs)
+
+        return RolloutResult(
+            training_texts=training_texts,
+            metrics=metrics,
+            latency=latency,
+            dataset_name=task["dataset"],
+            domain=task["domain"],
+        )
+
+    def _write_rollout_artifact(self, trajectory: Any, task: dict) -> None:
+        from cube_harness.core import AgentOutput
+
+        try:
+            self._rollout_artifact_dir.mkdir(parents=True, exist_ok=True)
+            llm_calls = []
+            for step_i, step in enumerate(trajectory.steps):
+                if not isinstance(step.output, AgentOutput):
+                    continue
+                for call_i, call in enumerate(step.output.llm_calls):
+                    llm_calls.append(
+                        {
+                            "step_index": step_i,
+                            "llm_call_index": call_i,
+                            "llm_call_id": call.id,
+                            "tag": call.tag,
+                            "timestamp": call.timestamp,
+                            "prompt_tokens": call.prompt_tokens,
+                            "output_tokens": call.output_tokens,
+                            "finish_reason": call.finish_reason,
+                            "metadata": call.metadata,
+                        }
+                    )
+
+            payload = {
+                "trajectory_id": trajectory.id,
+                "cube_id": task.get("domain"),
+                "dataset_name": task.get("dataset"),
+                "task_id": getattr(task.get("task_config"), "task_id", None),
+                "termination_reason": str(trajectory.termination_reason),
+                "reward_info": trajectory.reward_info,
+                "summary_stats": trajectory.summary_stats,
+                "n_steps": len(trajectory.steps),
+                "llm_calls": llm_calls,
+            }
+            artifact_path = self._rollout_artifact_dir / f"{self._worker_name}_{trajectory.id}_{time.time_ns()}.json"
+            artifact_path.write_text(json.dumps(payload, indent=2, default=str))
+        except Exception:
+            logger.exception("%s failed to write rollout artifact for %s", self._worker_name, trajectory.id)
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "worker_name": self._worker_name,
+            "ready": self._ready,
+            "current_cube_id": self._current_cube_id,
+            "n_tasks": len(self._task_by_id),
+            "error": self._setup_error,
+        }
+
+    def close(self) -> None:
+        self._close_current_cube()

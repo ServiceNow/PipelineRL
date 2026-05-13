@@ -14,6 +14,16 @@ finetune:
   seed: ${..seed}
 
 actor:
+  launcher: asyncio
+  ray_address: null
+  launch_ray_cluster: false
+  ray_head_port: 6379
+  ray_node_manager_port: 6380
+  ray_object_manager_port: 6381
+  ray_worker_port_start: 20000
+  ray_worker_port_count: null
+  ray_num_cpus_per_node: null
+  ray_extra_cpus_per_node: 1
   log_each_n_secs: 0
   llm_max_rollouts: 64
   rollout_workers: 1
@@ -22,6 +32,10 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  difficulty_aware_penalty:
+    enabled: false
+    gamma: 0.5
+    failure_scale: 0.5
 environment: null
 preprocess:
   input: actor
@@ -113,6 +127,7 @@ pop_old_data: true
 max_lag: null
 attempts: ${finetune.attempts}
 train_subset: null
+test_subset: null
 debug:
   mode: ""
   streams_from: null

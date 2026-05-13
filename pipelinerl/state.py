@@ -3,18 +3,13 @@ import threading
 import time
 from pathlib import Path
 
-from pydantic import TypeAdapter
-
-from pipelinerl.finetune_loop import (
-    TRAINER_TOPIC,
-    TrainerMessage,
-    WeightUpdateSuccess,
-    SamplesProcessed,
-    TrainingDone,
-)
 from pipelinerl.streams import SingleStreamSpec, read_stream
 
 logger = logging.getLogger(__name__)
+
+# Keep this in sync with pipelinerl.finetune_loop.TRAINER_TOPIC without importing
+# the full finetune stack (which imports DeepSpeed).
+TRAINER_TOPIC = "weight_update_request"
 
 
 class TrainerState:
@@ -37,12 +32,18 @@ class TrainerState:
         def listen():
             with read_stream(stream) as reader:
                 for line in reader.read():
-                    message = TypeAdapter(TrainerMessage).validate_python(line)
-                    if isinstance(message, WeightUpdateSuccess):
-                        self.propagated_weight_version = message.version
-                    if isinstance(message, SamplesProcessed):
-                        self.samples_processed = message.samples_processed
-                    if isinstance(message, TrainingDone):
+                    if not isinstance(line, dict):
+                        continue
+                    kind = line.get("kind")
+                    if kind == "weight_update_success":
+                        version = line.get("version")
+                        if version is not None:
+                            self.propagated_weight_version = int(version)
+                    if kind == "samples_processed":
+                        samples = line.get("samples_processed")
+                        if samples is not None:
+                            self.samples_processed = int(samples)
+                    if kind == "training_done":
                         self.training_done = True
                         self._training_done_event.set()
 

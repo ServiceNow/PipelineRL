@@ -8,6 +8,9 @@ class BaseMetrics(BaseModel):
     success: bool
     no_error: bool
     no_answer: bool
+    # Allow domain-specific metrics (e.g., num_steps, num_python_calls, penalty)
+    # to flow through RolloutResult model validation without being dropped.
+    model_config = {"extra": "allow"}
 
 
 class TrainingText(BaseModel):

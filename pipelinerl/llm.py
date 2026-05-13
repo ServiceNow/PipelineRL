@@ -181,6 +181,7 @@ class LLM(BaseModel, ABC):
 
     Attributes:
         model_name (str): Name of the LLM model
+        served_model_name (str, optional): Name of the served model if different from model_name
         parameters (dict): Model-specific parameters for generation
         context_size (int): Maximum context size in tokens (default: 32000)
         tokenizer_name (str): Name of the tokenizer used
@@ -194,6 +195,7 @@ class LLM(BaseModel, ABC):
     """
 
     model_name: str
+    served_model_name: str | None = None
     parameters: dict = {}
     context_size: int = 32000
     tokenizer_name: str = ""

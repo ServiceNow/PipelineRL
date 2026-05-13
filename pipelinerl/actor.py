@@ -16,14 +16,15 @@ import aiohttp
 import hydra
 import uvloop
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, Field
 
 import wandb
+from pipelinerl.async_llm import RetryableLLMResponseError
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.domains.math.rollouts import length_penalty
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.llm import TrainableLLM
+from pipelinerl.metrics import SlidingWindowAggregator
 from pipelinerl.rollouts import BaseMetrics, RolloutResult, rollout_has_overflow
 from pipelinerl.shared_memory_array import SharedMemoryQueue
 from pipelinerl.state import TrainerState
@@ -44,65 +45,6 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class SlidingWindowData(BaseModel):
-    prompt_tokens_window: list[list[int]] = Field(
-        default_factory=list,
-        description="Prompt token counts for each chunk in the window",
-    )
-    output_tokens_window: list[list[int]] = Field(
-        default_factory=list,
-        description="Output token counts for each chunk in the window",
-    )
-    timestamps: list[float] = Field(default_factory=list)
-
-
-class SlidingWindowAggregator:
-    def __init__(self, window_size: int):
-        self.window_size = window_size
-        self.data = SlidingWindowData()
-
-    def update(self, prompt_tokens: list[int], output_tokens: list[int]):
-        self.data.prompt_tokens_window.append(prompt_tokens)
-        self.data.output_tokens_window.append(output_tokens)
-        self.data.timestamps.append(time.time())
-        if len(self.data.prompt_tokens_window) > self.window_size:
-            self.data.prompt_tokens_window.pop(0)
-            self.data.output_tokens_window.pop(0)
-            self.data.timestamps.pop(0)
-
-    def get_stats(self):
-        if len(self.data.prompt_tokens_window) < self.window_size:
-            return None
-
-        # 1. How many samples do we produce per second?
-        # 2. How many output tokens do we produce per second?
-        # 3. How many prompt tokens do we produce per second?
-        # 4. How many total tokens do we produce per second?
-        null_stats = {
-            "samples_per_second": 0,
-            "output_tokens_per_second": 0,
-            "prompt_tokens_per_second": 0,
-            "total_tokens_per_second": 0,
-        }
-        if not self.data.timestamps:
-            return null_stats
-
-        time_span = self.data.timestamps[-1] - self.data.timestamps[0]
-        if time_span < 1e-6:
-            return null_stats
-
-        num_samples = sum(len(tokens) for tokens in self.data.prompt_tokens_window)
-        total_output_tokens = sum(sum(tokens) for tokens in self.data.output_tokens_window)
-        total_prompt_tokens = sum(sum(tokens) for tokens in self.data.prompt_tokens_window)
-
-        return {
-            "samples_per_second": num_samples / time_span,
-            "output_tokens_per_second": total_output_tokens / time_span,
-            "prompt_tokens_per_second": total_prompt_tokens / time_span,
-            "total_tokens_per_second": (total_output_tokens + total_prompt_tokens) / time_span,
-        }
 
 
 
@@ -142,7 +84,13 @@ async def schedule_rollouts(
 
     final_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
-    retryable_rollout_exceptions = (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError)
+    retryable_rollout_exceptions = (
+        aiohttp.ClientConnectionError,
+        aiohttp.ServerTimeoutError,
+        RetryableLLMResponseError,
+        asyncio.TimeoutError,
+        TimeoutError,
+    )
     max_rollout_retries = int(getattr(cfg.actor, "max_rollout_retries", -1))  # -1 means infinite retries
     retry_initial_delay_s = float(getattr(cfg.actor, "rollout_retry_initial_delay_s", 1.0))
     retry_max_delay_s = float(getattr(cfg.actor, "rollout_retry_max_delay_s", 30.0))
@@ -769,7 +717,11 @@ class ActorLoop:
         for k, v in self.sliding_stats.items():
             stats[k] = sum(v) / len(v) if v else 0
         if self.cfg.wandb.use_wandb:
-            wandb.log({f"actor/{k}": v for k, v in stats.items()})
+            wandb_stats = {f"actor/{k}": v for k, v in stats.items()}
+            trainer_model_version = stats.get("trainer_model_version")
+            if isinstance(trainer_model_version, (int, float)):
+                wandb_stats["actor/wandb_step"] = trainer_model_version
+            wandb.log(wandb_stats)
         stats_writer.write(stats)
         self.init_stats()  # Reset stats for the next iteration
 
@@ -783,6 +735,7 @@ def run_actor_loop(cfg: DictConfig):
     exp_path = Path(cfg.output_dir)
     setup_logging(exp_path / "actor", "actor")
     logger.info(f"Current dir: {os.getcwd()}, experiment root dir: {cfg.output_dir}")
+    run = None
     if cfg.wandb.use_wandb:
         run = init_wandb(cfg, exp_path / "actor", flatten_dict_config(cfg))  # type: ignore
         if run is None:
@@ -802,6 +755,8 @@ def run_actor_loop(cfg: DictConfig):
     test_dataset = dataset_loader(cfg.test_dataset_names, **dataset_loader_params)
     if cfg.train_subset:
         train_dataset = train_dataset[cfg.train_subset.begin : cfg.train_subset.end]
+    if cfg.test_subset:
+        test_dataset = test_dataset[cfg.test_subset.begin : cfg.test_subset.end]
     logger.info(f"Loaded {len(train_dataset)} training problems")
     logger.info(f"Loaded {len(test_dataset)} test problems")
 
@@ -810,7 +765,9 @@ def run_actor_loop(cfg: DictConfig):
         actor_model_path = finetune_model_path
     else:
         actor_model_path = cfg.model_path
-    
+
+    served_model_name = cfg.vllm_config.vllm_kwargs.get("served_model_name") if cfg.vllm_config.vllm_kwargs else None
+
     train_llms = [
         TrainableLLM(
             base_url=url,
@@ -818,6 +775,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
+            served_model_name=served_model_name,
         )
         for url in llm_urls
     ]
@@ -828,6 +786,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
+            served_model_name=served_model_name,
         )
         for url in llm_urls
     ]
@@ -859,43 +818,51 @@ def run_actor_loop(cfg: DictConfig):
 
     last_regular_eval = -1
     current_eval = -1
-    while True:
-        assert trainer_state.propagated_weight_version is not None
+    try:
+        while True:
+            assert trainer_state.propagated_weight_version is not None
 
-        # 1. Start a new test loop if needed
-        next_regular_eval = (
-            trainer_state.propagated_weight_version
-            if last_regular_eval == -1
-            else last_regular_eval + cfg.eval_every_n_versions
-        )
-        if (
-            cfg.eval_every_n_versions
-            and not cfg.debug.mode
-            and trainer_state.propagated_weight_version >= next_regular_eval
-            and test_dataset
-            and test_loop_run is None
-        ):
-            logger.info("Create test loop")
-            test_loop_run = test_loop.run(
-                dataset=test_dataset,
+            # 1. Start a new test loop if needed
+            next_regular_eval = (
+                trainer_state.propagated_weight_version
+                if last_regular_eval == -1
+                else last_regular_eval + cfg.eval_every_n_versions
             )
-            train_loop.is_scheduling_paused = True
-            current_eval = next_regular_eval
+            if (
+                cfg.eval_every_n_versions
+                and not cfg.debug.mode
+                and trainer_state.propagated_weight_version >= next_regular_eval
+                and test_dataset
+                and test_loop_run is None
+            ):
+                logger.info("Create test loop")
+                test_loop_run = test_loop.run(
+                    dataset=test_dataset,
+                )
+                train_loop.is_scheduling_paused = True
+                current_eval = next_regular_eval
 
-        # 2. If there is an active test loop, keep it running
-        if test_loop_run is not None:
+            # 2. If there is an active test loop, keep it running
+            if test_loop_run is not None:
+                try:
+                    _ = next(test_loop_run)
+                except StopIteration:
+                    # 2.1 If the test loop is finished, resume scheduling the training loop
+                    test_loop_run = None
+                    last_regular_eval = current_eval
+                    train_loop.is_scheduling_paused = False
+                    logger.info("Test loop finished")
+
+            # 3. Keep running the training loop
             try:
-                _ = next(test_loop_run)
+                _ = next(train_loop_run)
             except StopIteration:
-                # 2.1 If the test loop is finished, resume scheduling the training loop
-                test_loop_run = None
-                last_regular_eval = current_eval
-                train_loop.is_scheduling_paused = False
-                logger.info("Test loop finished")
-
-        # 3. Keep running the training loop
-        try:
-            _ = next(train_loop_run)
-        except StopIteration:
-            logger.info("Train loop finished")
-            break
+                logger.info("Train loop finished")
+                break
+    finally:
+        if run is not None:
+            try:
+                run.finish()
+                logger.info("Finished W&B run")
+            except Exception:
+                logger.exception("Failed to finish W&B run")
