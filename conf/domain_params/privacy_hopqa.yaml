@@ -7,7 +7,9 @@ final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/
 sample_size: 20
 max_examples: null
 task_data_root: ${oc.env:PRIVACY_AGENT_TASK_DATA_ROOT,.privacy_agent/inputs/tasks}
-local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,/mnt/llmd/results/exps/alexg/privacy_agent/local_indices_fixeddeps_20260415}
+# Previous local-index default, kept for debugging old runs:
+# /mnt/llmd/results/exps/alexg/privacy_agent/local_indices_fixeddeps_20260415
+local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,/mnt/llmd/results/exps/alexg/privacy_hopqa_shared/q30_final_residual_review_20260513/local_indices_fixeddeps_20260415}
 local_index_mmap_mode: r
 helper_service_url: ${oc.env:PRIVACY_AGENT_HELPER_URL, null}
 helper_timeout_s: 30.0
@@ -64,7 +66,9 @@ local_search_threshold: 0.0
 semantic_threshold: 0.7
 browsecomp_enabled: true
 browsecomp_device: cpu
-browsecomp_index_glob: ${oc.env:PRIVACY_AGENT_BROWSECOMP_INDEX_GLOB,.privacy_agent/browsecomp/indexes/qwen3-embedding-4b/corpus.shard*_of_*.pkl}
+# Previous local BrowseComp default, kept for debugging old runs:
+# .privacy_agent/browsecomp/indexes/qwen3-embedding-4b/corpus.shard*_of_*.pkl
+browsecomp_index_glob: ${oc.env:PRIVACY_AGENT_BROWSECOMP_INDEX_GLOB,/mnt/llmd/results/exps/alexg/privacy_hopqa_shared/q30_final_residual_review_20260513/browsecomp_indexes/qwen3-embedding-4b/corpus.shard*_of_*.pkl}
 browsecomp_model_name: Qwen/Qwen3-Embedding-4B
 browsecomp_corpus: Tevatron/browsecomp-plus-corpus
 browsecomp_top_k: 5
