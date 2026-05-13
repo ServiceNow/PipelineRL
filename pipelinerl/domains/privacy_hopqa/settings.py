@@ -109,6 +109,7 @@ class PrivacyHopQASettings:
     no_web: bool = False
     parallel_searches: bool = True
     max_parallel_doc_reads: int = 6
+    planner_privacy_prompt: bool = False
 
     @classmethod
     def from_cfg(cls, cfg: DictConfig | Mapping[str, Any] | None) -> "PrivacyHopQASettings":
@@ -179,6 +180,7 @@ class PrivacyHopQASettings:
             no_web=bool(data.get("no_web", False)),
             parallel_searches=bool(data.get("parallel_searches", True)),
             max_parallel_doc_reads=int(data.get("max_parallel_doc_reads", 6)),
+            planner_privacy_prompt=bool(data.get("planner_privacy_prompt", False)),
         )
 
     def dataset_loader_kwargs(self) -> dict[str, Any]:

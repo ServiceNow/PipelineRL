@@ -1121,6 +1121,7 @@ class PrivacyHopQAAgent:
                 max_parallel_retrieval_actions=self.settings.max_parallel_retrieval_actions,
                 no_web=self.settings.no_web,
                 retry_guidance=retry_guidance,
+                planner_privacy_prompt=self.settings.planner_privacy_prompt,
             )
             prompt_name = f"hop_plan_iter{iteration}_hop{hop.hop_number}"
             if plan_attempt > 0:

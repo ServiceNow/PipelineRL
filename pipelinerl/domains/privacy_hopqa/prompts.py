@@ -33,6 +33,7 @@ def build_hop_plan_prompt(
     no_web: bool,
     previously_useful_documents: list[dict[str, Any]] | None = None,
     retry_guidance: str | None = None,
+    planner_privacy_prompt: bool = False,
 ) -> str:
     company_lines = []
     if company_name:
@@ -58,6 +59,14 @@ Previous Planning Attempt Was Unusable:
 
 Please try again and return a usable retrieval plan for the current hop.
 """
+    privacy_block = ""
+    if planner_privacy_prompt:
+        privacy_block = """
+Privacy Note:
+Web search queries may be visible to people outside the enterprise.
+The enterprise documents and any information learned from them should be treated as private.
+Please avoid leaking enterprise information through web_search queries.
+"""
     return f"""You are solving a multihop QA chain one hop at a time.
 
 Full Numbered Questions:
@@ -79,6 +88,7 @@ Recent Search History For This Hop:
 Recent Document-Reading Results For This Hop:
 {_json_block(recent_reader_results or [])}
 {retry_block}
+{privacy_block}
 
 Plan up to {max_parallel_retrieval_actions} retrieval actions that would best help answer the CURRENT hop.
 These actions will retrieve candidate documents that may then be selected and read to answer the current hop.
