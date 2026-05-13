@@ -31,6 +31,7 @@ def build_hop_plan_prompt(
     company_description: str | None,
     max_parallel_retrieval_actions: int,
     no_web: bool,
+    previously_useful_documents: list[dict[str, Any]] | None = None,
     retry_guidance: str | None = None,
 ) -> str:
     company_lines = []
@@ -46,8 +47,8 @@ def build_hop_plan_prompt(
     initial_retrieval_guidance = (
         "Recent search history and document-reading results are empty, so return at least one retrieval action. "
         "Returning [] would leave the agent with no candidate documents to read."
-        if not (search_history or recent_reader_results)
-        else "Return [] only if the existing search history or document-reading results are enough for the next step and no additional retrieval is needed."
+        if not (search_history or recent_reader_results or previously_useful_documents)
+        else "Return [] only if the existing search history, document-reading results, or previously useful documents are enough for the next step and no additional retrieval is needed."
     )
     retry_block = ""
     if retry_guidance:
@@ -64,6 +65,9 @@ Full Numbered Questions:
 
 Current Answers So Far:
 {current_answers_so_far}
+
+Previously Useful Documents From Earlier Hops:
+{_json_block(previously_useful_documents or [])}
 
 {task_context}Current Hop: {current_hop_number}
 Current Hop Question:
@@ -85,6 +89,7 @@ Think first about how to search for the necessary information, then return the r
 - Use only these action types: {', '.join(action_types)}
 - web_search searches online web pages
 - local_document_search searches local company files
+- Previously useful documents were helpful on earlier hops and may be retried by the harness, but they are not evidence for the current hop until read for this hop
 - If the hop depends on company-specific, internal, operational, or task-context facts, include a local_document_search
 - Do not spend an entire early hop on web_search only when local company files may contain the answer
 - Do not plan analysis, URL fetches, downloads, or enterprise tools
@@ -116,6 +121,7 @@ def build_doc_choose_prompt(
     read_all_windows_max_count: int,
     large_parent_top_windows: int,
     large_parent_neighbor_windows: int,
+    previously_useful_documents: list[dict[str, Any]] | None = None,
 ) -> str:
     return f"""You are selecting which retrieved parent documents are worth reading closely for the current hop.
 Each candidate ID is a parent document ID. If you select a parent document with at most {read_all_windows_max_count} available evidence windows, all of those windows will be read.
@@ -126,6 +132,9 @@ Full Numbered Questions:
 
 Current Answers So Far:
 {current_answers_so_far}
+
+Previously Useful Documents From Earlier Hops:
+{_json_block(previously_useful_documents or [])}
 
 Current Hop: {current_hop_number}
 Current Hop Question:
@@ -143,6 +152,7 @@ Select up to {choose_top_k} parent document doc_id values to read next.
 - `total_window_count` is how many evidence windows the full parent document was split into
 - `best_rank` means the best retrieval rank this candidate achieved across the search batch
 - `top_queries` are example phrasings that retrieved the candidate and may help indicate why it matched
+- Candidates marked `memory_seed` were useful for earlier hops; prefer them only when they look relevant to the current hop
 
 Return JSON in this format:
 {{
@@ -177,6 +187,17 @@ Evidence Window:
 {_json_block(document)}
 
 If the evidence is in a table, list, or compact row, first match the requested row/entity/date and the requested column or quantity type. Do not propose an adjacent value that answers a nearby but different quantity.
+Use the full evidence window as context, including its title, locator, date/front matter, table headers, row labels, and the current answers so far. These context fields count as evidence.
+The current hop may include bridge context from earlier hops, for example "where (1)..." or "after identifying (2)...". If that bridge context is already provided by Current Answers So Far, do not require this evidence window to independently restate it. Use the bridge context to choose the requested target, then answer the new fact from this evidence window.
+The current hop question may also contain the previous answer already substituted into the wording, such as "where 83% ..." or "in the plan targeting 90% ...". Treat those bridge clauses as context selectors. Do not reject an evidence window solely because it does not repeat the bridge clause in the same sentence as the requested answer.
+If the evidence window is the target report, email, table, or page and it directly states the requested answer, set "can_answer" to true unless the evidence contradicts the bridge context or supports multiple equally plausible targets.
+Before deciding the evidence is insufficient, separate the main answer slot from bridge qualifiers. For example, in a question like "what percentage/year/company ... when/where/after [bridge context]?", the main answer slot is the requested percentage, year, company, etc. If the evidence directly states that main slot for the target entity/report/page, answer it. Treat a bridge qualifier as missing only when it is needed to choose between multiple plausible rows inside this evidence window.
+Document titles and source labels can identify the work, show, report, organization, or source when the current hop asks for that kind of entity.
+If the evidence directly states or strongly implies the answer, set "can_answer" to true. This includes extracting a component from a stated value, date, range, amount, or entity when the current hop asks for that component.
+Do not refuse merely because the evidence uses a synonym, an abbreviation, title context, or does not repeat every word in the question.
+In the justification, explicitly include the date/time/entity context that proves the answer is for the requested target, using title, date/front matter, or locator context when needed.
+Set "can_answer" to false if the evidence is merely related, missing the main requested answer slot, supports a nearby but different answer, or has multiple equally plausible conflicting answers.
+Use high confidence only for directly supported answers. If confidence would be below 0.75 because the evidence is genuinely ambiguous or missing the target, set "can_answer" to false and explain what is missing.
 
 {ANSWER_FORMAT_GUIDANCE}
 
@@ -212,7 +233,12 @@ The document reader has already seen each selected evidence window in full.
 Use the compact Document-Reading Results below as the reader's extracted answer, confidence, and citation evidence.
 If those results are insufficient or conflict, ask to read more unread parent documents rather than guessing.
 When reader results conflict, prefer the result whose justification most directly matches the current hop's requested entity, date, and quantity type. Do not select a high-confidence result if its justification answers a nearby but different question.
+A negative reader result from a different evidence window is not a conflict if it only says that window lacks the answer. Prefer a positive reader result when its justification directly supports the current hop.
+If exactly one positive reader result directly supports the current hop, answer from that result even if other windows are negative or unrelated.
+If multiple positive reader results disagree, compare their justifications against the current hop's requested row/entity/date and quantity type; do not prefer a nearby value just because it appears in more windows.
+Never create an answer from a negative reader result. If every reader result has can_answer=false, either read more or search more; if no more evidence is available, report that the answer is not supported.
 For large parent documents, the unread list may include the same parent document again because only its most relevant evidence windows were read first.
+If the unread candidate list is empty, no more documents can be read from the current retrieval batch. In that terminal case, do not set "next_step" to "read_more"; either answer from the best directly supported positive reader result or set "next_step" to "search_more" with a concrete reason for what evidence is still missing.
 
 Full Numbered Questions:
 {numbered_questions}
@@ -256,6 +282,7 @@ If you would like to read more documents from the unread candidate list above, s
 - "answered" to false
 - "next_step" to "read_more"
 - "selected_doc_ids" to up to {choose_top_k} unread parent document IDs
+- Do not choose this option when the unread candidate list is empty
 
 If you would like the agent to search again instead of reading more from this batch, set:
 - "answered" to false

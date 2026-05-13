@@ -495,6 +495,21 @@ class ActorLoop:
                     self.stats[k][dataset_name][group_id].append(v)
                 elif isinstance(v, str):
                     continue
+                elif isinstance(v, dict):
+                    for sub_key, sub_value in v.items():
+                        if sub_value is None:
+                            continue
+                        metric_key = f"{k}/{sub_key}"
+                        if isinstance(sub_value, list):
+                            self.stats[metric_key][dataset_name][group_id] += sub_value
+                        elif isinstance(sub_value, float) | isinstance(sub_value, bool) | isinstance(sub_value, int):
+                            self.stats[metric_key][dataset_name][group_id].append(sub_value)
+                        elif isinstance(sub_value, str):
+                            continue
+                        else:
+                            raise ValueError(
+                                f"Unsupported nested metric type: {type(sub_value)} for key {metric_key}"
+                            )
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
         

@@ -198,6 +198,10 @@ def _compact_reader_result_dict(raw: dict[str, Any]) -> dict[str, Any]:
         "can_answer",
         "proposed_answer",
         "confidence",
+        "parent_doc_id",
+        "evidence_window_id",
+        "window_index",
+        "window_count",
     ):
         if key in raw:
             value = raw[key]
@@ -334,6 +338,23 @@ def _parent_candidate_card(candidates: list["CandidateDoc"], excerpt_chars: int)
     snippet = str(best.metadata.get("snippet") or best.excerpt).strip()
     if excerpt_chars > 0 and snippet:
         card["snippet"] = _truncate(snippet, excerpt_chars)
+    memory_candidates = [candidate for candidate in candidates if candidate.metadata.get("memory_seed")]
+    if memory_candidates:
+        card["memory_seed"] = True
+        supported_hops: list[int] = []
+        supported_answers: list[str] = []
+        for candidate in memory_candidates:
+            for hop_number in candidate.metadata.get("supported_hops") or []:
+                if isinstance(hop_number, int) and hop_number not in supported_hops:
+                    supported_hops.append(hop_number)
+            for answer in candidate.metadata.get("supported_answers") or []:
+                answer_text = str(answer or "").strip()
+                if answer_text and answer_text not in supported_answers:
+                    supported_answers.append(answer_text)
+        if supported_hops:
+            card["supported_hops"] = sorted(supported_hops)
+        if supported_answers:
+            card["supported_answers"] = [_truncate(answer, 80) for answer in supported_answers[-3:]]
     return card
 
 
@@ -445,6 +466,9 @@ class CandidateDoc:
             "retrieval_context_mode",
             "retrieval_chunk_chars",
             "retrieval_chunk_overlap_chars",
+            "memory_seed",
+            "supported_hops",
+            "supported_answers",
         ):
             if key in self.metadata:
                 card[key] = self.metadata[key]
@@ -498,6 +522,54 @@ class ReaderResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class UsefulDocumentMemory:
+    parent_doc_id: str
+    source: str
+    title: str
+    locator: str
+    supported_hops: list[int] = field(default_factory=list)
+    supported_answers: list[str] = field(default_factory=list)
+    justifications: list[str] = field(default_factory=list)
+    window_doc_ids: list[str] = field(default_factory=list)
+    last_used_hop: int = 0
+
+    def remember(
+        self,
+        hop_number: int,
+        answer: str,
+        justification: str,
+        window_doc_id: str | None,
+    ) -> None:
+        if hop_number not in self.supported_hops:
+            self.supported_hops.append(hop_number)
+            self.supported_hops.sort()
+        answer = str(answer or "").strip()
+        if answer and answer not in self.supported_answers:
+            self.supported_answers.append(answer)
+        justification = str(justification or "").strip()
+        if justification and justification not in self.justifications:
+            self.justifications.append(justification)
+        if window_doc_id and window_doc_id not in self.window_doc_ids:
+            self.window_doc_ids.append(window_doc_id)
+        self.last_used_hop = max(self.last_used_hop, hop_number)
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "doc_id": self.parent_doc_id,
+            "source": self.source,
+            "title": _truncate(self.title, 160),
+            "locator": _truncate(self.locator, 180),
+            "supported_hops": list(self.supported_hops),
+            "supported_answers": [_truncate(answer, 80) for answer in self.supported_answers[-3:]],
+        }
+        if self.justifications:
+            payload["support"] = _truncate(self.justifications[-1], 180)
+        if self.window_doc_ids:
+            payload["available_window_count"] = len(self.window_doc_ids)
+        return payload
 
 
 @dataclass
@@ -599,6 +671,9 @@ class PrivacyHopQAAgent:
         self._errors_by_kind: Counter[str] = Counter()
         self._errors_by_stage_kind: dict[str, Counter[str]] = defaultdict(Counter)
         self._retrieval_stats: dict[str, int] = {}
+        self._document_memory: dict[str, UsefulDocumentMemory] = {}
+        self._candidate_cache_by_doc_id: dict[str, CandidateDoc] = {}
+        self._candidate_doc_ids_by_parent: dict[str, list[str]] = defaultdict(list)
         self.prompt_dir = self.run_root / "prompts"
         self.prompt_dir.mkdir(parents=True, exist_ok=True)
         self._run_started_at = _current_timestamp()
@@ -803,6 +878,69 @@ class PrivacyHopQAAgent:
                 return hop
         return None
 
+    def _document_memory_prompt_cards(self) -> list[dict[str, Any]]:
+        # Deduped parent-doc memory from earlier answered hops. This is a hint,
+        # not evidence for the current hop until one of these docs is read again.
+        entries = sorted(
+            self._document_memory.values(),
+            key=lambda entry: (entry.last_used_hop, entry.parent_doc_id),
+            reverse=True,
+        )
+        return [entry.to_prompt_dict() for entry in entries]
+
+    def _cache_candidates(self, candidates: list[CandidateDoc]) -> None:
+        # Candidate objects hold the full evidence window text. Keep the windows
+        # around so a later hop can retry a previously useful parent document.
+        for candidate in candidates:
+            self._candidate_cache_by_doc_id[candidate.doc_id] = candidate
+            parent_doc_id = _candidate_parent_id(candidate)
+            parent_doc_ids = self._candidate_doc_ids_by_parent[parent_doc_id]
+            if candidate.doc_id not in parent_doc_ids:
+                parent_doc_ids.append(candidate.doc_id)
+
+    def _clone_memory_candidate(self, candidate: CandidateDoc, memory: UsefulDocumentMemory) -> CandidateDoc:
+        metadata = dict(candidate.metadata)
+        metadata.update(
+            {
+                "memory_seed": True,
+                "supported_hops": list(memory.supported_hops),
+                "supported_answers": list(memory.supported_answers[-3:]),
+            }
+        )
+        queries = ["previously useful document"]
+        for query in candidate.queries:
+            if query not in queries:
+                queries.append(query)
+        return CandidateDoc(
+            doc_id=candidate.doc_id,
+            source=candidate.source,
+            title=candidate.title,
+            locator=candidate.locator,
+            excerpt=candidate.excerpt,
+            score=candidate.score,
+            rank=0,
+            queries=queries,
+            search_action_ids=[f"memory_hops_{'_'.join(str(hop) for hop in memory.supported_hops)}"],
+            metadata=metadata,
+        )
+
+    def _memory_seed_candidates(self, hop: HopState) -> list[CandidateDoc]:
+        seeds: list[CandidateDoc] = []
+        seen_doc_ids: set[str] = set()
+        for memory in sorted(self._document_memory.values(), key=lambda entry: entry.last_used_hop, reverse=True):
+            for doc_id in memory.window_doc_ids:
+                if doc_id in hop.selected_doc_ids or doc_id in seen_doc_ids:
+                    continue
+                candidate = self._candidate_cache_by_doc_id.get(doc_id)
+                if candidate is None:
+                    continue
+                seeds.append(self._clone_memory_candidate(candidate, memory))
+                seen_doc_ids.add(doc_id)
+        if seeds:
+            self._inc_retrieval_stat("memory_seed_windows", len(seeds))
+            self._inc_retrieval_stat("memory_seed_parent_docs", len({_candidate_parent_id(seed) for seed in seeds}))
+        return seeds
+
     def _recent_search_history(self, hop: HopState) -> list[dict[str, Any]]:
         return hop.search_history[-self.settings.max_history_entries :]
 
@@ -975,6 +1113,7 @@ class PrivacyHopQAAgent:
                 current_hop_number=hop.hop_number,
                 current_hop_question=self._materialize_question(hop.question),
                 current_answers_so_far=self._current_answers_so_far(),
+                previously_useful_documents=self._document_memory_prompt_cards(),
                 search_history=self._recent_search_history(hop),
                 recent_reader_results=self._recent_reader_results(hop),
                 company_name=self.company_name,
@@ -1365,32 +1504,16 @@ class PrivacyHopQAAgent:
         )
         return action, candidates, history_entry
 
-    async def _run_retrieval_actions(
-        self, actions: list[RetrievalActionRecord], hop: HopState, iteration: int
-    ) -> list[CandidateDoc]:
-        if not actions:
-            return []
-        self.action_records.extend(actions)
-        results: list[tuple[RetrievalActionRecord, list[CandidateDoc], dict[str, Any]]] = []
-        if self.settings.parallel_searches and len(actions) > 1:
-            results = list(
-                await asyncio.gather(*(self._execute_retrieval_action(action, hop, iteration) for action in actions))
-            )
-        else:
-            for action in actions:
-                results.append(await self._execute_retrieval_action(action, hop, iteration))
-
+    def _finalize_candidate_pool(self, hop: HopState, candidates: list[CandidateDoc]) -> list[CandidateDoc]:
         candidates_by_doc: dict[str, CandidateDoc] = {}
-        for action, candidates, history_entry in results:
-            hop.search_history.append(history_entry)
-            for candidate in candidates:
-                if candidate.doc_id in hop.selected_doc_ids:
-                    continue
-                existing = candidates_by_doc.get(candidate.doc_id)
-                if existing is None:
-                    candidates_by_doc[candidate.doc_id] = candidate
-                else:
-                    existing.merge(candidate)
+        for candidate in candidates:
+            if candidate.doc_id in hop.selected_doc_ids:
+                continue
+            existing = candidates_by_doc.get(candidate.doc_id)
+            if existing is None:
+                candidates_by_doc[candidate.doc_id] = candidate
+            else:
+                existing.merge(candidate)
 
         ordered = sorted(
             candidates_by_doc.values(),
@@ -1413,6 +1536,8 @@ class PrivacyHopQAAgent:
             ]
         else:
             trimmed = ordered
+
+        self._cache_candidates(trimmed)
         hop.candidate_doc_ids = [candidate.doc_id for candidate in trimmed]
         hop.candidate_cards = [candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in trimmed]
         before_trim_parent_ids = {_candidate_parent_id(candidate) for candidate in ordered}
@@ -1430,6 +1555,27 @@ class PrivacyHopQAAgent:
         self._inc_retrieval_stat("candidate_parent_docs_before_parent_trim", len(before_trim_parent_ids))
         self._inc_retrieval_stat("candidate_parent_docs_after_parent_trim", len(after_trim_parent_ids))
         return trimmed
+
+    async def _run_retrieval_actions(
+        self, actions: list[RetrievalActionRecord], hop: HopState, iteration: int
+    ) -> list[CandidateDoc]:
+        if not actions:
+            return []
+        self.action_records.extend(actions)
+        results: list[tuple[RetrievalActionRecord, list[CandidateDoc], dict[str, Any]]] = []
+        if self.settings.parallel_searches and len(actions) > 1:
+            results = list(
+                await asyncio.gather(*(self._execute_retrieval_action(action, hop, iteration) for action in actions))
+            )
+        else:
+            for action in actions:
+                results.append(await self._execute_retrieval_action(action, hop, iteration))
+
+        candidates: list[CandidateDoc] = self._memory_seed_candidates(hop)
+        for action, action_candidates, history_entry in results:
+            hop.search_history.append(history_entry)
+            candidates.extend(action_candidates)
+        return self._finalize_candidate_pool(hop, candidates)
 
     async def _choose_documents(self, hop: HopState, candidates: list[CandidateDoc], iteration: int) -> list[CandidateDoc]:
         if not candidates:
@@ -1468,6 +1614,7 @@ class PrivacyHopQAAgent:
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
             current_answers_so_far=self._current_answers_so_far(),
+            previously_useful_documents=self._document_memory_prompt_cards(),
             candidate_cards=_candidate_cards_for_prompt(candidates, self.settings.chooser_excerpt_chars),
             choose_top_k=self.settings.choose_top_k,
             read_all_windows_max_count=self.settings.read_all_windows_max_count,
@@ -1553,9 +1700,20 @@ class PrivacyHopQAAgent:
                 context_margin_tokens=self.settings.generation_context_margin_tokens,
             )
             payload = extract_json(response)
-            can_answer = bool(payload.get("can_answer"))
             proposed_answer = str(payload.get("proposed_answer") or "").strip()
             justification = str(payload.get("justification") or "").strip()
+            confidence = _clamp_confidence(payload.get("confidence"), default=0.0)
+            missing_information = str(payload.get("missing_information") or "").strip()
+            can_answer = bool(payload.get("can_answer")) and bool(proposed_answer)
+            if can_answer and confidence < self.settings.reader_min_answer_confidence:
+                can_answer = False
+                missing_information = (
+                    missing_information
+                    or f"Reader confidence {confidence:.2f} is below the required answer threshold "
+                    f"{self.settings.reader_min_answer_confidence:.2f}."
+                )
+            if can_answer and missing_information:
+                can_answer = False
             if can_answer and justification and f"[DOC:{candidate.doc_id}]" not in justification:
                 justification = f"{justification} [DOC:{candidate.doc_id}]"
             result = ReaderResult(
@@ -1563,11 +1721,11 @@ class PrivacyHopQAAgent:
                 source=candidate.source,
                 title=candidate.title,
                 locator=candidate.locator,
-                can_answer=can_answer and bool(proposed_answer),
+                can_answer=can_answer,
                 proposed_answer=proposed_answer,
                 justification=justification,
-                confidence=_clamp_confidence(payload.get("confidence"), default=0.0),
-                missing_information=str(payload.get("missing_information") or "").strip(),
+                confidence=confidence,
+                missing_information=missing_information,
                 parent_doc_id=str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
                 evidence_window_id=str(candidate.metadata.get("evidence_window_id") or candidate.doc_id),
                 window_index=candidate.metadata.get("window_index"),
@@ -1704,6 +1862,70 @@ class PrivacyHopQAAgent:
                 )
             )
         return results
+
+    def _supporting_reader_results(
+        self,
+        resolution: dict[str, Any],
+        reader_results: list[ReaderResult],
+    ) -> list[ReaderResult]:
+        positive = [result for result in reader_results if result.can_answer and result.proposed_answer.strip()]
+        if not positive:
+            return []
+        justification = str(resolution.get("justification") or "")
+        cited = [
+            result
+            for result in positive
+            if result.doc_id in justification or (result.parent_doc_id and result.parent_doc_id in justification)
+        ]
+        if cited:
+            return cited
+        answer_key = normalize_answer(str(resolution.get("answer") or ""))
+        matching = [result for result in positive if normalize_answer(result.proposed_answer) == answer_key]
+        if matching:
+            return [max(matching, key=lambda result: result.confidence)]
+        return positive[:1]
+
+    def _remember_useful_documents(
+        self,
+        hop: HopState,
+        resolution: dict[str, Any],
+        reader_results: list[ReaderResult],
+    ) -> None:
+        # Store only docs that the agent used as positive evidence. Retrieved
+        # distractors are deliberately excluded from cross-hop memory.
+        supporting_results = self._supporting_reader_results(resolution, reader_results)
+        for result in supporting_results:
+            parent_doc_id = result.parent_doc_id or result.doc_id
+            if not parent_doc_id:
+                continue
+            entry = self._document_memory.get(parent_doc_id)
+            if entry is None:
+                entry = UsefulDocumentMemory(
+                    parent_doc_id=parent_doc_id,
+                    source=result.source,
+                    title=result.title,
+                    locator=result.locator,
+                )
+                self._document_memory[parent_doc_id] = entry
+            if not entry.title and result.title:
+                entry.title = result.title
+            if not entry.locator and result.locator:
+                entry.locator = result.locator
+            if not entry.source and result.source:
+                entry.source = result.source
+            # If a selected parent was expanded into multiple windows, keep all
+            # cached windows for that parent. A later hop may need a different
+            # part of the same useful document.
+            cached_doc_ids = self._candidate_doc_ids_by_parent.get(parent_doc_id) or [result.doc_id]
+            for doc_id in cached_doc_ids:
+                entry.remember(
+                    hop.hop_number,
+                    str(resolution.get("answer") or ""),
+                    str(resolution.get("justification") or result.justification or ""),
+                    doc_id,
+                )
+        if supporting_results:
+            self._max_retrieval_stat("document_memory_parent_docs", len(self._document_memory))
 
     def _apply_resolution_to_hop(self, hop: HopState, resolution: dict[str, Any]) -> bool:
         if not (resolution.get("answered") and resolution.get("answer")):
@@ -1918,21 +2140,37 @@ class PrivacyHopQAAgent:
             hop.attempts += 1
             retrieval_actions = await self._plan_retrieval_actions(hop, iteration)
             if not retrieval_actions:
+                no_plan_reason = "No usable retrieval plan was produced for this hop in this iteration."
                 prior_reader_results = self._stored_reader_results(hop)
-                if prior_reader_results:
-                    resolution = await self._resolve_hop(hop, iteration, prior_reader_results, [])
+                prior_resolution_reason = ""
+                memory_candidates = self._finalize_candidate_pool(hop, self._memory_seed_candidates(hop))
+                if memory_candidates:
+                    resolution = await self._work_candidate_pool(hop, iteration, memory_candidates)
                     hop.resolution_reason = resolution.get("reason") or ""
                     if self._apply_resolution_to_hop(hop, resolution):
+                        self._remember_useful_documents(hop, resolution, self._stored_reader_results(hop))
+                        stalled = False
+                        continue
+                if prior_reader_results:
+                    resolution = await self._resolve_hop(hop, iteration, prior_reader_results, [])
+                    prior_resolution_reason = str(resolution.get("reason") or "").strip()
+                    hop.resolution_reason = prior_resolution_reason
+                    if self._apply_resolution_to_hop(hop, resolution):
+                        self._remember_useful_documents(hop, resolution, prior_reader_results)
                         stalled = False
                         continue
                 hop.status = "pending"
-                hop.resolution_reason = "No usable retrieval plan was produced for this hop in this iteration."
+                if prior_resolution_reason:
+                    hop.resolution_reason = f"{prior_resolution_reason} {no_plan_reason}"
+                else:
+                    hop.resolution_reason = no_plan_reason
                 stalled = True
                 continue
             candidates = await self._run_retrieval_actions(retrieval_actions, hop, iteration)
             resolution = await self._work_candidate_pool(hop, iteration, candidates)
             hop.resolution_reason = resolution.get("reason") or ""
             if self._apply_resolution_to_hop(hop, resolution):
+                self._remember_useful_documents(hop, resolution, self._stored_reader_results(hop))
                 stalled = False
             else:
                 hop.status = "pending"
@@ -1970,6 +2208,7 @@ class PrivacyHopQAAgent:
             "total_hops": len(self.hop_states),
             "searches_total": len(self.action_records),
             "docs_read": sum(len(hop.selected_doc_ids) for hop in self.hop_states),
+            "document_memory_parent_docs": len(self._document_memory),
             "duration_s": self._elapsed_s(),
             "stalled": stalled,
             "llm_calls_total": self.llm_adapter.total_calls,
@@ -1983,6 +2222,7 @@ class PrivacyHopQAAgent:
             "summary": summary,
             "hop_states": [hop.to_dict() for hop in self.hop_states],
             "actions": [action.to_dict() for action in self.action_records],
+            "document_memory": self._document_memory_prompt_cards(),
             "error_records": list(self.error_records),
             "timeline_paths": {},
             "report_path": str(report_path),

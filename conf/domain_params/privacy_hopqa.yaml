@@ -1,13 +1,13 @@
 annotations_path: ${oc.env:PRIVACY_AGENT_ANNOTATIONS_PATH,.privacy_agent/inputs/annotations_2026-04-06.json}
 curated_path: ${oc.env:PRIVACY_AGENT_CURATED_PATH,.privacy_agent/inputs/curated_chains.jsonl}
-final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-07_answer_variants.jsonl}
-final_train_dataset_path: ${oc.env:PRIVACY_HOPQA_TRAIN_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/train.jsonl}
-final_val_dataset_path: ${oc.env:PRIVACY_HOPQA_VAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/val.jsonl}
-final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/test.jsonl}
+final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review.jsonl}
+final_train_dataset_path: ${oc.env:PRIVACY_HOPQA_TRAIN_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_train.jsonl}
+final_val_dataset_path: ${oc.env:PRIVACY_HOPQA_VAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_val.jsonl}
+final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_test.jsonl}
 sample_size: 20
 max_examples: null
 task_data_root: ${oc.env:PRIVACY_AGENT_TASK_DATA_ROOT,.privacy_agent/inputs/tasks}
-local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,.privacy_agent/local_indices}
+local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,/mnt/llmd/results/exps/alexg/privacy_agent/local_indices_fixeddeps_20260415}
 local_index_mmap_mode: r
 helper_service_url: ${oc.env:PRIVACY_AGENT_HELPER_URL, null}
 helper_timeout_s: 30.0
@@ -23,7 +23,7 @@ capture_mode: all_calls
 answer_match_f1_threshold: 0.75
 answer_match_mode: exact_or_f1
 reward_mode: all_hops_correct
-max_iterations: 12
+max_iterations: 21
 iteration_budget_per_hop: 3
 # Keep retries/fallback explicit: hidden generic local+web fallback changes
 # the source-selection policy and can mask whether the model learned the tool.
@@ -32,7 +32,9 @@ enable_generic_retrieval_fallback: false
 enable_local_search_bootstrap: false
 max_parallel_retrieval_actions: 3
 retrieval_top_k: 5
-choose_top_k: 6
+# Select parent documents, not individual chunks. Each selected parent with
+# <= read_all_windows_max_count evidence windows is expanded into all windows.
+choose_top_k: 3
 # Interpreted as max parent documents. In windowed mode, all evidence windows
 # from those parent documents remain available to choose/read.
 max_candidate_cards: 20
@@ -48,11 +50,12 @@ retrieval_chunk_overlap_chars: 800
 reader_window_chars: 16000
 reader_window_overlap_chars: 1000
 max_windows_per_parent: 0
-# Parent documents with more than read_all_windows_max_count evidence windows
-# are read in query-relevant batches instead of expanding every window at once.
-# Set large_parent_window_policy=all to restore full-parent expansion.
+# Parent documents with <= read_all_windows_max_count evidence windows are read
+# in full. Longer parent docs should be removed by the helper live filter and
+# blacklist; if one slips through, read only query-relevant batches rather than
+# exploding the rollout.
 large_parent_window_policy: top_with_neighbors
-read_all_windows_max_count: 5
+read_all_windows_max_count: 10
 large_parent_top_windows: 4
 large_parent_neighbor_windows: 1
 large_parent_max_read_windows: 0
@@ -73,4 +76,4 @@ log_prompts: false
 verbose: false
 no_web: false
 parallel_searches: true
-max_parallel_doc_reads: 6
+max_parallel_doc_reads: 10

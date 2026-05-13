@@ -11,6 +11,7 @@ from typing import Any
 
 import aiohttp
 from omegaconf import DictConfig
+from pydantic import Field
 
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
@@ -92,6 +93,10 @@ class PrivacyHopQAMetrics(BaseMetrics):
     doc_read_parse_errors: int = 0
     hop_resolve_parse_errors: int = 0
     error: str | None = None
+    reward_by_pattern: dict[str, float] = Field(default_factory=dict)
+    success_by_pattern: dict[str, float] = Field(default_factory=dict)
+    reward_by_chain_length: dict[str, float] = Field(default_factory=dict)
+    success_by_chain_length: dict[str, float] = Field(default_factory=dict)
 
 
 def _build_run_paths(cfg: DictConfig, problem: dict) -> tuple[Path, Path]:
@@ -265,6 +270,18 @@ async def _run_privacy_hopqa_rollout_async(
         gold_parent_read_and_correct_hops / max(1, gold_parent_read_and_correct_hops + gold_parent_read_but_incorrect_hops)
     )
     n_question_hops = int(problem.get("n_question_hops") or problem.get("n_hops") or len(problem.get("hops") or []))
+    chain_length = int(problem.get("n_hops") or len(problem.get("hops") or []))
+    pattern_key = str(problem.get("pattern") or "").strip()
+    if not pattern_key:
+        pattern_key = "".join(
+            str(hop.get("hop_type") or "")[:1].upper()
+            for hop in problem.get("hops") or []
+            if hop.get("hop_type")
+        )
+    pattern_key = pattern_key or "unknown"
+    chain_length_key = str(chain_length or n_question_hops or "unknown")
+    reward_value = float(score["reward"])
+    success_value = float(score["correct_hops"] == score["total_hops"] and error is None)
     n_unique_docs = int(problem.get("n_unique_docs") or 0)
     n_cross_doc_transitions = int(problem.get("n_cross_doc_transitions") or max(0, n_unique_docs - 1))
     group_id = str(problem.get("chain_id") or problem.get("problem_id"))
@@ -272,6 +289,8 @@ async def _run_privacy_hopqa_rollout_async(
         "chain_id": problem.get("chain_id"),
         "task_id": problem.get("task_id"),
         "company": problem.get("company"),
+        "pattern": pattern_key,
+        "chain_length": chain_length,
         "problem_id": problem.get("problem_id"),
         "parsed_answers": answers,
         "iterations_used": iterations_used,
@@ -290,8 +309,8 @@ async def _run_privacy_hopqa_rollout_async(
         trace.reward = score["reward"]
 
     metrics = PrivacyHopQAMetrics(
-        reward=score["reward"],
-        success=(score["correct_hops"] == score["total_hops"] and error is None),
+        reward=reward_value,
+        success=success_value,
         no_error=error is None,
         no_answer=not bool(answers),
         correct_hops=score["correct_hops"],
@@ -355,6 +374,10 @@ async def _run_privacy_hopqa_rollout_async(
         doc_read_parse_errors=int((error_summary.get("parse_errors_by_stage") or {}).get("doc_read") or 0),
         hop_resolve_parse_errors=int((error_summary.get("parse_errors_by_stage") or {}).get("hop_resolve") or 0),
         error=error,
+        reward_by_pattern={pattern_key: reward_value},
+        success_by_pattern={pattern_key: success_value},
+        reward_by_chain_length={chain_length_key: reward_value},
+        success_by_chain_length={chain_length_key: success_value},
     )
     return RolloutResult(
         training_texts=training_texts,

@@ -11,7 +11,19 @@ DEFAULT_DATASET_NAME = "seed20"
 DEFAULT_SAMPLE_SIZE = 20
 DEFAULT_FINAL_DATASET_PATH = (
     "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
-    "privacy_hopqa_finalized_2026-05-09_contextsafe_answer_variants.jsonl"
+    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review.jsonl"
+)
+DEFAULT_FINAL_TRAIN_DATASET_PATH = (
+    "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
+    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_train.jsonl"
+)
+DEFAULT_FINAL_VAL_DATASET_PATH = (
+    "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
+    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_val.jsonl"
+)
+DEFAULT_FINAL_TEST_DATASET_PATH = (
+    "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
+    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_test.jsonl"
 )
 
 
@@ -106,10 +118,14 @@ def _load_from_materialized_jsonl(path: str | Path) -> list[dict]:
     problems: list[dict] = []
     for idx, row in enumerate(rows):
         row = dict(row)
-        row.setdefault("domain", DOMAIN_NAME)
-        row.setdefault("dataset", Path(path).stem)
-        row.setdefault("id", idx)
-        row.setdefault("problem_id", f"{DOMAIN_NAME}_{row.get('chain_id', idx)}")
+        if not row.get("domain"):
+            row["domain"] = DOMAIN_NAME
+        if not row.get("dataset"):
+            row["dataset"] = Path(path).stem
+        if row.get("id") is None:
+            row["id"] = idx
+        if not row.get("problem_id"):
+            row["problem_id"] = f"{DOMAIN_NAME}_{row.get('chain_id', idx)}"
         problems.append(row)
     return problems
 
@@ -141,6 +157,9 @@ def load_problems(
     annotations_path: str | Path | None = DEFAULT_ANNOTATIONS_PATH,
     curated_path: str | Path | None = DEFAULT_CURATED_CHAINS_PATH,
     final_dataset_path: str | Path | None = DEFAULT_FINAL_DATASET_PATH,
+    final_train_dataset_path: str | Path | None = DEFAULT_FINAL_TRAIN_DATASET_PATH,
+    final_val_dataset_path: str | Path | None = DEFAULT_FINAL_VAL_DATASET_PATH,
+    final_test_dataset_path: str | Path | None = DEFAULT_FINAL_TEST_DATASET_PATH,
     sample_size: int = DEFAULT_SAMPLE_SIZE,
     max_examples: int | None = None,
     **_: Any,
@@ -164,10 +183,17 @@ def load_problems(
             normalized_name = str(dataset_name).strip()
             if normalized_name in {"final", "privacy_hopqa_final", "final1001"}:
                 loaded = _load_from_materialized_jsonl(final_dataset_path or DEFAULT_FINAL_DATASET_PATH)
+            elif normalized_name in {"final_train", "privacy_hopqa_final_train", "train1001"}:
+                loaded = _load_from_materialized_jsonl(final_train_dataset_path or DEFAULT_FINAL_TRAIN_DATASET_PATH)
+            elif normalized_name in {"final_val", "privacy_hopqa_final_val", "val1001"}:
+                loaded = _load_from_materialized_jsonl(final_val_dataset_path or DEFAULT_FINAL_VAL_DATASET_PATH)
+            elif normalized_name in {"final_test", "privacy_hopqa_final_test", "test1001"}:
+                loaded = _load_from_materialized_jsonl(final_test_dataset_path or DEFAULT_FINAL_TEST_DATASET_PATH)
             elif normalized_name not in {DEFAULT_DATASET_NAME, "accepted20", "privacy_hopqa_seed20", "privacy_agent_seed20"}:
                 raise ValueError(
                     f"Unsupported privacy_hopqa dataset '{dataset_name}'. "
-                    f"Use '{DEFAULT_DATASET_NAME}', 'final', or pass a materialized JSONL file."
+                    f"Use '{DEFAULT_DATASET_NAME}', 'final', 'final_train', 'final_val', "
+                    "'final_test', or pass a materialized JSONL file."
                 )
             else:
                 annotations_file, curated_file = _ensure_seed20_sources_exist(
