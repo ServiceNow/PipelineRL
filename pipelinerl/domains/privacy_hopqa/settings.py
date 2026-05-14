@@ -108,7 +108,7 @@ class PrivacyHopQASettings:
     verbose: bool = False
     no_web: bool = False
     parallel_searches: bool = True
-    max_parallel_doc_reads: int = 6
+    max_parallel_doc_reads: int = 5
     planner_privacy_prompt: bool = False
 
     @classmethod
@@ -179,7 +179,7 @@ class PrivacyHopQASettings:
             verbose=bool(data.get("verbose", False)),
             no_web=bool(data.get("no_web", False)),
             parallel_searches=bool(data.get("parallel_searches", True)),
-            max_parallel_doc_reads=int(data.get("max_parallel_doc_reads", 6)),
+            max_parallel_doc_reads=int(data.get("max_parallel_doc_reads", 5)),
             planner_privacy_prompt=bool(data.get("planner_privacy_prompt", False)),
         )
 

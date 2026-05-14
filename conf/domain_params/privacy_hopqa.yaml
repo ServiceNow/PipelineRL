@@ -88,4 +88,4 @@ log_prompts: false
 verbose: false
 no_web: false
 parallel_searches: true
-max_parallel_doc_reads: 10
+max_parallel_doc_reads: 5
