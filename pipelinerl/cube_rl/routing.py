@@ -46,18 +46,41 @@ class RoutedVLLM:
     api_key: str = "EMPTY"
 
 
+@dataclass
+class _AffinityState:
+    server_id: int
+    created_at: float
+    last_used_at: float
+
+
 class RayVLLMRouter:
     """Synchronous cube-harness router backed by a non-blocking Ray actor."""
 
-    def __init__(self, router_actor: Any, *, poll_interval_s: float = 0.01):
+    def __init__(
+        self,
+        router_actor: Any,
+        *,
+        poll_interval_s: float = 0.01,
+        affinity_key: str | None = None,
+    ):
         self._router_actor = router_actor
         self._poll_interval_s = max(0.001, float(poll_interval_s))
+        self._affinity_key = affinity_key
+
+    def with_affinity(self, affinity_key: str) -> "RayVLLMRouter":
+        self._affinity_key = affinity_key or None
+        return self
 
     def acquire(self, config: Any, prompt: Any) -> LLMRouteLease:
         estimated_tokens = estimate_prompt_tokens(prompt) + int(getattr(config, "max_completion_tokens", 0) or 0)
         wait_started_at = time.perf_counter()
         while True:
-            lease = ray.get(self._router_actor.try_acquire.remote(estimated_tokens=estimated_tokens))
+            lease = ray.get(
+                self._router_actor.try_acquire.remote(
+                    estimated_tokens=estimated_tokens,
+                    affinity_key=self._affinity_key,
+                )
+            )
             if lease is not None:
                 return LLMRouteLease(
                     route_id=lease["route_id"],
@@ -71,6 +94,8 @@ class RayVLLMRouter:
                         "vllm_model_name": lease["model_name"],
                         "vllm_estimated_tokens": estimated_tokens,
                         "vllm_lease_wait_s": time.perf_counter() - wait_started_at,
+                        "vllm_affinity_key": self._affinity_key,
+                        "vllm_affinity_bound": lease.get("affinity_bound", False),
                     },
                 )
             time.sleep(self._poll_interval_s)
@@ -95,12 +120,24 @@ class RayVLLMRouter:
             )
         )
 
+    def finish_affinity(self) -> None:
+        if not self._affinity_key:
+            return
+        affinity_key = self._affinity_key
+        self._affinity_key = None
+        ray.get(self._router_actor.finish_affinity.remote(affinity_key))
+
 
 @ray.remote(max_restarts=0, max_task_retries=0)
 class VLLMRouterActor:
     """Tracks per-vLLM active generation load and leases one request at a time."""
 
-    def __init__(self, routes: list[dict[str, Any]], max_inflight_per_server: int):
+    def __init__(
+        self,
+        routes: list[dict[str, Any]],
+        max_inflight_per_server: int,
+        affinity_ttl_s: float = 3600.0,
+    ):
         if not routes:
             raise ValueError("VLLMRouterActor requires at least one route")
         if max_inflight_per_server < 1:
@@ -122,12 +159,22 @@ class VLLMRouterActor:
         self._requests = [0 for _ in self._routes]
         self._suppressed_until = [0.0 for _ in self._routes]
         self._leases: dict[str, tuple[int, float, int]] = {}
+        self._affinities: dict[str, _AffinityState] = {}
         self._lease_ids = itertools.count()
         self._error_suppression_threshold = 3
         self._suppression_cooldown_s = 30.0
+        self._affinity_ttl_s = max(1.0, float(affinity_ttl_s))
 
-    def try_acquire(self, estimated_tokens: int = 0) -> dict[str, Any] | None:
-        now = time.time()
+    def _prune_expired_affinities(self, now: float) -> None:
+        expired = [
+            key
+            for key, state in self._affinities.items()
+            if now - state.last_used_at > self._affinity_ttl_s
+        ]
+        for key in expired:
+            self._affinities.pop(key, None)
+
+    def _least_loaded_available_server(self, *, now: float) -> int | None:
         eligible = [
             route.server_id
             for route in self._routes
@@ -144,7 +191,7 @@ class VLLMRouterActor:
         if not eligible:
             return None
 
-        server_id = min(
+        return min(
             eligible,
             key=lambda i: (
                 self._inflight[i],
@@ -153,6 +200,35 @@ class VLLMRouterActor:
                 i,
             ),
         )
+
+    def try_acquire(self, estimated_tokens: int = 0, affinity_key: str | None = None) -> dict[str, Any] | None:
+        now = time.time()
+        self._prune_expired_affinities(now)
+
+        affinity_bound = False
+        if affinity_key:
+            affinity = self._affinities.get(affinity_key)
+            if affinity is not None:
+                server_id = affinity.server_id
+                if self._inflight[server_id] >= self._max_inflight:
+                    return None
+                affinity.last_used_at = now
+                affinity_bound = True
+            else:
+                server_id = self._least_loaded_available_server(now=now)
+                if server_id is None:
+                    return None
+                self._affinities[affinity_key] = _AffinityState(
+                    server_id=server_id,
+                    created_at=now,
+                    last_used_at=now,
+                )
+                affinity_bound = True
+        else:
+            server_id = self._least_loaded_available_server(now=now)
+            if server_id is None:
+                return None
+
         route = self._routes[server_id]
         route_id = f"{server_id}:{next(self._lease_ids)}"
         token_load = max(1, int(estimated_tokens or 1))
@@ -166,6 +242,7 @@ class VLLMRouterActor:
             "api_base": route.api_base,
             "api_key": route.api_key,
             "model_name": route.model_name,
+            "affinity_bound": affinity_bound,
         }
 
     def release(
@@ -195,10 +272,15 @@ class VLLMRouterActor:
             self._errors[server_id] = 0
             self._suppressed_until[server_id] = 0.0
 
+    def finish_affinity(self, affinity_key: str) -> None:
+        self._affinities.pop(affinity_key, None)
+
     def snapshot(self) -> dict[str, Any]:
         now = time.time()
+        self._prune_expired_affinities(now)
         return {
             "max_inflight_per_server": self._max_inflight,
+            "active_affinities": len(self._affinities),
             "servers": [
                 {
                     "server_id": route.server_id,
@@ -210,6 +292,9 @@ class VLLMRouterActor:
                     "requests": self._requests[route.server_id],
                     "suppressed": self._suppressed_until[route.server_id] > now,
                     "suppressed_remaining_s": max(0.0, self._suppressed_until[route.server_id] - now),
+                    "affinities": sum(
+                        1 for affinity in self._affinities.values() if affinity.server_id == route.server_id
+                    ),
                 }
                 for route in self._routes
             ],

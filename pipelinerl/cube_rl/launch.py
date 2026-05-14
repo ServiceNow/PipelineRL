@@ -562,6 +562,7 @@ class CubeActorLoop:
                         "requests",
                         "suppressed",
                         "suppressed_remaining_s",
+                        "affinities",
                     ):
                         value = server.get(key)
                         if isinstance(value, (bool, int, float)):
@@ -569,6 +570,7 @@ class CubeActorLoop:
                 stats[f"{split_name}vllm_router/max_inflight_per_server"] = router_snapshot.get(
                     "max_inflight_per_server", 0
                 )
+                stats[f"{split_name}vllm_router/active_affinities"] = router_snapshot.get("active_affinities", 0)
             except Exception:
                 logger.exception("%s: failed to collect vLLM router stats", self.scheduler_name)
 
@@ -611,7 +613,11 @@ class CubeActorLoop:
         worker = self.cube_workers[worker_index]
         next_llm = 0
         model_version = int(self.trainer_state.propagated_weight_version or 0)
-        ref = worker.rollout.remote(cube_id=task.cube_id, task_id=task.task_id)
+        rollout_key = (
+            f"{self.scheduler_name}:v{model_version}:g{group_id}:r{rollout_index}:"
+            f"{task.cube_id}:{task.task_id}"
+        )
+        ref = worker.rollout.remote(cube_id=task.cube_id, task_id=task.task_id, rollout_key=rollout_key)
         self._pending[ref] = PendingRollout(
             group_id=group_id,
             task=task,

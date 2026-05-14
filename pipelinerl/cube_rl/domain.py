@@ -347,7 +347,7 @@ class CubeBenchmarkWorker:
         self._task_by_id = task_by_id
         logger.info("%s prepared cube %s with %d tasks", self._worker_name, cube_id, len(task_by_id))
 
-    def rollout(self, *, cube_id: str, task_id: str) -> dict:
+    def rollout(self, *, cube_id: str, task_id: str, rollout_key: str) -> dict:
         rollout_log_context = start_worker_rollout_log_context(f"{cube_id}:{task_id}")
         try:
             if not self._ready:
@@ -366,7 +366,7 @@ class CubeBenchmarkWorker:
                 "container_backend": self._container_backend,
             }
 
-            result = self._rollout(task=_copy_model(task))
+            result = self._rollout(task=_copy_model(task), rollout_key=rollout_key)
             return result.model_dump()
         except Exception:
             logger.exception("%s rollout failed for cube_id=%s task_id=%s", self._worker_name, cube_id, task_id)
@@ -374,7 +374,7 @@ class CubeBenchmarkWorker:
         finally:
             reset_worker_rollout_log_context(rollout_log_context)
 
-    def _rollout(self, task: dict) -> RolloutResult:
+    def _rollout(self, task: dict, rollout_key: str) -> RolloutResult:
         from cube_harness.episode import Episode, MAX_STEPS
         from cube.core import EnvironmentOutput
         from cube_harness.core import AgentOutput, TerminationReason
@@ -385,7 +385,8 @@ class CubeBenchmarkWorker:
         agent_config = task["agent_config"]
 
         agent_llm_config = getattr(agent_config, "llm_config")
-        agent_llm_config.router = self._llm_router
+        rollout_router = self._llm_router.with_affinity(rollout_key)
+        agent_llm_config.router = rollout_router
 
         validate_per_step = False
 
@@ -400,7 +401,13 @@ class CubeBenchmarkWorker:
             runtime_context=self._runtime_context,
             container_backend=self._container_backend,
         )
-        trajectory = ep.run()
+        try:
+            trajectory = ep.run()
+        finally:
+            try:
+                rollout_router.finish_affinity()
+            except Exception:
+                logger.warning("Failed to finish vLLM rollout affinity", exc_info=True)
         if self._persist_rollout_artifacts:
             self._write_rollout_artifact(trajectory, task)
         logger.info(f"Trajectory completed due to {trajectory.termination_reason}")
