@@ -33,6 +33,7 @@ reward_mode: all_hops_correct
 # finetune.rl.pad_step_rewards_for_advantage=true.
 training_reward_mode: outcome
 stop_after_incorrect_hop: false
+zero_error_step_reward: true
 max_iterations: 14
 iteration_budget_per_hop: 2
 # Keep retries/fallback explicit: hidden generic local+web fallback changes
