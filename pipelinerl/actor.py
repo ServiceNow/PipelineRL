@@ -168,19 +168,9 @@ async def schedule_rollouts(
     retry_max_delay_s = float(getattr(cfg.actor, "rollout_retry_max_delay_s", 30.0))
 
     def is_trainer_finished() -> bool:
-        # For the Fast-LLM trainer path, the explicit `training_finished` event the
-        # trainer publishes to the `fast_llm_events` redis stream (tracked here as
-        # `trainer_state.training_done`) is the canonical completion signal.
-        # The legacy `max_train_steps × train_batch_size × gradient_accumulation_passes`
-        # formula below is for the HF/DeepSpeed path, where `gradient_accumulation_passes`
-        # counts microbatches per optimizer step. Under Fast-LLM, the trainer uses
-        # `schedule.docs_per_step` instead, and `_prefetch_to_doc_target` always
-        # overshoots that target by a few documents per step (the loop runs while
-        # `total_docs < target` and stops just after crossing it). The sample-counting
-        # heuristic therefore fires several optimizer steps early — e.g., on a single
-        # 8-GPU node with max_train_steps=400, the actor declares completion at
-        # samples_processed=410,400 while the trainer is only at step ~393/400, stops
-        # feeding redis, and the trainer eventually times out waiting for documents.
+        # Fast-LLM ignores `gradient_accumulation_passes` and overshoots `docs_per_step`
+        # by a few docs per step, so the sample-counting formula below fires several
+        # optimizer steps early. Use the explicit `training_finished` event instead.
         if cfg.use_fast_llm:
             return trainer_state.training_done
         return (
