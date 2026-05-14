@@ -33,8 +33,8 @@ reward_mode: all_hops_correct
 # finetune.rl.pad_step_rewards_for_advantage=true.
 training_reward_mode: outcome
 stop_after_incorrect_hop: false
-max_iterations: 21
-iteration_budget_per_hop: 3
+max_iterations: 14
+iteration_budget_per_hop: 2
 # Keep retries/fallback explicit: hidden generic local+web fallback changes
 # the source-selection policy and can mask whether the model learned the tool.
 hop_plan_attempts: 1
@@ -65,7 +65,7 @@ max_windows_per_parent: 0
 # blacklist; if one slips through, read only query-relevant batches rather than
 # exploding the rollout.
 large_parent_window_policy: top_with_neighbors
-read_all_windows_max_count: 10
+read_all_windows_max_count: 5
 large_parent_top_windows: 4
 large_parent_neighbor_windows: 1
 large_parent_max_read_windows: 0

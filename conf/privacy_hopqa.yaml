@@ -5,11 +5,16 @@ defaults:
 
 actor:
   rollout_policy: pipelinerl.domains.privacy_hopqa.generate_privacy_hopqa_rollout
+  llm_max_rollouts: 64
   system_prompt: ""
   task_template: |-
     {task}
   task_prompt: ""
   ensure_boxed_answers: false
+
+finetune:
+  gradient_accumulation_passes: 4096
+  num_warmup_steps: 0
 
 dataset_loader: pipelinerl.domains.privacy_hopqa.dataset.load_problems
 dataset_loader_params: ${privacy_hopqa}

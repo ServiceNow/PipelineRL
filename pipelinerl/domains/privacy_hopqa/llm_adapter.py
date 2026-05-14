@@ -81,6 +81,7 @@ class PrivacyHopQALLMAdapter:
         self.captured_prompt_tokens = 0
         self.captured_output_tokens = 0
         self.max_prompt_tokens_by_log_name: dict[str, int] = {}
+        self.last_captured_call_index_by_key: dict[tuple[str, int | None, int | None], int] = {}
 
     def _should_capture(self, log_name: str) -> bool:
         if self.capture_mode == "all_calls":
@@ -226,6 +227,7 @@ class PrivacyHopQALLMAdapter:
         if self._should_capture(log_name):
             self.captured_prompt_tokens += prompt_tokens
             self.captured_output_tokens += output_tokens
+            captured_index = len(self.captured_calls)
             self.captured_calls.append(
                 CapturedLLMCall(
                     llm_call=llm_call,
@@ -235,6 +237,7 @@ class PrivacyHopQALLMAdapter:
                     iteration=iteration,
                 )
             )
+            self.last_captured_call_index_by_key[(log_name, hop_number, iteration)] = captured_index
 
         return llm_call.output.content or ""
 

@@ -23,7 +23,7 @@ from .resources import (
     get_static_local_index,
 )
 
-from .agent import PrivacyHopQAAgent, is_helper_infrastructure_error
+from .agent import PrivacyHopQAAgent, PrivacyHopQAProtocolError, is_helper_infrastructure_error
 from .llm_adapter import PrivacyHopQALLMAdapter, is_llm_infrastructure_error
 from .reward import answers_match, score_chain_answers
 from .settings import PrivacyHopQASettings
@@ -142,9 +142,38 @@ def _prefix_progress_by_hop(score: dict) -> dict[str, dict[str, float | int | bo
     return progress
 
 
-def _assign_training_rewards(training_texts: list, score: dict, training_reward_mode: str) -> None:
+def _assign_training_rewards(
+    training_texts: list,
+    score: dict,
+    training_reward_mode: str,
+    zero_error_step_reward: bool = True,
+    error_records: list[dict] | None = None,
+) -> None:
     outcome_reward = float(score["reward"])
     prefix_progress = _prefix_progress_by_hop(score)
+    apply_zero_error_step_reward = zero_error_step_reward and training_reward_mode == "prefix_progress"
+
+    # Per-trace error match: exact captured_call_index values that had a
+    # recorded error event during the rollout. We zero ONLY those specific
+    # traces — never blanket-zero all traces in a hop or same iteration. A hop
+    # that ultimately produced no answer isn't necessarily the fault of any
+    # particular trace, so we don't zero hop-level traces just because the hop
+    # failed.
+    error_call_indices: set[int] = set()
+    if apply_zero_error_step_reward:
+        for rec in error_records or []:
+            if rec.get("stage") not in {"hop_plan", "doc_choose", "hop_resolve"}:
+                continue
+            captured_call_index = rec.get("captured_call_index")
+            if captured_call_index is not None:
+                error_call_indices.add(int(captured_call_index))
+
+    max_prefix_reward = 0.0
+    for hop_progress in prefix_progress.values():
+        max_prefix_reward = max(max_prefix_reward, float(hop_progress.get("reward", 0.0)))
+    if not prefix_progress:
+        max_prefix_reward = outcome_reward
+
     for trace in training_texts:
         privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
         hop_number = privacy_meta.get("hop_number")
@@ -155,6 +184,13 @@ def _assign_training_rewards(training_texts: list, score: dict, training_reward_
             reward = float((hop_progress or {}).get("reward", outcome_reward))
         else:
             raise ValueError(f"unknown privacy_hopqa training_reward_mode: {training_reward_mode}")
+        is_error_trace = False
+        if apply_zero_error_step_reward:
+            captured_call_index = privacy_meta.get("captured_call_index")
+            if captured_call_index is not None and int(captured_call_index) in error_call_indices:
+                is_error_trace = True
+        if is_error_trace:
+            reward = 0.0
         trace.reward = reward
         privacy_meta.update(
             {
@@ -165,8 +201,11 @@ def _assign_training_rewards(training_texts: list, score: dict, training_reward_
                 "prefix_correct_hops": int((hop_progress or {}).get("prefix_correct_hops", 0)),
                 "hop_correct": bool((hop_progress or {}).get("hop_correct", False)),
                 "prefix_intact": bool((hop_progress or {}).get("prefix_intact", False)),
+                "is_error_trace": is_error_trace,
             }
         )
+        if apply_zero_error_step_reward:
+            trace.metadata["padding_reward"] = max_prefix_reward
 
 
 async def generate_privacy_hopqa_rollout(
@@ -226,6 +265,8 @@ async def _run_privacy_hopqa_rollout_async(
 
     answers: dict[str, str] = {}
     error: str | None = None
+    protocol_error = False
+    error_records_for_reward: list[dict] = []
     report_metadata: dict[str, Any] = {}
     try:
         agent = PrivacyHopQAAgent(
@@ -246,12 +287,46 @@ async def _run_privacy_hopqa_rollout_async(
         final_report = agent_result.final_report
         answers = dict(agent_result.parsed_answers)
         report_metadata = dict(agent_result.report_metadata)
+        error_records_for_reward = list(agent_result.error_records or [])
         retrieval_summary = dict(report_metadata.get("retrieval_summary") or {})
         error_summary = dict(report_metadata.get("error_summary") or {})
         hops_resolved = sum(1 for hop in agent_result.hop_states if hop.get("answer"))
         searches_total = len(agent_result.action_records)
         docs_read = sum(len(hop.get("selected_doc_ids", [])) for hop in agent_result.hop_states)
         iterations_used = int(report_metadata.get("iterations_used") or 0)
+    except PrivacyHopQAProtocolError as exc:
+        logger.warning("privacy_hopqa protocol error stopped chain %s: %s", problem.get("chain_id"), exc)
+        protocol_error = True
+        error = str(exc)
+        final_report = ""
+        answers = {}
+        if "agent" in locals():
+            answers = {
+                str(hop.hop_number): str(hop.answer_for_context or hop.answer or "").strip()
+                for hop in agent.hop_states
+                if str(hop.answer_for_context or hop.answer or "").strip()
+            }
+            error_records_for_reward = list(getattr(agent, "error_records", []) or [])
+            error_summary_fn = getattr(agent, "_error_summary", None)
+            retrieval_summary_fn = getattr(agent, "_retrieval_summary", None)
+            error_summary = dict(error_summary_fn() if callable(error_summary_fn) else {})
+            retrieval_summary = dict(retrieval_summary_fn() if callable(retrieval_summary_fn) else {})
+            report_metadata = {
+                "protocol_error": error,
+                "error_records": error_records_for_reward,
+                "error_summary": error_summary,
+                "retrieval_summary": retrieval_summary,
+            }
+            hops_resolved = sum(1 for hop in agent.hop_states if hop.answer)
+            searches_total = len(getattr(agent, "action_records", []) or [])
+            docs_read = sum(len(hop.selected_doc_ids) for hop in agent.hop_states)
+        else:
+            error_summary = {}
+            retrieval_summary = {}
+            hops_resolved = 0
+            searches_total = 0
+            docs_read = 0
+        iterations_used = 0
     except Exception as exc:
         if is_llm_infrastructure_error(exc) or is_helper_infrastructure_error(exc):
             raise
@@ -272,10 +347,14 @@ async def _run_privacy_hopqa_rollout_async(
         reward_mode=settings.reward_mode,
         answer_match_mode=settings.answer_match_mode,
     )
+    if protocol_error:
+        score["reward"] = 0.0
     per_hop_scores = {str(item.get("hop")): item for item in score.get("per_hop", [])}
     hop_states_for_metrics = []
     if "agent_result" in locals():
         hop_states_for_metrics = list(agent_result.hop_states)
+    elif protocol_error and "agent" in locals():
+        hop_states_for_metrics = [hop.to_dict() for hop in agent.hop_states]
     gold_parent_read_and_correct_hops = 0
     gold_parent_read_but_incorrect_hops = 0
     gold_parent_read_but_no_answer_hops = 0
@@ -363,7 +442,13 @@ async def _run_privacy_hopqa_rollout_async(
         "retrieval_summary": retrieval_summary,
     }
     training_texts = adapter.make_training_texts(group_id=group_id, base_metadata=base_metadata)
-    _assign_training_rewards(training_texts, score, settings.training_reward_mode)
+    _assign_training_rewards(
+        training_texts,
+        score,
+        settings.training_reward_mode,
+        zero_error_step_reward=settings.zero_error_step_reward,
+        error_records=error_records_for_reward,
+    )
 
     metrics = PrivacyHopQAMetrics(
         reward=reward_value,

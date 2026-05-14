@@ -68,8 +68,17 @@ class PrivacyHopQASettings:
     reward_mode: str = "all_hops_correct"
     training_reward_mode: str = "outcome"
     stop_after_incorrect_hop: bool = False
-    max_iterations: int = 21
-    iteration_budget_per_hop: int = 3
+    # In prefix_progress training only, individual planning traces whose
+    # specific (stage, hop_number, iteration) appears in the rollout's
+    # error_records (JSON parse failures, context overflows, resolver
+    # self-wipes, exceptions) get reward=0. This is strictly per-trace: we
+    # never blanket-zero all traces in a hop just because the hop failed to
+    # produce an answer. Each rollout's padding_reward is set to the max
+    # prefix_progress achieved, so error-terminated rollouts pad to their best
+    # progress rather than to a zero'd error step.
+    zero_error_step_reward: bool = True
+    max_iterations: int = 14
+    iteration_budget_per_hop: int = 2
     hop_plan_attempts: int = 1
     enable_generic_retrieval_fallback: bool = False
     enable_local_search_bootstrap: bool = False
@@ -87,7 +96,7 @@ class PrivacyHopQASettings:
     reader_window_overlap_chars: int = 1000
     max_windows_per_parent: int = 0
     large_parent_window_policy: str = "top_with_neighbors"
-    read_all_windows_max_count: int = 10
+    read_all_windows_max_count: int = 5
     large_parent_top_windows: int = 4
     large_parent_neighbor_windows: int = 1
     large_parent_max_read_windows: int = 0
@@ -139,8 +148,9 @@ class PrivacyHopQASettings:
             reward_mode=str(data.get("reward_mode", "all_hops_correct")),
             training_reward_mode=str(data.get("training_reward_mode", "outcome")),
             stop_after_incorrect_hop=bool(data.get("stop_after_incorrect_hop", False)),
-            max_iterations=int(data.get("max_iterations", 21)),
-            iteration_budget_per_hop=int(data.get("iteration_budget_per_hop", 3)),
+            zero_error_step_reward=bool(data.get("zero_error_step_reward", True)),
+            max_iterations=int(data.get("max_iterations", 14)),
+            iteration_budget_per_hop=int(data.get("iteration_budget_per_hop", 2)),
             hop_plan_attempts=int(data.get("hop_plan_attempts", 1)),
             enable_generic_retrieval_fallback=bool(data.get("enable_generic_retrieval_fallback", False)),
             enable_local_search_bootstrap=bool(data.get("enable_local_search_bootstrap", False)),
@@ -158,7 +168,7 @@ class PrivacyHopQASettings:
             reader_window_overlap_chars=int(data.get("reader_window_overlap_chars", 1000)),
             max_windows_per_parent=int(data.get("max_windows_per_parent", 0)),
             large_parent_window_policy=str(data.get("large_parent_window_policy", "top_with_neighbors")),
-            read_all_windows_max_count=int(data.get("read_all_windows_max_count", 10)),
+            read_all_windows_max_count=int(data.get("read_all_windows_max_count", 5)),
             large_parent_top_windows=int(data.get("large_parent_top_windows", 4)),
             large_parent_neighbor_windows=int(data.get("large_parent_neighbor_windows", 1)),
             large_parent_max_read_windows=int(data.get("large_parent_max_read_windows", 0)),

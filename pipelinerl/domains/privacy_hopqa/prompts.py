@@ -163,7 +163,7 @@ Select up to {choose_top_k} parent document doc_id values to read next.
 - `matched_window_count` is how many retrieved windows are available from this parent document
 - `total_window_count` is how many evidence windows the full parent document was split into
 - `best_rank` means the best retrieval rank this candidate achieved across the search batch
-- `top_queries` are example phrasings that retrieved the candidate and may help indicate why it matched
+- `top_queries` lists every distinct search query that retrieved this candidate (up to 5); useful for telling which search intent surfaced the doc
 - Candidates marked `memory_seed` were useful for earlier hops; prefer them only when they look relevant to the current hop
 
 Return JSON in this format:

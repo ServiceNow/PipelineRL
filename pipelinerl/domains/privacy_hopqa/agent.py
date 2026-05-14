@@ -253,7 +253,7 @@ def _resolver_candidate_card(candidate: "CandidateDoc", excerpt_chars: int) -> d
             if key in {"title", "locator", "parent_doc_id"}:
                 value = _truncate(str(value), 180)
             elif key == "top_queries" and isinstance(value, list):
-                value = [_truncate(str(item), 100) for item in value[:2]]
+                value = [_truncate(str(item), 100) for item in value[:5]]
             compact[key] = value
     excerpt = str(card.get("excerpt") or "").strip()
     if excerpt_chars > 0 and excerpt:
@@ -312,15 +312,14 @@ def _parent_candidate_card(candidates: list["CandidateDoc"], excerpt_chars: int)
             candidate.doc_id,
         ),
     )
+    seen_queries: set[str] = set()
     top_queries: list[str] = []
     for candidate in candidates:
         for query in candidate.queries:
-            if query not in top_queries:
+            if query not in seen_queries:
+                seen_queries.add(query)
                 top_queries.append(query)
-            if len(top_queries) >= 2:
-                break
-        if len(top_queries) >= 2:
-            break
+    top_queries = top_queries[:5]
     total_window_count = max(int(candidate.metadata.get("window_count") or 1) for candidate in candidates)
     card = {
         "doc_id": parent_doc_id,
@@ -451,7 +450,7 @@ class CandidateDoc:
             "title": self.title,
             "best_rank": self.rank,
             "hit_count": len(self.queries),
-            "top_queries": self.queries[:2],
+            "top_queries": self.queries[:5],
             "snippet": _truncate(snippet, chooser_chars),
         }
         parent_doc_id = self.metadata.get("parent_doc_id")
@@ -615,6 +614,14 @@ class PrivacyHopQAAgentResult:
     report_metadata: dict[str, Any]
 
 
+class PrivacyHopQAProtocolError(RuntimeError):
+    """Model/protocol failure during a rollout.
+
+    These are bad model outputs or prompt/protocol failures, not infrastructure
+    failures. Training should stop the rollout and score the outcome as zero.
+    """
+
+
 class PrivacyHopQAAgent:
     def __init__(
         self,
@@ -725,6 +732,8 @@ class PrivacyHopQAAgent:
 
     def _classify_error_kind(self, exc: Exception | str) -> str:
         text = str(exc).lower()
+        if text.startswith("resolver_wipe:"):
+            return "resolver_wipe"
         if "no valid json found" in text or ("json" in text and "line 1 column 1" in text):
             return "parse_error"
         if "maximum context length" in text or "context length" in text:
@@ -751,6 +760,12 @@ class PrivacyHopQAAgent:
             "message": str(exc),
             "elapsed_s": round(self._elapsed_s(), 6),
         }
+        if hop_number is not None and iteration is not None:
+            captured_call_index = self.llm_adapter.last_captured_call_index_by_key.get(
+                (stage, hop_number, iteration)
+            )
+            if captured_call_index is not None:
+                record["captured_call_index"] = int(captured_call_index)
         if meta:
             record["meta"] = dict(meta)
         self.error_records.append(record)
@@ -1143,9 +1158,7 @@ class PrivacyHopQAAgent:
                     raise
                 logger.warning("hop planner failed for hop %s iteration %s attempt %s: %s", hop.hop_number, iteration, attempt_count, exc)
                 self._record_error(stage="hop_plan", hop_number=hop.hop_number, iteration=iteration, exc=exc)
-                payload = []
-                retry_guidance = "The previous response was not valid JSON or could not be parsed. Return a valid JSON array of retrieval actions."
-                continue
+                raise PrivacyHopQAProtocolError(f"hop_plan protocol error: {exc}") from exc
 
             raw_actions = payload if isinstance(payload, list) else []
             records: list[RetrievalActionRecord] = []
@@ -1642,7 +1655,7 @@ class PrivacyHopQAAgent:
                 raise
             logger.warning("doc chooser failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)
             self._record_error(stage="doc_choose", hop_number=hop.hop_number, iteration=iteration, exc=exc)
-            payload = {}
+            raise PrivacyHopQAProtocolError(f"doc_choose protocol error: {exc}") from exc
         selected_ids = payload.get("selected_doc_ids") if isinstance(payload, dict) else None
         valid_parent_ids = set(parent_ids)
         normalized_ids: list[str] = []
@@ -1751,21 +1764,7 @@ class PrivacyHopQAAgent:
                 label=f"read error {candidate.doc_id}",
                 meta={"doc_id": candidate.doc_id, "source": candidate.source},
             )
-            result = ReaderResult(
-                doc_id=candidate.doc_id,
-                source=candidate.source,
-                title=candidate.title,
-                locator=candidate.locator,
-                can_answer=False,
-                proposed_answer="",
-                justification="",
-                confidence=0.0,
-                missing_information=str(exc),
-                parent_doc_id=str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
-                evidence_window_id=str(candidate.metadata.get("evidence_window_id") or candidate.doc_id),
-                window_index=candidate.metadata.get("window_index"),
-                window_count=candidate.metadata.get("window_count"),
-            )
+            raise PrivacyHopQAProtocolError(f"doc_read protocol error: {exc}") from exc
         end_s = self._elapsed_s()
         self._record_event(
             stage="doc_read",
@@ -2056,21 +2055,23 @@ class PrivacyHopQAAgent:
                 raise
             logger.warning("hop resolver failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)
             self._record_error(stage="hop_resolve", hop_number=hop.hop_number, iteration=iteration, exc=exc)
-            resolution = self._fallback_resolution(reader_results)
+            raise PrivacyHopQAProtocolError(f"hop_resolve protocol error: {exc}") from exc
         if resolution.get("answered"):
             positive_read_ids = {
                 result.doc_id for result in reader_results if result.can_answer and result.proposed_answer.strip()
             }
             if not resolution.get("answer") or not positive_read_ids:
-                resolution = {
-                    "answered": False,
-                    "answer": "",
-                    "justification": "",
-                    "confidence": 0.0,
-                    "reason": "Resolver attempted to answer without a positive document read.",
-                    "next_step": "read_more" if unread_candidates else "search_more",
-                    "selected_doc_ids": [],
-                }
+                wipe_reason = (
+                    "empty_answer" if not resolution.get("answer") else "no_positive_reader"
+                )
+                self._record_error(
+                    stage="hop_resolve",
+                    hop_number=hop.hop_number,
+                    iteration=iteration,
+                    exc=f"resolver_wipe:{wipe_reason}",
+                    label=f"hop_resolve resolver_wipe ({wipe_reason})",
+                )
+                raise PrivacyHopQAProtocolError(f"hop_resolve resolver_wipe:{wipe_reason}")
         ended = self._elapsed_s()
         self._record_event(
             stage="hop_resolve",

@@ -464,6 +464,13 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df_stats = df_init[["group_id", "rollout_index", "step_index", "rewards"]].copy()
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
     df_stats["step_reward"] = df_stats["rewards"].apply(lambda x: x[0])
+    # Optional per-rollout padding override (e.g., privacy_hopqa sets this to
+    # max prefix_progress so error-terminated rollouts pad to last achieved
+    # progress instead of the zero'd error step). Falls back to step_reward.
+    if "padding_reward" in df_init.columns:
+        df_stats["padding_reward"] = df_init["padding_reward"].fillna(df_stats["step_reward"])
+    else:
+        df_stats["padding_reward"] = df_stats["step_reward"]
 
     if config.step_reward_advantages:
         df_rollouts = (
@@ -488,13 +495,14 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             for row in last_steps.itertuples(index=False):
                 max_step = int(max_step_by_group[row.group_id])
                 last_step = int(row.step_index)
+                pad_value = getattr(row, "padding_reward", row.step_reward)
                 for padded_step in range(last_step + 1, max_step + 1):
                     padded_rows.append(
                         {
                             "group_id": row.group_id,
                             "rollout_index": row.rollout_index,
                             "step_index": padded_step,
-                            "step_reward": row.step_reward,
+                            "step_reward": pad_value,
                         }
                     )
             if padded_rows:
