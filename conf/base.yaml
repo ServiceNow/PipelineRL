@@ -6,8 +6,7 @@ defaults:
 
 seed: 42
 
-# use FP32 for lm_head computation in both training and inference.
-fp32_lm_head: false
+# layer name prefix for FP32 output-head computation.
 fp32_layer_prefix: "lm_head"  # "lm_head" | "output" | "embed_out" | "head"
 
 finetune:
@@ -58,25 +57,20 @@ test_llm:
     top_k: 50
 
 vllm_config:
-  use_v1: false
-  quantization: null  # or bf16_last_layer_fp32
   vllm_kwargs:
     dtype: bfloat16
     gpu-memory-utilization: 0.9
     max-num-seqs: ${actor.llm_max_rollouts}
     max-num-batched-tokens: 1024
+    logprobs-mode: processed_logprobs
+    enable-prefix-caching: false
+    async-scheduling: false
     enable-chunked-prefill: ""
     return-tokens-as-token-ids: ""
     tensor-parallel-size: 1
     pipeline-parallel-size: 1
     generation-config: vllm
     max_model_len: 10000
-    # V1 specific settings
-    # logprobs-mode: processed_logprobs
-    # V0 specific settings
-    num-scheduler-steps: 1
-    disable-log-requests: ""
-    disable-frontend-multiprocessing: ""
 
 world:
   replicas: 1
@@ -94,7 +88,6 @@ jobs: []
 
 eval_every_n_versions: 78000
 
-# changed
 model_path: Qwen/Qwen2.5-7B
 
 # will use default based on the chosen backend

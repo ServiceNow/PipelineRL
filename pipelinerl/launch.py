@@ -51,6 +51,11 @@ def _popen(
 
 
 def validate_config(cfg: DictConfig):
+    if "fp32_lm_head" in cfg:
+        raise ValueError(
+            "fp32_lm_head is no longer configurable; PipelineRL always uses FP32 output-head logits"
+        )
+
     if cfg.world.preprocessor_fraction == 0 and cfg.finetune.rl.kl_coef > 0.0:
         raise ValueError("Preprocessor fraction must be > 0 if KL is used")
     
@@ -100,32 +105,50 @@ def validate_config(cfg: DictConfig):
 
 def _get_quantization_args(cfg: DictConfig) -> list[str]:
     """Build quantization CLI args for vLLM."""
-    if cfg.get("fp32_lm_head", False):
-        explicit_quant = cfg.vllm_config.get("quantization")
-        if explicit_quant and explicit_quant != "bf16_last_layer_fp32":
-            logger.warning(
-                f"fp32_lm_head=true overrides explicit vllm_config.quantization='{explicit_quant}' "
-                f"with 'bf16_last_layer_fp32'"
-            )
-        return ["--quantization", "bf16_last_layer_fp32"]
-    elif cfg.vllm_config.get("quantization"):
-        return ["--quantization", cfg.vllm_config.quantization]
-    return []
+    quantization = cfg.vllm_config.get("quantization")
+    if quantization and quantization != "bf16_last_layer_fp32":
+        raise ValueError(
+            f"vllm_config.quantization='{quantization}' is incompatible with PipelineRL's "
+            "required FP32 lm_head inference path"
+        )
+    return ["--quantization", "bf16_last_layer_fp32"]
 
 
 def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
     """Get environment variables for quantization config."""
-    env = {}
-    if cfg.get("fp32_lm_head", False):
-        # Pass the layer prefix to the quantization config via environment variable
-        prefix = cfg.get("fp32_layer_prefix", "lm_head")
-        env["PIPELINERL_FP32_LAYER_PREFIX"] = prefix
-    return env
+    prefix = cfg.get("fp32_layer_prefix", "lm_head")
+    return {"PIPELINERL_FP32_LAYER_PREFIX": prefix}
+
+
+def _get_vllm_kwargs(cfg: DictConfig) -> dict:
+    """Return launchable vLLM CLI kwargs for the supported V1 server path."""
+    kwargs = OmegaConf.to_container(cfg.vllm_config.vllm_kwargs, resolve=True)
+    if kwargs is None:
+        return {}
+    if not isinstance(kwargs, dict):
+        raise TypeError(f"vllm_kwargs must resolve to a mapping, got {type(kwargs)}")
+
+    for legacy_flag in ("disable-log-requests", "disable-frontend-multiprocessing"):
+        if legacy_flag in kwargs:
+            kwargs.pop(legacy_flag)
+            logger.info(f"Dropping legacy vLLM flag '--{legacy_flag}' for V1 launch")
+
+    return kwargs
+
+
+def _append_vllm_kwargs(cmd: list[str], kwargs: dict) -> None:
+    for k, v in kwargs.items():
+        if isinstance(v, bool):
+            cmd.append(f"--{k}" if v else f"--no-{k}")
+            continue
+        cmd.append(f"--{k}")
+        if v not in [None, ""]:
+            cmd.append(str(v))
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
-    kwargs = cfg.vllm_config.vllm_kwargs
-    if kwargs["num-scheduler-steps"] > 1:
+    kwargs = _get_vllm_kwargs(cfg)
+    if kwargs.get("num-scheduler-steps", 1) > 1:
         kwargs["num-scheduler-steps"] = 1
         logger.warning("Set num-scheduler-steps to 1 for reference vLLM")
     log_dir = exp_dir / f"ref_vllm_{preprocessor_llm_idx}"
@@ -147,11 +170,7 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
-    for k, v in kwargs.items():
-        cmd.append(f"--{k}")
-        if v not in [None, ""]:
-            cmd.append(str(v))
+    _append_vllm_kwargs(cmd, kwargs)
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
@@ -181,11 +200,7 @@ def run_actor_llm(
     # TODO: add support for tensor and process parallelism
     log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
-    entrypoint = (
-        "pipelinerl.entrypoints.run_vllm1" 
-        if cfg.vllm_config.use_v1 else 
-        "pipelinerl.entrypoints.run_vllm0"
-    )
+    entrypoint = "pipelinerl.entrypoints.run_vllm1"
     cmd = [
         "python",
         "-m",
@@ -208,12 +223,9 @@ def run_actor_llm(
 
     cmd.extend(_get_quantization_args(cfg))
 
-    # add vLLM kwargs as separate arguments
-    if cfg.vllm_config.vllm_kwargs:
-        for k, v in cfg.vllm_config.vllm_kwargs.items():
-            cmd.append(f"--{k}")
-            if v not in [None, ""]:
-                cmd.append(str(v))
+    kwargs = _get_vllm_kwargs(cfg)
+    if kwargs:
+        _append_vllm_kwargs(cmd, kwargs)
 
     if cfg.debug.mode:
         cmd.append("--disable-weight-updates")
