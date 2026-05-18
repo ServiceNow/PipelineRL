@@ -483,15 +483,97 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             .agg(group_tokens=("rollout_tokens", "mean"))
             .reset_index()
         )
-        df_reward_stats = df_stats[["group_id", "rollout_index", "step_index", "step_reward"]].copy()
-        if config.pad_step_rewards_for_advantage:
+        df_reward_stats = df_stats[
+            ["group_id", "rollout_index", "step_index", "rewards", "step_reward", "padding_reward"]
+        ].copy()
+        df_reward_stats["is_padding"] = False
+        df_reward_stats["advantage_bucket"] = df_reward_stats["step_index"].map(lambda value: f"step:{int(value)}")
+
+        if "metadata" in df_init.columns:
+            metadata = df_init["metadata"].apply(lambda value: value if isinstance(value, dict) else {})
+            df_reward_stats["step_advantage_group"] = metadata.apply(lambda value: value.get("step_advantage_group"))
+            df_reward_stats["step_advantage_local_index"] = metadata.apply(
+                lambda value: value.get("step_advantage_local_index")
+            )
+            df_reward_stats["step_advantage_segment_length"] = metadata.apply(
+                lambda value: value.get("step_advantage_segment_length")
+            )
+            df_reward_stats["step_advantage_padding_value"] = metadata.apply(
+                lambda value: value.get("step_advantage_padding_value")
+            )
+        else:
+            df_reward_stats["step_advantage_group"] = None
+            df_reward_stats["step_advantage_local_index"] = None
+            df_reward_stats["step_advantage_segment_length"] = None
+            df_reward_stats["step_advantage_padding_value"] = None
+
+        custom_mask = df_reward_stats["step_advantage_group"].notna()
+        padded_rows = []
+        if custom_mask.any():
+            # Some domains, e.g. Privacy HopQA, want stepwise advantages
+            # compared within semantic segments such as (hop, stage), not by
+            # global rollout step. The rollout metadata defines those buckets.
+            custom = df_reward_stats[custom_mask].copy()
+            custom["_row_id"] = custom.index
+            max_lengths = (
+                custom.groupby(["group_id", "step_advantage_group"])
+                .agg(max_segment_length=("step_advantage_segment_length", "max"))
+                .reset_index()
+            )
+            custom = pd.merge(custom, max_lengths, on=["group_id", "step_advantage_group"], how="left")
+            aligned_position = (
+                custom["max_segment_length"].astype(int)
+                - custom["step_advantage_segment_length"].astype(int)
+                + custom["step_advantage_local_index"].astype(int)
+            )
+            custom["advantage_bucket"] = (
+                custom["step_advantage_group"].astype(str)
+                + ":pos:"
+                + aligned_position.astype(int).astype(str)
+            )
+            df_reward_stats.loc[custom["_row_id"], "advantage_bucket"] = custom["advantage_bucket"].to_numpy()
+
+            if config.pad_step_rewards_for_advantage:
+                segment_rows = (
+                    custom.sort_values(["step_index", "step_advantage_local_index"])
+                    .groupby(["group_id", "rollout_index", "step_advantage_group"], as_index=False)
+                    .first()
+                )
+                for row in segment_rows.itertuples(index=False):
+                    segment_length = int(row.step_advantage_segment_length)
+                    max_segment_length = int(row.max_segment_length)
+                    pad_value = (
+                        float(row.step_advantage_padding_value)
+                        if pd.notna(row.step_advantage_padding_value)
+                        else float(row.step_reward)
+                    )
+                    for padded_position in range(max_segment_length - segment_length):
+                        padded_rows.append(
+                            {
+                                "group_id": row.group_id,
+                                "rollout_index": row.rollout_index,
+                                "step_index": -1,
+                                "rewards": [],
+                                "step_reward": pad_value,
+                                "padding_reward": pad_value,
+                                "is_padding": True,
+                                "advantage_bucket": f"{row.step_advantage_group}:pos:{padded_position}",
+                                "step_advantage_group": row.step_advantage_group,
+                                "step_advantage_local_index": None,
+                                "step_advantage_segment_length": segment_length,
+                                "step_advantage_padding_value": pad_value,
+                            }
+                        )
+
+        default_mask = df_reward_stats["step_advantage_group"].isna()
+        if config.pad_step_rewards_for_advantage and default_mask.any():
             max_step_by_group = df_stats.groupby("group_id")["step_index"].max().to_dict()
             last_steps = (
-                df_stats.sort_values("step_index")
+                df_reward_stats[default_mask]
+                .sort_values("step_index")
                 .groupby(["group_id", "rollout_index"], as_index=False)
                 .tail(1)
             )
-            padded_rows = []
             for row in last_steps.itertuples(index=False):
                 max_step = int(max_step_by_group[row.group_id])
                 last_step = int(row.step_index)
@@ -502,13 +584,22 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                             "group_id": row.group_id,
                             "rollout_index": row.rollout_index,
                             "step_index": padded_step,
+                            "rewards": [],
                             "step_reward": pad_value,
+                            "padding_reward": pad_value,
+                            "is_padding": True,
+                            "advantage_bucket": f"step:{padded_step}",
+                            "step_advantage_group": None,
+                            "step_advantage_local_index": None,
+                            "step_advantage_segment_length": None,
+                            "step_advantage_padding_value": None,
                         }
                     )
-            if padded_rows:
-                df_reward_stats = pd.concat([df_reward_stats, pd.DataFrame(padded_rows)], ignore_index=True)
+        if padded_rows:
+            df_reward_stats = pd.concat([df_reward_stats, pd.DataFrame(padded_rows)], ignore_index=True)
+
         df_grouped = (
-            df_reward_stats.groupby(["group_id", "step_index"])
+            df_reward_stats.groupby(["group_id", "advantage_bucket"])
             .agg(
                 step_reward_sum=("step_reward", "sum"),
                 step_reward_count=("step_reward", "count"),
@@ -519,15 +610,16 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         assert df_group_tokens.columns.tolist() == ["group_id", "group_tokens"]
         assert df_grouped.columns.tolist() == [
             "group_id",
-            "step_index",
+            "advantage_bucket",
             "step_reward_sum",
             "step_reward_count",
             "step_reward_std",
         ]
+        df_real_reward_stats = df_reward_stats[~df_reward_stats["is_padding"]].copy()
         df_advantages = pd.merge(
-            df_stats[["group_id", "rollout_index", "step_index", "rewards", "step_reward"]],
+            df_real_reward_stats[["group_id", "rollout_index", "step_index", "rewards", "step_reward", "advantage_bucket"]],
             df_grouped,
-            on=["group_id", "step_index"],
+            on=["group_id", "advantage_bucket"],
             how="left"
         )
         df_advantages = pd.merge(df_advantages, df_group_tokens, on="group_id", how="left")
@@ -548,7 +640,14 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
 
         df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
         df_advantages = df_advantages.drop(
-            columns=["rewards", "step_reward", "step_reward_sum", "step_reward_count", "step_reward_std"]
+            columns=[
+                "rewards",
+                "step_reward",
+                "advantage_bucket",
+                "step_reward_sum",
+                "step_reward_count",
+                "step_reward_std",
+            ]
         )
     else:
         # We assume that rewards for all tokens are the same

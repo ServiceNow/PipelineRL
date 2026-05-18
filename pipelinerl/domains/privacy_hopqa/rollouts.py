@@ -27,8 +27,23 @@ from .agent import PrivacyHopQAAgent, PrivacyHopQAProtocolError, is_helper_infra
 from .llm_adapter import PrivacyHopQALLMAdapter, is_llm_infrastructure_error
 from .reward import answers_match, score_chain_answers
 from .settings import PrivacyHopQASettings
+from .utils import extract_json
 
 logger = logging.getLogger(__name__)
+
+TRAINABLE_CONTROL_STAGES = {"hop_plan", "doc_choose", "hop_resolve"}
+
+# The finalized dataset records hop source patterns as compact "L"/"W"
+# strings. Some older/intermediate rows and helper metadata use the expanded
+# names below; these aliases are schema variants, not heuristic guesses.
+TARGET_SOURCE_TYPE_BY_HOP_KIND = {
+    "l": "local_document_search",
+    "local": "local_document_search",
+    "local_document_search": "local_document_search",
+    "w": "web_search",
+    "web": "web_search",
+    "web_search": "web_search",
+}
 
 
 class PrivacyHopQAMetrics(BaseMetrics):
@@ -142,16 +157,98 @@ def _prefix_progress_by_hop(score: dict) -> dict[str, dict[str, float | int | bo
     return progress
 
 
+def _target_source_by_hop(problem: dict) -> dict[str, str]:
+    """Return the gold tool/source type for each hop from the dataset L/W pattern."""
+    target: dict[str, str] = {}
+    pattern = str(problem.get("pattern") or "")
+    for idx, hop in enumerate(problem.get("hops") or [], start=1):
+        raw_kind = str(hop.get("hop_type") or hop.get("source") or "").strip().casefold()
+        if not raw_kind and idx <= len(pattern):
+            raw_kind = pattern[idx - 1].casefold()
+        source_type = TARGET_SOURCE_TYPE_BY_HOP_KIND.get(raw_kind)
+        if source_type:
+            target[str(hop.get("hop_number") or idx)] = source_type
+    return target
+
+
+def _planned_source_types(output_text: str) -> set[str]:
+    payload = extract_json(output_text)
+    if not isinstance(payload, list):
+        raise ValueError("hop_plan output must be a JSON list of retrieval actions")
+    source_types: set[str] = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ValueError("hop_plan JSON list entries must be objects")
+        action_type = str(item.get("type") or "").strip().casefold()
+        if action_type in {"web_search", "local_document_search"}:
+            source_types.add(action_type)
+    return source_types
+
+
+def _hop_correctness(score: dict) -> dict[str, bool]:
+    return {
+        str(hop_score.get("hop")): bool(hop_score.get("correct"))
+        for hop_score in score.get("per_hop", []) or []
+        if hop_score.get("hop") is not None
+    }
+
+
+def _hop_iteration_counts(training_texts: list) -> dict[str, int]:
+    iterations_by_hop: dict[str, set[int]] = {}
+    for trace in training_texts:
+        privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
+        stage = str(privacy_meta.get("log_name") or "")
+        hop_number = privacy_meta.get("hop_number")
+        iteration = privacy_meta.get("iteration")
+        if stage not in TRAINABLE_CONTROL_STAGES or hop_number is None or iteration is None:
+            continue
+        iterations_by_hop.setdefault(str(hop_number), set()).add(int(iteration))
+    return {hop_number: max(len(iterations), 1) for hop_number, iterations in iterations_by_hop.items()}
+
+
+def _annotate_answer_advantage_segments(training_texts: list) -> None:
+    """Mark answer rewards for hop/stage-local advantage comparison.
+
+    The trainer uses these fields only to build leave-one-out baseline buckets.
+    They do not create extra gradient examples.
+    """
+    segments: dict[tuple[str, str], list] = {}
+    for trace in training_texts:
+        privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
+        stage = str(privacy_meta.get("log_name") or "")
+        hop_number = privacy_meta.get("hop_number")
+        if stage not in TRAINABLE_CONTROL_STAGES or hop_number is None:
+            continue
+        segments.setdefault((str(hop_number), stage), []).append(trace)
+
+    for (hop_number, stage), traces in segments.items():
+        segment_key = f"privacy_hopqa:hop:{hop_number}:stage:{stage}"
+        segment_length = len(traces)
+        if segment_length == 0:
+            continue
+        padding_value = float(traces[0].reward)
+        for local_index, trace in enumerate(traces):
+            trace.metadata["step_advantage_group"] = segment_key
+            trace.metadata["step_advantage_local_index"] = local_index
+            trace.metadata["step_advantage_segment_length"] = segment_length
+            trace.metadata["step_advantage_padding_value"] = padding_value
+
+
 def _assign_training_rewards(
     training_texts: list,
+    problem: dict,
     score: dict,
     training_reward_mode: str,
     zero_error_step_reward: bool = True,
     error_records: list[dict] | None = None,
+    source_bonus: float = 0.25,
 ) -> None:
     outcome_reward = float(score["reward"])
     prefix_progress = _prefix_progress_by_hop(score)
-    apply_zero_error_step_reward = zero_error_step_reward and training_reward_mode == "prefix_progress"
+    hop_correct = _hop_correctness(score)
+    hop_iterations = _hop_iteration_counts(training_texts)
+    target_sources = _target_source_by_hop(problem)
+    apply_zero_error_step_reward = zero_error_step_reward and training_reward_mode in {"prefix_progress", "hop_step"}
 
     # Per-trace error match: exact captured_call_index values that had a
     # recorded error event during the rollout. We zero ONLY those specific
@@ -177,11 +274,41 @@ def _assign_training_rewards(
     for trace in training_texts:
         privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
         hop_number = privacy_meta.get("hop_number")
-        hop_progress = prefix_progress.get(str(hop_number)) if hop_number is not None else None
+        hop_key = str(hop_number) if hop_number is not None else None
+        hop_progress = prefix_progress.get(hop_key) if hop_key is not None else None
         if training_reward_mode == "outcome":
             reward = outcome_reward
         elif training_reward_mode == "prefix_progress":
             reward = float((hop_progress or {}).get("reward", outcome_reward))
+        elif training_reward_mode == "hop_step":
+            # Hop-step reward is local to the hop currently being trained:
+            #   doc_choose/hop_resolve: correct_hop / hop_iteration_count
+            #   hop_plan: (correct_hop + 0.25 * searched_gold_source_type)
+            #             / hop_iteration_count
+            # The source-type term is only a small shaping bonus. For a fixed
+            # iteration count, a correct hop is always better than an incorrect
+            # hop, even if the incorrect hop searched the right source type.
+            stage = str(privacy_meta.get("log_name") or "")
+            if stage in TRAINABLE_CONTROL_STAGES and hop_key is not None:
+                iteration_count = float(max(hop_iterations.get(hop_key, 1), 1))
+                correct_value = 1.0 if hop_correct.get(hop_key, False) else 0.0
+                target_source = target_sources.get(hop_key)
+                target_source_searched = False
+                if stage == "hop_plan" and target_source:
+                    target_source_searched = target_source in _planned_source_types(trace.output_text)
+                    reward = (correct_value + float(source_bonus) * float(target_source_searched)) / iteration_count
+                else:
+                    reward = correct_value / iteration_count
+                privacy_meta.update(
+                    {
+                        "hop_step_iteration_count": int(iteration_count),
+                        "hop_step_target_source": target_source,
+                        "hop_step_target_source_searched": target_source_searched,
+                        "hop_step_source_bonus": float(source_bonus),
+                    }
+                )
+            else:
+                reward = outcome_reward
         else:
             raise ValueError(f"unknown privacy_hopqa training_reward_mode: {training_reward_mode}")
         is_error_trace = False
@@ -206,6 +333,8 @@ def _assign_training_rewards(
         )
         if apply_zero_error_step_reward:
             trace.metadata["padding_reward"] = max_prefix_reward
+    if training_reward_mode == "hop_step":
+        _annotate_answer_advantage_segments(training_texts)
 
 
 async def generate_privacy_hopqa_rollout(
@@ -444,10 +573,12 @@ async def _run_privacy_hopqa_rollout_async(
     training_texts = adapter.make_training_texts(group_id=group_id, base_metadata=base_metadata)
     _assign_training_rewards(
         training_texts,
+        problem,
         score,
         settings.training_reward_mode,
         zero_error_step_reward=settings.zero_error_step_reward,
         error_records=error_records_for_reward,
+        source_bonus=settings.hop_step_source_bonus,
     )
 
     metrics = PrivacyHopQAMetrics(
