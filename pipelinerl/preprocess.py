@@ -101,6 +101,7 @@ def _make_dataset_chunk_message(
     dataset: list[dict],
     *,
     num_filtered_out: int,
+    num_filter_seen: int,
     chunk_index: int,
     chunk_count: int,
 ) -> dict[str, Any]:
@@ -108,6 +109,7 @@ def _make_dataset_chunk_message(
         "kind": PREPROCESS_DATASET_CHUNK_KIND,
         "dataset": dataset,
         "num_filtered_out": num_filtered_out,
+        "num_filter_seen": num_filter_seen,
         "chunk_index": chunk_index,
         "chunk_count": chunk_count,
     }
@@ -117,6 +119,7 @@ def _dataset_chunk_message_size_bytes(
     dataset: list[dict],
     *,
     num_filtered_out: int,
+    num_filter_seen: int,
     chunk_index: int,
     chunk_count: int,
 ) -> int:
@@ -125,6 +128,7 @@ def _dataset_chunk_message_size_bytes(
             _make_dataset_chunk_message(
                 dataset,
                 num_filtered_out=num_filtered_out,
+                num_filter_seen=num_filter_seen,
                 chunk_index=chunk_index,
                 chunk_count=chunk_count,
             ),
@@ -137,6 +141,7 @@ def _split_dataset_for_output_queue(
     dataset: list[dict],
     *,
     num_filtered_out: int,
+    num_filter_seen: int,
     max_entry_size: int,
 ) -> list[dict[str, Any]]:
     # SharedMemoryQueue rejects entries above max_entry_size. A single
@@ -145,6 +150,7 @@ def _split_dataset_for_output_queue(
     full_size = _dataset_chunk_message_size_bytes(
         dataset,
         num_filtered_out=num_filtered_out,
+        num_filter_seen=num_filter_seen,
         chunk_index=1,
         chunk_count=1,
     )
@@ -153,6 +159,7 @@ def _split_dataset_for_output_queue(
             _make_dataset_chunk_message(
                 dataset,
                 num_filtered_out=num_filtered_out,
+                num_filter_seen=num_filter_seen,
                 chunk_index=1,
                 chunk_count=1,
             )
@@ -163,6 +170,7 @@ def _split_dataset_for_output_queue(
             _make_dataset_chunk_message(
                 [],
                 num_filtered_out=num_filtered_out,
+                num_filter_seen=num_filter_seen,
                 chunk_index=1,
                 chunk_count=1,
             )
@@ -176,6 +184,7 @@ def _split_dataset_for_output_queue(
         candidate_size = _dataset_chunk_message_size_bytes(
             candidate_chunk,
             num_filtered_out=next_filtered_out,
+            num_filter_seen=num_filter_seen if len(chunks) == 0 else 0,
             chunk_index=len(chunks) + 1,
             chunk_count=len(chunks) + 1,
         )
@@ -187,6 +196,7 @@ def _split_dataset_for_output_queue(
             single_entry_size = _dataset_chunk_message_size_bytes(
                 [entry],
                 num_filtered_out=next_filtered_out,
+                num_filter_seen=num_filter_seen if len(chunks) == 0 else 0,
                 chunk_index=len(chunks) + 1,
                 chunk_count=len(chunks) + 1,
             )
@@ -207,6 +217,7 @@ def _split_dataset_for_output_queue(
         message = _make_dataset_chunk_message(
             chunk_entries,
             num_filtered_out=num_filtered_out if chunk_index == 1 else 0,
+            num_filter_seen=num_filter_seen if chunk_index == 1 else 0,
             chunk_index=chunk_index,
             chunk_count=len(chunks),
         )
@@ -470,6 +481,7 @@ def process_chunk(
                     rl_config=rl_config,
                 )
                 num_filtered_out = 0
+                num_filter_seen = len(dataset)
                 if rl_config.filter_zero_advantage_groups:
                     dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
                 extra_fields = None
@@ -488,6 +500,7 @@ def process_chunk(
                 )
                 if dataset_summary:
                     dataset_summary["num_filtered_out"] = num_filtered_out
+                    dataset_summary["num_filter_seen"] = num_filter_seen
                 if dataset_summary and chunk_summary:
                     input_pickle_bytes = int(chunk_summary.get("container_pickle_bytes") or 0)
                     output_pickle_bytes = int(dataset_summary.get("container_pickle_bytes") or 0)
@@ -506,6 +519,7 @@ def process_chunk(
                 output_messages = _split_dataset_for_output_queue(
                     dataset,
                     num_filtered_out=num_filtered_out,
+                    num_filter_seen=num_filter_seen,
                     max_entry_size=output_queue.shared_array.max_entry_size,
                 )
                 if len(output_messages) > 1:
@@ -735,7 +749,11 @@ def run_preprocessing_loop(
     target_samples_per_lead = samples_per_trainer[0] + samples_per_lead_per_step
     
     # Per-trainer sample tracking (similar to finetune_loop.py)
-    total_filtered_out = 0  # Track total filtered samples across all batches
+    # Track zero-advantage filtering in training-text entries, not original
+    # dataset rows. The denominator is the number of preprocessed entries seen
+    # by the filter before it removed all-zero-advantage groups.
+    total_filtered_out = 0
+    total_filter_seen = 0
 
     with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
@@ -770,6 +788,7 @@ def run_preprocessing_loop(
                 fetching_took = 0
                 writing_took = 0
                 num_filtered_out = 0
+                num_filter_seen = 0
                 while True:
                     if (
                         trainer_state.samples_processed is not None
@@ -822,13 +841,18 @@ def run_preprocessing_loop(
                             logger.error(f"Traceback: {dataset['traceback']}")
                             raise Exception(dataset["error"])
                         if isinstance(dataset, dict) and dataset.get("kind") == PREPROCESS_DATASET_CHUNK_KIND:
-                            num_filtered_out += int(dataset.get("num_filtered_out") or 0)
-                            if dataset.get("num_filtered_out"):
+                            chunk_filtered_out = int(dataset.get("num_filtered_out") or 0)
+                            chunk_filter_seen = int(dataset.get("num_filter_seen") or (chunk_filtered_out + len(dataset.get("dataset") or [])))
+                            num_filtered_out += chunk_filtered_out
+                            num_filter_seen += chunk_filter_seen
+                            if chunk_filtered_out:
                                 logger.info(
-                                    "Filtered out %s samples from groups with zero advantage.",
-                                    dataset["num_filtered_out"],
+                                    "Filtered out %s/%s samples from groups with zero advantage.",
+                                    chunk_filtered_out,
+                                    chunk_filter_seen,
                                 )
-                            total_filtered_out += int(dataset.get("num_filtered_out") or 0)
+                            total_filtered_out += chunk_filtered_out
+                            total_filter_seen += chunk_filter_seen
                             dataset_from_chunk_message = True
                             dataset = dataset.get("dataset")
                         if not isinstance(dataset, list):
@@ -836,10 +860,17 @@ def run_preprocessing_loop(
                                 f"Unexpected preprocess worker result type: {type(dataset).__name__}"
                             )
                         if rl_config.filter_zero_advantage_groups and not dataset_from_chunk_message:
+                            filter_seen = len(dataset)
                             dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
+                            num_filter_seen = filter_seen
                             total_filtered_out += num_filtered_out
+                            total_filter_seen += filter_seen
                             if num_filtered_out > 0:
-                                logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
+                                logger.info(
+                                    "Filtered out %s/%s samples from groups with zero advantage.",
+                                    num_filtered_out,
+                                    filter_seen,
+                                )
                         fetching_took += time.time() - start_fetching
                     except Empty:
                         pass
@@ -962,7 +993,15 @@ def run_preprocessing_loop(
                             "preprocessor/queue/output_samples": approx_samples_in_output_queue,
                             "preprocessor/queue/output": output_queue.qsize(),
                             "preprocessor/filtered_out_samples": num_filtered_out,
+                            "preprocessor/filter_seen_samples": num_filter_seen,
+                            "preprocessor/filtered_out_fraction": (
+                                num_filtered_out / num_filter_seen if num_filter_seen else 0.0
+                            ),
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
+                            "preprocessor/total_filter_seen_samples": total_filter_seen,
+                            "preprocessor/total_filtered_out_fraction": (
+                                total_filtered_out / total_filter_seen if total_filter_seen else 0.0
+                            ),
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
@@ -974,7 +1013,8 @@ def run_preprocessing_loop(
                         processed_samples = published_samples - last_published_samples
                         last_published_samples = published_samples
                         logger.info(
-                            f"Processed {processed_samples} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
+                            f"Processed {processed_samples} samples "
+                            f"(filtered out {num_filtered_out}/{num_filter_seen}) in {processing_took:.3f}s"
                             f" (fetching took {fetching_took:.3f} and writing took {writing_took:.3f})"
                             f" and wrote to {output_stream}, total {published_samples} samples so far,"
                             f" ~{approx_samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
@@ -983,6 +1023,7 @@ def run_preprocessing_loop(
                         fetching_took = 0
                         writing_took = 0
                         num_filtered_out = 0
+                        num_filter_seen = 0
             finally:
                 # Clean up worker processes
                 for worker in workers:
