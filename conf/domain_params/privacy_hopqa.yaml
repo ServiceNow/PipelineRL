@@ -62,13 +62,12 @@ retrieval_context_mode: windowed_evidence
 retrieval_source_chars: 0
 retrieval_chunk_chars: 4000
 retrieval_chunk_overlap_chars: 800
-reader_window_chars: 16000
+reader_window_chars: 10000
 reader_window_overlap_chars: 1000
 max_windows_per_parent: 0
 # Parent documents with <= read_all_windows_max_count evidence windows are read
-# in full. Longer parent docs should be removed by the helper live filter and
-# blacklist; if one slips through, read only query-relevant batches rather than
-# exploding the rollout.
+# in full. Longer parent docs are kept available, but read only query-relevant
+# batches rather than exploding the rollout.
 large_parent_window_policy: top_with_neighbors
 read_all_windows_max_count: 5
 large_parent_top_windows: 4

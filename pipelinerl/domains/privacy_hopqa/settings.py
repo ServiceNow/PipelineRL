@@ -93,7 +93,7 @@ class PrivacyHopQASettings:
     retrieval_source_chars: int = 0
     retrieval_chunk_chars: int = 4000
     retrieval_chunk_overlap_chars: int = 800
-    reader_window_chars: int = 16000
+    reader_window_chars: int = 10000
     reader_window_overlap_chars: int = 1000
     max_windows_per_parent: int = 0
     large_parent_window_policy: str = "top_with_neighbors"
@@ -166,7 +166,7 @@ class PrivacyHopQASettings:
             retrieval_source_chars=int(data.get("retrieval_source_chars", 0)),
             retrieval_chunk_chars=int(data.get("retrieval_chunk_chars", 4000)),
             retrieval_chunk_overlap_chars=int(data.get("retrieval_chunk_overlap_chars", 800)),
-            reader_window_chars=int(data.get("reader_window_chars", 16000)),
+            reader_window_chars=int(data.get("reader_window_chars", 10000)),
             reader_window_overlap_chars=int(data.get("reader_window_overlap_chars", 1000)),
             max_windows_per_parent=int(data.get("max_windows_per_parent", 0)),
             large_parent_window_policy=str(data.get("large_parent_window_policy", "top_with_neighbors")),

@@ -474,13 +474,17 @@ class CandidateDoc:
         return card
 
     def as_reader_input(self, excerpt_chars: int) -> dict[str, Any]:
+        excerpt_limit = int(excerpt_chars)
+        excerpt = self.excerpt
+        if excerpt_limit > 0:
+            excerpt = _truncate(excerpt, excerpt_limit)
         document = {
             "doc_id": self.doc_id,
             "source": self.source,
             "title": self.title,
             "locator": self.locator,
             "queries": self.queries,
-            "excerpt": self.excerpt,
+            "excerpt": excerpt,
         }
         parent_doc_id = self.metadata.get("parent_doc_id")
         if parent_doc_id and parent_doc_id != self.doc_id:
@@ -1700,15 +1704,39 @@ class PrivacyHopQAAgent:
         return selected
 
     async def _read_document(self, hop: HopState, candidate: CandidateDoc, iteration: int) -> ReaderResult:
+        reader_excerpt_chars = self._reader_excerpt_chars()
+        reader_input = candidate.as_reader_input(reader_excerpt_chars)
+        reader_input_excerpt = str(reader_input.get("excerpt") or "")
+        reader_log_metadata = {
+            "doc_id": candidate.doc_id,
+            "source": candidate.source,
+            "parent_doc_id": str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
+            "evidence_window_id": str(candidate.metadata.get("evidence_window_id") or candidate.doc_id),
+            "window_index": candidate.metadata.get("window_index"),
+            "window_count": candidate.metadata.get("window_count"),
+            "excerpt_chars": len(candidate.excerpt),
+            "reader_input_excerpt_chars": len(reader_input_excerpt),
+            "reader_input_truncated": bool(reader_excerpt_chars > 0 and len(candidate.excerpt) > reader_excerpt_chars),
+            "reader_excerpt_chars": reader_excerpt_chars,
+            "reader_window_chars": self.settings.reader_window_chars,
+            "doc_read_max_tokens": self.settings.doc_read_max_tokens,
+        }
+        if "source_text_chars" in candidate.metadata:
+            reader_log_metadata["source_text_chars"] = candidate.metadata["source_text_chars"]
+        if "window_char_start" in candidate.metadata:
+            reader_log_metadata["window_char_start"] = candidate.metadata["window_char_start"]
+        if "window_char_end" in candidate.metadata:
+            reader_log_metadata["window_char_end"] = candidate.metadata["window_char_end"]
         prompt = build_doc_reader_prompt(
             numbered_questions=self.numbered_questions,
             current_hop_number=hop.hop_number,
             current_hop_question=self._materialize_question(hop.question),
             current_answers_so_far=self._current_answers_so_far(),
-            document=candidate.as_reader_input(self._reader_excerpt_chars()),
+            document=reader_input,
         )
         self._save_prompt(f"doc_read_iter{iteration}_hop{hop.hop_number}_{candidate.doc_id.replace('/', '_')}", prompt)
         start_s = self._elapsed_s()
+        response: str | None = None
         try:
             response = await self.llm_adapter.generate_text(
                 prompt,
@@ -1718,6 +1746,7 @@ class PrivacyHopQAAgent:
                 context_margin_tokens=self.settings.generation_context_margin_tokens,
                 hop_number=hop.hop_number,
                 iteration=iteration,
+                log_metadata=reader_log_metadata,
             )
             payload = extract_json(response)
             proposed_answer = str(payload.get("proposed_answer") or "").strip()
@@ -1754,6 +1783,18 @@ class PrivacyHopQAAgent:
         except Exception as exc:
             if is_llm_infrastructure_error(exc):
                 raise
+            failure_record = {
+                "rollout_id": self.llm_adapter.rollout_id,
+                "task_id": self.llm_adapter.task_id,
+                "chain_id": self.llm_adapter.chain_id,
+                "hop_number": hop.hop_number,
+                "iteration": iteration,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "response_chars": (len(response) if response is not None else None),
+                **reader_log_metadata,
+            }
+            logger.warning("privacy_hopqa doc_read failure: %s", json.dumps(failure_record, sort_keys=True))
             logger.warning("doc read failed for %s: %s", candidate.doc_id, exc)
             self._record_error(
                 stage="doc_read",
@@ -1762,7 +1803,11 @@ class PrivacyHopQAAgent:
                 exc=exc,
                 lane=f"error:read:{candidate.doc_id}",
                 label=f"read error {candidate.doc_id}",
-                meta={"doc_id": candidate.doc_id, "source": candidate.source},
+                meta={
+                    **reader_log_metadata,
+                    "error_type": type(exc).__name__,
+                    "response_chars": (len(response) if response is not None else None),
+                },
             )
             raise PrivacyHopQAProtocolError(f"doc_read protocol error: {exc}") from exc
         end_s = self._elapsed_s()
@@ -1779,6 +1824,8 @@ class PrivacyHopQAAgent:
                 "parent_doc_id": str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
                 "window_index": candidate.metadata.get("window_index"),
                 "window_count": candidate.metadata.get("window_count"),
+                "excerpt_chars": len(candidate.excerpt),
+                "reader_window_chars": self.settings.reader_window_chars,
                 "source": candidate.source,
                 "title": candidate.title,
                 "can_answer": result.can_answer,

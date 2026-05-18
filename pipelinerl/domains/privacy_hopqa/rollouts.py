@@ -172,13 +172,16 @@ def _target_source_by_hop(problem: dict) -> dict[str, str]:
 
 
 def _planned_source_types(output_text: str) -> set[str]:
-    payload = extract_json(output_text)
+    try:
+        payload = extract_json(output_text)
+    except (TypeError, ValueError):
+        return set()
     if not isinstance(payload, list):
-        raise ValueError("hop_plan output must be a JSON list of retrieval actions")
+        return set()
     source_types: set[str] = set()
     for item in payload:
         if not isinstance(item, dict):
-            raise ValueError("hop_plan JSON list entries must be objects")
+            continue
         action_type = str(item.get("type") or "").strip().casefold()
         if action_type in {"web_search", "local_document_search"}:
             source_types.add(action_type)

@@ -88,7 +88,14 @@ class PrivacyHopQALLMAdapter:
             return True
         return log_name in PLANNING_LOG_NAMES
 
-    def _log_prompt_summary(self, *, log_name: str, prompt_tokens: int, force: bool = False) -> None:
+    def _log_prompt_summary(
+        self,
+        *,
+        log_name: str,
+        prompt_tokens: int,
+        force: bool = False,
+        log_metadata: dict[str, Any] | None = None,
+    ) -> None:
         previous_max = self.max_prompt_tokens_by_log_name.get(log_name, 0)
         if not force and prompt_tokens <= previous_max and prompt_tokens < 4096:
             return
@@ -99,6 +106,8 @@ class PrivacyHopQALLMAdapter:
             "log_name": log_name,
             "prompt_tokens": int(prompt_tokens),
         }
+        if log_metadata:
+            record["metadata"] = log_metadata
         logger.info("privacy_hopqa prompt summary: %s", json.dumps(record, sort_keys=True))
         self.max_prompt_tokens_by_log_name[log_name] = max(previous_max, prompt_tokens)
 
@@ -109,6 +118,8 @@ class PrivacyHopQALLMAdapter:
         prompt_tokens: int,
         output_tokens: int,
         requested_model: str | None,
+        budget: dict[str, Any] | None = None,
+        log_metadata: dict[str, Any] | None = None,
     ) -> None:
         record = {
             "rollout_id": self.rollout_id,
@@ -122,7 +133,33 @@ class PrivacyHopQALLMAdapter:
             "captured": self._should_capture(log_name),
             "requested_model": requested_model or self.llm.model_name,
         }
+        if budget:
+            record["budget"] = budget
+        if log_metadata:
+            record["metadata"] = log_metadata
         logger.info("privacy_hopqa llm call summary: %s", json.dumps(record, sort_keys=True))
+
+    def _base_log_record(
+        self,
+        *,
+        log_name: str,
+        hop_number: int | None,
+        iteration: int | None,
+        log_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "rollout_id": self.rollout_id,
+            "task_id": self.task_id,
+            "chain_id": self.chain_id,
+            "log_name": log_name,
+        }
+        if hop_number is not None:
+            record["hop_number"] = int(hop_number)
+        if iteration is not None:
+            record["iteration"] = int(iteration)
+        if log_metadata:
+            record["metadata"] = log_metadata
+        return record
 
     async def _run_generation(
         self,
@@ -162,20 +199,45 @@ class PrivacyHopQALLMAdapter:
         context_margin_tokens: int = 0,
         hop_number: int | None = None,
         iteration: int | None = None,
+        log_metadata: dict[str, Any] | None = None,
     ) -> str:
         prompt_text = str(prompt)
         prompt_obj = Prompt(messages=[{"role": "user", "content": prompt_text}])
         estimated_prompt_tokens = max(0, self.llm.count_tokens(prompt_obj.messages))
-        self._log_prompt_summary(log_name=log_name, prompt_tokens=estimated_prompt_tokens)
+        self._log_prompt_summary(
+            log_name=log_name,
+            prompt_tokens=estimated_prompt_tokens,
+            log_metadata=log_metadata,
+        )
         parameters_override: dict[str, Any] = {}
+        budget_record: dict[str, Any] | None = None
         if max_tokens is not None:
             requested_max_tokens = max(1, int(max_tokens))
             safe_max_tokens = requested_max_tokens
+            budget_record = {
+                "requested_max_tokens": requested_max_tokens,
+                "safe_max_tokens": safe_max_tokens,
+                "estimated_prompt_tokens": estimated_prompt_tokens,
+            }
             if max_context_tokens is not None:
                 context_limit = int(max_context_tokens)
                 margin = int(context_margin_tokens)
                 remaining_tokens = context_limit - estimated_prompt_tokens - margin
+                budget_record.update(
+                    {
+                        "context_limit": context_limit,
+                        "context_margin_tokens": margin,
+                        "remaining_tokens": remaining_tokens,
+                    }
+                )
                 if remaining_tokens <= 0:
+                    record = self._base_log_record(
+                        log_name=log_name,
+                        hop_number=hop_number,
+                        iteration=iteration,
+                        log_metadata=log_metadata,
+                    )
+                    record["budget"] = budget_record
                     logger.warning(
                         "privacy_hopqa skipped %s generation because prompt_tokens=%s exceeds context_limit=%s margin=%s",
                         log_name,
@@ -183,12 +245,22 @@ class PrivacyHopQALLMAdapter:
                         context_limit,
                         margin,
                     )
+                    logger.warning("privacy_hopqa generation skipped: %s", json.dumps(record, sort_keys=True))
                     raise PrivacyHopQAContextLengthError(
                         f"{log_name} prompt has {estimated_prompt_tokens} tokens, leaving no room in "
                         f"context limit {context_limit} with margin {margin}"
                     )
                 safe_max_tokens = min(requested_max_tokens, max(1, remaining_tokens))
+                budget_record["safe_max_tokens"] = safe_max_tokens
+                budget_record["capped"] = safe_max_tokens < requested_max_tokens
                 if safe_max_tokens < requested_max_tokens:
+                    record = self._base_log_record(
+                        log_name=log_name,
+                        hop_number=hop_number,
+                        iteration=iteration,
+                        log_metadata=log_metadata,
+                    )
+                    record["budget"] = budget_record
                     logger.warning(
                         "privacy_hopqa capped %s max_tokens from %s to %s for prompt_tokens=%s context_limit=%s margin=%s",
                         log_name,
@@ -198,6 +270,7 @@ class PrivacyHopQALLMAdapter:
                         context_limit,
                         margin,
                     )
+                    logger.warning("privacy_hopqa generation capped: %s", json.dumps(record, sort_keys=True))
             parameters_override["max_tokens"] = safe_max_tokens
 
         try:
@@ -209,7 +282,12 @@ class PrivacyHopQALLMAdapter:
         except Exception as exc:
             exc_text = str(exc).lower()
             if "maximum context length" in exc_text or "requested" in exc_text or "context" in exc_text:
-                self._log_prompt_summary(log_name=log_name, prompt_tokens=estimated_prompt_tokens, force=True)
+                self._log_prompt_summary(
+                    log_name=log_name,
+                    prompt_tokens=estimated_prompt_tokens,
+                    force=True,
+                    log_metadata=log_metadata,
+                )
             raise
 
         prompt_tokens = max(0, llm_call.prompt_length_tokens)
@@ -222,6 +300,8 @@ class PrivacyHopQALLMAdapter:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             requested_model=model,
+            budget=budget_record,
+            log_metadata=log_metadata,
         )
 
         if self._should_capture(log_name):
