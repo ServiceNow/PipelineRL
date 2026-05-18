@@ -172,19 +172,19 @@ def _target_source_by_hop(problem: dict) -> dict[str, str]:
 
 
 def _planned_source_types(output_text: str) -> set[str]:
-    try:
-        payload = extract_json(output_text)
-    except (TypeError, ValueError):
-        return set()
+    payload = extract_json(output_text)
     if not isinstance(payload, list):
-        return set()
+        raise ValueError("hop_plan output must be a JSON list of retrieval actions")
     source_types: set[str] = set()
     for item in payload:
         if not isinstance(item, dict):
-            continue
+            raise ValueError("hop_plan JSON list entries must be objects")
         action_type = str(item.get("type") or "").strip().casefold()
         if action_type in {"web_search", "local_document_search"}:
-            source_types.add(action_type)
+            parameters = item.get("parameters") if isinstance(item.get("parameters"), dict) else {}
+            query = str(parameters.get("query") or item.get("description") or "").strip()
+            if query:
+                source_types.add(action_type)
     return source_types
 
 
@@ -209,23 +209,30 @@ def _hop_iteration_counts(training_texts: list) -> dict[str, int]:
     return {hop_number: max(len(iterations), 1) for hop_number, iterations in iterations_by_hop.items()}
 
 
-def _annotate_answer_advantage_segments(training_texts: list) -> None:
-    """Mark answer rewards for hop/stage-local advantage comparison.
+def _annotate_hop_step_advantage_segments(training_texts: list) -> None:
+    """Mark hop-step rewards for stage-local advantage comparison.
 
-    The trainer uses these fields only to build leave-one-out baseline buckets.
-    They do not create extra gradient examples.
+    Control stages are compared within each hop/stage segment. Non-control
+    stages, such as doc_read when capture_mode=all_calls, are placed in their
+    own zero-reward segments so they do not get accidental global-step
+    advantages. These fields only affect baseline buckets; they do not create
+    extra gradient examples.
     """
-    segments: dict[tuple[str, str], list] = {}
+    segments: dict[tuple[str, str, str], list] = {}
     for trace in training_texts:
         privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
         stage = str(privacy_meta.get("log_name") or "")
         hop_number = privacy_meta.get("hop_number")
-        if stage not in TRAINABLE_CONTROL_STAGES or hop_number is None:
-            continue
-        segments.setdefault((str(hop_number), stage), []).append(trace)
+        if stage in TRAINABLE_CONTROL_STAGES and hop_number is not None:
+            segments.setdefault(("control", str(hop_number), stage), []).append(trace)
+        else:
+            segments.setdefault(("ignored", "none", stage or "unknown"), []).append(trace)
 
-    for (hop_number, stage), traces in segments.items():
-        segment_key = f"privacy_hopqa:hop:{hop_number}:stage:{stage}"
+    for (kind, hop_number, stage), traces in segments.items():
+        if kind == "control":
+            segment_key = f"privacy_hopqa:hop:{hop_number}:stage:{stage}"
+        else:
+            segment_key = f"privacy_hopqa:ignored_stage:{stage}"
         segment_length = len(traces)
         if segment_length == 0:
             continue
@@ -279,6 +286,11 @@ def _assign_training_rewards(
         hop_number = privacy_meta.get("hop_number")
         hop_key = str(hop_number) if hop_number is not None else None
         hop_progress = prefix_progress.get(hop_key) if hop_key is not None else None
+        is_error_trace = False
+        if apply_zero_error_step_reward:
+            captured_call_index = privacy_meta.get("captured_call_index")
+            if captured_call_index is not None and int(captured_call_index) in error_call_indices:
+                is_error_trace = True
         if training_reward_mode == "outcome":
             reward = outcome_reward
         elif training_reward_mode == "prefix_progress":
@@ -292,7 +304,9 @@ def _assign_training_rewards(
             # iteration count, a correct hop is always better than an incorrect
             # hop, even if the incorrect hop searched the right source type.
             stage = str(privacy_meta.get("log_name") or "")
-            if stage in TRAINABLE_CONTROL_STAGES and hop_key is not None:
+            if is_error_trace:
+                reward = 0.0
+            elif stage in TRAINABLE_CONTROL_STAGES and hop_key is not None:
                 iteration_count = float(max(hop_iterations.get(hop_key, 1), 1))
                 correct_value = 1.0 if hop_correct.get(hop_key, False) else 0.0
                 target_source = target_sources.get(hop_key)
@@ -311,14 +325,10 @@ def _assign_training_rewards(
                     }
                 )
             else:
-                reward = outcome_reward
+                reward = 0.0
+                privacy_meta["hop_step_ignored_stage"] = stage
         else:
             raise ValueError(f"unknown privacy_hopqa training_reward_mode: {training_reward_mode}")
-        is_error_trace = False
-        if apply_zero_error_step_reward:
-            captured_call_index = privacy_meta.get("captured_call_index")
-            if captured_call_index is not None and int(captured_call_index) in error_call_indices:
-                is_error_trace = True
         if is_error_trace:
             reward = 0.0
         trace.reward = reward
@@ -337,7 +347,7 @@ def _assign_training_rewards(
         if apply_zero_error_step_reward:
             trace.metadata["padding_reward"] = max_prefix_reward
     if training_reward_mode == "hop_step":
-        _annotate_answer_advantage_segments(training_texts)
+        _annotate_hop_step_advantage_segments(training_texts)
 
 
 async def generate_privacy_hopqa_rollout(
