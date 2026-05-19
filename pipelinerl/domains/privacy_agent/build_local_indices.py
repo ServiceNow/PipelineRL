@@ -42,8 +42,13 @@ def build_local_indices_for_tasks(
     settings: PrivacyAgentSettings,
     max_workers: int = 4,
     force: bool = False,
+    local_file_source: str = "env",
+    prefer_md: bool = True,
 ) -> list[dict]:
     """Build task-local private-document indices for the given tasks."""
+
+    if local_file_source not in {"env", "all-files"}:
+        raise ValueError(f"Unsupported local_file_source={local_file_source!r}")
 
     _validate_embedding_settings(settings)
     index_root = settings.local_index_root
@@ -105,13 +110,20 @@ def build_local_indices_for_tasks(
             vector_store=vector_store,
         )
         ingestion = LocalDocumentIngestionTool(content_processor=content_processor, max_workers=max_workers)
-        stats = ingestion.ingest_paths(file_paths=task.get_local_files_list(), recursive=True)
+        if local_file_source == "all-files":
+            local_file_paths = task.get_all_task_files_list(prefer_md=prefer_md)
+        else:
+            local_file_paths = task.get_local_files_list()
+        stats = ingestion.ingest_paths(file_paths=local_file_paths, recursive=True)
         _write_metadata(
             task_output_dir / "metadata.json",
             {
                 "task_id": task_id,
+                "local_file_source": local_file_source,
+                "prefer_md": prefer_md,
                 "embedding_provider": run_cfg.get_embedding_provider(),
                 "embedding_model": run_cfg.get_embedding_model(),
+                "indexed_files": len(local_file_paths),
                 "processed_files": stats.processed_files,
                 "total_files": stats.total_files,
                 "task_data_root": str(settings.task_data_root),
@@ -128,6 +140,14 @@ def build_local_indices_for_tasks(
         )
 
     return build_records
+
+
+def _filter_task_shard(task_ids: list[str], num_shards: int, shard_index: int) -> list[str]:
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(f"shard_index must satisfy 0 <= shard_index < num_shards, got {shard_index}")
+    return [task_id for idx, task_id in enumerate(sorted(set(task_ids))) if idx % num_shards == shard_index]
 
 
 def _settings_from_args(args: argparse.Namespace) -> PrivacyAgentSettings:
@@ -177,21 +197,54 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--annotations-path", default=None)
     parser.add_argument("--curated-path", default=None)
+    parser.add_argument(
+        "--local-file-source",
+        choices=("env", "all-files"),
+        default="env",
+        help="Use env.json local files or every usable file under DRxxxx/files. Privacy HopQA finalized datasets require all-files.",
+    )
+    parser.add_argument("--prefer-md", dest="prefer_md", action="store_true")
+    parser.add_argument("--no-prefer-md", dest="prefer_md", action="store_false")
+    parser.add_argument("--task-id", action="append", default=[])
+    parser.add_argument("--task-ids-file", default=None)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.set_defaults(use_remote_embeddings=True)
+    parser.set_defaults(prefer_md=True)
     args = parser.parse_args()
 
     settings = _settings_from_args(args)
 
-    problems = load_problems(
-        [args.dataset_name],
-        **settings.dataset_loader_kwargs(),
+    explicit_task_ids = list(args.task_id or [])
+    if args.task_ids_file:
+        explicit_task_ids.extend(
+            line.strip()
+            for line in Path(args.task_ids_file).expanduser().read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+
+    if explicit_task_ids:
+        all_task_ids = sorted(set(explicit_task_ids))
+    else:
+        problems = load_problems(
+            [args.dataset_name],
+            **settings.dataset_loader_kwargs(),
+        )
+        all_task_ids = sorted({problem["task_id"] for problem in problems})
+
+    task_ids = _filter_task_shard(
+        all_task_ids,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
-    task_ids = sorted({problem["task_id"] for problem in problems})
+    print(f"Building {len(task_ids)} task indices for shard {args.shard_index}/{args.num_shards}")
     build_records = build_local_indices_for_tasks(
         task_ids=task_ids,
         settings=settings,
         max_workers=args.max_workers,
         force=args.force,
+        local_file_source=args.local_file_source,
+        prefer_md=args.prefer_md,
     )
     for record in build_records:
         if record.get("skipped"):

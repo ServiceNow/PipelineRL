@@ -837,9 +837,13 @@ def run_preprocessing_loop(
                         if isinstance(dataset, Exception):
                             raise dataset
                         if isinstance(dataset, dict) and "error" in dataset:
-                            logger.error(f"Got exception from the result queue: {dataset['error']}")
-                            logger.error(f"Traceback: {dataset['traceback']}")
-                            raise Exception(dataset["error"])
+                            error_message = str(dataset.get("error") or "").strip()
+                            traceback_text = str(dataset.get("traceback") or "").strip()
+                            logger.error("Got exception from the result queue: %s", error_message)
+                            logger.error("Traceback: %s", traceback_text)
+                            raise RuntimeError(
+                                error_message or f"preprocess worker failed:\n{traceback_text}"
+                            )
                         if isinstance(dataset, dict) and dataset.get("kind") == PREPROCESS_DATASET_CHUNK_KIND:
                             chunk_filtered_out = int(dataset.get("num_filtered_out") or 0)
                             chunk_filter_seen = int(dataset.get("num_filter_seen") or (chunk_filtered_out + len(dataset.get("dataset") or [])))

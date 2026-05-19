@@ -9,7 +9,7 @@ max_examples: null
 task_data_root: ${oc.env:PRIVACY_AGENT_TASK_DATA_ROOT,.privacy_agent/inputs/tasks}
 # Previous local-index default, kept for debugging old runs:
 # /mnt/llmd/results/exps/alexg/privacy_agent/local_indices_fixeddeps_20260415
-local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,/mnt/llmd/results/exps/alexg/privacy_hopqa_shared/q30_final_residual_review_20260513/local_indices_fixeddeps_20260415}
+local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,/mnt/llmd/results/exps/alexg/privacy_hopqa_shared/q30_final_residual_review_20260513/local_indices_goldcoverage_20260519}
 local_index_mmap_mode: r
 helper_service_url: ${oc.env:PRIVACY_AGENT_HELPER_URL, null}
 helper_timeout_s: 30.0
@@ -28,8 +28,10 @@ reward_mode: all_hops_correct
 # Training texts use the rollout outcome by default. Experimental stepwise modes:
 # training_reward_mode=prefix_progress gives each captured call
 # prefix_correct_hops_so_far / total_hops. training_reward_mode=hop_step gives
-# hop-local shaped reward: hop correctness plus a 0.25 source-type bonus for
-# hop_plan, divided by the number of iterations spent on that hop.
+# hop-local shaped reward. hop_plan gets hop correctness plus a small expected
+# source-type bonus; doc_choose gets hop correctness plus a small bonus for
+# selecting a parent document that aliases the gold document; hop_resolve gets
+# hop correctness only.
 # hop_step_efficiency_metric=llm_calls additionally scales each hop's shaped
 # reward by min_hop_llm_calls / rollout_hop_llm_calls within the comparison
 # group. This rewards cheaper successful hop attempts without using noisy
@@ -40,6 +42,7 @@ reward_mode: all_hops_correct
 # finetune.rl.pad_step_rewards_for_advantage=true.
 training_reward_mode: outcome
 hop_step_source_bonus: 0.25
+hop_step_doc_bonus: 0.25
 hop_step_efficiency_metric: none
 stop_after_incorrect_hop: false
 zero_error_step_reward: true

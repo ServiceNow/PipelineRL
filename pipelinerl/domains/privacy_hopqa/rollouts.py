@@ -259,6 +259,7 @@ def _assign_training_rewards(
     zero_error_step_reward: bool = True,
     error_records: list[dict] | None = None,
     source_bonus: float = 0.25,
+    doc_bonus: float = 0.25,
     hop_step_efficiency_metric: str = "none",
 ) -> None:
     outcome_reward = float(score["reward"])
@@ -305,17 +306,21 @@ def _assign_training_rewards(
             reward = float((hop_progress or {}).get("reward", outcome_reward))
         elif training_reward_mode == "hop_step":
             # Hop-step reward is local to the hop currently being trained:
-            #   doc_choose/hop_resolve: correct_hop
+            #   hop_resolve: correct_hop
             #   hop_plan with executable retrieval actions:
             #       correct_hop + 0.25 * searched_gold_source_type
+            #   doc_choose:
+            #       correct_hop + 0.25 * selected_gold_or_alias_parent
             #   hop_plan with no executable retrieval actions:
             #       0
-            # The source-type term is only a small shaping bonus for retrieval
-            # planning. Expensive hop attempts are penalized once, later in the
-            # RL data path, by hop-level LLM-call efficiency shaping when
-            # hop_step_efficiency_metric=llm_calls. We deliberately do not also
-            # divide by hop_iteration_count here, because that double-penalizes
-            # slow but correct attempts.
+            # These bonuses are small stage-local shaping terms. They reward
+            # choosing the right tool family and, after candidate docs are
+            # visible, choosing a gold/equivalent parent document. Expensive
+            # hop attempts are penalized once, later in the RL data path, by
+            # hop-level LLM-call efficiency shaping when
+            # hop_step_efficiency_metric=llm_calls. We deliberately do not
+            # also divide by hop_iteration_count here, because that
+            # double-penalizes slow but correct attempts.
             stage = str(privacy_meta.get("log_name") or "")
             if is_error_trace:
                 reward = 0.0
@@ -324,6 +329,7 @@ def _assign_training_rewards(
                 correct_value = 1.0 if hop_correct.get(hop_key, False) else 0.0
                 target_source = target_sources.get(hop_key)
                 target_source_searched = False
+                selected_gold_parent = False
                 planned_sources: set[str] = set()
                 if stage == "hop_plan":
                     planned_sources = _planned_source_types(trace.output_text)
@@ -334,6 +340,11 @@ def _assign_training_rewards(
                         )
                     else:
                         reward = 0.0
+                elif stage == "doc_choose":
+                    call_meta = privacy_meta.get("call_metadata")
+                    if isinstance(call_meta, dict):
+                        selected_gold_parent = bool(call_meta.get("doc_choose_selected_gold_parent"))
+                    reward = correct_value + float(doc_bonus) * float(selected_gold_parent)
                 else:
                     reward = correct_value
                 privacy_meta.update(
@@ -341,8 +352,10 @@ def _assign_training_rewards(
                         "hop_step_iteration_count": int(iteration_count),
                         "hop_step_target_source": target_source,
                         "hop_step_target_source_searched": target_source_searched,
+                        "hop_step_doc_choose_selected_gold_parent": selected_gold_parent,
                         "hop_step_executable_plan": stage != "hop_plan" or bool(planned_sources),
                         "hop_step_source_bonus": float(source_bonus),
+                        "hop_step_doc_bonus": float(doc_bonus),
                         "hop_step_efficiency_metric": hop_step_efficiency_metric,
                         "hop_step_efficiency_group": f"privacy_hopqa:hop:{hop_key}",
                     }
@@ -625,6 +638,7 @@ async def _run_privacy_hopqa_rollout_async(
         zero_error_step_reward=settings.zero_error_step_reward,
         error_records=error_records_for_reward,
         source_bonus=settings.hop_step_source_bonus,
+        doc_bonus=settings.hop_step_doc_bonus,
         hop_step_efficiency_metric=settings.hop_step_efficiency_metric,
     )
 

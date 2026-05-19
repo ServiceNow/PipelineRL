@@ -794,6 +794,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                 "rewards",
                 "step_reward",
                 "advantage_bucket",
+                "advantage_scale",
                 "step_reward_sum",
                 "step_reward_count",
                 "step_reward_std",
@@ -852,13 +853,22 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             columns=["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
         )
     assert len(df_advantages) == len(df_init)
-    assert df_advantages.columns.tolist() == [
+    expected_advantage_columns = [
         "group_id",
         "rollout_index",
         "step_index",
         "group_tokens",
         "advantages",
     ]
+    missing_advantage_columns = [
+        column for column in expected_advantage_columns if column not in df_advantages.columns
+    ]
+    if missing_advantage_columns:
+        raise ValueError(
+            "RL advantage table missing columns "
+            f"{missing_advantage_columns}; present columns={df_advantages.columns.tolist()}"
+        )
+    df_advantages = df_advantages[expected_advantage_columns]
 
     # Step 3: bring advantages and group level stats back to the main df
     drop_columns = [column for column in ["advantages", "group_tokens"] if column in df_init.columns]

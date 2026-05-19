@@ -260,6 +260,26 @@ class VectorStore:
 
         existing_metadata = self.documents[doc_id].get("metadata", {})
 
+        alias_fields = {
+            "source_identifier": "source_identifiers",
+            "original_path": "original_paths",
+            "file_path": "file_paths",
+            "relative_path": "relative_paths",
+            "filename": "filenames",
+        }
+        for source_key, alias_key in alias_fields.items():
+            values = [
+                existing_metadata.get(source_key),
+                new_metadata.get(source_key),
+            ]
+            aliases = existing_metadata.setdefault(alias_key, [])
+            if not isinstance(aliases, list):
+                aliases = [aliases]
+                existing_metadata[alias_key] = aliases
+            for value in values:
+                if value and value not in aliases:
+                    aliases.append(value)
+
         # Update access count
         existing_metadata["access_count"] = existing_metadata.get("access_count", 1) + 1
         existing_metadata["last_accessed"] = datetime.now().isoformat()

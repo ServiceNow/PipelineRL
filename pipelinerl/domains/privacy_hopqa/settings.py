@@ -68,6 +68,7 @@ class PrivacyHopQASettings:
     reward_mode: str = "all_hops_correct"
     training_reward_mode: str = "outcome"
     hop_step_source_bonus: float = 0.25
+    hop_step_doc_bonus: float = 0.25
     hop_step_efficiency_metric: str = "none"
     stop_after_incorrect_hop: bool = False
     # In stepwise training modes, individual planning traces whose
@@ -150,6 +151,7 @@ class PrivacyHopQASettings:
             reward_mode=str(data.get("reward_mode", "all_hops_correct")),
             training_reward_mode=str(data.get("training_reward_mode", "outcome")),
             hop_step_source_bonus=float(data.get("hop_step_source_bonus", 0.25)),
+            hop_step_doc_bonus=float(data.get("hop_step_doc_bonus", data.get("hop_step_source_bonus", 0.25))),
             hop_step_efficiency_metric=str(data.get("hop_step_efficiency_metric", "none")),
             stop_after_incorrect_hop=bool(data.get("stop_after_incorrect_hop", False)),
             zero_error_step_reward=bool(data.get("zero_error_step_reward", True)),

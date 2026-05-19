@@ -52,6 +52,7 @@ class CapturedLLMCall:
     requested_model: str | None
     hop_number: int | None = None
     iteration: int | None = None
+    log_metadata: dict[str, Any] | None = None
 
 
 class PrivacyHopQALLMAdapter:
@@ -322,11 +323,28 @@ class PrivacyHopQALLMAdapter:
                     requested_model=model,
                     hop_number=hop_number,
                     iteration=iteration,
+                    log_metadata=dict(log_metadata or {}),
                 )
             )
             self.last_captured_call_index_by_key[(log_name, hop_number, iteration)] = captured_index
 
         return llm_call.output.content or ""
+
+    def update_captured_metadata(
+        self,
+        log_name: str,
+        hop_number: int | None,
+        iteration: int | None,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Attach post-generation metadata, such as normalized chooser IDs."""
+        captured_index = self.last_captured_call_index_by_key.get((log_name, hop_number, iteration))
+        if captured_index is None:
+            return
+        captured = self.captured_calls[captured_index]
+        if captured.log_metadata is None:
+            captured.log_metadata = {}
+        captured.log_metadata.update(metadata)
 
     def make_training_texts(self, group_id: str | None, base_metadata: dict[str, Any]) -> list:
         traces = []
@@ -360,5 +378,7 @@ class PrivacyHopQALLMAdapter:
                     ),
                 }
             )
+            if captured.log_metadata:
+                trace.metadata["privacy_hopqa"]["call_metadata"] = dict(captured.log_metadata)
             traces.append(trace)
         return traces

@@ -105,6 +105,7 @@ _DOC_WINDOW_SUFFIX_RE = re.compile(r"#w\d+of\d+$", re.IGNORECASE)
 _TASK_ID_RE = re.compile(r"\bdr\d{4,}\b", re.IGNORECASE)
 _TASK_FILES_RE = re.compile(r"(dr\d{4,})/files/(.+)$", re.IGNORECASE)
 _LOCAL_DOC_RE = re.compile(r"(?:^|/)local/(dr\d{4,})/(.+)$", re.IGNORECASE)
+_COMPACT_DOC_NAME_RE = re.compile(r"[^a-z0-9]+")
 
 
 def _uses_legacy_retrieval_context(mode: str) -> bool:
@@ -120,6 +121,24 @@ def _strip_doc_extension(value: str) -> str:
         path = path[: -len(suffix)]
 
 
+def _compact_doc_name(value: str) -> str:
+    """Normalize common filename drift without crossing task boundaries."""
+    compact = _COMPACT_DOC_NAME_RE.sub("", str(value or "").lower())
+    return compact
+
+
+def _doc_name_variants(value: str) -> set[str]:
+    compact = _compact_doc_name(value)
+    if not compact:
+        return set()
+    variants = {compact}
+    q_to_quarter = re.sub(r"q([1-4])", r"quarter\1", compact)
+    quarter_to_q = re.sub(r"quarter([1-4])", r"q\1", compact)
+    variants.add(q_to_quarter)
+    variants.add(quarter_to_q)
+    return {variant for variant in variants if variant}
+
+
 def document_identity_aliases(value: Any, task_id: str | None = None) -> set[str]:
     """Stable document aliases for matching dataset gold IDs to runtime docs.
 
@@ -127,6 +146,12 @@ def document_identity_aliases(value: Any, task_id: str | None = None) -> set[str
     source-file locators or window IDs. These aliases intentionally keep task
     context, so same-named files in different DR tasks do not collide.
     """
+    if isinstance(value, (list, tuple, set)):
+        aliases: set[str] = set()
+        for item in value:
+            aliases.update(document_identity_aliases(item, task_id=task_id))
+        return aliases
+
     raw = str(value or "").strip()
     if not raw:
         return set()
@@ -145,12 +170,16 @@ def document_identity_aliases(value: Any, task_id: str | None = None) -> set[str
         doc_task = match.group(1).lower()
         rel_path = _strip_doc_extension(match.group(2).strip("/"))
         aliases.add(f"local/{doc_task}/{rel_path}")
-        aliases.add(f"{doc_task}:{Path(rel_path).name}")
-        if task_key and task_key == doc_task:
-            aliases.add(f"{task_key}:{Path(rel_path).name}")
+        # Keep path-derived aliases task- and path-scoped. Basename-only
+        # aliases are only safe for raw filename values handled below; emitting
+        # them here can falsely equate sibling files with the same name.
+        for variant in _doc_name_variants(rel_path):
+            aliases.add(f"local/{doc_task}/compact:{variant}")
 
     if task_key and "/" not in no_ext and len(no_ext) >= 6:
         aliases.add(f"{task_key}:{Path(no_ext).name}")
+        for variant in _doc_name_variants(Path(no_ext).name):
+            aliases.add(f"{task_key}:compact:{variant}")
 
     return aliases
 
@@ -346,7 +375,23 @@ def _candidate_identity_values(candidate: "CandidateDoc") -> list[Any]:
     ]
     if str(candidate.source or "").lower() == "local":
         values.append(candidate.title)
-    for key in ("doc_ref", "document_id", "file_path", "locator", "original_doc_id", "parent_doc_id", "path", "source_path", "url"):
+    for key in (
+        "doc_ref",
+        "document_id",
+        "file_path",
+        "file_paths",
+        "filenames",
+        "locator",
+        "original_doc_id",
+        "original_paths",
+        "parent_doc_id",
+        "path",
+        "relative_paths",
+        "source_identifier",
+        "source_identifiers",
+        "source_path",
+        "url",
+    ):
         values.append(candidate.metadata.get(key))
     return values
 
@@ -356,6 +401,20 @@ def _candidate_matches_gold(candidate: "CandidateDoc", hop: "HopState") -> bool:
         _candidate_identity_values(candidate),
         [hop.gold_doc_id, hop.gold_doc_ref],
     )
+
+
+def _gold_parent_ids_for_candidates(candidates: list["CandidateDoc"], hop: "HopState") -> list[str]:
+    """Return current candidate parent IDs that alias the hop's gold document."""
+    seen: set[str] = set()
+    parent_ids: list[str] = []
+    for candidate in candidates:
+        if not _candidate_matches_gold(candidate, hop):
+            continue
+        parent_id = _candidate_parent_id(candidate)
+        if parent_id not in seen:
+            seen.add(parent_id)
+            parent_ids.append(parent_id)
+    return parent_ids
 
 
 def _candidate_parent_groups(candidates: list["CandidateDoc"]) -> dict[str, list["CandidateDoc"]]:
@@ -1500,6 +1559,14 @@ class PrivacyHopQAAgent:
         title = Path(file_path).name if file_path else str(hit.get("doc_id") or "local document")
         score = hit.get("similarity_score", hit.get("relevance_score"))
         excerpt = str(hit.get("content") or hit.get("preview") or "")
+        candidate_metadata = dict(metadata)
+        candidate_metadata.update(
+            {
+                "file_path": file_path,
+                "folder_path": metadata.get("folder_path"),
+                "parent_doc_id": str(hit.get("doc_id") or f"local_missing_{action_id}_{rank}"),
+            }
+        )
         return CandidateDoc(
             doc_id=str(hit.get("doc_id") or f"local_missing_{action_id}_{rank}"),
             source="local",
@@ -1510,11 +1577,7 @@ class PrivacyHopQAAgent:
             rank=rank,
             queries=[query],
             search_action_ids=[action_id],
-            metadata={
-                "file_path": file_path,
-                "folder_path": metadata.get("folder_path"),
-                "parent_doc_id": str(hit.get("doc_id") or f"local_missing_{action_id}_{rank}"),
-            },
+            metadata=candidate_metadata,
         )
 
     async def _execute_retrieval_action(
@@ -1695,6 +1758,7 @@ class PrivacyHopQAAgent:
             return []
         parent_groups = _candidate_parent_groups(candidates)
         parent_ids = list(parent_groups)
+        gold_parent_ids = _gold_parent_ids_for_candidates(candidates, hop)
         if len(parent_ids) <= self.settings.choose_top_k:
             selected_parent_ids = parent_ids[: self.settings.choose_top_k]
             selected, selection_meta = self._expand_selected_parent_documents(
@@ -1716,6 +1780,8 @@ class PrivacyHopQAAgent:
                     "iteration": iteration,
                     "candidate_count": len(candidates),
                     "parent_candidate_count": len(parent_ids),
+                    "candidate_parent_doc_ids": parent_ids,
+                    "gold_candidate_parent_doc_ids": gold_parent_ids,
                     **selection_meta,
                     "skipped": True,
                 },
@@ -1778,6 +1844,19 @@ class PrivacyHopQAAgent:
             iteration=iteration,
             selection_stage="initial_model",
         )
+        selected_gold_parent = bool(set(selected_parent_ids).intersection(gold_parent_ids))
+        self.llm_adapter.update_captured_metadata(
+            log_name="doc_choose",
+            hop_number=hop.hop_number,
+            iteration=iteration,
+            metadata={
+                "candidate_parent_doc_ids": parent_ids,
+                "selected_parent_doc_ids": selected_parent_ids,
+                "selected_doc_ids": [doc.doc_id for doc in selected],
+                "gold_candidate_parent_doc_ids": gold_parent_ids,
+                "doc_choose_selected_gold_parent": selected_gold_parent,
+            },
+        )
         ended = self._elapsed_s()
         self._record_event(
             stage="doc_choose",
@@ -1790,6 +1869,9 @@ class PrivacyHopQAAgent:
                 "iteration": iteration,
                 "candidate_count": len(candidates),
                 "parent_candidate_count": len(parent_ids),
+                "candidate_parent_doc_ids": parent_ids,
+                "gold_candidate_parent_doc_ids": gold_parent_ids,
+                "doc_choose_selected_gold_parent": selected_gold_parent,
                 **selection_meta,
             },
         )
