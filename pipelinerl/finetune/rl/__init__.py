@@ -103,6 +103,10 @@ class RLConfig(BaseModel):
         default=False,
         description="When step_reward_advantages is enabled, pad each rollout's reward sequence with its final reward for advantage statistics only",
     )
+    normalize_step_loss_by_advantage_group: bool = Field(
+        default=False,
+        description="When step_reward_advantages is enabled, divide each row's final advantage by the number of real calls in its rollout/advantage-group segment",
+    )
     value_loss_coef: float = Field(
         default=0.0,
         description="Coefficient for the value loss in the final loss",
@@ -252,7 +256,6 @@ def rl_step(
         tokens_weights = torch.ones_like(group_tokens) / group_tokens
     else:
         tokens_weights = torch.ones_like(group_tokens) / config.batch_size
-
     if config.overlong_filtering:
         # filter out sequences that do not have eos_token_id
         overflow = torch.tensor(overflow, device=overflow.device)
@@ -484,10 +487,18 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             .reset_index()
         )
         df_reward_stats = df_stats[
-            ["group_id", "rollout_index", "step_index", "rewards", "step_reward", "padding_reward"]
+            [
+                "group_id",
+                "rollout_index",
+                "step_index",
+                "rewards",
+                "step_reward",
+                "padding_reward",
+            ]
         ].copy()
         df_reward_stats["is_padding"] = False
         df_reward_stats["advantage_bucket"] = df_reward_stats["step_index"].map(lambda value: f"step:{int(value)}")
+        df_reward_stats["advantage_scale"] = 1.0
 
         if "metadata" in df_init.columns:
             metadata = df_init["metadata"].apply(lambda value: value if isinstance(value, dict) else {})
@@ -533,6 +544,29 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         custom_mask = df_reward_stats["step_advantage_group"].notna()
         padded_rows = []
         if custom_mask.any():
+            if config.normalize_step_loss_by_advantage_group:
+                # Normalize multi-step credit expansion, not reward semantics
+                # or GSPO's token weighting. If one rollout emits three
+                # hop_plan calls for a hop while another emits one, the longer
+                # attempt should not get three times the policy-gradient signal
+                # purely because it made more trainable decisions.
+                custom_scaled = df_reward_stats[custom_mask].copy()
+                custom_scaled["_row_id"] = custom_scaled.index
+                group_call_counts = (
+                    custom_scaled.groupby(["group_id", "rollout_index", "step_advantage_group"])
+                    .size()
+                    .rename("advantage_group_call_count")
+                    .reset_index()
+                )
+                custom_scaled = pd.merge(
+                    custom_scaled,
+                    group_call_counts,
+                    on=["group_id", "rollout_index", "step_advantage_group"],
+                    how="left",
+                )
+                advantage_scale = 1.0 / custom_scaled["advantage_group_call_count"].astype(float).clip(lower=1.0)
+                df_reward_stats.loc[custom_scaled["_row_id"], "advantage_scale"] = advantage_scale.to_numpy()
+
             # Some domains, e.g. Privacy HopQA, want stepwise advantages
             # compared within semantic segments such as (hop, stage), not by
             # global rollout step. The rollout metadata defines those buckets.
@@ -663,6 +697,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                                 "step_advantage_local_index": None,
                                 "step_advantage_segment_length": segment_length,
                                 "step_advantage_padding_value": pad_value,
+                                "advantage_scale": 0.0,
                             }
                         )
 
@@ -694,6 +729,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                             "step_advantage_local_index": None,
                             "step_advantage_segment_length": None,
                             "step_advantage_padding_value": None,
+                            "advantage_scale": 0.0,
                         }
                     )
         if padded_rows:
@@ -718,7 +754,17 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         ]
         df_real_reward_stats = df_reward_stats[~df_reward_stats["is_padding"]].copy()
         df_advantages = pd.merge(
-            df_real_reward_stats[["group_id", "rollout_index", "step_index", "rewards", "step_reward", "advantage_bucket"]],
+            df_real_reward_stats[
+                [
+                    "group_id",
+                    "rollout_index",
+                    "step_index",
+                    "rewards",
+                    "step_reward",
+                    "advantage_bucket",
+                    "advantage_scale",
+                ]
+            ],
             df_grouped,
             on=["group_id", "advantage_bucket"],
             how="left"
@@ -736,8 +782,11 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                 loo_mean = current_reward
             std = row["step_reward_std"]
             if config.divide_advantage_by_std:
-                return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
-            return [(r - loo_mean) for r in rewards]
+                advantages = [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
+            else:
+                advantages = [(r - loo_mean) for r in rewards]
+            scale = float(row.get("advantage_scale", 1.0))
+            return [advantage * scale for advantage in advantages]
 
         df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
         df_advantages = df_advantages.drop(
@@ -812,7 +861,8 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     ]
 
     # Step 3: bring advantages and group level stats back to the main df
-    df = df_init.drop(columns=["advantages", "group_tokens"])
+    drop_columns = [column for column in ["advantages", "group_tokens"] if column in df_init.columns]
+    df = df_init.drop(columns=drop_columns)
     df = pd.merge(df, df_advantages, on=["group_id", "rollout_index", "step_index"], how="left")
     # Debug print lengths of all dataframes
     assert len(df) == len(df_init)
