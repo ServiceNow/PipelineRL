@@ -82,6 +82,8 @@ class PrivacyHopQALLMAdapter:
         self.captured_output_tokens = 0
         self.max_prompt_tokens_by_log_name: dict[str, int] = {}
         self.last_captured_call_index_by_key: dict[tuple[str, int | None, int | None], int] = {}
+        self.llm_calls_by_hop: dict[str, int] = {}
+        self.llm_calls_by_hop_stage: dict[str, dict[str, int]] = {}
 
     def _should_capture(self, log_name: str) -> bool:
         if self.capture_mode == "all_calls":
@@ -295,6 +297,11 @@ class PrivacyHopQALLMAdapter:
         self.total_calls += 1
         self.total_prompt_tokens += prompt_tokens
         self.total_output_tokens += output_tokens
+        if hop_number is not None:
+            hop_key = str(hop_number)
+            self.llm_calls_by_hop[hop_key] = self.llm_calls_by_hop.get(hop_key, 0) + 1
+            stage_counts = self.llm_calls_by_hop_stage.setdefault(hop_key, {})
+            stage_counts[log_name] = stage_counts.get(log_name, 0) + 1
         self._log_call_summary(
             log_name=log_name,
             prompt_tokens=prompt_tokens,
@@ -324,6 +331,7 @@ class PrivacyHopQALLMAdapter:
     def make_training_texts(self, group_id: str | None, base_metadata: dict[str, Any]) -> list:
         traces = []
         for idx, captured in enumerate(self.captured_calls):
+            hop_key = str(captured.hop_number) if captured.hop_number is not None else None
             if self.llm.collect_logprobs and captured.llm_call.logprobs:
                 trace = make_rl_training_text(self.llm, captured.llm_call)
             else:
@@ -344,6 +352,12 @@ class PrivacyHopQALLMAdapter:
                     "iteration": captured.iteration,
                     "requested_model": captured.requested_model,
                     "capture_mode": self.capture_mode,
+                    "hop_step_llm_call_count": (
+                        self.llm_calls_by_hop.get(hop_key, 0) if hop_key is not None else None
+                    ),
+                    "hop_step_llm_call_counts_by_stage": (
+                        dict(self.llm_calls_by_hop_stage.get(hop_key, {})) if hop_key is not None else {}
+                    ),
                 }
             )
             traces.append(trace)

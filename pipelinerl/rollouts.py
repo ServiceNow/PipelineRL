@@ -7,6 +7,9 @@ class BaseMetrics(BaseModel):
     success: bool
     no_error: bool
     no_answer: bool
+    rollout_retry_count: int = 0
+    rollout_retry_any: bool = False
+    rollout_retry_backoff_s: float = 0.0
 
 
 class TrainingText(BaseModel):

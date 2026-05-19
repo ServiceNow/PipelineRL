@@ -219,6 +219,7 @@ async def schedule_rollouts(
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
             retry_count = 0
+            retry_backoff_s = 0.0
             while True:
                 try:
                     rollout_result = await rollout_policy(cfg, llm, problem, session)
@@ -231,16 +232,20 @@ async def schedule_rollouts(
                     if is_retryable and can_retry and not is_trainer_finished():
                         retry_count += 1
                         backoff_s = min(retry_max_delay_s, retry_initial_delay_s * (2 ** (retry_count - 1)))
+                        retry_backoff_s += backoff_s
                         if retry_count == 1 or retry_count % 10 == 0:
                             logger.warning(
                                 f"{scheduler_name}: rollout {group_id}/{rollout_index} failed with "
-                                f"{exc.__class__.__name__}, retry {retry_count}"
+                                f"{exc.__class__.__name__}: {exc}, retry {retry_count}"
                             )
                         await asyncio.sleep(backoff_s)
                         continue
                     handle_rollout_exception(exc)
                     return
             rollout_result.model_version = model_version
+            rollout_result.metrics.rollout_retry_count = retry_count
+            rollout_result.metrics.rollout_retry_any = retry_count > 0
+            rollout_result.metrics.rollout_retry_backoff_s = retry_backoff_s
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
             rollout_result.group_id = full_group_id

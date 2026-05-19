@@ -23,7 +23,12 @@ from .resources import (
     get_static_local_index,
 )
 
-from .agent import PrivacyHopQAAgent, PrivacyHopQAProtocolError, is_helper_infrastructure_error
+from .agent import (
+    PrivacyHopQAAgent,
+    PrivacyHopQAProtocolError,
+    document_identity_values_match,
+    is_helper_infrastructure_error,
+)
 from .llm_adapter import PrivacyHopQALLMAdapter, is_llm_infrastructure_error
 from .reward import answers_match, score_chain_answers
 from .settings import PrivacyHopQASettings
@@ -174,11 +179,13 @@ def _target_source_by_hop(problem: dict) -> dict[str, str]:
 def _planned_source_types(output_text: str) -> set[str]:
     payload = extract_json(output_text)
     if not isinstance(payload, list):
-        raise ValueError("hop_plan output must be a JSON list of retrieval actions")
+        # The agent only executes JSON-list retrieval plans. Non-list JSON is a
+        # valid model output text, but it did not search the target source type.
+        return set()
     source_types: set[str] = set()
     for item in payload:
         if not isinstance(item, dict):
-            raise ValueError("hop_plan JSON list entries must be objects")
+            continue
         action_type = str(item.get("type") or "").strip().casefold()
         if action_type in {"web_search", "local_document_search"}:
             parameters = item.get("parameters") if isinstance(item.get("parameters"), dict) else {}
@@ -252,6 +259,7 @@ def _assign_training_rewards(
     zero_error_step_reward: bool = True,
     error_records: list[dict] | None = None,
     source_bonus: float = 0.25,
+    hop_step_efficiency_metric: str = "none",
 ) -> None:
     outcome_reward = float(score["reward"])
     prefix_progress = _prefix_progress_by_hop(score)
@@ -297,12 +305,17 @@ def _assign_training_rewards(
             reward = float((hop_progress or {}).get("reward", outcome_reward))
         elif training_reward_mode == "hop_step":
             # Hop-step reward is local to the hop currently being trained:
-            #   doc_choose/hop_resolve: correct_hop / hop_iteration_count
-            #   hop_plan: (correct_hop + 0.25 * searched_gold_source_type)
-            #             / hop_iteration_count
-            # The source-type term is only a small shaping bonus. For a fixed
-            # iteration count, a correct hop is always better than an incorrect
-            # hop, even if the incorrect hop searched the right source type.
+            #   doc_choose/hop_resolve: correct_hop
+            #   hop_plan with executable retrieval actions:
+            #       correct_hop + 0.25 * searched_gold_source_type
+            #   hop_plan with no executable retrieval actions:
+            #       0
+            # The source-type term is only a small shaping bonus for retrieval
+            # planning. Expensive hop attempts are penalized once, later in the
+            # RL data path, by hop-level LLM-call efficiency shaping when
+            # hop_step_efficiency_metric=llm_calls. We deliberately do not also
+            # divide by hop_iteration_count here, because that double-penalizes
+            # slow but correct attempts.
             stage = str(privacy_meta.get("log_name") or "")
             if is_error_trace:
                 reward = 0.0
@@ -311,17 +324,27 @@ def _assign_training_rewards(
                 correct_value = 1.0 if hop_correct.get(hop_key, False) else 0.0
                 target_source = target_sources.get(hop_key)
                 target_source_searched = False
-                if stage == "hop_plan" and target_source:
-                    target_source_searched = target_source in _planned_source_types(trace.output_text)
-                    reward = (correct_value + float(source_bonus) * float(target_source_searched)) / iteration_count
+                planned_sources: set[str] = set()
+                if stage == "hop_plan":
+                    planned_sources = _planned_source_types(trace.output_text)
+                    target_source_searched = bool(target_source and target_source in planned_sources)
+                    if planned_sources:
+                        reward = (
+                            correct_value + float(source_bonus) * float(target_source_searched)
+                        )
+                    else:
+                        reward = 0.0
                 else:
-                    reward = correct_value / iteration_count
+                    reward = correct_value
                 privacy_meta.update(
                     {
                         "hop_step_iteration_count": int(iteration_count),
                         "hop_step_target_source": target_source,
                         "hop_step_target_source_searched": target_source_searched,
+                        "hop_step_executable_plan": stage != "hop_plan" or bool(planned_sources),
                         "hop_step_source_bonus": float(source_bonus),
+                        "hop_step_efficiency_metric": hop_step_efficiency_metric,
+                        "hop_step_efficiency_group": f"privacy_hopqa:hop:{hop_key}",
                     }
                 )
             else:
@@ -336,6 +359,7 @@ def _assign_training_rewards(
             {
                 "training_reward_mode": training_reward_mode,
                 "training_reward": reward,
+                "hop_step_base_reward": reward,
                 "outcome_reward": outcome_reward,
                 "prefix_progress_reward": float((hop_progress or {}).get("reward", outcome_reward)),
                 "prefix_correct_hops": int((hop_progress or {}).get("prefix_correct_hops", 0)),
@@ -517,7 +541,7 @@ async def _run_privacy_hopqa_rollout_async(
             gold_parent_read_but_incorrect_hops += 1
             if not hop_state.get("answer"):
                 gold_parent_read_but_no_answer_hops += 1
-        gold_doc_id = str(hop_state.get("gold_doc_id") or "")
+        gold_doc_values = [hop_state.get("gold_doc_id"), hop_state.get("gold_doc_ref")]
         gold_reader_correct = False
         any_reader_correct = False
         for reader_result in hop_state.get("reader_results") or []:
@@ -532,10 +556,19 @@ async def _run_privacy_hopqa_rollout_async(
             if not reader_correct:
                 continue
             any_reader_correct = True
-            if gold_doc_id and (
-                str(reader_result.get("parent_doc_id") or "") == gold_doc_id
-                or str(reader_result.get("doc_id") or "") == gold_doc_id
-            ):
+            reader_doc_values = [
+                reader_result.get("parent_doc_id"),
+                reader_result.get("doc_id"),
+                reader_result.get("locator"),
+                reader_result.get("title"),
+            ]
+            metadata = reader_result.get("metadata")
+            if isinstance(metadata, dict):
+                reader_doc_values.extend(
+                    metadata.get(key)
+                    for key in ("doc_ref", "document_id", "file_path", "locator", "original_doc_id", "parent_doc_id", "path", "source_path", "url")
+                )
+            if document_identity_values_match(reader_doc_values, gold_doc_values):
                 gold_reader_correct = True
         if gold_reader_correct:
             gold_reader_correct_hops += 1
@@ -592,6 +625,7 @@ async def _run_privacy_hopqa_rollout_async(
         zero_error_step_reward=settings.zero_error_step_reward,
         error_records=error_records_for_reward,
         source_bonus=settings.hop_step_source_bonus,
+        hop_step_efficiency_metric=settings.hop_step_efficiency_metric,
     )
 
     metrics = PrivacyHopQAMetrics(

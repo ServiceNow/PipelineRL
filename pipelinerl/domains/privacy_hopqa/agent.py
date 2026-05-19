@@ -100,10 +100,83 @@ _QUERY_STOPWORDS = {
     "why",
     "with",
 }
+_DOC_ID_EXTENSIONS = {".csv", ".docx", ".html", ".jsonl", ".md", ".pdf", ".pptx", ".txt", ".xlsx"}
+_DOC_WINDOW_SUFFIX_RE = re.compile(r"#w\d+of\d+$", re.IGNORECASE)
+_TASK_ID_RE = re.compile(r"\bdr\d{4,}\b", re.IGNORECASE)
+_TASK_FILES_RE = re.compile(r"(dr\d{4,})/files/(.+)$", re.IGNORECASE)
+_LOCAL_DOC_RE = re.compile(r"(?:^|/)local/(dr\d{4,})/(.+)$", re.IGNORECASE)
 
 
 def _uses_legacy_retrieval_context(mode: str) -> bool:
     return str(mode or "").strip().lower() in _LEGACY_RETRIEVAL_CONTEXT_MODES
+
+
+def _strip_doc_extension(value: str) -> str:
+    path = value
+    while True:
+        suffix = Path(path).suffix.lower()
+        if suffix not in _DOC_ID_EXTENSIONS:
+            return path
+        path = path[: -len(suffix)]
+
+
+def document_identity_aliases(value: Any, task_id: str | None = None) -> set[str]:
+    """Stable document aliases for matching dataset gold IDs to runtime docs.
+
+    Dataset gold refs often use converted markdown paths while retrieval returns
+    source-file locators or window IDs. These aliases intentionally keep task
+    context, so same-named files in different DR tasks do not collide.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return set()
+
+    normalized = raw.replace("\\", "/").strip().lower()
+    normalized = _DOC_WINDOW_SUFFIX_RE.sub("", normalized)
+    normalized = normalized.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    no_ext = _strip_doc_extension(normalized)
+
+    aliases = {normalized, no_ext}
+    task_key = str(task_id or "").strip().lower()
+
+    for match in (_TASK_FILES_RE.search(no_ext), _LOCAL_DOC_RE.search(no_ext)):
+        if not match:
+            continue
+        doc_task = match.group(1).lower()
+        rel_path = _strip_doc_extension(match.group(2).strip("/"))
+        aliases.add(f"local/{doc_task}/{rel_path}")
+        aliases.add(f"{doc_task}:{Path(rel_path).name}")
+        if task_key and task_key == doc_task:
+            aliases.add(f"{task_key}:{Path(rel_path).name}")
+
+    if task_key and "/" not in no_ext and len(no_ext) >= 6:
+        aliases.add(f"{task_key}:{Path(no_ext).name}")
+
+    return aliases
+
+
+def document_identity_values_match(
+    left_values: list[Any],
+    right_values: list[Any],
+    *,
+    task_id: str | None = None,
+) -> bool:
+    task_ids = {
+        match.group(0).lower()
+        for value in left_values + right_values
+        for match in _TASK_ID_RE.finditer(str(value or ""))
+    }
+    inferred_task_id = str(task_id or "").strip().lower()
+    if not inferred_task_id and len(task_ids) == 1:
+        inferred_task_id = next(iter(task_ids))
+
+    left_aliases: set[str] = set()
+    right_aliases: set[str] = set()
+    for value in left_values:
+        left_aliases.update(document_identity_aliases(value, task_id=inferred_task_id))
+    for value in right_values:
+        right_aliases.update(document_identity_aliases(value, task_id=inferred_task_id))
+    return bool(left_aliases and right_aliases and left_aliases.intersection(right_aliases))
 
 
 def _query_terms(query: str) -> set[str]:
@@ -263,6 +336,26 @@ def _resolver_candidate_card(candidate: "CandidateDoc", excerpt_chars: int) -> d
 
 def _candidate_parent_id(candidate: "CandidateDoc") -> str:
     return str(candidate.metadata.get("parent_doc_id") or candidate.doc_id)
+
+
+def _candidate_identity_values(candidate: "CandidateDoc") -> list[Any]:
+    values: list[Any] = [
+        candidate.doc_id,
+        _candidate_parent_id(candidate),
+        candidate.locator,
+    ]
+    if str(candidate.source or "").lower() == "local":
+        values.append(candidate.title)
+    for key in ("doc_ref", "document_id", "file_path", "locator", "original_doc_id", "parent_doc_id", "path", "source_path", "url"):
+        values.append(candidate.metadata.get(key))
+    return values
+
+
+def _candidate_matches_gold(candidate: "CandidateDoc", hop: "HopState") -> bool:
+    return document_identity_values_match(
+        _candidate_identity_values(candidate),
+        [hop.gold_doc_id, hop.gold_doc_ref],
+    )
 
 
 def _candidate_parent_groups(candidates: list["CandidateDoc"]) -> dict[str, list["CandidateDoc"]]:
@@ -977,7 +1070,7 @@ class PrivacyHopQAAgent:
         for doc in selected:
             if doc.doc_id not in hop.selected_doc_ids:
                 hop.selected_doc_ids.append(doc.doc_id)
-            if hop.gold_doc_id and _candidate_parent_id(doc) == hop.gold_doc_id:
+            if _candidate_matches_gold(doc, hop):
                 hop.gold_parent_read = True
                 if doc.doc_id not in hop.gold_candidate_doc_ids:
                     hop.gold_candidate_doc_ids.append(doc.doc_id)
@@ -1562,13 +1655,13 @@ class PrivacyHopQAAgent:
         hop.candidate_cards = [candidate.as_card(self.settings.chooser_excerpt_chars) for candidate in trimmed]
         before_trim_parent_ids = {_candidate_parent_id(candidate) for candidate in ordered}
         after_trim_parent_ids = {_candidate_parent_id(candidate) for candidate in trimmed}
-        if hop.gold_doc_id:
-            if hop.gold_doc_id in before_trim_parent_ids:
+        if hop.gold_doc_id or hop.gold_doc_ref:
+            if any(_candidate_matches_gold(candidate, hop) for candidate in ordered):
                 hop.gold_parent_retrieved_before_trim = True
-            if hop.gold_doc_id in after_trim_parent_ids:
+            if any(_candidate_matches_gold(candidate, hop) for candidate in trimmed):
                 hop.gold_parent_retrieved = True
             for candidate in trimmed:
-                if _candidate_parent_id(candidate) == hop.gold_doc_id and candidate.doc_id not in hop.gold_candidate_doc_ids:
+                if _candidate_matches_gold(candidate, hop) and candidate.doc_id not in hop.gold_candidate_doc_ids:
                     hop.gold_candidate_doc_ids.append(candidate.doc_id)
         self._inc_retrieval_stat("candidate_windows_before_parent_trim", len(ordered))
         self._inc_retrieval_stat("candidate_windows_after_parent_trim", len(trimmed))
@@ -1809,7 +1902,21 @@ class PrivacyHopQAAgent:
                     "response_chars": (len(response) if response is not None else None),
                 },
             )
-            raise PrivacyHopQAProtocolError(f"doc_read protocol error: {exc}") from exc
+            result = ReaderResult(
+                doc_id=candidate.doc_id,
+                source=candidate.source,
+                title=candidate.title,
+                locator=candidate.locator,
+                can_answer=False,
+                proposed_answer="",
+                justification="",
+                confidence=0.0,
+                missing_information=f"Reader returned an invalid response: {exc}",
+                parent_doc_id=str(candidate.metadata.get("parent_doc_id") or candidate.doc_id),
+                evidence_window_id=str(candidate.metadata.get("evidence_window_id") or candidate.doc_id),
+                window_index=candidate.metadata.get("window_index"),
+                window_count=candidate.metadata.get("window_count"),
+            )
         end_s = self._elapsed_s()
         self._record_event(
             stage="doc_read",
@@ -2118,7 +2225,17 @@ class PrivacyHopQAAgent:
                     exc=f"resolver_wipe:{wipe_reason}",
                     label=f"hop_resolve resolver_wipe ({wipe_reason})",
                 )
-                raise PrivacyHopQAProtocolError(f"hop_resolve resolver_wipe:{wipe_reason}")
+                resolution = {
+                    **resolution,
+                    "answered": False,
+                    "answer": "",
+                    "confidence": 0.0,
+                    "reason": (
+                        f"Resolver returned an unsupported answer ({wipe_reason}); "
+                        "continuing with retrieval instead of accepting it."
+                    ),
+                    "next_step": "read_more" if reader_results else "search_more",
+                }
         ended = self._elapsed_s()
         self._record_event(
             stage="hop_resolve",

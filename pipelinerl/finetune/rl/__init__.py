@@ -501,11 +501,34 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             df_reward_stats["step_advantage_padding_value"] = metadata.apply(
                 lambda value: value.get("step_advantage_padding_value")
             )
+            privacy_metadata = metadata.apply(
+                lambda value: value.get("privacy_hopqa") if isinstance(value.get("privacy_hopqa"), dict) else {}
+            )
+            df_reward_stats["hop_step_efficiency_metric"] = privacy_metadata.apply(
+                lambda value: value.get("hop_step_efficiency_metric")
+            )
+            df_reward_stats["hop_step_efficiency_group"] = privacy_metadata.apply(
+                lambda value: value.get("hop_step_efficiency_group")
+            )
+            df_reward_stats["hop_step_llm_call_count"] = privacy_metadata.apply(
+                lambda value: value.get("hop_step_llm_call_count")
+            )
+            df_reward_stats["hop_step_hop_correct"] = privacy_metadata.apply(
+                lambda value: bool(value.get("hop_correct"))
+            )
+            df_reward_stats["hop_step_efficiency_bonus_weight"] = privacy_metadata.apply(
+                lambda value: value.get("hop_step_source_bonus", 0.25)
+            )
         else:
             df_reward_stats["step_advantage_group"] = None
             df_reward_stats["step_advantage_local_index"] = None
             df_reward_stats["step_advantage_segment_length"] = None
             df_reward_stats["step_advantage_padding_value"] = None
+            df_reward_stats["hop_step_efficiency_metric"] = None
+            df_reward_stats["hop_step_efficiency_group"] = None
+            df_reward_stats["hop_step_llm_call_count"] = None
+            df_reward_stats["hop_step_hop_correct"] = False
+            df_reward_stats["hop_step_efficiency_bonus_weight"] = 0.25
 
         custom_mask = df_reward_stats["step_advantage_group"].notna()
         padded_rows = []
@@ -521,6 +544,84 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                 .reset_index()
             )
             custom = pd.merge(custom, max_lengths, on=["group_id", "step_advantage_group"], how="left")
+            efficiency_mask = (
+                custom["hop_step_efficiency_metric"].eq("llm_calls")
+                & custom["hop_step_efficiency_group"].notna()
+                & custom["hop_step_llm_call_count"].notna()
+            )
+            if efficiency_mask.any():
+                # Domain-specific reward shaping for Privacy HopQA.
+                #
+                # Rollout code stores the total number of LLM calls used while
+                # solving the current hop. Among rollouts that solved the same
+                # hop correctly, cheaper hop attempts get a small additive
+                # efficiency bonus:
+                #
+                #   reward += bonus_weight * min_correct_calls / this_hop_calls
+                #
+                # Incorrect hop attempts never receive this cost bonus. This
+                # keeps every correct hop above every incorrect hop while still
+                # preferring correct rollouts that answered with fewer LLM
+                # calls. Call count is used instead of latency so the signal is
+                # deterministic and comparable across workers.
+                custom.loc[efficiency_mask, "hop_step_llm_call_count"] = (
+                    custom.loc[efficiency_mask, "hop_step_llm_call_count"].astype(float).clip(lower=1.0)
+                )
+                custom["hop_step_hop_correct"] = custom["hop_step_hop_correct"].astype(bool)
+
+                # Step 1: find the cheapest correct hop attempt among
+                # comparable rollouts. The efficiency group is hop-local, not
+                # stage-local, so hop_plan/doc_choose/hop_resolve all use the
+                # same factor for a given hop attempt.
+                correct_efficiency_mask = efficiency_mask & custom["hop_step_hop_correct"]
+                min_call_counts = (
+                    custom[correct_efficiency_mask]
+                    .groupby(["group_id", "hop_step_efficiency_group"])
+                    .agg(hop_step_min_llm_call_count=("hop_step_llm_call_count", "min"))
+                    .reset_index()
+                )
+
+                # Step 2: attach min_calls to each real training text and
+                # compute the relative cost factor. Groups with no correct hop
+                # attempts do not use this value.
+                custom = pd.merge(
+                    custom,
+                    min_call_counts,
+                    on=["group_id", "hop_step_efficiency_group"],
+                    how="left",
+                )
+                efficiency = (
+                    custom["hop_step_min_llm_call_count"] / custom["hop_step_llm_call_count"]
+                ).where(correct_efficiency_mask, 0.0)
+                efficiency = efficiency.fillna(0.0).astype(float)
+                custom["hop_step_efficiency_factor"] = efficiency
+
+                bonus_weight = (
+                    custom["hop_step_efficiency_bonus_weight"]
+                    .fillna(0.25)
+                    .astype(float)
+                    .clip(lower=0.0)
+                )
+                efficiency_bonus = bonus_weight * efficiency
+                custom["hop_step_efficiency_bonus"] = efficiency_bonus
+
+                # Step 3: add the same efficiency bonus to real rewards and
+                # padding rewards. Padding participates only in the baseline
+                # calculation; it never creates gradient tokens, but it must
+                # have the same value the rollout would have contributed at the
+                # padded position.
+                custom["step_reward"] = custom["step_reward"].astype(float) + efficiency_bonus
+                custom["padding_reward"] = custom["padding_reward"].astype(float) + efficiency_bonus
+                padding_values = custom["step_advantage_padding_value"]
+                custom["step_advantage_padding_value"] = padding_values.astype(float) + efficiency_bonus
+
+                # Step 4: write the scaled values back to the full reward table
+                # before aligned buckets and prefix padding are constructed.
+                df_reward_stats.loc[custom["_row_id"], "step_reward"] = custom["step_reward"].to_numpy()
+                df_reward_stats.loc[custom["_row_id"], "padding_reward"] = custom["padding_reward"].to_numpy()
+                df_reward_stats.loc[
+                    custom["_row_id"], "step_advantage_padding_value"
+                ] = custom["step_advantage_padding_value"].to_numpy()
             aligned_position = (
                 custom["max_segment_length"].astype(int)
                 - custom["step_advantage_segment_length"].astype(int)
