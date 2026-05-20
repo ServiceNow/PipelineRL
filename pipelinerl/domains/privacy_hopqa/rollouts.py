@@ -260,6 +260,7 @@ def _assign_training_rewards(
     error_records: list[dict] | None = None,
     source_bonus: float = 0.25,
     doc_bonus: float = 0.25,
+    hop_resolve_reward_mode: str = "hop_correct",
     hop_step_efficiency_metric: str = "none",
 ) -> None:
     outcome_reward = float(score["reward"])
@@ -290,8 +291,18 @@ def _assign_training_rewards(
     if not prefix_progress:
         max_prefix_reward = outcome_reward
 
+    def _error_trace_reward(stage: str) -> float:
+        if (
+            training_reward_mode == "hop_step"
+            and stage == "hop_resolve"
+            and hop_resolve_reward_mode == "local_decision"
+        ):
+            return -1.0
+        return 0.0
+
     for trace in training_texts:
         privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
+        stage = str(privacy_meta.get("log_name") or "")
         hop_number = privacy_meta.get("hop_number")
         hop_key = str(hop_number) if hop_number is not None else None
         hop_progress = prefix_progress.get(hop_key) if hop_key is not None else None
@@ -321,9 +332,8 @@ def _assign_training_rewards(
             # hop_step_efficiency_metric=llm_calls. We deliberately do not
             # also divide by hop_iteration_count here, because that
             # double-penalizes slow but correct attempts.
-            stage = str(privacy_meta.get("log_name") or "")
             if is_error_trace:
-                reward = 0.0
+                reward = _error_trace_reward(stage)
             elif stage in TRAINABLE_CONTROL_STAGES and hop_key is not None:
                 iteration_count = float(max(hop_iterations.get(hop_key, 1), 1))
                 correct_value = 1.0 if hop_correct.get(hop_key, False) else 0.0
@@ -346,7 +356,14 @@ def _assign_training_rewards(
                         selected_gold_parent = bool(call_meta.get("doc_choose_selected_gold_parent"))
                     reward = correct_value + float(doc_bonus) * float(selected_gold_parent)
                 else:
-                    reward = correct_value
+                    call_meta = privacy_meta.get("call_metadata")
+                    if hop_resolve_reward_mode == "local_decision" and isinstance(call_meta, dict):
+                        if bool(call_meta.get("hop_resolve_answered")):
+                            reward = 1.0 if bool(call_meta.get("hop_resolve_answer_matches_accepted")) else 0.0
+                        else:
+                            reward = 0.0
+                    else:
+                        reward = correct_value
                 privacy_meta.update(
                     {
                         "hop_step_iteration_count": int(iteration_count),
@@ -356,6 +373,7 @@ def _assign_training_rewards(
                         "hop_step_executable_plan": stage != "hop_plan" or bool(planned_sources),
                         "hop_step_source_bonus": float(source_bonus),
                         "hop_step_doc_bonus": float(doc_bonus),
+                        "hop_resolve_reward_mode": hop_resolve_reward_mode,
                         "hop_step_efficiency_metric": hop_step_efficiency_metric,
                         "hop_step_efficiency_group": f"privacy_hopqa:hop:{hop_key}",
                     }
@@ -366,7 +384,7 @@ def _assign_training_rewards(
         else:
             raise ValueError(f"unknown privacy_hopqa training_reward_mode: {training_reward_mode}")
         if is_error_trace:
-            reward = 0.0
+            reward = _error_trace_reward(stage)
         trace.reward = reward
         privacy_meta.update(
             {
@@ -640,6 +658,7 @@ async def _run_privacy_hopqa_rollout_async(
         source_bonus=settings.hop_step_source_bonus,
         doc_bonus=settings.hop_step_doc_bonus,
         hop_step_efficiency_metric=settings.hop_step_efficiency_metric,
+        hop_resolve_reward_mode=settings.hop_resolve_reward_mode,
     )
 
     metrics = PrivacyHopQAMetrics(

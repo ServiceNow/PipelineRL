@@ -2113,6 +2113,25 @@ class PrivacyHopQAAgent:
         positive = [result for result in reader_results if result.can_answer and result.proposed_answer.strip()]
         if not positive:
             return []
+        support_ids = {
+            str(value).strip()
+            for value in resolution.get("supporting_doc_ids") or []
+            if str(value).strip()
+        }
+        if support_ids:
+            supported = [
+                result
+                for result in positive
+                if result.doc_id in support_ids or (result.parent_doc_id and result.parent_doc_id in support_ids)
+            ]
+            if supported:
+                answer_key = normalize_answer(str(resolution.get("answer") or ""))
+                matching_supported = [
+                    result for result in supported if normalize_answer(result.proposed_answer) == answer_key
+                ]
+                if matching_supported:
+                    return matching_supported
+                return supported
         justification = str(resolution.get("justification") or "")
         cited = [
             result
@@ -2126,6 +2145,24 @@ class PrivacyHopQAAgent:
         if matching:
             return [max(matching, key=lambda result: result.confidence)]
         return positive[:1]
+
+    def _resolver_justification_from_reader_support(
+        self,
+        resolution: dict[str, Any],
+        reader_results: list[ReaderResult],
+    ) -> str:
+        supporting_results = self._supporting_reader_results(resolution, reader_results)
+        snippets: list[str] = []
+        for result in supporting_results[:2]:
+            text = str(result.justification or "").strip()
+            if not text:
+                text = f"Reader result supports the answer from [DOC:{result.doc_id}]."
+            elif f"[DOC:{result.doc_id}]" not in text and not (
+                result.parent_doc_id and f"[DOC:{result.parent_doc_id}]" in text
+            ):
+                text = f"{text} [DOC:{result.doc_id}]"
+            snippets.append(text)
+        return _truncate(" ".join(snippets), 900)
 
     def _remember_useful_documents(
         self,
@@ -2258,6 +2295,7 @@ class PrivacyHopQAAgent:
                 max_cards=80,
             ),
             choose_top_k=self.settings.choose_top_k,
+            constrained=self.settings.constrained_resolver,
         )
         self._save_prompt(f"hop_resolve_iter{iteration}_hop{hop.hop_number}", prompt)
         started = self._elapsed_s()
@@ -2280,11 +2318,14 @@ class PrivacyHopQAAgent:
             resolution = {
                 "answered": bool(payload.get("answered")),
                 "answer": str(payload.get("answer") or "").strip(),
-                "justification": str(payload.get("justification") or "").strip(),
+                "justification": "" if self.settings.constrained_resolver else str(payload.get("justification") or "").strip(),
                 "confidence": _clamp_confidence(payload.get("confidence"), default=0.0),
-                "reason": str(payload.get("reason") or "").strip(),
+                "reason": "" if self.settings.constrained_resolver else str(payload.get("reason") or "").strip(),
                 "next_step": next_step,
                 "selected_doc_ids": payload.get("selected_doc_ids") if isinstance(payload.get("selected_doc_ids"), list) else [],
+                "supporting_doc_ids": (
+                    payload.get("supporting_doc_ids") if isinstance(payload.get("supporting_doc_ids"), list) else []
+                ),
             }
         except Exception as exc:
             if is_llm_infrastructure_error(exc):
@@ -2319,6 +2360,28 @@ class PrivacyHopQAAgent:
                     "next_step": "read_more" if reader_results else "search_more",
                 }
         ended = self._elapsed_s()
+        answer_matches_accepted = False
+        if resolution.get("answered"):
+            answer_matches_accepted = self._answer_matches_accepted_variant(hop, str(resolution.get("answer") or ""))
+            if self.settings.constrained_resolver:
+                resolution["justification"] = self._resolver_justification_from_reader_support(
+                    resolution,
+                    reader_results,
+                )
+        self.llm_adapter.update_captured_metadata(
+            log_name="hop_resolve",
+            hop_number=hop.hop_number,
+            iteration=iteration,
+            metadata={
+                "hop_resolve_answered": bool(resolution.get("answered")),
+                "hop_resolve_answer": str(resolution.get("answer") or ""),
+                "hop_resolve_answer_matches_accepted": answer_matches_accepted,
+                "hop_resolve_next_step": str(resolution.get("next_step") or "search_more"),
+                "hop_resolve_constrained": bool(self.settings.constrained_resolver),
+                "hop_resolve_supporting_doc_ids": list(resolution.get("supporting_doc_ids") or []),
+                "hop_resolve_selected_doc_ids": list(resolution.get("selected_doc_ids") or []),
+            },
+        )
         self._record_event(
             stage="hop_resolve",
             lane="resolve",
@@ -2329,9 +2392,11 @@ class PrivacyHopQAAgent:
                 "hop_number": hop.hop_number,
                 "iteration": iteration,
                 "answered": bool(resolution.get("answered")),
+                "answer_matches_accepted": answer_matches_accepted,
                 "confidence": round(float(resolution.get("confidence") or 0.0), 3),
                 "next_step": resolution.get("next_step", "search_more"),
                 "selected_doc_ids": list(resolution.get("selected_doc_ids") or []),
+                "supporting_doc_ids": list(resolution.get("supporting_doc_ids") or []),
                 "unread_candidate_count": len(unread_candidates),
             },
         )

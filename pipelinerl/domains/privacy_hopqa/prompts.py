@@ -239,7 +239,73 @@ def build_hop_resolve_prompt(
     reader_results: list[dict[str, Any]],
     unread_candidate_cards: list[dict[str, Any]],
     choose_top_k: int,
+    constrained: bool = False,
 ) -> str:
+    if constrained:
+        output_contract = f"""Return JSON in one of these formats.
+
+If the hop is answered:
+{{
+  "answered": true,
+  "answer": "short answer",
+  "confidence": 0.9,
+  "next_step": "done",
+  "supporting_doc_ids": ["doc_id_or_parent_doc_id"]
+}}
+
+If more unread parent documents should be read:
+{{
+  "answered": false,
+  "answer": "",
+  "confidence": 0.0,
+  "next_step": "read_more",
+  "selected_doc_ids": ["unread_parent_doc_id"]
+}}
+
+If another search is needed:
+{{
+  "answered": false,
+  "answer": "",
+  "confidence": 0.0,
+  "next_step": "search_more",
+  "selected_doc_ids": []
+}}
+
+- Do not include "justification", "reason", markdown, prose, or extra fields
+- "supporting_doc_ids" must name positive Document-Reading Results that directly support the answer
+- "selected_doc_ids" must contain up to {choose_top_k} unread parent document IDs and is used only with "read_more"
+- Do not set "next_step" to "read_more" when the unread candidate list is empty
+- Return valid JSON only."""
+    else:
+        output_contract = f"""Return JSON in this format:
+{{
+  "answered": true,
+  "answer": "short answer",
+  "justification": "1-3 sentences quoting the shortest supporting span when available and citing the best supporting [DOC:...] references",
+  "confidence": 0.9,
+  "reason": "why this is enough, or what is still missing",
+  "next_step": "done",
+  "selected_doc_ids": []
+}}
+
+If you would like to mark this hop as answered, set:
+- "answered" to true
+- "next_step" to "done"
+- "selected_doc_ids" to []
+- Only do this when at least one Document-Reading Result has "can_answer": true and directly supports the answer
+
+If you would like to read more documents from the unread candidate list above, set:
+- "answered" to false
+- "next_step" to "read_more"
+- "selected_doc_ids" to up to {choose_top_k} unread parent document IDs
+- Do not choose this option when the unread candidate list is empty
+
+If you would like the agent to search again instead of reading more from this batch, set:
+- "answered" to false
+- "next_step" to "search_more"
+- "selected_doc_ids" to []
+
+Return valid JSON only."""
     return f"""Decide whether the current hop can now be answered.
 
 The document reader has already seen each selected evidence window in full.
@@ -275,35 +341,7 @@ Unread Candidate Parent Documents From The Current Retrieval Round (compact card
 
 {ANSWER_FORMAT_GUIDANCE}
 
-Return JSON in this format:
-{{
-  "answered": true,
-  "answer": "short answer",
-  "justification": "1-3 sentences quoting the shortest supporting span when available and citing the best supporting [DOC:...] references",
-  "confidence": 0.9,
-  "reason": "why this is enough, or what is still missing",
-  "next_step": "done",
-  "selected_doc_ids": []
-}}
-
-If you would like to mark this hop as answered, set:
-- "answered" to true
-- "next_step" to "done"
-- "selected_doc_ids" to []
-- Only do this when at least one Document-Reading Result has "can_answer": true and directly supports the answer
-
-If you would like to read more documents from the unread candidate list above, set:
-- "answered" to false
-- "next_step" to "read_more"
-- "selected_doc_ids" to up to {choose_top_k} unread parent document IDs
-- Do not choose this option when the unread candidate list is empty
-
-If you would like the agent to search again instead of reading more from this batch, set:
-- "answered" to false
-- "next_step" to "search_more"
-- "selected_doc_ids" to []
-
-Return valid JSON only.
+{output_contract}
 """
 
 

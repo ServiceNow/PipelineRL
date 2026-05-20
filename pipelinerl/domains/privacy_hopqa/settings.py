@@ -69,16 +69,18 @@ class PrivacyHopQASettings:
     training_reward_mode: str = "outcome"
     hop_step_source_bonus: float = 0.25
     hop_step_doc_bonus: float = 0.25
+    hop_resolve_reward_mode: str = "hop_correct"
     hop_step_efficiency_metric: str = "none"
+    constrained_resolver: bool = False
     stop_after_incorrect_hop: bool = False
     # In stepwise training modes, individual planning traces whose
     # specific (stage, hop_number, iteration) appears in the rollout's
     # error_records (JSON parse failures, context overflows, resolver
-    # self-wipes, exceptions) get reward=0. This is strictly per-trace: we
-    # never blanket-zero all traces in a hop just because the hop failed to
-    # produce an answer. Each rollout's padding_reward is set to the max
-    # prefix_progress achieved, so error-terminated rollouts pad to their best
-    # progress rather than to a zero'd error step.
+    # self-wipes, exceptions) get an error-local reward. This is strictly
+    # per-trace: we never blanket-zero all traces in a hop just because the hop
+    # failed to produce an answer. Each rollout's padding_reward is set to the
+    # max prefix_progress achieved, so error-terminated rollouts pad to their
+    # best progress rather than to a zero'd error step.
     zero_error_step_reward: bool = True
     max_iterations: int = 14
     iteration_budget_per_hop: int = 2
@@ -152,7 +154,9 @@ class PrivacyHopQASettings:
             training_reward_mode=str(data.get("training_reward_mode", "outcome")),
             hop_step_source_bonus=float(data.get("hop_step_source_bonus", 0.25)),
             hop_step_doc_bonus=float(data.get("hop_step_doc_bonus", data.get("hop_step_source_bonus", 0.25))),
+            hop_resolve_reward_mode=str(data.get("hop_resolve_reward_mode", "hop_correct")),
             hop_step_efficiency_metric=str(data.get("hop_step_efficiency_metric", "none")),
+            constrained_resolver=bool(data.get("constrained_resolver", False)),
             stop_after_incorrect_hop=bool(data.get("stop_after_incorrect_hop", False)),
             zero_error_step_reward=bool(data.get("zero_error_step_reward", True)),
             max_iterations=int(data.get("max_iterations", 14)),

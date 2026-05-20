@@ -29,6 +29,7 @@ RL_DATA_COLUMNS = [
     "overflow",
     "group_tokens",
     "num_labels",
+    "loss_weight_scale",
     "rewards",
     "advantages",
     "old_logprobs",
@@ -106,6 +107,10 @@ class RLConfig(BaseModel):
     normalize_step_loss_by_advantage_group: bool = Field(
         default=False,
         description="When step_reward_advantages is enabled, divide each row's final advantage by the number of real calls in its rollout/advantage-group segment",
+    )
+    batch_size_normalization: str = Field(
+        default="training_texts",
+        description="Loss denominator unit: training_texts counts every trainable call; rollouts groups sub-calls from the same rollout attempt",
     )
     value_loss_coef: float = Field(
         default=0.0,
@@ -260,6 +265,8 @@ def rl_step(
         # filter out sequences that do not have eos_token_id
         overflow = torch.tensor(overflow, device=overflow.device)
         tokens_weights = tokens_weights * (1 - overflow)
+    if batch.loss_weight_scale is not None:
+        tokens_weights = tokens_weights * batch.loss_weight_scale[:, 1:].to(tokens_weights.device)
 
     assert new_logprobs.shape == ref_logprobs.shape
 
@@ -439,6 +446,11 @@ def rl_step(
         "token_weight": sum_sum(tokens_weights / num_labels_in_seq, masks_shifted, segments).item(),
         "max_token_weight": tokens_weights[masks_shifted].max().item(),
         "min_token_weight": tokens_weights[masks_shifted].min().item(),
+        "loss_weight_scale": (
+            sum_sum(batch.loss_weight_scale[:, 1:] / num_labels_in_seq, masks_shifted, segments).item()
+            if batch.loss_weight_scale is not None
+            else 1.0
+        ),
         "kl_coef": num_sequences * kl_coef,
         "entropy_bonus_coef": num_sequences * entropy_bonus_coef,
         "num_output_tokens_sum": masks_shifted.sum().item(),
@@ -558,13 +570,30 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                     .rename("advantage_group_call_count")
                     .reset_index()
                 )
+                comparison_call_counts = (
+                    group_call_counts.groupby(["group_id", "step_advantage_group"])
+                    .agg(mean_advantage_group_call_count=("advantage_group_call_count", "mean"))
+                    .reset_index()
+                )
                 custom_scaled = pd.merge(
                     custom_scaled,
                     group_call_counts,
                     on=["group_id", "rollout_index", "step_advantage_group"],
                     how="left",
                 )
-                advantage_scale = 1.0 / custom_scaled["advantage_group_call_count"].astype(float).clip(lower=1.0)
+                custom_scaled = pd.merge(
+                    custom_scaled,
+                    comparison_call_counts,
+                    on=["group_id", "step_advantage_group"],
+                    how="left",
+                )
+                # Preserve the average advantage scale within a comparison
+                # bucket while preventing longer hop/stage attempts from
+                # contributing more gradient only because they made more calls.
+                advantage_scale = (
+                    custom_scaled["mean_advantage_group_call_count"].astype(float)
+                    / custom_scaled["advantage_group_call_count"].astype(float).clip(lower=1.0)
+                )
                 df_reward_stats.loc[custom_scaled["_row_id"], "advantage_scale"] = advantage_scale.to_numpy()
 
             # Some domains, e.g. Privacy HopQA, want stepwise advantages
@@ -896,17 +925,27 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df["num_labels"] = df.apply(
         lambda row: [sum(1 for label in row["labels"] if label != -100)] * len(row["input_ids"]), axis=1
     )
+    loss_weight_scale = 1.0
+    if config.batch_size_normalization == "rollouts":
+        rollout_count = len(df[["group_id", "rollout_index"]].drop_duplicates())
+        if rollout_count > 0:
+            loss_weight_scale = len(df) / rollout_count
+    elif config.batch_size_normalization != "training_texts":
+        raise ValueError(f"unknown RL batch_size_normalization: {config.batch_size_normalization}")
+    df["loss_weight_scale"] = df["input_ids"].apply(lambda input_ids: [loss_weight_scale] * len(input_ids))
 
     # Step 5: move the results back to the dataset
     advantages_list = df["advantages"].tolist()
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()
     num_labels_list = df["num_labels"].tolist()
+    loss_weight_scale_list = df["loss_weight_scale"].tolist()
     for i, entry in enumerate(dataset):
         entry["advantages"] = advantages_list[i]
         entry["group_tokens"] = group_tokens_list[i]
         entry["overflow"] = overflow_list[i]
         entry["num_labels"] = num_labels_list[i]
+        entry["loss_weight_scale"] = loss_weight_scale_list[i]
     return dataset
 
 
@@ -931,4 +970,5 @@ def prepare_rl_fields(
     encoding["overflow"] = [0] * len(encoding["labels"])  # place holder
     encoding["group_tokens"] = [0] * len(encoding["labels"])  # place holder
     encoding["num_labels"] = [1 if label != -100 else 0 for label in encoding["labels"]]  # count only output tokens
+    encoding["loss_weight_scale"] = [1.0] * len(encoding["labels"])  # place holder
     return encoding

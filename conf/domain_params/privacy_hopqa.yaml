@@ -31,7 +31,9 @@ reward_mode: all_hops_correct
 # hop-local shaped reward. hop_plan gets hop correctness plus a small expected
 # source-type bonus; doc_choose gets hop correctness plus a small bonus for
 # selecting a parent document that aliases the gold document; hop_resolve gets
-# hop correctness only.
+# hop correctness only unless hop_resolve_reward_mode=local_decision is set.
+# constrained_resolver removes free-form resolver justification/reason fields;
+# report justifications then come from the document-reader support.
 # hop_step_efficiency_metric=llm_calls additionally scales each hop's shaped
 # reward by min_hop_llm_calls / rollout_hop_llm_calls within the comparison
 # group. This rewards cheaper successful hop attempts without using noisy
@@ -43,7 +45,9 @@ reward_mode: all_hops_correct
 training_reward_mode: outcome
 hop_step_source_bonus: 0.25
 hop_step_doc_bonus: 0.25
+hop_resolve_reward_mode: hop_correct
 hop_step_efficiency_metric: none
+constrained_resolver: false
 stop_after_incorrect_hop: false
 zero_error_step_reward: true
 max_iterations: 14

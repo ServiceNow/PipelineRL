@@ -17,6 +17,7 @@ finetune:
   num_warmup_steps: 0
   rl:
     normalize_step_loss_by_advantage_group: false
+    batch_size_normalization: training_texts
 
 dataset_loader: pipelinerl.domains.privacy_hopqa.dataset.load_problems
 dataset_loader_params: ${privacy_hopqa}
