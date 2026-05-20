@@ -370,6 +370,7 @@ class TrainableLLM(LLM):
     max_parallel_requests: int = 32
     max_retries: int = 5
     base_delay: float = 0.5
+    chat_template_kwargs: dict = {}
     _semaphore: asyncio.Semaphore
 
     def model_post_init(self, __context):
@@ -549,12 +550,14 @@ class TrainableLLM(LLM):
             - Removes BOS token if present in the beginning of the text
         """
         self.load_tokenizer()
+        chat_kwargs = dict(self.chat_template_kwargs) if self.chat_template_kwargs else {}
         prompt_text = self.tokenizer.apply_chat_template(
-            conversation=prompt.messages, tokenize=False, add_generation_prompt=True
+            conversation=prompt.messages, tokenize=False, add_generation_prompt=True, **chat_kwargs
         )
         text = self.tokenizer.apply_chat_template(
             prompt.messages + [{"role": "assistant", "content": output.content}],
             tokenize=False,
+            **chat_kwargs,
         )
         output_text = text[len(prompt_text) :]
 
@@ -737,11 +740,12 @@ class TrainableLLM(LLM):
             headers |= {"Authorization": f"Bearer {self.api_token}"}
 
         time_t0 = time.time()
-        prompt_text = self.tokenizer.apply_chat_template(prompt.messages, tokenize=False)
+        chat_kwargs = dict(self.chat_template_kwargs) if self.chat_template_kwargs else {}
+        prompt_text = self.tokenizer.apply_chat_template(prompt.messages, tokenize=False, **chat_kwargs)
         completion = output.content or ""
         messages = prompt.messages + [{"role": "assistant", "content": completion}]
-        prompt_text = self.tokenizer.apply_chat_template(prompt.messages, tokenize=False, add_generation_prompt=True)
-        prompt_completion_text = self.tokenizer.apply_chat_template(messages, tokenize=False)
+        prompt_text = self.tokenizer.apply_chat_template(prompt.messages, tokenize=False, add_generation_prompt=True, **chat_kwargs)
+        prompt_completion_text = self.tokenizer.apply_chat_template(messages, tokenize=False, **chat_kwargs)
         if self.tokenizer.bos_token and prompt_text.startswith(self.tokenizer.bos_token):
             prompt_text = prompt_text[len(self.tokenizer.bos_token) :]
             prompt_completion_text = prompt_completion_text[len(self.tokenizer.bos_token) :]
@@ -843,7 +847,8 @@ class TrainableLLM(LLM):
                 return len(self.tokenizer(messages).input_ids)
             else:
                 add_generation_prompt = False if messages[-1]["role"] == "assistant" else True
-                return len(self.tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt))
+                chat_kwargs = dict(self.chat_template_kwargs) if self.chat_template_kwargs else {}
+                return len(self.tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt, **chat_kwargs))
         except Exception as e:
             if self.use_litellm_tokenizer_fallback:
                 logger.warning("Failed to count tokens with tokenizer, fallback to litellm counter")
