@@ -50,6 +50,22 @@ from pipelinerl.streams import (
 logger = logging.getLogger(__name__)
 
 
+def _needs_reference_logprobs(rl_config: RLConfig) -> bool:
+    return max(rl_config.kl_coef, rl_config.final_kl_coef) > 0.0
+
+
+def _get_worker_ref_llm(worker_idx: int, llms: list[TrainableLLM]) -> TrainableLLM | None:
+    return llms[worker_idx % len(llms)] if llms else None
+
+
+def _validate_reference_logprob_setup(rl_config: RLConfig, llm_urls: list[str]):
+    if _needs_reference_logprobs(rl_config) and not llm_urls:
+        raise ValueError(
+            "Reference logprobs require preprocessor reference LLM URLs. "
+            "Set world.preprocessor_fraction > 0 and launch the preprocessor with reference servers."
+        )
+
+
 
 def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
     """Check that each group_id occures exactly group_size times."""
@@ -263,7 +279,7 @@ class SlidingWindowAggregator:
 
 
 def process_chunk(
-    llm: TrainableLLM,
+    llm: TrainableLLM | None,
     tokenizer: transformers.PreTrainedTokenizerBase,
     seq_length: int,
     rl_config: RLConfig,
@@ -272,6 +288,10 @@ def process_chunk(
 ):
     """Worker process function to preprocess chunks of data"""
     try:
+        if llm is not None and llm.tokenizer is None:
+            llm.tokenizer = tokenizer
+        worker_ref_source = llm.base_url if llm is not None else "rollout logprobs fallback"
+        logger.info(f"Preprocessor worker started with reference source: {worker_ref_source}")
         while True:
             try:
                 chunk = input_queue.get()
@@ -369,6 +389,9 @@ def run_preprocessing_loop(
     tokenizer = load_tokenizer(cfg.finetune.config_name)
     
     llm_urls = str(cfg.me.llm_urls).split("+") if cfg.me.llm_urls else []
+    rl_config = RLConfig(**cfg.finetune.rl)
+    _validate_reference_logprob_setup(rl_config, llm_urls)
+    logger.info(f"Discovered {len(llm_urls)} reference LLM urls")
     if llm_urls:
         wait_for_inference_servers(llm_urls)
 
@@ -382,7 +405,6 @@ def run_preprocessing_loop(
     logger.info("Streams initialized")
 
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
-    rl_config = RLConfig(**cfg.finetune.rl)
     pop_old_data = cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode
     dataset_loader_worker_fn = partial(
         run_dataset_loader,
@@ -426,7 +448,6 @@ def run_preprocessing_loop(
     submitted_chunks = 0
     processed_chunks = 0
     worker_pool_size = cfg.preprocess.n_workers
-    next_llm_index = 0
     processed_entries_queue_popped_data = 0
     last_time_notice = 0
     trainer_id = 0
@@ -475,11 +496,14 @@ def run_preprocessing_loop(
             workers = []
             
             # Start worker processes
-            for _ in range(worker_pool_size):
+            for worker_idx in range(worker_pool_size):
+                worker_llm = _get_worker_ref_llm(worker_idx, llms)
+                worker_ref_source = worker_llm.base_url if worker_llm is not None else "rollout logprobs fallback"
+                logger.info(f"Starting preprocessing worker {worker_idx} with reference source: {worker_ref_source}")
                 worker = Process(
                     target=process_chunk,
                     args=(
-                        None,  # We'll assign the LLM in the main loop
+                        worker_llm,
                         tokenizer,
                         cfg.finetune.seq_length,
                         rl_config,
@@ -502,7 +526,6 @@ def run_preprocessing_loop(
                     ):
                         logger.info("Trainer signalled completion; stopping preprocessor loop")
                         break
-                    llm = llms[next_llm_index] if llms else None
                     if not input_queue.full():
                         try:
                             raw_chunk = raw_chunk_queue.get(timeout=0.001)
@@ -512,7 +535,6 @@ def run_preprocessing_loop(
                             # Put chunk in the input queue for workers
                             input_queue.put(raw_chunk)
                             submitted_chunks += 1
-                            next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
                         except Empty:
                             pass
 
