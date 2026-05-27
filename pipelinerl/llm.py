@@ -18,7 +18,7 @@ import numpy as np
 import requests
 import transformers
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from pipelinerl.rollouts import TrainingText
@@ -371,7 +371,8 @@ class TrainableLLM(LLM):
     max_retries: int = 5
     base_delay: float = 0.5
     chat_template_kwargs: dict = {}
-    _semaphore: asyncio.Semaphore
+    mm_processor_kwargs: dict = Field(default_factory=dict)
+    _semaphore: asyncio.Semaphore = PrivateAttr()
 
     def model_post_init(self, __context):
         super().model_post_init(__context)

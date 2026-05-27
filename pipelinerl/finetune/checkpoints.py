@@ -13,7 +13,7 @@ from packaging import version
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     AutoTokenizer,
     AutoProcessor,
     BitsAndBytesConfig,
@@ -117,7 +117,7 @@ def get_auto_model_class(
         case "seq2seq-language-modeling":
             return AutoModelForSeq2SeqLM
         case "vision2seq-language-modeling":
-            return AutoModelForVision2Seq
+            return AutoModelForImageTextToText
         case _:
             raise ValueError(f"Unsupported model class: {model_class}")
 
@@ -217,6 +217,28 @@ def load_model(args, model_class, current_dir):
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": args.reentrant_checkpointing}
         )
+
+    # Freeze vision tower if specified
+    freeze_vision_tower = getattr(args, "freeze_vision_tower", False)
+    if freeze_vision_tower:
+        # Try to get vision tower module from the model
+        vision_tower = None
+        if hasattr(model, "visual"):
+            vision_tower = model.visual  # Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL
+        elif hasattr(model, "vision_tower"):
+            vision_tower = model.vision_tower  # LLaVA
+        elif hasattr(model, "vision_model"):
+            vision_tower = model.vision_model  # BLIP-2, InstructBLIP
+
+        if vision_tower is not None:
+            vision_tower.requires_grad_(False)
+            logger.info("Vision tower parameters frozen successfully (i.e. its parameters will be excluded from optimizer)")
+        else:
+            logger.warning(
+                "freeze_vision_tower=True but could not find vision tower. "
+                "Checked attributes: model.visual (Qwen*-VL), model.vision_tower (LlaVA), model.vision_model (BLIP-2, InstructBLIP). "
+                "So setting this parameter does not have any effect."
+            )
 
     get_accelerator().wait_for_everyone()
     return model

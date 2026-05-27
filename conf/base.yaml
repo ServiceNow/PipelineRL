@@ -21,6 +21,8 @@ actor:
   result_queue_size: 64
   throughput_window_size: 50
   shared_memory_entry_size: 10000000
+  # Maximum number of entries to retain in the actor data stream (Redis only for now)
+  max_stream_size: 1000000
 environment: null
 preprocess:
   input: actor
@@ -42,6 +44,8 @@ preprocess:
   pop_old_data: ${..pop_old_data}
   shared_memory_entry_size: 100000000
   log_every_n_samples: 128
+  # Maximum number of entries to retain in the training data stream (Redis only for now)
+  max_stream_size: 1000000
 
 llm:
   parameters:
@@ -50,7 +54,7 @@ llm:
     # changed
     temperature: 1.0
 test_llm:
-  parameters: 
+  parameters:
     max_tokens: 8192
     temperature: 1.0
     top_p: 0.95
