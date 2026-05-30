@@ -199,6 +199,10 @@ async def llm_async_generate(
     llm_call = llm.log_output(prompt, output, count_tokens=False)
     llm_call.prompt_length_tokens = response_data["usage"]["prompt_tokens"]
     llm_call.output_length_tokens = response_data["usage"]["completion_tokens"]
+    if response_data.get("id"):
+        llm_call.llm_info["response_id"] = response_data["id"]
+    if response_data.get("usage"):
+        llm_call.llm_info["usage"] = response_data["usage"]
     if finish_reason:
         llm_call.llm_info["finish_reason"] = finish_reason
     assert llm_call is not None, "llm_call is None"

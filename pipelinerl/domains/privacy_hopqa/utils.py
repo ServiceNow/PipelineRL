@@ -47,8 +47,8 @@ def extract_json(text: str) -> Any:
                 return json.loads(candidate[start_idx : end_idx + 1])
             except json.JSONDecodeError:
                 continue
-        break
 
+    logger.warning("No valid JSON found in response; response_chars=%s", len(candidate))
     raise json.JSONDecodeError("No valid JSON found in response", candidate, 0)
 
 

@@ -11,19 +11,19 @@ DEFAULT_DATASET_NAME = "seed20"
 DEFAULT_SAMPLE_SIZE = 20
 DEFAULT_FINAL_DATASET_PATH = (
     "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
-    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review.jsonl"
+    "privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants.jsonl"
 )
 DEFAULT_FINAL_TRAIN_DATASET_PATH = (
     "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
-    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_train.jsonl"
+    "privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_train.jsonl"
 )
 DEFAULT_FINAL_VAL_DATASET_PATH = (
     "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
-    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_val.jsonl"
+    "privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_val.jsonl"
 )
 DEFAULT_FINAL_TEST_DATASET_PATH = (
     "/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/"
-    "privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_test.jsonl"
+    "privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_test.jsonl"
 )
 
 

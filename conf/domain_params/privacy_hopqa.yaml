@@ -1,9 +1,9 @@
 annotations_path: ${oc.env:PRIVACY_AGENT_ANNOTATIONS_PATH,.privacy_agent/inputs/annotations_2026-04-06.json}
 curated_path: ${oc.env:PRIVACY_AGENT_CURATED_PATH,.privacy_agent/inputs/curated_chains.jsonl}
-final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review.jsonl}
-final_train_dataset_path: ${oc.env:PRIVACY_HOPQA_TRAIN_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_train.jsonl}
-final_val_dataset_path: ${oc.env:PRIVACY_HOPQA_VAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_val.jsonl}
-final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-13_q30_final_residual_review_test.jsonl}
+final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants.jsonl}
+final_train_dataset_path: ${oc.env:PRIVACY_HOPQA_TRAIN_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_train.jsonl}
+final_val_dataset_path: ${oc.env:PRIVACY_HOPQA_VAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_val.jsonl}
+final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_test.jsonl}
 sample_size: 20
 max_examples: null
 task_data_root: ${oc.env:PRIVACY_AGENT_TASK_DATA_ROOT,.privacy_agent/inputs/tasks}
@@ -12,7 +12,9 @@ task_data_root: ${oc.env:PRIVACY_AGENT_TASK_DATA_ROOT,.privacy_agent/inputs/task
 local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,/mnt/llmd/results/exps/alexg/privacy_hopqa_shared/q30_final_residual_review_20260513/local_indices_goldcoverage_20260519}
 local_index_mmap_mode: r
 helper_service_url: ${oc.env:PRIVACY_AGENT_HELPER_URL, null}
+privacy_reward_service_url: ${oc.env:PRIVACY_HOPQA_PRIVACY_REWARD_URL, null}
 helper_timeout_s: 30.0
+privacy_reward_timeout_s: 30.0
 generation_context_limit_tokens: 16384
 generation_context_margin_tokens: 128
 hop_plan_max_tokens: 4096
@@ -28,12 +30,20 @@ reward_mode: all_hops_correct
 # Training texts use the rollout outcome by default. Experimental stepwise modes:
 # training_reward_mode=prefix_progress gives each captured call
 # prefix_correct_hops_so_far / total_hops. training_reward_mode=hop_step gives
-# hop-local shaped reward. hop_plan gets hop correctness plus a small expected
-# source-type bonus; doc_choose gets hop correctness plus a small bonus for
-# selecting a parent document that aliases the gold document; hop_resolve gets
-# hop correctness only unless hop_resolve_reward_mode=local_decision is set.
+# hop-local shaped reward. In the current default planning-only setup, only
+# hop_plan and doc_choose are captured for training. hop_plan gets hop
+# correctness plus small bonuses for searching the expected source type and
+# retrieving a gold/equivalent parent document. doc_choose gets hop correctness;
+# when a gold/equivalent parent is visible, it also gets a small bonus for
+# selecting one. hop_resolve still runs with the standard short-justification
+# contract, but is not captured or trained because its reward is noisier.
+# training_reward_mode=hop_step_situational is the simpler ablation: compare
+# rewards only within (hop, stage, situation). hop_plan is split by whether the
+# gold/equivalent document had already been retrieved; doc_choose is split by
+# whether a gold/equivalent parent was visible, and gold-absent chooser calls
+# are ignored rather than punished.
 # constrained_resolver removes free-form resolver justification/reason fields;
-# report justifications then come from the document-reader support.
+# leave it false for the current retrieval-policy runs.
 # hop_step_efficiency_metric=llm_calls additionally scales each hop's shaped
 # reward by min_hop_llm_calls / rollout_hop_llm_calls within the comparison
 # group. This rewards cheaper successful hop attempts without using noisy
@@ -47,6 +57,19 @@ hop_step_source_bonus: 0.25
 hop_step_doc_bonus: 0.25
 hop_resolve_reward_mode: hop_correct
 hop_step_efficiency_metric: none
+# Optional privacy penalty for hop_plan web queries. When enabled, the rollout
+# scores each visible web-query batch against the separate privacy reward model
+# and subtracts:
+#   privacy_reward_weight * max(
+#       0,
+#       direct - threshold,
+#       context_with_current - max(context_without_current, threshold),
+#   )
+# from the hop_plan reward. The comparison bucket remains the existing
+# hop/stage/situation bucket, so utility and privacy trade off in one advantage.
+privacy_reward_weight: 0.0
+privacy_reward_threshold: 0.6
+privacy_reward_context_hops: 2
 constrained_resolver: false
 stop_after_incorrect_hop: false
 zero_error_step_reward: true

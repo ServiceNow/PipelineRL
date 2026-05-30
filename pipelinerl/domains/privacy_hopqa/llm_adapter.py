@@ -13,7 +13,10 @@ from pipelinerl.llm import LLMCall, Prompt, TrainableLLM
 
 logger = logging.getLogger(__name__)
 
-PLANNING_LOG_NAMES = {"hop_plan", "doc_choose", "hop_resolve"}
+# Planning-only RL trains the controllable retrieval policy. The resolver still
+# runs during rollouts, but its reward is too entangled with reader quality and
+# answer-variant noise to train in the current Privacy HopQA experiments.
+PLANNING_LOG_NAMES = {"hop_plan", "doc_choose"}
 
 
 class PrivacyHopQALLMInfrastructureError(RuntimeError):
@@ -136,6 +139,9 @@ class PrivacyHopQALLMAdapter:
             "captured": self._should_capture(log_name),
             "requested_model": requested_model or self.llm.model_name,
         }
+        usage = getattr(getattr(self, "_last_llm_call", None), "llm_info", {}).get("usage")
+        if isinstance(usage, dict):
+            record["provider_usage"] = usage
         if budget:
             record["budget"] = budget
         if log_metadata:
@@ -295,6 +301,7 @@ class PrivacyHopQALLMAdapter:
 
         prompt_tokens = max(0, llm_call.prompt_length_tokens)
         output_tokens = max(0, llm_call.output_length_tokens)
+        self._last_llm_call = llm_call
         self.total_calls += 1
         self.total_prompt_tokens += prompt_tokens
         self.total_output_tokens += output_tokens

@@ -52,7 +52,9 @@ class PrivacyHopQASettings:
     local_index_root: Path = DEFAULT_LOCAL_INDEX_ROOT
     local_index_mmap_mode: str = "r"
     helper_service_url: str | None = None
+    privacy_reward_service_url: str | None = None
     helper_timeout_s: float = 30.0
+    privacy_reward_timeout_s: float = 30.0
     generation_context_limit_tokens: int = 16384
     generation_context_margin_tokens: int = 128
     hop_plan_max_tokens: int = 4096
@@ -71,6 +73,9 @@ class PrivacyHopQASettings:
     hop_step_doc_bonus: float = 0.25
     hop_resolve_reward_mode: str = "hop_correct"
     hop_step_efficiency_metric: str = "none"
+    privacy_reward_weight: float = 0.0
+    privacy_reward_threshold: float = 0.6
+    privacy_reward_context_hops: int = 2
     constrained_resolver: bool = False
     stop_after_incorrect_hop: bool = False
     # In stepwise training modes, individual planning traces whose
@@ -137,7 +142,11 @@ class PrivacyHopQASettings:
             local_index_root=Path(data.get("local_index_root", DEFAULT_LOCAL_INDEX_ROOT)).expanduser(),
             local_index_mmap_mode=str(data.get("local_index_mmap_mode", "r")),
             helper_service_url=(str(data["helper_service_url"]) if data.get("helper_service_url") is not None else None),
+            privacy_reward_service_url=(
+                str(data["privacy_reward_service_url"]) if data.get("privacy_reward_service_url") is not None else None
+            ),
             helper_timeout_s=float(data.get("helper_timeout_s", 30.0)),
+            privacy_reward_timeout_s=float(data.get("privacy_reward_timeout_s", data.get("helper_timeout_s", 30.0))),
             generation_context_limit_tokens=int(data.get("generation_context_limit_tokens", 16384)),
             generation_context_margin_tokens=int(data.get("generation_context_margin_tokens", 128)),
             hop_plan_max_tokens=int(data.get("hop_plan_max_tokens", 4096)),
@@ -156,6 +165,9 @@ class PrivacyHopQASettings:
             hop_step_doc_bonus=float(data.get("hop_step_doc_bonus", data.get("hop_step_source_bonus", 0.25))),
             hop_resolve_reward_mode=str(data.get("hop_resolve_reward_mode", "hop_correct")),
             hop_step_efficiency_metric=str(data.get("hop_step_efficiency_metric", "none")),
+            privacy_reward_weight=float(data.get("privacy_reward_weight", 0.0)),
+            privacy_reward_threshold=float(data.get("privacy_reward_threshold", 0.6)),
+            privacy_reward_context_hops=int(data.get("privacy_reward_context_hops", 2)),
             constrained_resolver=bool(data.get("constrained_resolver", False)),
             stop_after_incorrect_hop=bool(data.get("stop_after_incorrect_hop", False)),
             zero_error_step_reward=bool(data.get("zero_error_step_reward", True)),

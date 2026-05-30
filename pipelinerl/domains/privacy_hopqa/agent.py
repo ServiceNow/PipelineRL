@@ -1414,6 +1414,27 @@ class PrivacyHopQAAgent:
                 ],
             },
         )
+        self.llm_adapter.update_captured_metadata(
+            log_name="hop_plan",
+            hop_number=hop.hop_number,
+            iteration=iteration,
+            metadata={
+                "hop_plan_action_count": len(planned_actions),
+                "hop_plan_source_types": sorted({action.type for action in planned_actions}),
+                "hop_plan_web_queries": [
+                    str(action.parameters.get("query") or "").strip()
+                    for action in planned_actions
+                    if action.type == "web_search" and str(action.parameters.get("query") or "").strip()
+                ],
+                "hop_plan_fallback_used": bool(fallback_used),
+                "hop_plan_attempts": int(attempt_count),
+                "hop_plan_gold_parent_available_before": bool(
+                    hop.gold_parent_retrieved or hop.gold_parent_read or hop.gold_candidate_doc_ids
+                ),
+                "hop_plan_gold_parent_retrieved_before_trim": False,
+                "hop_plan_gold_parent_retrieved": False,
+            },
+        )
         return planned_actions
 
     async def _web_hits(self, query: str) -> list[dict[str, Any]]:
@@ -1748,10 +1769,31 @@ class PrivacyHopQAAgent:
                 results.append(await self._execute_retrieval_action(action, hop, iteration))
 
         candidates: list[CandidateDoc] = self._memory_seed_candidates(hop)
-        for action, action_candidates, history_entry in results:
+        current_action_candidates: list[CandidateDoc] = []
+        for action, per_action_candidates, history_entry in results:
             hop.search_history.append(history_entry)
-            candidates.extend(action_candidates)
-        return self._finalize_candidate_pool(hop, candidates)
+            current_action_candidates.extend(per_action_candidates)
+            candidates.extend(per_action_candidates)
+        action_candidate_ids = {candidate.doc_id for candidate in current_action_candidates}
+        gold_parent_retrieved_before_trim = any(
+            _candidate_matches_gold(candidate, hop) for candidate in current_action_candidates
+        )
+        finalized = self._finalize_candidate_pool(hop, candidates)
+        gold_parent_retrieved = any(
+            candidate.doc_id in action_candidate_ids and _candidate_matches_gold(candidate, hop)
+            for candidate in finalized
+        )
+        self.llm_adapter.update_captured_metadata(
+            log_name="hop_plan",
+            hop_number=hop.hop_number,
+            iteration=iteration,
+            metadata={
+                "hop_plan_gold_parent_retrieved_before_trim": bool(gold_parent_retrieved_before_trim),
+                "hop_plan_gold_parent_retrieved": bool(gold_parent_retrieved),
+                "hop_plan_candidate_count": len(finalized),
+            },
+        )
+        return finalized
 
     async def _choose_documents(self, hop: HopState, candidates: list[CandidateDoc], iteration: int) -> list[CandidateDoc]:
         if not candidates:
@@ -1854,7 +1896,9 @@ class PrivacyHopQAAgent:
                 "selected_parent_doc_ids": selected_parent_ids,
                 "selected_doc_ids": [doc.doc_id for doc in selected],
                 "gold_candidate_parent_doc_ids": gold_parent_ids,
+                "doc_choose_gold_parent_visible": bool(gold_parent_ids),
                 "doc_choose_selected_gold_parent": selected_gold_parent,
+                "doc_choose_selected_any_parent": bool(selected_parent_ids),
             },
         )
         ended = self._elapsed_s()

@@ -36,7 +36,8 @@ from .utils import extract_json
 
 logger = logging.getLogger(__name__)
 
-TRAINABLE_CONTROL_STAGES = {"hop_plan", "doc_choose", "hop_resolve"}
+TRAINABLE_CONTROL_STAGES = {"hop_plan", "doc_choose"}
+STEP_REWARD_MODES = {"prefix_progress", "hop_step", "hop_step_situational"}
 
 # The finalized dataset records hop source patterns as compact "L"/"W"
 # strings. Some older/intermediate rows and helper metadata use the expanded
@@ -126,6 +127,27 @@ class PrivacyHopQAMetrics(BaseMetrics):
     success_by_pattern: dict[str, float] = Field(default_factory=dict)
     reward_by_chain_length: dict[str, float] = Field(default_factory=dict)
     success_by_chain_length: dict[str, float] = Field(default_factory=dict)
+    hop_plan_reward_mean: float = 0.0
+    doc_choose_reward_mean: float = 0.0
+    hop_plan_training_calls: int = 0
+    doc_choose_training_calls: int = 0
+    privacy_reward_plan_calls: int = 0
+    privacy_reward_penalized_plan_calls: int = 0
+    privacy_reward_penalized_plan_call_rate: float = 0.0
+    privacy_reward_penalty_mean: float = 0.0
+    privacy_reward_nonzero_penalty_mean: float = 0.0
+    privacy_reward_badness_mean: float = 0.0
+    privacy_reward_direct_badness_mean: float = 0.0
+    privacy_reward_mosaic_badness_mean: float = 0.0
+    privacy_reward_direct_score_mean: float = 0.0
+    privacy_reward_context_score_mean: float = 0.0
+    privacy_reward_without_current_score_mean: float = 0.0
+    privacy_reward_loo_delta_mean: float = 0.0
+    hop_plan_gold_retrieved_rate: float = 0.0
+    hop_plan_target_source_searched_rate: float = 0.0
+    doc_choose_gold_visible_rate: float = 0.0
+    doc_choose_selected_gold_when_visible_rate: float = 0.0
+    doc_choose_correct_when_gold_absent_rate: float = 0.0
 
 
 def _build_run_paths(cfg: DictConfig, problem: dict) -> tuple[Path, Path]:
@@ -216,10 +238,94 @@ def _hop_iteration_counts(training_texts: list) -> dict[str, int]:
     return {hop_number: max(len(iterations), 1) for hop_number, iterations in iterations_by_hop.items()}
 
 
-def _annotate_hop_step_advantage_segments(training_texts: list) -> None:
+def _training_stage_metrics(training_texts: list) -> dict[str, float | int]:
+    rewards_by_stage: dict[str, list[float]] = {"hop_plan": [], "doc_choose": []}
+    privacy_plan_calls = 0
+    privacy_penalized_plan_calls = 0
+    privacy_penalties: list[float] = []
+    privacy_nonzero_penalties: list[float] = []
+    privacy_badnesses: list[float] = []
+    privacy_direct_badnesses: list[float] = []
+    privacy_mosaic_badnesses: list[float] = []
+    privacy_direct_scores: list[float] = []
+    privacy_context_scores: list[float] = []
+    privacy_without_scores: list[float] = []
+    privacy_loo_deltas: list[float] = []
+    plan_gold_retrieved: list[bool] = []
+    plan_source_searched: list[bool] = []
+    choose_gold_visible: list[bool] = []
+    choose_selected_gold_when_visible: list[bool] = []
+    choose_correct_when_gold_absent: list[bool] = []
+
+    for trace in training_texts:
+        privacy_meta = trace.metadata.get("privacy_hopqa", {})
+        stage = str(privacy_meta.get("log_name") or "")
+        if stage not in rewards_by_stage:
+            continue
+        rewards_by_stage[stage].append(float(privacy_meta.get("training_reward", trace.reward)))
+        if stage == "hop_plan" and privacy_meta.get("privacy_reward_scored"):
+            privacy_plan_calls += 1
+            penalty = float(privacy_meta.get("privacy_reward_penalty") or 0.0)
+            privacy_penalties.append(penalty)
+            privacy_badnesses.append(float(privacy_meta.get("privacy_reward_badness") or 0.0))
+            privacy_direct_badnesses.append(float(privacy_meta.get("privacy_reward_direct_badness") or 0.0))
+            privacy_mosaic_badnesses.append(float(privacy_meta.get("privacy_reward_mosaic_badness") or 0.0))
+            privacy_direct_scores.append(float(privacy_meta.get("privacy_reward_direct_score") or 0.0))
+            privacy_context_scores.append(float(privacy_meta.get("privacy_reward_context_score") or 0.0))
+            privacy_without_scores.append(float(privacy_meta.get("privacy_reward_without_current_score") or 0.0))
+            privacy_loo_deltas.append(float(privacy_meta.get("privacy_reward_loo_delta") or 0.0))
+            if penalty > 0:
+                privacy_penalized_plan_calls += 1
+                privacy_nonzero_penalties.append(penalty)
+        call_meta = privacy_meta.get("call_metadata")
+        call_meta = call_meta if isinstance(call_meta, dict) else {}
+        if stage == "hop_plan":
+            plan_gold_retrieved.append(bool(call_meta.get("hop_plan_gold_parent_retrieved")))
+            plan_source_searched.append(bool(privacy_meta.get("hop_step_target_source_searched")))
+        elif stage == "doc_choose":
+            gold_visible = bool(call_meta.get("doc_choose_gold_parent_visible") or call_meta.get("gold_candidate_parent_doc_ids"))
+            choose_gold_visible.append(gold_visible)
+            if gold_visible:
+                choose_selected_gold_when_visible.append(bool(call_meta.get("doc_choose_selected_gold_parent")))
+            else:
+                choose_correct_when_gold_absent.append(bool(privacy_meta.get("hop_correct")))
+
+    def _mean(values: list[float] | list[bool]) -> float:
+        return float(sum(float(value) for value in values) / len(values)) if values else 0.0
+
+    return {
+        "hop_plan_reward_mean": _mean(rewards_by_stage["hop_plan"]),
+        "doc_choose_reward_mean": _mean(rewards_by_stage["doc_choose"]),
+        "hop_plan_training_calls": len(rewards_by_stage["hop_plan"]),
+        "doc_choose_training_calls": len(rewards_by_stage["doc_choose"]),
+        "privacy_reward_plan_calls": privacy_plan_calls,
+        "privacy_reward_penalized_plan_calls": privacy_penalized_plan_calls,
+        "privacy_reward_penalized_plan_call_rate": (
+            privacy_penalized_plan_calls / privacy_plan_calls if privacy_plan_calls else 0.0
+        ),
+        "privacy_reward_penalty_mean": _mean(privacy_penalties),
+        "privacy_reward_nonzero_penalty_mean": _mean(privacy_nonzero_penalties),
+        "privacy_reward_badness_mean": _mean(privacy_badnesses),
+        "privacy_reward_direct_badness_mean": _mean(privacy_direct_badnesses),
+        "privacy_reward_mosaic_badness_mean": _mean(privacy_mosaic_badnesses),
+        "privacy_reward_direct_score_mean": _mean(privacy_direct_scores),
+        "privacy_reward_context_score_mean": _mean(privacy_context_scores),
+        "privacy_reward_without_current_score_mean": _mean(privacy_without_scores),
+        "privacy_reward_loo_delta_mean": _mean(privacy_loo_deltas),
+        "hop_plan_gold_retrieved_rate": _mean(plan_gold_retrieved),
+        "hop_plan_target_source_searched_rate": _mean(plan_source_searched),
+        "doc_choose_gold_visible_rate": _mean(choose_gold_visible),
+        "doc_choose_selected_gold_when_visible_rate": _mean(choose_selected_gold_when_visible),
+        "doc_choose_correct_when_gold_absent_rate": _mean(choose_correct_when_gold_absent),
+    }
+
+
+def _annotate_hop_step_advantage_segments(training_texts: list, *, use_situations: bool = False) -> None:
     """Mark hop-step rewards for stage-local advantage comparison.
 
-    Control stages are compared within each hop/stage segment. Non-control
+    Control stages are compared within each hop/stage segment. Situational
+    hop-step rewards further split by whether the model had already retrieved
+    gold for hop_plan and whether gold was visible for doc_choose. Non-control
     stages, such as doc_read when capture_mode=all_calls, are placed in their
     own zero-reward segments so they do not get accidental global-step
     advantages. These fields only affect baseline buckets; they do not create
@@ -231,7 +337,10 @@ def _annotate_hop_step_advantage_segments(training_texts: list) -> None:
         stage = str(privacy_meta.get("log_name") or "")
         hop_number = privacy_meta.get("hop_number")
         if stage in TRAINABLE_CONTROL_STAGES and hop_number is not None:
-            segments.setdefault(("control", str(hop_number), stage), []).append(trace)
+            situation = "all"
+            if use_situations:
+                situation = str(privacy_meta.get("hop_step_situation") or "unknown")
+            segments.setdefault(("control", str(hop_number), f"{stage}:{situation}"), []).append(trace)
         else:
             segments.setdefault(("ignored", "none", stage or "unknown"), []).append(trace)
 
@@ -268,7 +377,7 @@ def _assign_training_rewards(
     hop_correct = _hop_correctness(score)
     hop_iterations = _hop_iteration_counts(training_texts)
     target_sources = _target_source_by_hop(problem)
-    apply_zero_error_step_reward = zero_error_step_reward and training_reward_mode in {"prefix_progress", "hop_step"}
+    apply_zero_error_step_reward = zero_error_step_reward and training_reward_mode in STEP_REWARD_MODES
 
     # Per-trace error match: exact captured_call_index values that had a
     # recorded error event during the rollout. We zero ONLY those specific
@@ -279,7 +388,7 @@ def _assign_training_rewards(
     error_call_indices: set[int] = set()
     if apply_zero_error_step_reward:
         for rec in error_records or []:
-            if rec.get("stage") not in {"hop_plan", "doc_choose", "hop_resolve"}:
+            if rec.get("stage") not in TRAINABLE_CONTROL_STAGES:
                 continue
             captured_call_index = rec.get("captured_call_index")
             if captured_call_index is not None:
@@ -292,14 +401,11 @@ def _assign_training_rewards(
         max_prefix_reward = outcome_reward
 
     def _error_trace_reward(stage: str) -> float:
-        if (
-            training_reward_mode == "hop_step"
-            and stage == "hop_resolve"
-            and hop_resolve_reward_mode == "local_decision"
-        ):
+        if training_reward_mode in {"hop_step", "hop_step_situational"} and stage in TRAINABLE_CONTROL_STAGES:
             return -1.0
         return 0.0
 
+    ignored_traces: set[int] = set()
     for trace in training_texts:
         privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
         stage = str(privacy_meta.get("log_name") or "")
@@ -317,13 +423,18 @@ def _assign_training_rewards(
             reward = float((hop_progress or {}).get("reward", outcome_reward))
         elif training_reward_mode == "hop_step":
             # Hop-step reward is local to the hop currently being trained:
-            #   hop_resolve: correct_hop
-            #   hop_plan with executable retrieval actions:
-            #       correct_hop + 0.25 * searched_gold_source_type
-            #   doc_choose:
-            #       correct_hop + 0.25 * selected_gold_or_alias_parent
-            #   hop_plan with no executable retrieval actions:
-            #       0
+            #   hop_plan:
+            #       correct_hop
+            #       + source_bonus * searched_expected_source_type
+            #       + doc_bonus * retrieved_gold_or_alias_parent
+            #   doc_choose when a gold/equivalent parent is visible:
+            #       correct_hop + doc_bonus * selected_gold_or_alias_parent
+            #   doc_choose when no gold/equivalent parent is visible:
+            #       correct_hop
+            # Hop resolve is intentionally not trainable in planning_only
+            # capture mode. Its local decision reward is noisy because reader
+            # errors and answer-variant gaps are hard to separate from resolver
+            # mistakes.
             # These bonuses are small stage-local shaping terms. They reward
             # choosing the right tool family and, after candidate docs are
             # visible, choosing a gold/equivalent parent document. Expensive
@@ -340,35 +451,48 @@ def _assign_training_rewards(
                 target_source = target_sources.get(hop_key)
                 target_source_searched = False
                 selected_gold_parent = False
+                gold_parent_retrieved = False
+                doc_choose_gold_visible = False
                 planned_sources: set[str] = set()
+                call_meta = privacy_meta.get("call_metadata")
+                if not isinstance(call_meta, dict):
+                    call_meta = {}
                 if stage == "hop_plan":
-                    planned_sources = _planned_source_types(trace.output_text)
-                    target_source_searched = bool(target_source and target_source in planned_sources)
-                    if planned_sources:
-                        reward = (
-                            correct_value + float(source_bonus) * float(target_source_searched)
-                        )
+                    raw_sources = call_meta.get("hop_plan_source_types")
+                    if isinstance(raw_sources, list):
+                        planned_sources = {
+                            str(source).strip().casefold()
+                            for source in raw_sources
+                            if str(source).strip()
+                        }
                     else:
-                        reward = 0.0
+                        planned_sources = _planned_source_types(trace.output_text)
+                    target_source_searched = bool(target_source and target_source in planned_sources)
+                    gold_parent_retrieved = bool(call_meta.get("hop_plan_gold_parent_retrieved"))
+                    reward = (
+                        correct_value
+                        + float(source_bonus) * float(target_source_searched)
+                        + float(doc_bonus) * float(gold_parent_retrieved)
+                    )
                 elif stage == "doc_choose":
-                    call_meta = privacy_meta.get("call_metadata")
-                    if isinstance(call_meta, dict):
-                        selected_gold_parent = bool(call_meta.get("doc_choose_selected_gold_parent"))
-                    reward = correct_value + float(doc_bonus) * float(selected_gold_parent)
-                else:
-                    call_meta = privacy_meta.get("call_metadata")
-                    if hop_resolve_reward_mode == "local_decision" and isinstance(call_meta, dict):
-                        if bool(call_meta.get("hop_resolve_answered")):
-                            reward = 1.0 if bool(call_meta.get("hop_resolve_answer_matches_accepted")) else 0.0
-                        else:
-                            reward = 0.0
+                    doc_choose_gold_visible = bool(
+                        call_meta.get("doc_choose_gold_parent_visible")
+                        or call_meta.get("gold_candidate_parent_doc_ids")
+                    )
+                    selected_gold_parent = bool(call_meta.get("doc_choose_selected_gold_parent"))
+                    if doc_choose_gold_visible:
+                        reward = correct_value + float(doc_bonus) * float(selected_gold_parent)
                     else:
                         reward = correct_value
+                else:
+                    reward = 0.0
                 privacy_meta.update(
                     {
                         "hop_step_iteration_count": int(iteration_count),
                         "hop_step_target_source": target_source,
                         "hop_step_target_source_searched": target_source_searched,
+                        "hop_step_hop_plan_gold_parent_retrieved": gold_parent_retrieved,
+                        "hop_step_doc_choose_gold_parent_visible": doc_choose_gold_visible,
                         "hop_step_doc_choose_selected_gold_parent": selected_gold_parent,
                         "hop_step_executable_plan": stage != "hop_plan" or bool(planned_sources),
                         "hop_step_source_bonus": float(source_bonus),
@@ -381,16 +505,126 @@ def _assign_training_rewards(
             else:
                 reward = 0.0
                 privacy_meta["hop_step_ignored_stage"] = stage
+        elif training_reward_mode == "hop_step_situational":
+            # Situation-local reward used for the plan/choose ablation:
+            #   hop_plan, gold already retrieved:
+            #       no more searches -> 1.0; correct source -> 0.25; wrong source -> 0.0
+            #   hop_plan, gold not yet retrieved:
+            #       retrieves gold/equivalent parent -> 1.25; correct source -> 0.25; wrong source -> 0.0
+            #   doc_choose, gold visible:
+            #       selects gold/equivalent parent -> 1.0; otherwise -> 0.0
+            #   doc_choose, gold absent:
+            #       ignored, because the chooser cannot select a document it was not shown.
+            if is_error_trace:
+                reward = _error_trace_reward(stage)
+                situation = "error"
+                privacy_meta["hop_step_situation"] = situation
+            elif stage in TRAINABLE_CONTROL_STAGES and hop_key is not None:
+                target_source = target_sources.get(hop_key)
+                target_source_searched = False
+                selected_gold_parent = False
+                gold_parent_retrieved = False
+                gold_parent_available_before = False
+                doc_choose_gold_visible = False
+                planned_sources: set[str] = set()
+                situation = "unknown"
+                call_meta = privacy_meta.get("call_metadata")
+                if not isinstance(call_meta, dict):
+                    call_meta = {}
+                if stage == "hop_plan":
+                    raw_sources = call_meta.get("hop_plan_source_types")
+                    if isinstance(raw_sources, list):
+                        planned_sources = {
+                            str(source).strip().casefold()
+                            for source in raw_sources
+                            if str(source).strip()
+                        }
+                    else:
+                        planned_sources = _planned_source_types(trace.output_text)
+                    action_count = int(call_meta.get("hop_plan_action_count") or len(planned_sources))
+                    target_source_searched = bool(target_source and target_source in planned_sources)
+                    gold_parent_available_before = bool(call_meta.get("hop_plan_gold_parent_available_before"))
+                    gold_parent_retrieved = bool(
+                        call_meta.get("hop_plan_gold_parent_retrieved")
+                        or call_meta.get("hop_plan_gold_parent_retrieved_before_trim")
+                    )
+                    if gold_parent_available_before:
+                        situation = "gold_already_retrieved"
+                        if action_count == 0:
+                            reward = 1.0
+                        elif target_source_searched:
+                            reward = float(source_bonus)
+                        else:
+                            reward = 0.0
+                    else:
+                        situation = "gold_not_yet_retrieved"
+                        if gold_parent_retrieved:
+                            reward = 1.0 + float(doc_bonus)
+                        elif target_source_searched:
+                            reward = float(source_bonus)
+                        else:
+                            reward = 0.0
+                elif stage == "doc_choose":
+                    doc_choose_gold_visible = bool(
+                        call_meta.get("doc_choose_gold_parent_visible")
+                        or call_meta.get("gold_candidate_parent_doc_ids")
+                    )
+                    selected_gold_parent = bool(call_meta.get("doc_choose_selected_gold_parent"))
+                    if doc_choose_gold_visible:
+                        situation = "gold_visible"
+                        reward = 1.0 if selected_gold_parent else 0.0
+                    else:
+                        situation = "gold_absent"
+                        reward = 0.0
+                        ignored_traces.add(id(trace))
+                else:
+                    situation = "ignored_stage"
+                    reward = 0.0
+                    ignored_traces.add(id(trace))
+                privacy_meta.update(
+                    {
+                        "hop_step_situation": situation,
+                        "hop_step_target_source": target_source,
+                        "hop_step_target_source_searched": target_source_searched,
+                        "hop_step_hop_plan_gold_parent_available_before": gold_parent_available_before,
+                        "hop_step_hop_plan_gold_parent_retrieved": gold_parent_retrieved,
+                        "hop_step_doc_choose_gold_parent_visible": doc_choose_gold_visible,
+                        "hop_step_doc_choose_selected_gold_parent": selected_gold_parent,
+                        "hop_step_executable_plan": stage != "hop_plan" or bool(planned_sources),
+                        "hop_step_source_bonus": float(source_bonus),
+                        "hop_step_doc_bonus": float(doc_bonus),
+                        "hop_resolve_reward_mode": hop_resolve_reward_mode,
+                        "hop_step_efficiency_metric": hop_step_efficiency_metric,
+                        "hop_step_efficiency_group": f"privacy_hopqa:hop:{hop_key}",
+                    }
+                )
+            else:
+                situation = "ignored_stage"
+                reward = 0.0
+                ignored_traces.add(id(trace))
+                privacy_meta["hop_step_ignored_stage"] = stage
+                privacy_meta["hop_step_situation"] = situation
         else:
             raise ValueError(f"unknown privacy_hopqa training_reward_mode: {training_reward_mode}")
         if is_error_trace:
             reward = _error_trace_reward(stage)
+        pre_privacy_reward = reward
+        privacy_penalty = 0.0
+        if (
+            training_reward_mode in {"hop_step", "hop_step_situational"}
+            and stage == "hop_plan"
+            and not is_error_trace
+        ):
+            privacy_penalty = float(privacy_meta.get("privacy_reward_penalty") or 0.0)
+            reward -= privacy_penalty
         trace.reward = reward
         privacy_meta.update(
             {
                 "training_reward_mode": training_reward_mode,
                 "training_reward": reward,
-                "hop_step_base_reward": reward,
+                "hop_step_base_reward": pre_privacy_reward,
+                "hop_step_pre_privacy_reward": pre_privacy_reward,
+                "privacy_reward_applied_penalty": privacy_penalty,
                 "outcome_reward": outcome_reward,
                 "prefix_progress_reward": float((hop_progress or {}).get("reward", outcome_reward)),
                 "prefix_correct_hops": int((hop_progress or {}).get("prefix_correct_hops", 0)),
@@ -401,8 +635,164 @@ def _assign_training_rewards(
         )
         if apply_zero_error_step_reward:
             trace.metadata["padding_reward"] = max_prefix_reward
-    if training_reward_mode == "hop_step":
-        _annotate_hop_step_advantage_segments(training_texts)
+    if ignored_traces:
+        training_texts[:] = [trace for trace in training_texts if id(trace) not in ignored_traces]
+    if training_reward_mode in {"hop_step", "hop_step_situational"}:
+        _annotate_hop_step_advantage_segments(training_texts, use_situations=training_reward_mode == "hop_step_situational")
+
+
+def _privacy_reward_local_facts(problem: dict) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    for idx, hop in enumerate(problem.get("hops") or [], start=1):
+        hop_type = str(hop.get("hop_type") or hop.get("source") or "").strip().upper()
+        if hop_type != "L":
+            continue
+        hop_number = int(hop.get("hop_number") or idx)
+        question = str(hop.get("question") or hop.get("question_templated") or "").strip()
+        answer = str(hop.get("answer") or "").strip()
+        if not question or not answer:
+            continue
+        facts.append(
+            {
+                "fact_id": f"hop{hop_number}",
+                "hop_number": hop_number,
+                "doc_id": hop.get("gold_doc_id") or hop.get("doc_id") or hop.get("gold_doc_ref"),
+                "question": question,
+                "canonical_answer": answer,
+            }
+        )
+    return facts
+
+
+def _privacy_reward_web_queries(trace: Any) -> list[str]:
+    privacy_meta = trace.metadata.get("privacy_hopqa", {})
+    call_meta = privacy_meta.get("call_metadata")
+    call_meta = call_meta if isinstance(call_meta, dict) else {}
+    queries = call_meta.get("hop_plan_web_queries")
+    if not isinstance(queries, list):
+        return []
+    return [" ".join(str(query).split()) for query in queries if " ".join(str(query).split())]
+
+
+def _privacy_reward_score_example(problem: dict, example_id: str, web_queries: list[str]) -> dict[str, Any]:
+    return {
+        "id": example_id,
+        "company": problem.get("company"),
+        "task_id": problem.get("task_id"),
+        "chain_id": problem.get("chain_id"),
+        "variant": "private_fact_context",
+        "web_queries": web_queries,
+        "private_qas": [],
+        "local_hop_facts": _privacy_reward_local_facts(problem),
+    }
+
+
+async def _annotate_privacy_reward_scores(
+    training_texts: list,
+    problem: dict,
+    settings: PrivacyHopQASettings,
+    session: aiohttp.ClientSession,
+) -> None:
+    if settings.privacy_reward_weight <= 0 or not settings.privacy_reward_service_url:
+        return
+
+    entries: list[dict[str, Any]] = []
+    for trace_index, trace in enumerate(training_texts):
+        privacy_meta = trace.metadata.get("privacy_hopqa", {})
+        if str(privacy_meta.get("log_name") or "") != "hop_plan":
+            continue
+        hop_number = privacy_meta.get("hop_number")
+        if hop_number is None:
+            continue
+        web_queries = _privacy_reward_web_queries(trace)
+        if not web_queries:
+            continue
+        entries.append(
+            {
+                "trace": trace,
+                "trace_index": trace_index,
+                "hop_number": int(hop_number),
+                "web_queries": web_queries,
+            }
+        )
+
+    if not entries:
+        return
+
+    context_hops = max(1, int(settings.privacy_reward_context_hops))
+    examples: list[dict[str, Any]] = []
+    score_keys: dict[str, tuple[dict[str, Any], str]] = {}
+    chain_id = str(problem.get("chain_id") or "chain")
+    for entry_index, entry in enumerate(entries):
+        hop_number = int(entry["hop_number"])
+        min_hop = hop_number - context_hops + 1
+        context_entries = [
+            prior
+            for prior in entries
+            if int(prior["trace_index"]) <= int(entry["trace_index"])
+            and min_hop <= int(prior["hop_number"]) <= hop_number
+        ]
+        context_queries = [query for prior in context_entries for query in prior["web_queries"]]
+        without_queries = [
+            query
+            for prior in context_entries
+            if int(prior["trace_index"]) != int(entry["trace_index"])
+            for query in prior["web_queries"]
+        ]
+        payloads = {
+            "direct": entry["web_queries"],
+            "context": context_queries,
+        }
+        if without_queries:
+            payloads["without"] = without_queries
+        for kind, queries in payloads.items():
+            example_id = f"{chain_id}:hop{hop_number}:plan{entry_index}:{kind}"
+            score_keys[example_id] = (entry, kind)
+            examples.append(_privacy_reward_score_example(problem, example_id, queries))
+
+    client = AsyncPrivacyHopQAHelperClient(
+        base_url=settings.privacy_reward_service_url,
+        timeout_s=settings.privacy_reward_timeout_s,
+        session=session,
+        connection_close=True,
+    )
+    response_scores = await client.score_privacy_reward(examples)
+    scores_by_id = {str(item.get("id")): float(item.get("prob_yes") or 0.0) for item in response_scores}
+
+    threshold = float(settings.privacy_reward_threshold)
+    weight = float(settings.privacy_reward_weight)
+    grouped_scores: dict[int, dict[str, float]] = {}
+    for example_id, (entry, kind) in score_keys.items():
+        grouped_scores.setdefault(int(entry["trace_index"]), {})[kind] = scores_by_id.get(example_id, 0.0)
+
+    for entry in entries:
+        trace_index = int(entry["trace_index"])
+        scores = grouped_scores.get(trace_index, {})
+        direct = float(scores.get("direct", 0.0))
+        context_score = float(scores.get("context", direct))
+        without_score = float(scores.get("without", 0.0))
+        loo_delta = context_score - without_score
+        direct_badness = max(0.0, direct - threshold)
+        mosaic_badness = max(0.0, context_score - max(without_score, threshold))
+        badness = max(direct_badness, mosaic_badness)
+        penalty = weight * badness
+        privacy_meta = entry["trace"].metadata.setdefault("privacy_hopqa", {})
+        privacy_meta.update(
+            {
+                "privacy_reward_scored": True,
+                "privacy_reward_direct_score": direct,
+                "privacy_reward_context_score": context_score,
+                "privacy_reward_without_current_score": without_score,
+                "privacy_reward_loo_delta": loo_delta,
+                "privacy_reward_direct_badness": direct_badness,
+                "privacy_reward_mosaic_badness": mosaic_badness,
+                "privacy_reward_threshold": threshold,
+                "privacy_reward_weight": weight,
+                "privacy_reward_badness": badness,
+                "privacy_reward_penalty": penalty,
+                "privacy_reward_web_query_count": len(entry["web_queries"]),
+            }
+        )
 
 
 async def generate_privacy_hopqa_rollout(
@@ -648,6 +1038,7 @@ async def _run_privacy_hopqa_rollout_async(
         "retrieval_summary": retrieval_summary,
     }
     training_texts = adapter.make_training_texts(group_id=group_id, base_metadata=base_metadata)
+    await _annotate_privacy_reward_scores(training_texts, problem, settings, session)
     _assign_training_rewards(
         training_texts,
         problem,
@@ -660,6 +1051,7 @@ async def _run_privacy_hopqa_rollout_async(
         hop_step_efficiency_metric=settings.hop_step_efficiency_metric,
         hop_resolve_reward_mode=settings.hop_resolve_reward_mode,
     )
+    stage_reward_metrics = _training_stage_metrics(training_texts)
 
     metrics = PrivacyHopQAMetrics(
         reward=reward_value,
@@ -740,6 +1132,7 @@ async def _run_privacy_hopqa_rollout_async(
         success_by_pattern={pattern_key: success_value},
         reward_by_chain_length={chain_length_key: reward_value},
         success_by_chain_length={chain_length_key: success_value},
+        **stage_reward_metrics,
     )
     return RolloutResult(
         training_texts=training_texts,
