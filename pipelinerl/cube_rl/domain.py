@@ -507,7 +507,17 @@ class CubeBenchmarkWorker:
 
         latency = time.perf_counter() - start
         profiling = last_step_info.pop("profiling", {})
-        metrics_kwargs = {'reward': final_reward, 'num_steps': len(training_texts), **last_step_info}
+        # BaseMetrics requires success/no_error/no_answer. Derive them generically so cubes
+        # whose task info doesn't emit them (e.g. arithmetic-cube) work; task-provided values
+        # in last_step_info still override these defaults (e.g. math-tool-use).
+        metrics_kwargs = {
+            'reward': final_reward,
+            'num_steps': len(training_texts),
+            'success': bool(final_reward > 0),
+            'no_error': len(agent_errors) == 0,
+            'no_answer': False,
+            **last_step_info,
+        }
         metrics = BaseMetrics(**metrics_kwargs)
 
         return RolloutResult(

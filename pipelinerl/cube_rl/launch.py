@@ -491,7 +491,10 @@ class CubeActorLoop:
                 elif isinstance(value, (float, bool, int)):
                     self.stats[key][dataset_name][group_id].append(value)
                 else:
-                    raise ValueError(f"Unsupported metric type: {type(value)} for key {key}")
+                    # Non-aggregatable value (None, or descriptive task info like the question
+                    # text / submitted answer that a cube may surface). Skip rather than crash —
+                    # the aggregator only tracks numeric stats.
+                    logger.debug("Skipping non-numeric metric %r=%r (%s)", key, value, type(value).__name__)
 
         prompt_tokens = [t.prompt_tokens for result in rollout_results for t in result.training_texts]
         output_tokens = [t.output_tokens for result in rollout_results for t in result.training_texts]
