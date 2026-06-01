@@ -501,7 +501,7 @@ wheels = [
 
 [[package]]
 name = "cube-standard"
-version = "0.1.0rc5"
+version = "0.1.0rc9"
 source = { directory = "../cube-standard" }
 dependencies = [
     { name = "docstring-parser", marker = "sys_platform == 'linux'" },
@@ -513,6 +513,7 @@ dependencies = [
     { name = "requests", marker = "sys_platform == 'linux'" },
     { name = "rich", marker = "sys_platform == 'linux'" },
     { name = "tqdm", marker = "sys_platform == 'linux'" },
+    { name = "typing-extensions", marker = "sys_platform == 'linux'" },
     { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'linux'" },
 ]
 
@@ -541,6 +542,7 @@ requires-dist = [
     { name = "tenacity", marker = "extra == 'modal'", specifier = ">=9.1.4" },
     { name = "tenacity", marker = "extra == 'toolkit'", specifier = ">=9.1.4" },
     { name = "tqdm", specifier = ">=4.60" },
+    { name = "typing-extensions", specifier = ">=4.12" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34.0" },
 ]
 provides-extras = ["dev", "docker", "daytona", "modal", "toolkit"]
