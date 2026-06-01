@@ -1,0 +1,93 @@
+# Env-agnostic cube RL config. First env = arithmetic-cube (no sandbox, deterministic
+# reward) driven by TirAgent. Extend to other envs by adding entries to cube_params.cubes
+# (or a thin overlay: `defaults: [cube_rl, _self_]`). See ~/dev/plans_rl/PLAN.md.
+#
+# 4 GPUs: base_4gpu + base's world (actor_fraction:4 / finetune_fraction:4 ratio) -> 2 vLLM
+# actor GPUs + 2 finetune GPUs. Small model + small accumulation = fast finetune steps for a
+# plumbing run (T3a). Tune cube_workers / gradient_accumulation_passes when iterating.
+defaults:
+  - base_4gpu
+  - override rewards: success_and_format
+  - _self_
+
+output_dir: results/cube_rl/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /home/toolkit/models/Qwen2.5-1.5B-Instruct
+litellm_logging_level: info
+ray_debug: 0
+ray_local_mode: false
+
+actor:
+  launcher: ray
+  ray_num_cpus: null
+  cube_workers_num_cpus: 1.0
+  cube_eval_workers_fraction: 0.5
+  cube_workers: 16
+  llm_max_rollouts: 16
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+
+llm:
+  parameters:
+    max_tokens: 1024
+    max_completion_tokens: 1024
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 1024
+    max_completion_tokens: 1024
+    temperature: 1.0
+    top_p: 0.95
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 4096
+    served_model_name: Qwen2.5-1.5B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+finetune:
+  seq_length: 4096
+  gradient_accumulation_passes: 32
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 4
+  shared_memory_entry_size: 100000000
+
+cube_params:
+  resource_guard:
+    actor_memory_gb: 1.25
+    memory_overhead_gb: 8.0
+    memory_usage_threshold: 0.90
+  seed: ${seed}
+  cubes:
+    - id: arithmetic
+      split: train
+      # No dataset_name: arithmetic tasks carry no extra_info["dataset"], so a filter
+      # would drop every task (see cube_rl/registry.py _cube_dataset_filter).
+      benchmark:
+        _target_: arithmetic_cube.benchmark.ArithmeticBenchmarkConfig
+      agent:
+        _target_: cube_harness.agents.tir.TirAgentConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 1
+          extra_body:
+            return_token_ids: true
+        system_prompt: |
+          You solve a single simple arithmetic problem. Read the problem, compute the exact
+          integer result, then call the submit_answer tool with that integer. Keep it short —
+          do not write long explanations.
+        max_actions: 3
