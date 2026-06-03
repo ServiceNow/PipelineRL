@@ -18,7 +18,7 @@ import uvloop
 from omegaconf import DictConfig, OmegaConf
 
 import wandb
-from pipelinerl.async_llm import RetryableLLMResponseError
+from pipelinerl.async_llm import RetryableAbortedCompletionError, RetryableLLMResponseError
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.domains.math.rollouts import length_penalty
 from pipelinerl.finetune_loop import calculate_train_steps
@@ -88,6 +88,7 @@ async def schedule_rollouts(
         aiohttp.ClientConnectionError,
         aiohttp.ServerTimeoutError,
         RetryableLLMResponseError,
+        RetryableAbortedCompletionError,
         asyncio.TimeoutError,
         TimeoutError,
     )
@@ -776,6 +777,7 @@ def run_actor_loop(cfg: DictConfig):
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
             served_model_name=served_model_name,
+            chat_template_kwargs=cfg.llm.get("chat_template_kwargs", {}),
         )
         for url in llm_urls
     ]
@@ -787,6 +789,7 @@ def run_actor_loop(cfg: DictConfig):
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
             served_model_name=served_model_name,
+            chat_template_kwargs=cfg.test_llm.get("chat_template_kwargs", {}),
         )
         for url in llm_urls
     ]

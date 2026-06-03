@@ -26,6 +26,10 @@ class RetryableLLMResponseError(aiohttp.ClientPayloadError):
         super().__init__(message)
 
 
+class RetryableAbortedCompletionError(TimeoutError):
+    """Abort-shaped completion that should be retried instead of treated as data."""
+
+
 def _preview_response_body(body: str | None, limit: int = 1000) -> str:
     if body is None:
         return "<unavailable>"
@@ -107,6 +111,31 @@ def normalize_chat_template_messages(messages: list) -> list[dict]:
     return normalized
 
 
+def _is_retryable_abort_response(data: dict, collect_logprobs: bool) -> tuple[bool, str | None]:
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return False, None
+
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == "abort":
+        return True, "finish_reason=abort"
+
+    if not collect_logprobs:
+        return False, None
+
+    try:
+        content = choice["message"]["content"]
+        completion_logprobs = choice["logprobs"]["content"]
+        completion_tokens = data["usage"]["completion_tokens"]
+    except (KeyError, TypeError):
+        return False, None
+
+    if completion_tokens == 0 and not content and completion_logprobs == []:
+        return True, "empty completion with empty logprobs"
+    return False, None
+
+
 async def llm_async_generate(
     llm: TrainableLLM,
     prompt: Prompt,
@@ -140,6 +169,9 @@ async def llm_async_generate(
             f"LLM parameters must serialize to a mapping, got {type(extra_parameters)}"
         )
 
+    if llm.chat_template_kwargs:
+        extra_parameters = {**extra_parameters, "chat_template_kwargs": _to_plain_obj(llm.chat_template_kwargs)}
+
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
     if prompt.tools:
@@ -150,58 +182,76 @@ async def llm_async_generate(
 
     # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
     payload = _to_plain_obj({**extra_parameters, **data})
-    async with session.post(
-        url=f"{llm.base_url}/v1/chat/completions",
-        json=payload,
-        headers=headers,
-        ssl=False,
-    ) as response:
-        response_text = await response.text()
-        if not response.ok:
-            logger.error(f"Failed to get completion: {response_text}")
-            response.raise_for_status()
-        try:
-            data = json.loads(response_text)
-        except json.JSONDecodeError:
-            logger.exception(
-                "Failed to decode LLM response JSON: status=%s body=%r",
-                response.status,
-                _preview_response_body(response_text),
-            )
+    response_data = None
+    response_text = None
+    for attempt in range(2):
+        async with session.post(
+            url=f"{llm.base_url}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            ssl=False,
+        ) as response:
+            response_text = await response.text()
+            if not response.ok:
+                logger.error(f"Failed to get completion: {response_text}")
+                response.raise_for_status()
+            try:
+                response_data = json.loads(response_text)
+            except json.JSONDecodeError:
+                logger.exception(
+                    "Failed to decode LLM response JSON: status=%s body=%r",
+                    response.status,
+                    _preview_response_body(response_text),
+                )
+                _raise_invalid_llm_response(
+                    "response body is not valid JSON",
+                    status=response.status,
+                    body=response_text,
+                )
+
+        if response_data is None:
+            _raise_invalid_llm_response("response body is JSON null", body=response_text)
+        if not isinstance(response_data, dict):
             _raise_invalid_llm_response(
-                "response body is not valid JSON",
-                status=response.status,
-                body=response_text,
+                f"expected JSON object, got {type(response_data).__name__}", body=response_text
             )
 
-    if data is None:
+        is_retryable_abort, abort_reason = _is_retryable_abort_response(
+            response_data, llm.collect_logprobs
+        )
+        if not is_retryable_abort:
+            break
+
+        choice = response_data.get("choices", [{}])[0]
+        usage = response_data.get("usage", {})
         logger.warning(
-            "LLM server returned JSON null: status=%s body=%r",
-            response.status,
-            _preview_response_body(response_text),
+            "Retryable aborted completion prompt_id=%s response_id=%s attempt=%s/2 reason=%s "
+            "finish_reason=%s prompt_tokens=%s completion_tokens=%s",
+            prompt.id,
+            response_data.get("id", "<unknown>"),
+            attempt + 1,
+            abort_reason,
+            choice.get("finish_reason"),
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
         )
-        _raise_invalid_llm_response(
-            "response body is JSON null",
-            status=response.status,
-            body=response_text,
-        )
-    if not isinstance(data, dict):
-        _raise_invalid_llm_response(
-            f"expected JSON object, got {type(data).__name__}",
-            status=response.status,
-            body=response_text,
-        )
+        if attempt == 1:
+            raise RetryableAbortedCompletionError(
+                f"Repeated aborted completion for prompt {prompt.id}: {abort_reason}"
+            )
+
+    assert response_data is not None, "response_data is None"
 
     try:
-        content = data["choices"][0]["message"]["content"]
-        raw_tool_calls = data["choices"][0]["message"].get("tool_calls", [])
+        content = response_data["choices"][0]["message"]["content"]
+        raw_tool_calls = response_data["choices"][0]["message"].get("tool_calls", [])
         if not content and not raw_tool_calls:
-            logger.warning(f"Empty completion {data}")
+            logger.warning(f"Empty completion {response_data}")
 
         parsed_logprobs = []
         finish_reason = None
         if llm.collect_logprobs:
-            completion_logprobs = data["choices"][0]["logprobs"]["content"]
+            completion_logprobs = response_data["choices"][0]["logprobs"]["content"]
             for logprob in completion_logprobs:
                 if logprob:
                     try:
@@ -217,17 +267,15 @@ async def llm_async_generate(
                     except Exception as e:
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
-        finish_reason = data["choices"][0].get("finish_reason")
+        finish_reason = response_data["choices"][0].get("finish_reason")
     except Exception:
         logger.exception(
-            "Failed to parse LLM response: status=%s body=%r parsed=%r",
-            response.status,
+            "Failed to parse LLM response: body=%r parsed=%r",
             _preview_response_body(response_text),
-            data,
+            response_data,
         )
         _raise_invalid_llm_response(
             "response does not match OpenAI chat completion schema",
-            status=response.status,
             body=response_text,
         )
 
@@ -235,8 +283,8 @@ async def llm_async_generate(
     if raw_tool_calls:
         output.tool_calls = [litellm.ChatCompletionMessageToolCall(**tc) for tc in raw_tool_calls]
     llm_call = llm.log_output(prompt, output, count_tokens=False)
-    llm_call.prompt_length_tokens = data["usage"]["prompt_tokens"]
-    llm_call.output_length_tokens = data["usage"]["completion_tokens"]
+    llm_call.prompt_length_tokens = response_data["usage"]["prompt_tokens"]
+    llm_call.output_length_tokens = response_data["usage"]["completion_tokens"]
     if finish_reason:
         llm_call.llm_info["finish_reason"] = finish_reason
     assert llm_call is not None, "llm_call is None"
@@ -245,6 +293,12 @@ async def llm_async_generate(
 
 
 def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
+    finish_reason = llm_call.llm_info.get("finish_reason")
+    if finish_reason == "abort":
+        raise RetryableAbortedCompletionError(
+            f"Aborted completion for prompt {llm_call.prompt.id} should be retried"
+        )
+
     # Extract visual features if present
     images = []
     use_processor = False
@@ -314,23 +368,26 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         except Exception as e:
             raise ValueError(f"Failed to process with vision-language processor: {e}")
     else:
+        # Use tokenizer for text-only models
         tools_kwarg = {"tools": llm_call.prompt.tools} if llm_call.prompt.tools else {}
+        chat_kwargs = _to_plain_obj(llm.chat_template_kwargs) if llm.chat_template_kwargs else {}
+        template_kwargs = {**tools_kwarg, **chat_kwargs}
         prompt_text = llm.tokenizer.apply_chat_template(
             conversation=prompt_messages,
             tokenize=False,
             add_generation_prompt=True,
-            **tools_kwarg,
+            **template_kwargs,
         )
         text = llm.tokenizer.apply_chat_template(
             full_messages,
             tokenize=False,
-            **tools_kwarg,
+            **template_kwargs,
         )
         prompt_token_ids = llm.tokenizer.apply_chat_template(
             prompt_messages,
             add_special_tokens=True,
             add_generation_prompt=True,
-            **tools_kwarg,
+            **template_kwargs,
         )
 
     output_text = text[len(prompt_text) :]
@@ -349,7 +406,6 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
     logprobs = [lp.logprob for lp in llm_call.logprobs]
-    finish_reason = llm_call.llm_info.get("finish_reason")
     if finish_reason is not None:
         finished = finish_reason != "length"
     else:
