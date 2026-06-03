@@ -45,7 +45,6 @@ dependencies = [
     "uvloop>=0.19.0",
     "wandb>=0.16.0",
     "hydra-core>=1.3.2",
-    "flash-attn",
     "debugpy>=1.8.20",
     "cube-standard",
 ]
@@ -80,7 +79,6 @@ include = ["pipelinerl*"]
 environments = ["sys_platform == 'linux'"]
 
 [tool.uv.sources]
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
 cube-harness = { path = "../cube-harness", editable = true }
 math-tool-use = { path = "../cube-harness/cubes/math-tool-use", editable = true }
 cube-standard = { path = "../cube-standard" }
