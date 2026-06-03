@@ -93,7 +93,7 @@ cube_params:
           tokenizer_name: ${model_path}
           max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
           timeout: 600.0
-          num_retries: 1
+          num_retries: 4  # retry transient vLLM 5xx in-place (cheaper than dropping the whole rollout)
           extra_body:
             return_token_ids: true
         system_prompt: |

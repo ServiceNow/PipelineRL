@@ -369,8 +369,20 @@ class CubeBenchmarkWorker:
             result = self._rollout(task=_copy_model(task), rollout_key=rollout_key)
             return result.model_dump()
         except Exception:
-            logger.exception("%s rollout failed for cube_id=%s task_id=%s", self._worker_name, cube_id, task_id)
-            raise
+            logger.exception(
+                "%s rollout failed for cube_id=%s task_id=%s; dropping (empty result, will be retried)",
+                self._worker_name,
+                cube_id,
+                task_id,
+            )
+            # Don't crash the actor on a single failed rollout (e.g. a transient vLLM 5xx — whose
+            # litellm exception also can't be unpickled across Ray, so re-raising surfaces as an
+            # opaque RaySystemError). Return an empty result; the train loop drops + retries it.
+            return RolloutResult(
+                training_texts=[],
+                metrics=BaseMetrics(reward=0.0, success=False, no_error=False, no_answer=True),
+                latency=0.0,
+            ).model_dump()
         finally:
             reset_worker_rollout_log_context(rollout_log_context)
 
