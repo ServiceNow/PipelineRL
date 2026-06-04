@@ -12,14 +12,24 @@ def get_grouped_params(
 ):
     params_with_wd, params_without_wd = [], []
     for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
         if any(nd in n for nd in no_decay):
             params_without_wd.append(p)
         else:
             params_with_wd.append(p)
-    return [
-        {"params": params_with_wd, "weight_decay": weight_decay},
-        {"params": params_without_wd, "weight_decay": 0.0},
-    ]
+    # Only emit non-empty groups. Models with no biases and no `LayerNorm.weight`
+    # (e.g. Qwen3, which uses RMSNorm `*.weight` and bias-free linears) yield an
+    # empty no-decay group. DeepSpeed ZeRO drops empty param groups during init,
+    # but the LR scheduler still builds one lambda per group created here -> on
+    # torch>=2.x `LRScheduler._update_lr` does `zip(param_groups, lrs, strict=True)`
+    # and raises "zip() argument 2 is longer than argument 1" when the counts differ.
+    groups = []
+    if params_with_wd:
+        groups.append({"params": params_with_wd, "weight_decay": weight_decay})
+    if params_without_wd:
+        groups.append({"params": params_without_wd, "weight_decay": 0.0})
+    return groups
 
 
 def get_optimizer(name, model, learning_rate, weight_decay):
