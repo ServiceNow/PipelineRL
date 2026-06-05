@@ -485,6 +485,11 @@ def run_preprocessing_loop(
     final_train_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
+    def is_trainer_finished() -> bool:
+        if cfg.use_fast_llm:
+            return trainer_state.training_done
+        return trainer_state.samples_processed is not None and trainer_state.samples_processed >= samples_target
+
     # Load published samples from state file
     llms = [
         TrainableLLM(
@@ -579,10 +584,7 @@ def run_preprocessing_loop(
                 num_filtered_out = 0
                 last_backpressure_log = 0.0
                 while True:
-                    if (
-                        trainer_state.samples_processed is not None
-                        and trainer_state.samples_processed >= samples_target
-                    ):
+                    if is_trainer_finished():
                         logger.info("Trainer signalled completion; stopping preprocessor loop")
                         break
                     llm = llms[next_llm_index] if llms else None

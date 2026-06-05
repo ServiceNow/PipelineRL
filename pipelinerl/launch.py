@@ -705,6 +705,10 @@ def is_inference_process(proc: LaunchedProcess) -> bool:
     return proc.kind in {"actor_llm", "preprocessor_llm"}
 
 
+def is_finetune_process(proc: LaunchedProcess) -> bool:
+    return proc.kind == "finetune"
+
+
 def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False, use_fast_llm: bool = False, weight_broadcast: bool = True):
     if not debug_mode:
         trainer_state = TrainerState(exp_path, use_fast_llm=use_fast_llm, weight_broadcast=weight_broadcast)
@@ -719,6 +723,23 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         for proc in processes:
             logger.info(f"Terminating {proc.handle.args}")
             terminate_with_children(proc.handle.pid)
+
+    def stop_alive_processes(alive: List[LaunchedProcess], reason: str):
+        logger.info(f"{reason}; stopping remaining {len(alive)} process(es): {[proc.kind for proc in alive]}")
+        for proc in list(alive):
+            logger.info(f"Terminating {proc.kind} process {proc.handle.args}")
+            terminate_with_children(proc.handle.pid)
+        for proc in list(alive):
+            proc.handle.wait()
+            logger.info(f"{proc.kind} process {proc.handle.args} stopped")
+            alive.remove(proc)
+
+    def wait_for_training_done_signal():
+        logger.info(
+            "Waiting for training completion signal "
+            f"(training_done={trainer_state.training_done})"
+        )
+        trainer_state.wait_for_training_done(timeout=5.0)
 
     logger.info("I have launched everyone, waiting for them to finish...")
 
@@ -741,21 +762,18 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                     sys.exit(1)
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
-            if alive and all(is_inference_process(proc) for proc in alive):
+            if alive and trainer_state is not None and not any(is_finetune_process(proc) for proc in alive):
+                if not trainer_state.training_done:
+                    wait_for_training_done_signal()
+                    continue
+                stop_alive_processes(alive, "Trainer completion detected")
+            elif alive and all(is_inference_process(proc) for proc in alive):
                 # shut down inference servers after training is complete
                 if trainer_state is not None and not trainer_state.training_done:
                     # check if training is completed
-                    logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
-                    trainer_state.wait_for_training_done(timeout=5.0)
+                    wait_for_training_done_signal()
                     continue
-                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} inference server(s)")
-                for proc in list(alive):
-                    logger.info(f"Terminating inference server {proc.handle.args}")
-                    terminate_with_children(proc.handle.pid)
-                for proc in list(alive):
-                    proc.handle.wait()
-                    logger.info(f"Inference server {proc.handle.args} stopped")
-                    alive.remove(proc)
+                stop_alive_processes(alive, "Trainer completion detected")
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
             #     and (version := trainer_state.propagated_weight_version is not None)
