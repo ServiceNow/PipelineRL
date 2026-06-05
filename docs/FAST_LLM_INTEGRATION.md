@@ -337,6 +337,7 @@ Both submit launchers default to Denis's setup. Before running, override these e
 | `RESULTS_DIR` | `/mnt/shared/denis/math_7b_results` | Where outputs / checkpoints / logs land. Must be on a shared NFS readable by every node. |
 | `WANDB_ENTITY` | `denisko-se` | Your wandb entity (user or org). |
 | `WANDB_PROJECT` | `watermelon` | Your wandb project. |
+| `WANDB_API_KEY_PATH` | unset | Optional path to a file containing your wandb API key. |
 | `EAI_HOME_DATA` | `snow.home.denis_kocetkov` | Your EAI home data object (mounted at `/home/toolkit` inside the container). |
 | `EAI_SHARED_DATA` | `snow.research.afm.shared_fml` | Your shared NFS data object (mounted at `/mnt/shared`). |
 | `MODEL_PATH` | `/home/toolkit/Qwen2.5-7B` | Path to the base model checkpoint inside the container. |
@@ -360,7 +361,7 @@ Prereqs:
 
 1. Fast-LLM + PipelineRL installed in a shared venv — see [§3 End-to-end install → "Steps"](#3-end-to-end-install) above (clones both repos, checks out `gspo` and `fast-llm` branches, editable-installs).
 2. `eai` CLI authenticated. Run `eai login` once if it isn't already.
-3. Wandb credentials configured for the entity in `WANDB_ENTITY` (`~/.netrc` or `wandb login`).
+3. Wandb credentials configured for the entity in `WANDB_ENTITY`; set `WANDB_API_KEY_PATH` to a key file, or use `~/.netrc` / `wandb login`.
 4. The personalization env vars above exported (or edit the defaults in the script).
 5. A 7B base model checkpoint at the path `MODEL_PATH` points to (default `/home/toolkit/Qwen2.5-7B`).
 
