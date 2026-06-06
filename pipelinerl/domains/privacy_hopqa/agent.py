@@ -269,7 +269,11 @@ def _clamp_confidence(value: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, numeric))
 
 
-def _normalize_answer(value: str | None) -> str:
+def _surface_key(value: str | None) -> str:
+    """Loose surface-form key (case + whitespace only) for telling whether two
+    answer *surface forms* differ. Distinct from reward.normalize_answer, which
+    folds units/punctuation for semantic answer matching and would over-collapse
+    distinct surface forms here."""
     return " ".join(str(value or "").strip().lower().split())
 
 
@@ -986,7 +990,7 @@ class PrivacyHopQAAgent:
             if hop.answer:
                 context_answer = self._answer_for_context(hop)
                 lines.append(f"({hop.hop_number}) {hop.answer}")
-                if context_answer and _normalize_answer(context_answer) != _normalize_answer(hop.answer):
+                if context_answer and _surface_key(context_answer) != _surface_key(hop.answer):
                     lines.append(f"    For references to ({hop.hop_number}), use: {context_answer}")
                 if hop.justification:
                     lines.append(f"    Justification: {_truncate(hop.justification, 420)}")

@@ -161,7 +161,10 @@ def _prefix_reward_by_hop(score: dict) -> dict[str, dict[str, float | int | bool
     progress: dict[str, dict[str, float | int | bool]] = {}
     for hop_score in per_hop:
         hop_num = str(hop_score.get("hop"))
-        hop_correct = bool(hop_score.get("correct"))
+        # conditional_correct (correct AND not dependency-blocked) so a blocked hop
+        # ends the prefix, matching dependency_aware_metrics. Equivalent in practice
+        # since the first blocked hop is always preceded by the first wrong hop.
+        hop_correct = bool(hop_score.get("conditional_correct"))
         if prefix_intact and hop_correct:
             prefix_correct += 1
         else:
