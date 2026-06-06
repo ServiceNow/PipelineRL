@@ -215,7 +215,6 @@ def score_chain_answers(
         "correct_hops": correct_count,
         "total_hops": len(hops),
         "hop_accuracy": hop_accuracy,
-        "raw_hop_accuracy": hop_accuracy,
         **dependency_metrics,
         "strict_chain_success": strict_chain_success,
         "reward": reward,
