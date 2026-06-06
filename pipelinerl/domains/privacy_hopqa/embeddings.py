@@ -16,10 +16,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-4B"
 
 
-@functools.lru_cache(maxsize=2)
+@functools.cache
 def _load_hf_model(model: str, device: str | None) -> SentenceTransformer:
-    # lru_cache memoizes the loaded weights per (model, device) and is itself
-    # thread-safe, so this replaces a hand-rolled global + lock.
+    # Memoize the loaded weights (loading is expensive). functools.cache is
+    # thread-safe and replaces a hand-rolled global + lock; there are only ever a
+    # couple of (model, device) keys, so no eviction is needed.
     if device is None and torch.cuda.is_available():
         # Default to the last visible GPU so the embedder doesn't crowd the
         # trainer/inference shards that sit on cuda:0.

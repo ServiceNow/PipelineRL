@@ -755,14 +755,8 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         "group_tokens",
         "advantages",
     ]
-    missing_advantage_columns = [
-        column for column in expected_advantage_columns if column not in df_advantages.columns
-    ]
-    if missing_advantage_columns:
-        raise ValueError(
-            "RL advantage table missing columns "
-            f"{missing_advantage_columns}; present columns={df_advantages.columns.tolist()}"
-        )
+    # Both advantage modes must yield exactly these columns; the select drops any
+    # extras before the merge-back and raises KeyError if one is missing.
     df_advantages = df_advantages[expected_advantage_columns]
 
     # Step 3: bring advantages and group level stats back to the main df
