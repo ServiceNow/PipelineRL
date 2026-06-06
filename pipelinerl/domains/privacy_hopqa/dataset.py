@@ -72,15 +72,13 @@ def _configured_dataset_path(dataset_name: str, configured_paths: dict[str, str 
 
 def load_problems(
     dataset_names: list[str] | str | None = None,
-    seed: int | None = None,
     final_dataset_path: str | Path | None = None,
     final_train_dataset_path: str | Path | None = None,
     final_val_dataset_path: str | Path | None = None,
     final_test_dataset_path: str | Path | None = None,
     max_examples: int | None = None,
-    **_: Any,
+    **_: Any,  # absorbs the rest of dataset_loader_params (helper_service_url, knobs, etc.)
 ) -> list[dict[str, Any]]:
-    del seed
     if dataset_names is None:
         return []
     if isinstance(dataset_names, str):

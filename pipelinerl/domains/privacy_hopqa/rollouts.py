@@ -154,7 +154,7 @@ def _build_run_paths(cfg: DictConfig, problem: dict) -> tuple[Path, Path]:
 
 
 def _prefix_reward_by_hop(score: dict) -> dict[str, dict[str, float | int | bool]]:
-    per_hop = sorted(score.get("per_hop") or [], key=lambda item: int(item.get("hop") or 0))
+    per_hop = sorted(score.get("per_hop") or [], key=lambda item: item.get("hop") or 0)
     total_hops = max(1, len(per_hop))
     prefix_correct = 0
     prefix_intact = True
@@ -819,7 +819,7 @@ async def _run_privacy_hopqa_rollout_async(
     )
     if protocol_error:
         score["reward"] = 0.0
-    per_hop_scores = {str(item.get("hop")): item for item in score.get("per_hop", [])}
+    per_hop_scores = {item.get("hop"): item for item in score.get("per_hop", [])}
     hop_states_for_metrics = []
     if agent_result is not None:
         hop_states_for_metrics = list(agent_result.hop_states)
@@ -833,7 +833,7 @@ async def _run_privacy_hopqa_rollout_async(
     any_reader_correct_hops = 0
     any_reader_correct_but_final_incorrect_hops = 0
     for hop_state in hop_states_for_metrics:
-        hop_number = str(hop_state.get("hop_number"))
+        hop_number = hop_state.get("hop_number")
         hop_score = per_hop_scores.get(hop_number) or {}
         final_correct_for_hop = bool(hop_score.get("correct"))
         accepted_answers = hop_score.get("accepted_answers") or []

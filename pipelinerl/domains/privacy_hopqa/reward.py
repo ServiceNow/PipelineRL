@@ -41,17 +41,8 @@ def _accepted_list(primary: str | None, variants: list | tuple | None = None, al
     return values
 
 
-def _parse_int(value: object) -> int | None:
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
-    text = str(value or "").strip()
-    if re.fullmatch(r"-?\d+", text):
-        return int(text)
-    return None
-
-
 def _hop_number(hop: dict) -> int:
-    return _parse_int(hop.get("hop_number") or hop.get("hop")) or 0
+    return int(hop.get("hop_number") or 0)
 
 
 def _hop_dependencies(hop: dict) -> list[int]:
@@ -70,7 +61,7 @@ def dependency_aware_metrics(hops: list[dict], per_hop: list[dict]) -> dict:
     """
     per_hop_by_number = {}
     for item in per_hop:
-        hop_number = _parse_int(item.get("hop"))
+        hop_number = item.get("hop")
         if hop_number is not None:
             per_hop_by_number[hop_number] = item
 
