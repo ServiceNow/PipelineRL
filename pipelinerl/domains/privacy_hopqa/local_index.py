@@ -24,6 +24,9 @@ class StaticLocalIndex:
         embeddings: np.ndarray,
         embedding_model: str | None = None,
         embedding_provider: str | None = None,
+        embedding_base_url: str | None = None,
+        embedding_api_key: str | None = None,
+        embedding_device: str | None = None,
         semantic_threshold: float = 0.7,
         max_length: int = 8192,
     ):
@@ -33,6 +36,9 @@ class StaticLocalIndex:
         self.embeddings = embeddings
         self.embedding_model = embedding_model
         self.embedding_provider = embedding_provider
+        self.embedding_base_url = embedding_base_url
+        self.embedding_api_key = embedding_api_key
+        self.embedding_device = embedding_device
         self.semantic_threshold = semantic_threshold
         self.max_length = max_length
         self._embedding_norms: np.ndarray | None = None
@@ -43,6 +49,9 @@ class StaticLocalIndex:
         storage_dir: str | Path,
         embedding_model: str | None = None,
         embedding_provider: str | None = None,
+        embedding_base_url: str | None = None,
+        embedding_api_key: str | None = None,
+        embedding_device: str | None = None,
         semantic_threshold: float = 0.7,
         mmap_mode: str | None = "r",
     ) -> "StaticLocalIndex":
@@ -56,6 +65,8 @@ class StaticLocalIndex:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             embedding_model = embedding_model or metadata.get("embedding_model")
             embedding_provider = embedding_provider or metadata.get("embedding_provider")
+            embedding_base_url = embedding_base_url or metadata.get("embedding_base_url")
+            embedding_device = embedding_device or metadata.get("embedding_device")
 
         return cls(
             storage_dir=storage_dir,
@@ -64,6 +75,9 @@ class StaticLocalIndex:
             embeddings=embeddings,
             embedding_model=embedding_model,
             embedding_provider=embedding_provider,
+            embedding_base_url=embedding_base_url,
+            embedding_api_key=embedding_api_key,
+            embedding_device=embedding_device,
             semantic_threshold=semantic_threshold,
         )
 
@@ -109,6 +123,9 @@ class StaticLocalIndex:
                 [query[: self.max_length]],
                 model=self.embedding_model,
                 provider=self.embedding_provider,
+                base_url=self.embedding_base_url,
+                api_key=self.embedding_api_key,
+                device=self.embedding_device,
             )[0]
         )
         similarities = self.cosine_similarities(query_vector)

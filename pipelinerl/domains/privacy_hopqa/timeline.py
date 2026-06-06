@@ -1,7 +1,5 @@
 """Interactive timeline artifact generation for privacy_hopqa rollouts."""
 
-from __future__ import annotations
-
 import html
 import json
 from pathlib import Path
@@ -64,7 +62,6 @@ def _truncate(text: str, limit: int = 280) -> str:
 def _build_event_details(
     summary: dict[str, Any],
     events: list[dict[str, Any]],
-    *,
     trace: dict[str, Any] | None = None,
     report_text: str | None = None,
     prompt_dir: Path | None = None,
@@ -215,7 +212,6 @@ def _build_event_details(
 def render_timeline_html(
     summary: dict[str, Any],
     events: list[dict[str, Any]],
-    *,
     trace: dict[str, Any] | None = None,
     report_text: str | None = None,
     prompt_dir: Path | None = None,
@@ -810,7 +806,6 @@ def render_timeline_html(
 
 def write_timeline_artifacts(
     output_dir: Path,
-    *,
     summary: dict[str, Any],
     events: list[dict[str, Any]],
     trace: dict[str, Any] | None = None,

@@ -1,7 +1,5 @@
 """Core hop-wise QA agent for the privacy_hopqa domain."""
 
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -10,7 +8,6 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import aiohttp
@@ -187,7 +184,6 @@ def document_identity_aliases(value: Any, task_id: str | None = None) -> set[str
 def document_identity_values_match(
     left_values: list[Any],
     right_values: list[Any],
-    *,
     task_id: str | None = None,
 ) -> bool:
     task_ids = {
@@ -512,7 +508,6 @@ def _parent_candidate_card(candidates: list["CandidateDoc"], excerpt_chars: int)
 def _candidate_cards_for_prompt(
     candidates: list["CandidateDoc"],
     preferred_excerpt_chars: int,
-    *,
     max_cards: int | None = None,
 ) -> list[dict[str, Any]]:
     if not candidates:
@@ -781,7 +776,6 @@ class PrivacyHopQAProtocolError(RuntimeError):
 class PrivacyHopQAAgent:
     def __init__(
         self,
-        *,
         settings: PrivacyHopQASettings,
         llm_adapter: PrivacyHopQALLMAdapter,
         run_root: Path,
@@ -793,7 +787,6 @@ class PrivacyHopQAAgent:
         hops: list[dict[str, Any]],
         helper_client: Any = None,
         static_local_index: Any = None,
-        browsecomp_tool: Any = None,
     ):
         self.settings = settings
         self.llm_adapter = llm_adapter
@@ -826,7 +819,6 @@ class PrivacyHopQAAgent:
             )
         self.helper_client = helper_client
         self.static_local_index = static_local_index
-        self.browsecomp_tool = browsecomp_tool
         self.action_records: list[RetrievalActionRecord] = []
         self.timeline_events: list[dict[str, Any]] = []
         self.error_records: list[dict[str, Any]] = []
@@ -861,7 +853,6 @@ class PrivacyHopQAAgent:
 
     def _record_event(
         self,
-        *,
         stage: str,
         lane: str,
         label: str,
@@ -898,7 +889,6 @@ class PrivacyHopQAAgent:
 
     def _record_error(
         self,
-        *,
         stage: str,
         hop_number: int | None,
         iteration: int | None,
@@ -1185,7 +1175,6 @@ class PrivacyHopQAAgent:
         self,
         parent_groups: dict[str, list[CandidateDoc]],
         selected_parent_ids: list[str],
-        *,
         hop: HopState,
         iteration: int,
         selection_stage: str,
@@ -1310,6 +1299,8 @@ class PrivacyHopQAAgent:
                 )
                 payload = extract_json(response)
             except Exception as exc:
+                # Bad planner JSON is a model/protocol failure for this rollout.
+                # Transport and server failures still bubble up to PipelineRL.
                 if is_llm_infrastructure_error(exc):
                     raise
                 logger.warning("hop planner failed for hop %s iteration %s attempt %s: %s", hop.hop_number, iteration, attempt_count, exc)
@@ -1444,14 +1435,10 @@ class PrivacyHopQAAgent:
             return await self.helper_client.search_browsecomp(
                 query=query,
                 task_id=self.task_id,
-                k=self.settings.retrieval_top_k,
+                k=self.settings.browsecomp_top_k,
                 max_chars=self._browsecomp_request_chars(),
             )
-        if self.browsecomp_tool is None:
-            return []
-        result = await asyncio.to_thread(self.browsecomp_tool.execute, query, SimpleNamespace(task_id=self.task_id))
-        raw_hits = result.get("results")
-        return raw_hits if isinstance(raw_hits, list) else []
+        return []
 
     async def _local_hits(self, query: str) -> list[dict[str, Any]]:
         if self.helper_client is not None and self.settings.use_remote_local_search:
@@ -1470,7 +1457,7 @@ class PrivacyHopQAAgent:
             threshold=self.settings.local_search_threshold,
         )
 
-    def _candidate_from_web_hit(self, hit: dict[str, Any], *, query: str, action_id: str, rank: int) -> CandidateDoc:
+    def _candidate_from_web_hit(self, hit: dict[str, Any], query: str, action_id: str, rank: int) -> CandidateDoc:
         doc_id = str(hit.get("docid") or hit.get("doc_id") or "")
         url = str(hit.get("url") or "")
         title = url or doc_id or "web document"
@@ -1494,7 +1481,7 @@ class PrivacyHopQAAgent:
             },
         )
 
-    def _candidates_from_web_hit(self, hit: dict[str, Any], *, query: str, action_id: str, rank: int) -> list[CandidateDoc]:
+    def _candidates_from_web_hit(self, hit: dict[str, Any], query: str, action_id: str, rank: int) -> list[CandidateDoc]:
         if self._uses_legacy_retrieval_context():
             return [self._candidate_from_web_hit(hit, query=query, action_id=action_id, rank=rank)]
 
@@ -1574,7 +1561,7 @@ class PrivacyHopQAAgent:
             )
         return candidates
 
-    def _candidate_from_local_hit(self, hit: dict[str, Any], *, query: str, action_id: str, rank: int) -> CandidateDoc:
+    def _candidate_from_local_hit(self, hit: dict[str, Any], query: str, action_id: str, rank: int) -> CandidateDoc:
         metadata = dict(hit.get("metadata") or {})
         file_path = str(metadata.get("file_path") or metadata.get("original_path") or "")
         title = Path(file_path).name if file_path else str(hit.get("doc_id") or "local document")
@@ -1653,6 +1640,8 @@ class PrivacyHopQAAgent:
                 ],
             }
         except Exception as exc:
+            # A single malformed retrieval result should fail that action, not
+            # discard the whole rollout. Helper transport failures still abort.
             if is_helper_infrastructure_error(exc):
                 raise PrivacyHopQAHelperInfrastructureError(
                     f"Retrieval helper failure for {action.type} action {action.id}: {exc}"
@@ -1856,6 +1845,8 @@ class PrivacyHopQAAgent:
             )
             payload = extract_json(response)
         except Exception as exc:
+            # Selection JSON is used to build training traces; malformed output is
+            # recorded as a protocol error instead of silently choosing documents.
             if is_llm_infrastructure_error(exc):
                 raise
             logger.warning("doc chooser failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)
@@ -2000,6 +1991,8 @@ class PrivacyHopQAAgent:
                 window_count=candidate.metadata.get("window_count"),
             )
         except Exception as exc:
+            # Reader failures are tied to one candidate document. Keep enough
+            # metadata for reward shaping and prompt debugging, then continue.
             if is_llm_infrastructure_error(exc):
                 raise
             failure_record = {
@@ -2372,6 +2365,8 @@ class PrivacyHopQAAgent:
                 ),
             }
         except Exception as exc:
+            # The resolver is the final structured-output step for a hop. Bad
+            # JSON stops the rollout so the failed trace can be scored directly.
             if is_llm_infrastructure_error(exc):
                 raise
             logger.warning("hop resolver failed for hop %s iteration %s: %s", hop.hop_number, iteration, exc)

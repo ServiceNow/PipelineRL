@@ -104,10 +104,6 @@ class RLConfig(BaseModel):
         default=False,
         description="When step_reward_advantages is enabled, pad each rollout's reward sequence with its final reward for advantage statistics only",
     )
-    normalize_step_loss_by_advantage_group: bool = Field(
-        default=False,
-        description="When step_reward_advantages is enabled, divide each row's final advantage by the number of real calls in its rollout/advantage-group segment",
-    )
     batch_size_normalization: str = Field(
         default="training_texts",
         description="Loss denominator unit: training_texts counts every trainable call; rollouts groups sub-calls from the same rollout attempt",
@@ -261,11 +257,14 @@ def rl_step(
         tokens_weights = torch.ones_like(group_tokens) / group_tokens
     else:
         tokens_weights = torch.ones_like(group_tokens) / config.batch_size
+
     if config.overlong_filtering:
         # filter out sequences that do not have eos_token_id
         overflow = torch.tensor(overflow, device=overflow.device)
         tokens_weights = tokens_weights * (1 - overflow)
     if batch.loss_weight_scale is not None:
+        # Stepwise domains can emit multiple trainable texts for one rollout.
+        # This scale preserves the configured loss denominator after packing.
         tokens_weights = tokens_weights * batch.loss_weight_scale[:, 1:].to(tokens_weights.device)
 
     assert new_logprobs.shape == ref_logprobs.shape
@@ -446,7 +445,7 @@ def rl_step(
         "token_weight": sum_sum(tokens_weights / num_labels_in_seq, masks_shifted, segments).item(),
         "max_token_weight": tokens_weights[masks_shifted].max().item(),
         "min_token_weight": tokens_weights[masks_shifted].min().item(),
-        "loss_weight_scale": (
+        "rollout_weight_scale": (
             sum_sum(batch.loss_weight_scale[:, 1:] / num_labels_in_seq, masks_shifted, segments).item()
             if batch.loss_weight_scale is not None
             else 1.0
@@ -480,7 +479,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
     df_stats["step_reward"] = df_stats["rewards"].apply(lambda x: x[0])
     # Optional per-rollout padding override (e.g., privacy_hopqa sets this to
-    # max prefix_progress so error-terminated rollouts pad to last achieved
+    # max prefix reward so error-terminated rollouts pad to last achieved
     # progress instead of the zero'd error step). Falls back to step_reward.
     if "padding_reward" in df_init.columns:
         df_stats["padding_reward"] = df_init["padding_reward"].fillna(df_stats["step_reward"])
@@ -524,78 +523,15 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             df_reward_stats["step_advantage_padding_value"] = metadata.apply(
                 lambda value: value.get("step_advantage_padding_value")
             )
-            privacy_metadata = metadata.apply(
-                lambda value: value.get("privacy_hopqa") if isinstance(value.get("privacy_hopqa"), dict) else {}
-            )
-            df_reward_stats["hop_step_efficiency_metric"] = privacy_metadata.apply(
-                lambda value: value.get("hop_step_efficiency_metric")
-            )
-            df_reward_stats["hop_step_efficiency_group"] = privacy_metadata.apply(
-                lambda value: value.get("hop_step_efficiency_group")
-            )
-            df_reward_stats["hop_step_llm_call_count"] = privacy_metadata.apply(
-                lambda value: value.get("hop_step_llm_call_count")
-            )
-            df_reward_stats["hop_step_hop_correct"] = privacy_metadata.apply(
-                lambda value: bool(value.get("hop_correct"))
-            )
-            df_reward_stats["hop_step_efficiency_bonus_weight"] = privacy_metadata.apply(
-                lambda value: value.get("hop_step_source_bonus", 0.25)
-            )
         else:
             df_reward_stats["step_advantage_group"] = None
             df_reward_stats["step_advantage_local_index"] = None
             df_reward_stats["step_advantage_segment_length"] = None
             df_reward_stats["step_advantage_padding_value"] = None
-            df_reward_stats["hop_step_efficiency_metric"] = None
-            df_reward_stats["hop_step_efficiency_group"] = None
-            df_reward_stats["hop_step_llm_call_count"] = None
-            df_reward_stats["hop_step_hop_correct"] = False
-            df_reward_stats["hop_step_efficiency_bonus_weight"] = 0.25
 
         custom_mask = df_reward_stats["step_advantage_group"].notna()
         padded_rows = []
         if custom_mask.any():
-            if config.normalize_step_loss_by_advantage_group:
-                # Normalize multi-step credit expansion, not reward semantics
-                # or GSPO's token weighting. If one rollout emits three
-                # hop_plan calls for a hop while another emits one, the longer
-                # attempt should not get three times the policy-gradient signal
-                # purely because it made more trainable decisions.
-                custom_scaled = df_reward_stats[custom_mask].copy()
-                custom_scaled["_row_id"] = custom_scaled.index
-                group_call_counts = (
-                    custom_scaled.groupby(["group_id", "rollout_index", "step_advantage_group"])
-                    .size()
-                    .rename("advantage_group_call_count")
-                    .reset_index()
-                )
-                comparison_call_counts = (
-                    group_call_counts.groupby(["group_id", "step_advantage_group"])
-                    .agg(mean_advantage_group_call_count=("advantage_group_call_count", "mean"))
-                    .reset_index()
-                )
-                custom_scaled = pd.merge(
-                    custom_scaled,
-                    group_call_counts,
-                    on=["group_id", "rollout_index", "step_advantage_group"],
-                    how="left",
-                )
-                custom_scaled = pd.merge(
-                    custom_scaled,
-                    comparison_call_counts,
-                    on=["group_id", "step_advantage_group"],
-                    how="left",
-                )
-                # Preserve the average advantage scale within a comparison
-                # bucket while preventing longer hop/stage attempts from
-                # contributing more gradient only because they made more calls.
-                advantage_scale = (
-                    custom_scaled["mean_advantage_group_call_count"].astype(float)
-                    / custom_scaled["advantage_group_call_count"].astype(float).clip(lower=1.0)
-                )
-                df_reward_stats.loc[custom_scaled["_row_id"], "advantage_scale"] = advantage_scale.to_numpy()
-
             # Some domains, e.g. Privacy HopQA, want stepwise advantages
             # compared within semantic segments such as (hop, stage), not by
             # global rollout step. The rollout metadata defines those buckets.
@@ -607,84 +543,6 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
                 .reset_index()
             )
             custom = pd.merge(custom, max_lengths, on=["group_id", "step_advantage_group"], how="left")
-            efficiency_mask = (
-                custom["hop_step_efficiency_metric"].eq("llm_calls")
-                & custom["hop_step_efficiency_group"].notna()
-                & custom["hop_step_llm_call_count"].notna()
-            )
-            if efficiency_mask.any():
-                # Domain-specific reward shaping for Privacy HopQA.
-                #
-                # Rollout code stores the total number of LLM calls used while
-                # solving the current hop. Among rollouts that solved the same
-                # hop correctly, cheaper hop attempts get a small additive
-                # efficiency bonus:
-                #
-                #   reward += bonus_weight * min_correct_calls / this_hop_calls
-                #
-                # Incorrect hop attempts never receive this cost bonus. This
-                # keeps every correct hop above every incorrect hop while still
-                # preferring correct rollouts that answered with fewer LLM
-                # calls. Call count is used instead of latency so the signal is
-                # deterministic and comparable across workers.
-                custom.loc[efficiency_mask, "hop_step_llm_call_count"] = (
-                    custom.loc[efficiency_mask, "hop_step_llm_call_count"].astype(float).clip(lower=1.0)
-                )
-                custom["hop_step_hop_correct"] = custom["hop_step_hop_correct"].astype(bool)
-
-                # Step 1: find the cheapest correct hop attempt among
-                # comparable rollouts. The efficiency group is hop-local, not
-                # stage-local, so hop_plan/doc_choose/hop_resolve all use the
-                # same factor for a given hop attempt.
-                correct_efficiency_mask = efficiency_mask & custom["hop_step_hop_correct"]
-                min_call_counts = (
-                    custom[correct_efficiency_mask]
-                    .groupby(["group_id", "hop_step_efficiency_group"])
-                    .agg(hop_step_min_llm_call_count=("hop_step_llm_call_count", "min"))
-                    .reset_index()
-                )
-
-                # Step 2: attach min_calls to each real training text and
-                # compute the relative cost factor. Groups with no correct hop
-                # attempts do not use this value.
-                custom = pd.merge(
-                    custom,
-                    min_call_counts,
-                    on=["group_id", "hop_step_efficiency_group"],
-                    how="left",
-                )
-                efficiency = (
-                    custom["hop_step_min_llm_call_count"] / custom["hop_step_llm_call_count"]
-                ).where(correct_efficiency_mask, 0.0)
-                efficiency = efficiency.fillna(0.0).astype(float)
-                custom["hop_step_efficiency_factor"] = efficiency
-
-                bonus_weight = (
-                    custom["hop_step_efficiency_bonus_weight"]
-                    .fillna(0.25)
-                    .astype(float)
-                    .clip(lower=0.0)
-                )
-                efficiency_bonus = bonus_weight * efficiency
-                custom["hop_step_efficiency_bonus"] = efficiency_bonus
-
-                # Step 3: add the same efficiency bonus to real rewards and
-                # padding rewards. Padding participates only in the baseline
-                # calculation; it never creates gradient tokens, but it must
-                # have the same value the rollout would have contributed at the
-                # padded position.
-                custom["step_reward"] = custom["step_reward"].astype(float) + efficiency_bonus
-                custom["padding_reward"] = custom["padding_reward"].astype(float) + efficiency_bonus
-                padding_values = custom["step_advantage_padding_value"]
-                custom["step_advantage_padding_value"] = padding_values.astype(float) + efficiency_bonus
-
-                # Step 4: write the scaled values back to the full reward table
-                # before aligned buckets and prefix padding are constructed.
-                df_reward_stats.loc[custom["_row_id"], "step_reward"] = custom["step_reward"].to_numpy()
-                df_reward_stats.loc[custom["_row_id"], "padding_reward"] = custom["padding_reward"].to_numpy()
-                df_reward_stats.loc[
-                    custom["_row_id"], "step_advantage_padding_value"
-                ] = custom["step_advantage_padding_value"].to_numpy()
             aligned_position = (
                 custom["max_segment_length"].astype(int)
                 - custom["step_advantage_segment_length"].astype(int)
@@ -927,6 +785,8 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     )
     loss_weight_scale = 1.0
     if config.batch_size_normalization == "rollouts":
+        # A rollout attempt may produce several trainable traces. Scaling by
+        # trainable_texts / rollouts makes each attempt count once in the loss.
         rollout_count = len(df[["group_id", "rollout_index"]].drop_duplicates())
         if rollout_count > 0:
             loss_weight_scale = len(df) / rollout_count

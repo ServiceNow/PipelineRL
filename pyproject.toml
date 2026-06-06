@@ -73,18 +73,13 @@ ifeval = [
     "langdetect",
     "absl-py",
 ]
-privacy_agent = [
+privacy_hopqa = [
+    "openai>=1.0.0",
     "sentence-transformers>=3.0.0",
-    "openpyxl>=3.1.0",
-    "python-docx>=1.1.0",
-    "python-pptx>=1.0.0",
-    "PyPDF2>=3.0.0",
-    "pdfplumber>=0.11.0",
-    "xlrd>=2.0.0",
 ]
 # Install all domain dependencies
 domains = [
-    "pipelinerl[coding,fn_calling,logic,ifeval,privacy_agent]",
+    "pipelinerl[coding,fn_calling,logic,ifeval]",
 ]
 
 [tool.uv]

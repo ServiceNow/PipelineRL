@@ -40,10 +40,7 @@ preprocess:
   # "virtual" sample queue per lead trainer
   max_ready_samples_per_lead: 64
   pop_old_data: ${..pop_old_data}
-  # Large all-calls RL domains can produce valid samples above 100 MB.
-  # Workers still split oversized batches, but this avoids failing on a
-  # single large-but-valid packed entry.
-  shared_memory_entry_size: 256000000
+  shared_memory_entry_size: 100000000
   log_every_n_samples: 128
 
 llm:

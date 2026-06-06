@@ -20,7 +20,6 @@ ANSWER_FORMAT_GUIDANCE = """Answer Format Guidance:
 
 
 def build_hop_plan_prompt(
-    *,
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
@@ -123,7 +122,6 @@ Return valid JSON only.
 
 
 def build_doc_choose_prompt(
-    *,
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
@@ -176,7 +174,6 @@ Return valid JSON only.
 
 
 def build_doc_reader_prompt(
-    *,
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
@@ -230,7 +227,6 @@ Return valid JSON only.
 
 
 def build_hop_resolve_prompt(
-    *,
     numbered_questions: str,
     current_hop_number: int,
     current_hop_question: str,
@@ -347,7 +343,6 @@ Unread Candidate Parent Documents From The Current Retrieval Round (compact card
 
 def build_final_summary_lines(
     hop_answers: Iterable[dict[str, Any]],
-    *,
     final_answer: str,
     final_justification: str,
 ) -> str:

@@ -1,5 +1,4 @@
 import os
-import pickle
 from collections import defaultdict, deque
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -13,17 +12,12 @@ from multiprocessing import Process, Queue
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from queue import Empty
-from typing import Any, List
+from typing import List
 
 import datasets
 import transformers
 from litellm import BaseModel, Field
 
-from pipelinerl.domains.privacy_agent.size_debug import (
-    format_privacy_agent_payload_summary,
-    should_log_privacy_agent_payload,
-    summarize_privacy_agent_payload,
-)
 from pipelinerl.finetune.logging_ import flatten_dict_config
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.shared_memory_array import SharedMemoryQueue
@@ -54,181 +48,6 @@ from pipelinerl.streams import (
 )
 
 logger = logging.getLogger(__name__)
-
-PREPROCESS_DATASET_CHUNK_KIND = "dataset_chunk"
-
-
-def _summarize_privacy_agent_preprocess_payload(
-    label: str,
-    samples: list[dict],
-    *,
-    container,
-    limit_bytes: int,
-    extra_fields: dict | None = None,
-    always_log: bool = False,
-    log_summary: bool = True,
-) -> dict | None:
-    summary = summarize_privacy_agent_payload(
-        samples,
-        container=container,
-        limit_bytes=limit_bytes,
-    )
-    if not summary:
-        return None
-
-    if extra_fields:
-        summary.update(extra_fields)
-
-    if log_summary and (always_log or should_log_privacy_agent_payload(summary)):
-        limit_utilization = float(summary.get("limit_utilization") or 0.0)
-        if always_log:
-            log_level = logging.ERROR
-        elif limit_utilization >= 0.8:
-            log_level = logging.WARNING
-        else:
-            log_level = logging.INFO
-        logger.log(
-            log_level,
-            "privacy_agent preprocess %s payload summary: %s",
-            label,
-            format_privacy_agent_payload_summary(summary),
-        )
-
-    return summary
-
-
-def _make_dataset_chunk_message(
-    dataset: list[dict],
-    *,
-    num_filtered_out: int,
-    num_filter_seen: int,
-    chunk_index: int,
-    chunk_count: int,
-) -> dict[str, Any]:
-    return {
-        "kind": PREPROCESS_DATASET_CHUNK_KIND,
-        "dataset": dataset,
-        "num_filtered_out": num_filtered_out,
-        "num_filter_seen": num_filter_seen,
-        "chunk_index": chunk_index,
-        "chunk_count": chunk_count,
-    }
-
-
-def _dataset_chunk_message_size_bytes(
-    dataset: list[dict],
-    *,
-    num_filtered_out: int,
-    num_filter_seen: int,
-    chunk_index: int,
-    chunk_count: int,
-) -> int:
-    return len(
-        pickle.dumps(
-            _make_dataset_chunk_message(
-                dataset,
-                num_filtered_out=num_filtered_out,
-                num_filter_seen=num_filter_seen,
-                chunk_index=chunk_index,
-                chunk_count=chunk_count,
-            ),
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-    )
-
-
-def _split_dataset_for_output_queue(
-    dataset: list[dict],
-    *,
-    num_filtered_out: int,
-    num_filter_seen: int,
-    max_entry_size: int,
-) -> list[dict[str, Any]]:
-    # SharedMemoryQueue rejects entries above max_entry_size. A single
-    # preprocessed privacy group can be valid but too large after all-call
-    # capture, so split by sample while preserving filtered-count accounting.
-    full_size = _dataset_chunk_message_size_bytes(
-        dataset,
-        num_filtered_out=num_filtered_out,
-        num_filter_seen=num_filter_seen,
-        chunk_index=1,
-        chunk_count=1,
-    )
-    if full_size <= max_entry_size:
-        return [
-            _make_dataset_chunk_message(
-                dataset,
-                num_filtered_out=num_filtered_out,
-                num_filter_seen=num_filter_seen,
-                chunk_index=1,
-                chunk_count=1,
-            )
-        ]
-
-    if not dataset:
-        return [
-            _make_dataset_chunk_message(
-                [],
-                num_filtered_out=num_filtered_out,
-                num_filter_seen=num_filter_seen,
-                chunk_index=1,
-                chunk_count=1,
-            )
-        ]
-
-    chunks: list[list[dict]] = []
-    current_chunk: list[dict] = []
-    next_filtered_out = num_filtered_out
-    for entry in dataset:
-        candidate_chunk = current_chunk + [entry]
-        candidate_size = _dataset_chunk_message_size_bytes(
-            candidate_chunk,
-            num_filtered_out=next_filtered_out,
-            num_filter_seen=num_filter_seen if len(chunks) == 0 else 0,
-            chunk_index=len(chunks) + 1,
-            chunk_count=len(chunks) + 1,
-        )
-        if candidate_size <= max_entry_size:
-            current_chunk = candidate_chunk
-            continue
-
-        if not current_chunk:
-            single_entry_size = _dataset_chunk_message_size_bytes(
-                [entry],
-                num_filtered_out=next_filtered_out,
-                num_filter_seen=num_filter_seen if len(chunks) == 0 else 0,
-                chunk_index=len(chunks) + 1,
-                chunk_count=len(chunks) + 1,
-            )
-            raise ValueError(
-                f"Single preprocessed entry size ({single_entry_size} bytes) exceeds maximum entry size "
-                f"({max_entry_size} bytes)"
-            )
-
-        chunks.append(current_chunk)
-        current_chunk = [entry]
-        next_filtered_out = 0
-
-    if current_chunk or not chunks:
-        chunks.append(current_chunk)
-
-    messages: list[dict[str, Any]] = []
-    for chunk_index, chunk_entries in enumerate(chunks, start=1):
-        message = _make_dataset_chunk_message(
-            chunk_entries,
-            num_filtered_out=num_filtered_out if chunk_index == 1 else 0,
-            num_filter_seen=num_filter_seen if chunk_index == 1 else 0,
-            chunk_index=chunk_index,
-            chunk_count=len(chunks),
-        )
-        message_size = len(pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL))
-        if message_size > max_entry_size:
-            raise ValueError(
-                f"Split preprocessed chunk size ({message_size} bytes) still exceeds maximum entry size "
-                f"({max_entry_size} bytes)"
-            )
-        messages.append(message)
-    return messages
 
 
 def _needs_reference_logprobs(rl_config: RLConfig) -> bool:
@@ -275,11 +94,9 @@ def batch_annotate_traces_with_ref_logprobs(llm: TrainableLLM, traces: List[dict
         all_ref_logprobs = llm.get_batch_logprobs_token_ids(prompt_token_ids, completion_token_ids)
     except Exception as e:
         logger.error(f"Failed to get ref logprobs: {e}")
-        response = getattr(e, "response", None)
-        if response is not None:
-            logger.error(f"Response content: {response.text}")
-        logger.error("Ref logprobs exception type: %s", type(e).__name__)
-        raise
+        assert (response := getattr(e, "response", None))
+        logger.error(f"Response content: {response.text}")
+        raise e
     for trace, ref_logprobs in zip(traces, all_ref_logprobs):
         trace["ref_logprobs"] = [c["logprob"] for c in ref_logprobs["content"]]
         assert len(trace["ref_logprobs"]) == len(trace["logprobs"]), (
@@ -332,9 +149,6 @@ def preprocess_dataset(
     seq_length: int,
     rl_config: RLConfig,
 ) -> list[dict]:
-    if not data:
-        return []
-
     preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True)
 
     data = replace_oov_tokens_with_the(data, tokenizer)
@@ -480,19 +294,8 @@ def process_chunk(
         worker_ref_source = llm.base_url if llm is not None else "rollout logprobs fallback"
         logger.info(f"Preprocessor worker started with reference source: {worker_ref_source}")
         while True:
-            chunk = None
-            chunk_summary = None
-            dataset = None
-            dataset_summary = None
             try:
                 chunk = input_queue.get()
-                chunk_summary = _summarize_privacy_agent_preprocess_payload(
-                    "input_chunk",
-                    chunk,
-                    container=chunk,
-                    limit_bytes=input_queue.shared_array.max_entry_size,
-                    log_summary=False,
-                )
                 dataset = preprocess_dataset(
                     llm=llm,
                     data=chunk,
@@ -500,97 +303,11 @@ def process_chunk(
                     seq_length=seq_length,
                     rl_config=rl_config,
                 )
-                num_filtered_out = 0
-                num_filter_seen = len(dataset)
-                if rl_config.filter_zero_advantage_groups:
-                    dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
-                extra_fields = None
-                if chunk_summary:
-                    input_pickle_bytes = int(chunk_summary.get("container_pickle_bytes") or 0)
-                    extra_fields = {
-                        "input_chunk_pickle_bytes": input_pickle_bytes,
-                    }
-                dataset_summary = _summarize_privacy_agent_preprocess_payload(
-                    "output_dataset",
-                    dataset,
-                    container=dataset,
-                    limit_bytes=output_queue.shared_array.max_entry_size,
-                    extra_fields=extra_fields,
-                    log_summary=False,
-                )
-                if dataset_summary:
-                    dataset_summary["num_filtered_out"] = num_filtered_out
-                    dataset_summary["num_filter_seen"] = num_filter_seen
-                if dataset_summary and chunk_summary:
-                    input_pickle_bytes = int(chunk_summary.get("container_pickle_bytes") or 0)
-                    output_pickle_bytes = int(dataset_summary.get("container_pickle_bytes") or 0)
-                    dataset_summary["expansion_ratio_vs_input"] = round(
-                        output_pickle_bytes / max(1, input_pickle_bytes),
-                        4,
-                    )
-                if dataset_summary and should_log_privacy_agent_payload(dataset_summary):
-                    limit_utilization = float(dataset_summary.get("limit_utilization") or 0.0)
-                    log_level = logging.WARNING if limit_utilization >= 0.8 else logging.INFO
-                    logger.log(
-                        log_level,
-                        "privacy_agent preprocess output_dataset payload summary: %s",
-                        format_privacy_agent_payload_summary(dataset_summary),
-                    )
-                output_messages = _split_dataset_for_output_queue(
-                    dataset,
-                    num_filtered_out=num_filtered_out,
-                    num_filter_seen=num_filter_seen,
-                    max_entry_size=output_queue.shared_array.max_entry_size,
-                )
-                if len(output_messages) > 1:
-                    max_chunk_size = max(
-                        len(pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)) for message in output_messages
-                    )
-                    logger.warning(
-                        "Split preprocessed dataset into %s output queue chunks to fit %s bytes "
-                        "(filtered_out=%s, original_pickle_bytes=%s, max_chunk_pickle_bytes=%s)",
-                        len(output_messages),
-                        output_queue.shared_array.max_entry_size,
-                        num_filtered_out,
-                        dataset_summary.get("container_pickle_bytes") if dataset_summary else -1,
-                        max_chunk_size,
-                    )
-                try:
-                    for message in output_messages:
-                        output_queue.put(message)
-                except Exception:
-                    if dataset_summary:
-                        _summarize_privacy_agent_preprocess_payload(
-                            "output_dataset_failed_put",
-                            dataset,
-                            container=dataset,
-                            limit_bytes=output_queue.shared_array.max_entry_size,
-                            extra_fields=dataset_summary,
-                            always_log=True,
-                        )
-                    raise
+                output_queue.put(dataset)
             except Exception as e:
-                if chunk_summary:
-                    _summarize_privacy_agent_preprocess_payload(
-                        "input_chunk_error_context",
-                        chunk,
-                        container=chunk,
-                        limit_bytes=input_queue.shared_array.max_entry_size,
-                        extra_fields={"error": str(e)},
-                        always_log=True,
-                    )
-                logger.error("Error while preprocessing chunk: %s", e)
-                logger.error("Worker traceback:\n%s", traceback.format_exc())
-                first_entry = chunk[0] if isinstance(chunk, list) and chunk else None
                 error_info = {
-                    "error_type": type(e).__name__,
                     "error": str(e),
-                    "traceback": traceback.format_exc(),
-                    "worker_pid": os.getpid(),
-                    "chunk_type": type(chunk).__name__ if chunk is not None else None,
-                    "chunk_len": len(chunk) if isinstance(chunk, list) else None,
-                    "first_entry_type": type(first_entry).__name__ if first_entry is not None else None,
-                    "first_entry_keys": list(first_entry.keys())[:20] if isinstance(first_entry, dict) else None,
+                    "traceback": traceback.format_exc()
                 }
                 output_queue.put(error_info)
     except KeyboardInterrupt:
@@ -612,12 +329,7 @@ def filter_zero_advantage_groups(dataset: list[dict], epsilon: float = 1e-6) -> 
     groups = {}
     
     # Group entries by group_id
-    for idx, entry in enumerate(dataset):
-        if not isinstance(entry, dict):
-            raise TypeError(
-                f"Expected dataset entries to be dicts in filter_zero_advantage_groups, "
-                f"got {type(entry).__name__} at index {idx}"
-            )
+    for entry in dataset:
         group_id = entry["group_id"]
         if group_id not in groups:
             groups[group_id] = []
@@ -770,11 +482,7 @@ def run_preprocessing_loop(
     target_samples_per_lead = samples_per_trainer[0] + samples_per_lead_per_step
     
     # Per-trainer sample tracking (similar to finetune_loop.py)
-    # Track zero-advantage filtering in training-text entries, not original
-    # dataset rows. The denominator is the number of preprocessed entries seen
-    # by the filter before it removed all-zero-advantage groups.
-    total_filtered_out = 0
-    total_filter_seen = 0
+    total_filtered_out = 0  # Track total filtered samples across all batches
 
     with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
@@ -812,7 +520,6 @@ def run_preprocessing_loop(
                 fetching_took = 0
                 writing_took = 0
                 num_filtered_out = 0
-                num_filter_seen = 0
                 while True:
                     if (
                         trainer_state.samples_processed is not None
@@ -827,25 +534,7 @@ def run_preprocessing_loop(
                                 raise raw_chunk
                             
                             # Put chunk in the input queue for workers
-                            raw_chunk_summary = _summarize_privacy_agent_preprocess_payload(
-                                "raw_chunk",
-                                raw_chunk,
-                                container=raw_chunk,
-                                limit_bytes=input_queue.shared_array.max_entry_size,
-                            )
-                            try:
-                                input_queue.put(raw_chunk)
-                            except Exception:
-                                if raw_chunk_summary:
-                                    _summarize_privacy_agent_preprocess_payload(
-                                        "raw_chunk_failed_put",
-                                        raw_chunk,
-                                        container=raw_chunk,
-                                        limit_bytes=input_queue.shared_array.max_entry_size,
-                                        extra_fields=raw_chunk_summary,
-                                        always_log=True,
-                                    )
-                                raise
+                            input_queue.put(raw_chunk)
                             submitted_chunks += 1
                         except Empty:
                             pass
@@ -854,54 +543,23 @@ def run_preprocessing_loop(
                     try:
                         # Try to write the next dataset to the output stream, if it is ready
                         start_fetching = time.time()
-                        dataset_from_chunk_message = False
                         dataset = output_queue.get(timeout=0.001)
                         if isinstance(dataset, Exception):
                             raise dataset
-                        if isinstance(dataset, dict) and "error" in dataset:
-                            error_message = str(dataset.get("error") or "").strip()
-                            traceback_text = str(dataset.get("traceback") or "").strip()
-                            logger.error("Got exception from the result queue: %s", error_message)
-                            logger.error("Traceback: %s", traceback_text)
-                            raise RuntimeError(
-                                error_message or f"preprocess worker failed:\n{traceback_text}"
-                            )
-                        if isinstance(dataset, dict) and dataset.get("kind") == PREPROCESS_DATASET_CHUNK_KIND:
-                            chunk_filtered_out = int(dataset.get("num_filtered_out") or 0)
-                            chunk_filter_seen = int(dataset.get("num_filter_seen") or (chunk_filtered_out + len(dataset.get("dataset") or [])))
-                            num_filtered_out += chunk_filtered_out
-                            num_filter_seen += chunk_filter_seen
-                            if chunk_filtered_out:
-                                logger.info(
-                                    "Filtered out %s/%s samples from groups with zero advantage.",
-                                    chunk_filtered_out,
-                                    chunk_filter_seen,
-                                )
-                            total_filtered_out += chunk_filtered_out
-                            total_filter_seen += chunk_filter_seen
-                            dataset_from_chunk_message = True
-                            dataset = dataset.get("dataset")
-                        if not isinstance(dataset, list):
-                            raise TypeError(
-                                f"Unexpected preprocess worker result type: {type(dataset).__name__}"
-                            )
-                        if rl_config.filter_zero_advantage_groups and not dataset_from_chunk_message:
-                            filter_seen = len(dataset)
+                        if rl_config.filter_zero_advantage_groups:
                             dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
-                            num_filter_seen = filter_seen
                             total_filtered_out += num_filtered_out
-                            total_filter_seen += filter_seen
                             if num_filtered_out > 0:
-                                logger.info(
-                                    "Filtered out %s/%s samples from groups with zero advantage.",
-                                    num_filtered_out,
-                                    filter_seen,
-                                )
+                                logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
                         fetching_took += time.time() - start_fetching
                     except Empty:
                         pass
                     
                     if dataset:
+                        if isinstance(dataset, dict) and "error" in dataset:
+                            logger.error(f"Got exception from the result queue: {dataset['error']}")
+                            logger.error(f"Traceback: {dataset['traceback']}")
+                            raise Exception(dataset['error'])
                         for entry in dataset:
                             buffer.append(entry)
                         processed_chunks += 1
@@ -1009,25 +667,16 @@ def run_preprocessing_loop(
                         published_samples > last_published_samples 
                         and (cfg.debug.mode or batch_done or (published_samples - last_published_samples > cfg.preprocess.log_every_n_samples))
                     ):
-                        approx_samples_in_output_queue = output_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts
+                        samples_in_output_queue = output_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts
                         stats = {
                             "preprocessor/published_samples": published_samples,
                             "preprocessor/published_model_version": max_model_version,
                             "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts,
                             "preprocessor/queue/raw": raw_chunk_queue.qsize(),
-                            # Approximate only: one logical preprocessed group may now span multiple output queue entries.
-                            "preprocessor/queue/output_samples": approx_samples_in_output_queue,
+                            "preprocessor/queue/output_samples": samples_in_output_queue,
                             "preprocessor/queue/output": output_queue.qsize(),
                             "preprocessor/filtered_out_samples": num_filtered_out,
-                            "preprocessor/filter_seen_samples": num_filter_seen,
-                            "preprocessor/filtered_out_fraction": (
-                                num_filtered_out / num_filter_seen if num_filter_seen else 0.0
-                            ),
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
-                            "preprocessor/total_filter_seen_samples": total_filter_seen,
-                            "preprocessor/total_filtered_out_fraction": (
-                                total_filtered_out / total_filter_seen if total_filter_seen else 0.0
-                            ),
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
@@ -1039,17 +688,15 @@ def run_preprocessing_loop(
                         processed_samples = published_samples - last_published_samples
                         last_published_samples = published_samples
                         logger.info(
-                            f"Processed {processed_samples} samples "
-                            f"(filtered out {num_filtered_out}/{num_filter_seen}) in {processing_took:.3f}s"
+                            f"Processed {processed_samples} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
                             f" (fetching took {fetching_took:.3f} and writing took {writing_took:.3f})"
                             f" and wrote to {output_stream}, total {published_samples} samples so far,"
-                            f" ~{approx_samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
+                            f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
                         )
                         start_processing = time.time()
                         fetching_took = 0
                         writing_took = 0
                         num_filtered_out = 0
-                        num_filter_seen = 0
             finally:
                 # Clean up worker processes
                 for worker in workers:

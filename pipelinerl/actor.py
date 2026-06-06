@@ -21,11 +21,6 @@ from pydantic import BaseModel, Field
 import wandb
 from pipelinerl.async_llm import RetryableAbortedCompletionError
 from pipelinerl.domain_sampling import DomainWeightedSampler
-from pipelinerl.domains.privacy_agent.size_debug import (
-    format_privacy_agent_payload_summary,
-    should_log_privacy_agent_payload,
-    summarize_privacy_agent_payload,
-)
 from pipelinerl.domains.math.rollouts import length_penalty
 from pipelinerl.finetune_loop import calculate_train_steps
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
@@ -116,34 +111,6 @@ def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
 
 
-def _log_privacy_agent_result_queue_payload(
-    group_rollout_results: list[RolloutResult],
-    *,
-    limit_bytes: int,
-) -> dict | None:
-    samples = []
-    for rollout_result in group_rollout_results:
-        for text in rollout_result.training_texts:
-            samples.append(text.model_dump())
-
-    summary = summarize_privacy_agent_payload(
-        samples,
-        container=group_rollout_results,
-        limit_bytes=limit_bytes,
-    )
-    if not summary or not should_log_privacy_agent_payload(summary):
-        return summary
-
-    limit_utilization = float(summary.get("limit_utilization") or 0.0)
-    log_level = logging.WARNING if limit_utilization >= 0.8 else logging.INFO
-    logger.log(
-        log_level,
-        "privacy_agent actor result_queue payload summary: %s",
-        format_privacy_agent_payload_summary(summary),
-    )
-    return summary
-
-
 async def schedule_rollouts(
     cfg: DictConfig,
     attempts: int,
@@ -219,7 +186,6 @@ async def schedule_rollouts(
             model_version = trainer_state.propagated_weight_version
             assert model_version is not None
             retry_count = 0
-            retry_backoff_s = 0.0
             while True:
                 try:
                     rollout_result = await rollout_policy(cfg, llm, problem, session)
@@ -232,20 +198,16 @@ async def schedule_rollouts(
                     if is_retryable and can_retry and not is_trainer_finished():
                         retry_count += 1
                         backoff_s = min(retry_max_delay_s, retry_initial_delay_s * (2 ** (retry_count - 1)))
-                        retry_backoff_s += backoff_s
                         if retry_count == 1 or retry_count % 10 == 0:
                             logger.warning(
                                 f"{scheduler_name}: rollout {group_id}/{rollout_index} failed with "
-                                f"{exc.__class__.__name__}: {exc}, retry {retry_count}"
+                                f"{exc.__class__.__name__}, retry {retry_count}"
                             )
                         await asyncio.sleep(backoff_s)
                         continue
                     handle_rollout_exception(exc)
                     return
             rollout_result.model_version = model_version
-            rollout_result.metrics.rollout_retry_count = retry_count
-            rollout_result.metrics.rollout_retry_any = retry_count > 0
-            rollout_result.metrics.rollout_retry_backoff_s = retry_backoff_s
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
             rollout_result.group_id = full_group_id
@@ -259,19 +221,7 @@ async def schedule_rollouts(
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
                 random.shuffle(group_rollouts[group_id])
-                payload_summary = _log_privacy_agent_result_queue_payload(
-                    group_rollouts[group_id],
-                    limit_bytes=result_queue.shared_array.max_entry_size,
-                )
-                try:
-                    result_queue.put(group_rollouts[group_id])
-                except Exception:
-                    if payload_summary:
-                        logger.error(
-                            "privacy_agent actor result_queue put failed: %s",
-                            format_privacy_agent_payload_summary(payload_summary),
-                        )
-                    raise
+                result_queue.put(group_rollouts[group_id])
                 del group_rollouts[group_id]
             finished_rollouts += 1
         except Exception as e:
@@ -490,31 +440,12 @@ class ActorLoop:
                 if dataset_name is not None:
                     self.dataset_to_domain[str(dataset_name)] = domain_key
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
-            all_metrics = result.metrics.model_dump(exclude_none=True) | domain_agnostic_metrics
+            all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
             for k, v in all_metrics.items():
                 if isinstance(v, list):
                     self.stats[k][dataset_name][group_id] += v
-                elif v is None:
-                    continue
                 elif isinstance(v, float) | isinstance(v, bool) | isinstance(v, int):
                     self.stats[k][dataset_name][group_id].append(v)
-                elif isinstance(v, str):
-                    continue
-                elif isinstance(v, dict):
-                    for sub_key, sub_value in v.items():
-                        if sub_value is None:
-                            continue
-                        metric_key = f"{k}/{sub_key}"
-                        if isinstance(sub_value, list):
-                            self.stats[metric_key][dataset_name][group_id] += sub_value
-                        elif isinstance(sub_value, float) | isinstance(sub_value, bool) | isinstance(sub_value, int):
-                            self.stats[metric_key][dataset_name][group_id].append(sub_value)
-                        elif isinstance(sub_value, str):
-                            continue
-                        else:
-                            raise ValueError(
-                                f"Unsupported nested metric type: {type(sub_value)} for key {metric_key}"
-                            )
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
         
@@ -718,18 +649,7 @@ class ActorLoop:
                 for r in rollout_results:
                     for text in r.training_texts:
                         all_text_dumps.append(text.model_dump())
-                if all_text_dumps:
-                    data_stream_writer.write(all_text_dumps)
-                else:
-                    # A whole group can be filtered out upstream when every
-                    # rollout has zero advantage. Do not publish an empty
-                    # training record; the preprocessor expects real samples.
-                    logger.warning(
-                        "Skipping empty %s group publish for group_id=%s with %s rollout results",
-                        "train" if self.is_training else "test",
-                        rollout_results[0].group_id,
-                        len(rollout_results),
-                    )
+                data_stream_writer.write(all_text_dumps)
                 in_progress = submitted_groups - finished_groups
                 logger.info(
                     f"Published {group_samples} {'train' if self.is_training else 'test'} samples"

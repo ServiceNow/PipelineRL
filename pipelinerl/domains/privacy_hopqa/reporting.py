@@ -1,7 +1,5 @@
 """Report helpers for privacy_hopqa."""
 
-from __future__ import annotations
-
 import re
 from typing import Any
 
@@ -19,7 +17,6 @@ def parse_answer_lines(report_text: str) -> dict[str, str]:
 
 
 def build_deterministic_report(
-    *,
     numbered_questions: str,
     hop_states: list[dict[str, Any]],
 ) -> str:

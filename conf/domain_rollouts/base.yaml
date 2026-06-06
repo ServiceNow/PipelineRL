@@ -9,5 +9,3 @@ livecodebench: pipelinerl.domains.coding.generate_coding_rollout
 fn_calling: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
 logic: pipelinerl.domains.logic.generate_logic_rollout
 ifeval: pipelinerl.domains.ifeval.generate_ifeval_rollout
-privacy_agent: pipelinerl.domains.privacy_agent.generate_privacy_agent_rollout
-privacy_hopqa: pipelinerl.domains.privacy_hopqa.generate_privacy_hopqa_rollout

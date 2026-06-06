@@ -1,98 +1,66 @@
-annotations_path: ${oc.env:PRIVACY_AGENT_ANNOTATIONS_PATH,.privacy_agent/inputs/annotations_2026-04-06.json}
-curated_path: ${oc.env:PRIVACY_AGENT_CURATED_PATH,.privacy_agent/inputs/curated_chains.jsonl}
-final_dataset_path: ${oc.env:PRIVACY_HOPQA_FINAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants.jsonl}
-final_train_dataset_path: ${oc.env:PRIVACY_HOPQA_TRAIN_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_train.jsonl}
-final_val_dataset_path: ${oc.env:PRIVACY_HOPQA_VAL_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_val.jsonl}
-final_test_dataset_path: ${oc.env:PRIVACY_HOPQA_TEST_DATASET_PATH,/home/toolkit/my_code/MosaicProject/data_files/privacy_hopqa_final_dataset/privacy_hopqa_finalized_2026-05-20_q30_hume_safe_variants_test.jsonl}
-sample_size: 20
+# Paths produced by MosaicProject. The default training config reads the train
+# and validation JSONL files below; set final/test when running evaluation jobs
+# that use those aliases.
+final_dataset_path: null
+final_train_dataset_path: ???
+final_val_dataset_path: ???
+final_test_dataset_path: null
 max_examples: null
-task_data_root: ${oc.env:PRIVACY_AGENT_TASK_DATA_ROOT,.privacy_agent/inputs/tasks}
-# Previous local-index default, kept for debugging old runs:
-# /mnt/llmd/results/exps/alexg/privacy_agent/local_indices_fixeddeps_20260415
-local_index_root: ${oc.env:PRIVACY_AGENT_LOCAL_INDEX_ROOT,/mnt/llmd/results/exps/alexg/privacy_hopqa_shared/q30_final_residual_review_20260513/local_indices_goldcoverage_20260519}
+
+# DRBench-style task files used by the helper service and optional local search.
+task_data_root: ???
+local_index_root: .privacy_hopqa/local_indices
 local_index_mmap_mode: r
-helper_service_url: ${oc.env:PRIVACY_AGENT_HELPER_URL, null}
-privacy_reward_service_url: ${oc.env:PRIVACY_HOPQA_PRIVACY_REWARD_URL, null}
-helper_timeout_s: 30.0
-privacy_reward_timeout_s: 30.0
+
+# Current MosaicLeaks training runs use the helper for private-doc retrieval
+# and BrowseComp search. Local private-doc search remains available by setting
+# use_remote_local_search=false and pointing local_index_root at prebuilt indices.
+helper_service_url: ???
+helper_timeout_s: 180.0
+use_remote_local_search: true
+use_remote_browsecomp: true
+
 generation_context_limit_tokens: 16384
 generation_context_margin_tokens: 128
 hop_plan_max_tokens: 4096
 doc_choose_max_tokens: 4096
 doc_read_max_tokens: 4096
 hop_resolve_max_tokens: 4096
-use_remote_local_search: true
-use_remote_browsecomp: true
-capture_mode: all_calls
+
+capture_mode: planning_only
 answer_match_f1_threshold: 0.75
 answer_match_mode: exact_or_f1
-reward_mode: all_hops_correct
-# Training texts use the rollout outcome by default. Experimental stepwise modes:
-# training_reward_mode=prefix_progress gives each captured call
-# prefix_correct_hops_so_far / total_hops. training_reward_mode=hop_step gives
-# hop-local shaped reward. In the current default planning-only setup, only
-# hop_plan and doc_choose are captured for training. hop_plan gets hop
-# correctness plus small bonuses for searching the expected source type and
-# retrieving a gold/equivalent parent document. doc_choose gets hop correctness;
-# when a gold/equivalent parent is visible, it also gets a small bonus for
-# selecting one. hop_resolve still runs with the standard short-justification
-# contract, but is not captured or trained because its reward is noisier.
-# training_reward_mode=hop_step_situational is the simpler ablation: compare
-# rewards only within (hop, stage, situation). hop_plan is split by whether the
-# gold/equivalent document had already been retrieved; doc_choose is split by
-# whether a gold/equivalent parent was visible, and gold-absent chooser calls
-# are ignored rather than punished.
-# constrained_resolver removes free-form resolver justification/reason fields;
-# leave it false for the current retrieval-policy runs.
-# hop_step_efficiency_metric=llm_calls additionally scales each hop's shaped
-# reward by min_hop_llm_calls / rollout_hop_llm_calls within the comparison
-# group. This rewards cheaper successful hop attempts without using noisy
-# latency measurements.
-# stop_after_incorrect_hop=true ends the rollout after the first resolved wrong
-# hop without injecting gold.
-# Use together with finetune.rl.step_reward_advantages=true and
-# finetune.rl.pad_step_rewards_for_advantage=true.
+reward_mode: hop_accuracy
 training_reward_mode: outcome
+
+# For hop_step_situational training, set:
+#   privacy_hopqa.training_reward_mode=hop_step_situational
+#   finetune.rl.step_reward_advantages=true
+#   finetune.rl.filter_zero_advantage_groups=true
+# Privacy-reward runs also set privacy_reward_weight>0 and
+# privacy_reward_service_url to the reward-model helper.
 hop_step_source_bonus: 0.25
 hop_step_doc_bonus: 0.25
-hop_resolve_reward_mode: hop_correct
-hop_step_efficiency_metric: none
-# Optional privacy penalty for hop_plan web queries. When enabled, the rollout
-# scores each visible web-query batch against the separate privacy reward model
-# and subtracts:
-#   privacy_reward_weight * max(
-#       0,
-#       direct - threshold,
-#       context_with_current - max(context_without_current, threshold),
-#   )
-# from the hop_plan reward. The comparison bucket remains the existing
-# hop/stage/situation bucket, so utility and privacy trade off in one advantage.
+privacy_reward_service_url: null
+privacy_reward_timeout_s: 30.0
 privacy_reward_weight: 0.0
-privacy_reward_threshold: 0.6
+privacy_reward_threshold: 0.5
 privacy_reward_context_hops: 2
+
 constrained_resolver: false
 stop_after_incorrect_hop: false
 zero_error_step_reward: true
 max_iterations: 14
 iteration_budget_per_hop: 2
-# Keep retries/fallback explicit: hidden generic local+web fallback changes
-# the source-selection policy and can mask whether the model learned the tool.
 hop_plan_attempts: 1
 enable_generic_retrieval_fallback: false
 enable_local_search_bootstrap: false
 max_parallel_retrieval_actions: 3
 retrieval_top_k: 5
-# Select parent documents, not individual chunks. Each selected parent with
-# <= read_all_windows_max_count evidence windows is expanded into all windows.
 choose_top_k: 3
-# Interpreted as max parent documents. In windowed mode, all evidence windows
-# from those parent documents remain available to choose/read.
 max_candidate_cards: 20
 chooser_excerpt_chars: 500
 reader_excerpt_chars: 2500
-# New default: retrieve parent docs, then expose larger selectable evidence
-# windows to the chooser/reader. Revert to the original prefix-only behavior
-# with: privacy_hopqa.retrieval_context_mode=legacy_prefix
 retrieval_context_mode: windowed_evidence
 retrieval_source_chars: 0
 retrieval_chunk_chars: 4000
@@ -100,9 +68,6 @@ retrieval_chunk_overlap_chars: 800
 reader_window_chars: 10000
 reader_window_overlap_chars: 1000
 max_windows_per_parent: 0
-# Parent documents with <= read_all_windows_max_count evidence windows are read
-# in full. Longer parent docs are kept available, but read only query-relevant
-# batches rather than exploding the rollout.
 large_parent_window_policy: top_with_neighbors
 read_all_windows_max_count: 5
 large_parent_top_windows: 4
@@ -111,20 +76,20 @@ large_parent_max_read_windows: 0
 max_history_entries: 10
 local_search_threshold: 0.0
 semantic_threshold: 0.7
+
 browsecomp_enabled: true
-browsecomp_device: cpu
-# Previous local BrowseComp default, kept for debugging old runs:
-# .privacy_agent/browsecomp/indexes/qwen3-embedding-4b/corpus.shard*_of_*.pkl
-browsecomp_index_glob: ${oc.env:PRIVACY_AGENT_BROWSECOMP_INDEX_GLOB,/mnt/llmd/results/exps/alexg/privacy_hopqa_shared/q30_final_residual_review_20260513/browsecomp_indexes/qwen3-embedding-4b/corpus.shard*_of_*.pkl}
-browsecomp_model_name: Qwen/Qwen3-Embedding-4B
-browsecomp_corpus: Tevatron/browsecomp-plus-corpus
 browsecomp_top_k: 5
 browsecomp_max_chars: 8000
+
 llm_provider: vllm
 embedding_provider: huggingface
 embedding_model: Qwen/Qwen3-Embedding-4B
+embedding_base_url: null
+embedding_api_key: null
+embedding_device: null
 log_prompts: false
 verbose: false
 no_web: false
 parallel_searches: true
 max_parallel_doc_reads: 5
+planner_privacy_prompt: false

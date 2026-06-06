@@ -840,8 +840,7 @@ def rl_finetuning_worker(
                 queue_size=batch_queue.qsize(),
             )
         optimizer_step_and_zero_grad()
-        if not using_deepspeed:
-            lr_scheduler.step()
+        lr_scheduler.step()
         if memory_debug is not None and memory_debug.should_log_step(logical_step):
             memory_debug.log_snapshot(
                 "after_optimizer_step",

@@ -1,14 +1,11 @@
 """Embedding helpers for the privacy_hopqa domain."""
 
-
 import logging
-import os
 import threading
-from typing import List, Optional
 
 from openai import OpenAI
-
-from .config import OPENAI_API_KEY, OPENROUTER_API_KEY, OPENROUTER_API_URL, VLLM_EMBEDDING_URL
+from sentence_transformers import SentenceTransformer
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -24,89 +21,73 @@ _HF_MODEL_NAME = None
 _HF_LOCK = threading.Lock()
 
 
-def _get_openai_embeddings(texts: List[str], model: str) -> List[List[float]]:
-    client = OpenAI(base_url="https://api.openai.com/v1", api_key=OPENAI_API_KEY)
+def _openai_client(base_url: str, api_key: str | None) -> OpenAI:
+    if not api_key:
+        raise ValueError("embedding_api_key is required for OpenAI-compatible embeddings.")
+    return OpenAI(base_url=base_url.rstrip("/"), api_key=api_key)
+
+
+def _get_openai_embeddings(texts: list[str], model: str, api_key: str | None) -> list[list[float]]:
+    client = _openai_client("https://api.openai.com/v1", api_key)
     response = client.embeddings.create(input=texts, model=model)
     return [item.embedding for item in response.data]
 
 
-def _get_openrouter_embeddings(texts: List[str], model: str) -> List[List[float]]:
-    client = OpenAI(base_url=OPENROUTER_API_URL, api_key=OPENROUTER_API_KEY)
+def _get_openrouter_embeddings(
+    texts: list[str],
+    model: str,
+    base_url: str | None,
+    api_key: str | None,
+) -> list[list[float]]:
+    client = _openai_client(base_url or "https://openrouter.ai/api/v1", api_key)
     response = client.embeddings.create(input=texts, model=model)
     return [item.embedding for item in response.data]
 
 
-def _get_huggingface_embeddings(texts: List[str], model: str) -> List[List[float]]:
+def _get_huggingface_embeddings(texts: list[str], model: str, device: str | None) -> list[list[float]]:
     global _HF_MODEL, _HF_MODEL_NAME
-
-    from sentence_transformers import SentenceTransformer
 
     if _HF_MODEL is None or _HF_MODEL_NAME != model:
         with _HF_LOCK:
             if _HF_MODEL is None or _HF_MODEL_NAME != model:
-                import torch
-
-                embedding_device = os.getenv("DRBENCH_EMBEDDING_DEVICE")
+                embedding_device = device
                 force_cpu = bool(embedding_device and embedding_device.lower().startswith("cpu"))
-
-                if torch.cuda.is_available() and not force_cpu:
+                if not embedding_device and torch.cuda.is_available():
                     num_gpus = torch.cuda.device_count()
-                    default_device = f"cuda:{num_gpus - 1}" if num_gpus > 1 else "cuda:0"
-                    embedding_device = embedding_device or default_device
-                    try:
-                        _HF_MODEL = SentenceTransformer(
-                            model,
-                            device=embedding_device,
-                            model_kwargs={
-                                "attn_implementation": "flash_attention_2",
-                                "torch_dtype": torch.float16,
-                            },
-                            tokenizer_kwargs={"padding_side": "left"},
-                        )
-                    except Exception:
-                        _HF_MODEL = SentenceTransformer(
-                            model,
-                            device=embedding_device,
-                            tokenizer_kwargs={"padding_side": "left"},
-                        )
-                else:
-                    _HF_MODEL = SentenceTransformer(
-                        model,
-                        device="cpu" if force_cpu else None,
-                        tokenizer_kwargs={"padding_side": "left"},
-                    )
-
+                    embedding_device = f"cuda:{num_gpus - 1}" if num_gpus > 1 else "cuda:0"
+                _HF_MODEL = SentenceTransformer(
+                    model,
+                    device="cpu" if force_cpu else embedding_device or None,
+                    tokenizer_kwargs={"padding_side": "left"},
+                )
                 _HF_MODEL_NAME = model
-                logger.info("Loaded embedding model %s", model)
+                logger.info("Loaded embedding model %s on %s", model, embedding_device or "default device")
 
     embeddings = _HF_MODEL.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
     return embeddings.tolist()
 
 
-def _get_vllm_embeddings(texts: List[str], model: str) -> List[List[float]]:
-    if not VLLM_EMBEDDING_URL:
-        raise ValueError(
-            "VLLM_EMBEDDING_URL must be set when using DRBENCH_EMBEDDING_PROVIDER=vllm"
-        )
-    client = OpenAI(base_url=f"{VLLM_EMBEDDING_URL}/v1", api_key="not-needed")
+def _get_vllm_embeddings(texts: list[str], model: str, base_url: str | None, api_key: str | None) -> list[list[float]]:
+    if not base_url:
+        raise ValueError("embedding_base_url is required when embedding_provider=vllm.")
+    client = OpenAI(base_url=base_url.rstrip("/"), api_key=api_key or "not-needed")
     response = client.embeddings.create(input=texts, model=model)
     return [item.embedding for item in response.data]
 
 
 def get_embeddings(
-    texts: List[str],
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    helper_client=None,
-) -> List[List[float]]:
+    texts: list[str],
+    model: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    device: str | None = None,
+) -> list[list[float]]:
     if not texts:
         return []
 
-    provider_name = (provider or "openai").lower()
+    provider_name = (provider or "huggingface").lower()
     model_name = model or DEFAULT_MODELS[provider_name]
-
-    if helper_client is not None:
-        return helper_client.embed(texts, model=model_name)
 
     if model_name.startswith("text-embedding-") and provider_name not in {"openai", "openrouter"}:
         raise ValueError(
@@ -114,12 +95,12 @@ def get_embeddings(
         )
 
     if provider_name == "openai":
-        return _get_openai_embeddings(texts, model_name)
+        return _get_openai_embeddings(texts, model_name, api_key)
     if provider_name == "openrouter":
-        return _get_openrouter_embeddings(texts, model_name)
+        return _get_openrouter_embeddings(texts, model_name, base_url, api_key)
     if provider_name == "huggingface":
-        return _get_huggingface_embeddings(texts, model_name)
+        return _get_huggingface_embeddings(texts, model_name, device)
     if provider_name == "vllm":
-        return _get_vllm_embeddings(texts, model_name)
+        return _get_vllm_embeddings(texts, model_name, base_url, api_key)
 
     raise ValueError(f"Unknown embedding provider: {provider_name}")

@@ -64,7 +64,6 @@ class PrivacyHopQALLMAdapter:
         llm: TrainableLLM,
         session: aiohttp.ClientSession,
         capture_mode: str = "all_calls",
-        *,
         rollout_id: str = "",
         task_id: str = "",
         chain_id: str = "",
@@ -96,7 +95,6 @@ class PrivacyHopQALLMAdapter:
 
     def _log_prompt_summary(
         self,
-        *,
         log_name: str,
         prompt_tokens: int,
         force: bool = False,
@@ -119,7 +117,6 @@ class PrivacyHopQALLMAdapter:
 
     def _log_call_summary(
         self,
-        *,
         log_name: str,
         prompt_tokens: int,
         output_tokens: int,
@@ -150,7 +147,6 @@ class PrivacyHopQALLMAdapter:
 
     def _base_log_record(
         self,
-        *,
         log_name: str,
         hop_number: int | None,
         iteration: int | None,
@@ -174,7 +170,6 @@ class PrivacyHopQALLMAdapter:
         self,
         prompt: Prompt,
         requested_model: str | None,
-        *,
         parameters_override: dict[str, Any] | None = None,
     ) -> LLMCall:
         if requested_model and requested_model != self.llm.model_name:
@@ -190,6 +185,8 @@ class PrivacyHopQALLMAdapter:
                 parameters_override=parameters_override,
             )
         except Exception as exc:
+            # Infrastructure errors are retried or failed by the actor; prompt
+            # and parsing errors stay in the domain rollout path.
             if is_llm_infrastructure_error(exc):
                 # Let PipelineRL's actor fail-fast path handle dead vLLM shards.
                 raise PrivacyHopQALLMInfrastructureError(
@@ -200,7 +197,6 @@ class PrivacyHopQALLMAdapter:
     async def generate_text(
         self,
         prompt: str,
-        *,
         model: str | None = None,
         log_name: str = "llm",
         max_tokens: int | None = None,
@@ -289,6 +285,8 @@ class PrivacyHopQALLMAdapter:
                 parameters_override=parameters_override or None,
             )
         except Exception as exc:
+            # Context failures are easier to debug with the exact prompt size in
+            # the rollout logs, so force one more prompt summary before re-raising.
             exc_text = str(exc).lower()
             if "maximum context length" in exc_text or "requested" in exc_text or "context" in exc_text:
                 self._log_prompt_summary(
