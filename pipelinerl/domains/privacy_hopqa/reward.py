@@ -192,7 +192,7 @@ def score_chain_answers(
         problem.get("global_answer_variants"),
         problem.get("global_alternate_valid_answers"),
     )
-    final_correct, final_match_score = answers_match(
+    final_correct, _ = answers_match(
         answers.get(final_key, ""),
         final_accepted_answers,
         f1_threshold=f1_threshold,
@@ -220,9 +220,5 @@ def score_chain_answers(
         "strict_chain_success": strict_chain_success,
         "reward": reward,
         "final_correct": final_correct,
-        "final_match_score": final_match_score,
-        "final_accepted_answers": final_accepted_answers,
         "chain_complete": chain_complete,
-        "f1_threshold": f1_threshold,
-        "answer_match_mode": answer_match_mode,
     }

@@ -327,37 +327,6 @@ def _resolver_reader_result(result: "ReaderResult") -> dict[str, Any]:
     return _compact_reader_result_dict(result.to_dict())
 
 
-def _resolver_candidate_card(candidate: "CandidateDoc", excerpt_chars: int) -> dict[str, Any]:
-    excerpt_chars = max(0, int(excerpt_chars))
-    card = candidate.as_card(max(1, excerpt_chars))
-    compact: dict[str, Any] = {}
-    for key in (
-        "doc_id",
-        "source",
-        "title",
-        "locator",
-        "score",
-        "rank",
-        "parent_doc_id",
-        "window_index",
-        "window_count",
-        "best_rank",
-        "hit_count",
-        "top_queries",
-    ):
-        if key in card:
-            value = card[key]
-            if key in {"title", "locator", "parent_doc_id"}:
-                value = _truncate(str(value), 180)
-            elif key == "top_queries" and isinstance(value, list):
-                value = [_truncate(str(item), 100) for item in value[:5]]
-            compact[key] = value
-    excerpt = str(card.get("excerpt") or "").strip()
-    if excerpt_chars > 0 and excerpt:
-        compact["snippet"] = _truncate(excerpt, excerpt_chars)
-    return compact
-
-
 def _candidate_parent_id(candidate: "CandidateDoc") -> str:
     return str(candidate.metadata.get("parent_doc_id") or candidate.doc_id)
 
@@ -1553,7 +1522,7 @@ class PrivacyHopQAAgent:
                         "snippet": _query_snippet(
                             window_text,
                             query,
-                            max(self.settings.chooser_excerpt_chars * 4, self.settings.chooser_excerpt_chars),
+                            self.settings.chooser_excerpt_chars * 4,
                         ),
                     },
                 )
@@ -2076,43 +2045,6 @@ class PrivacyHopQAAgent:
         for result in results:
             hop.reader_results.append(result.to_dict())
         return results
-
-    def _fallback_resolution(self, reader_results: list[ReaderResult]) -> dict[str, Any]:
-        positive = [result for result in reader_results if result.can_answer and result.proposed_answer]
-        if not positive:
-            return {
-                "answered": False,
-                "answer": "",
-                "justification": "",
-                "confidence": 0.0,
-                "reason": "No selected document excerpt confidently answered the hop.",
-                "next_step": "search_more",
-                "selected_doc_ids": [],
-            }
-        grouped: dict[str, list[ReaderResult]] = {}
-        for result in positive:
-            grouped.setdefault(_normalize_answer(result.proposed_answer), []).append(result)
-        best_key, best_group = max(grouped.items(), key=lambda item: (len(item[1]), max(res.confidence for res in item[1])))
-        if len(best_group) == 1 and len(grouped) > 1:
-            return {
-                "answered": False,
-                "answer": "",
-                "justification": "",
-                "confidence": 0.0,
-                "reason": "Selected documents proposed conflicting answers.",
-                "next_step": "search_more",
-                "selected_doc_ids": [],
-            }
-        best = max(best_group, key=lambda res: res.confidence)
-        return {
-            "answered": True,
-            "answer": best.proposed_answer,
-            "justification": best.justification,
-            "confidence": best.confidence,
-            "reason": "Fallback resolver selected the strongest consistent document read.",
-            "next_step": "done",
-            "selected_doc_ids": [],
-        }
 
     def _stored_reader_results(self, hop: HopState) -> list[ReaderResult]:
         results: list[ReaderResult] = []

@@ -38,13 +38,11 @@ def build_deterministic_report(
         final_justification = "The final hop could not be resolved from the available evidence."
     elif len(resolved_prefix) <= 1:
         final_justification = final_hop["justification"]
-    elif resolved_prefix:
+    else:
         final_justification = (
             f"The chain resolves through {', '.join(resolved_prefix[:-1])} to the final hop answer. "
             f"{final_hop['justification']}"
         ).strip()
-    else:
-        final_justification = final_hop["justification"]
 
     body = build_final_summary_lines(
         hop_answers,

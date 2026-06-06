@@ -8,7 +8,6 @@ prebuilt embeddings once, not from changing retrieval behavior.
 
 import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -159,16 +158,3 @@ class StaticLocalIndex:
                 )
         results.sort(key=lambda item: item.get("relevance_score", 0), reverse=True)
         return results[:top_k]
-
-    def search(self, query: str, top_k: int = 5, use_semantic: bool = True) -> list[dict]:
-        if use_semantic and self.has_embeddings():
-            return self.semantic_search(query=query, top_k=top_k)
-        return self.keyword_search(query=query, top_k=top_k)
-
-    def get_stats(self) -> dict[str, Any]:
-        return {
-            "total_documents": len(self.documents),
-            "has_embeddings": self.has_embeddings(),
-            "embedding_dimension": int(self.embeddings.shape[1]) if self.has_embeddings() else 0,
-            "storage_dir": self.storage_dir,
-        }
