@@ -748,16 +748,6 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             columns=["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
         )
     assert len(df_advantages) == len(df_init)
-    expected_advantage_columns = [
-        "group_id",
-        "rollout_index",
-        "step_index",
-        "group_tokens",
-        "advantages",
-    ]
-    # Both advantage modes must yield exactly these columns; the select drops any
-    # extras before the merge-back and raises KeyError if one is missing.
-    df_advantages = df_advantages[expected_advantage_columns]
 
     # Step 3: bring advantages and group level stats back to the main df
     drop_columns = [column for column in ["advantages", "group_tokens"] if column in df_init.columns]
