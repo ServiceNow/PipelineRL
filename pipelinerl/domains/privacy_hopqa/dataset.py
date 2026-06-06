@@ -35,7 +35,6 @@ def _load_from_materialized_jsonl(path: str | Path) -> list[dict[str, Any]]:
         problem = dict(row)
         problem.setdefault("domain", DOMAIN_NAME)
         problem.setdefault("dataset", dataset_path.stem)
-        problem.setdefault("id", index)
         problem.setdefault("problem_id", f"{DOMAIN_NAME}_{problem.get('chain_id', index)}")
         problems.append(problem)
     return problems
@@ -71,15 +70,6 @@ def _configured_dataset_path(dataset_name: str, configured_paths: dict[str, str 
     return configured_path
 
 
-def _advance_next_id(next_id: int, problem: dict[str, Any]) -> int:
-    id_value = problem.get("id")
-    if isinstance(id_value, int):
-        return max(next_id, id_value + 1)
-    if isinstance(id_value, str) and id_value.isdigit():
-        return max(next_id, int(id_value) + 1)
-    return next_id
-
-
 def load_problems(
     dataset_names: list[str] | str | None = None,
     seed: int | None = None,
@@ -104,21 +94,19 @@ def load_problems(
     }
 
     problems: list[dict[str, Any]] = []
-    next_id = 0
     for dataset_name in dataset_names:
         candidate_path = Path(str(dataset_name)).expanduser()
         if candidate_path.is_file():
-            loaded = _load_from_materialized_jsonl(candidate_path)
+            path: str | Path = candidate_path
         else:
-            configured_path = _configured_dataset_path(str(dataset_name).strip(), configured_paths)
-            loaded = _load_from_materialized_jsonl(configured_path)
+            path = _configured_dataset_path(str(dataset_name).strip(), configured_paths)
+        problems.extend(_load_from_materialized_jsonl(path))
 
-        for problem in loaded:
-            if "id" not in problem:
-                problem["id"] = next_id
-            next_id = _advance_next_id(next_id, problem)
-            problem.setdefault("domain", DOMAIN_NAME)
-            problems.append(problem)
+    # One contiguous id across everything we loaded, so ids stay unique even when
+    # several split files are concatenated.
+    for index, problem in enumerate(problems):
+        problem["id"] = index
+        problem.setdefault("domain", DOMAIN_NAME)
 
     if max_examples is not None:
         problems = problems[: int(max_examples)]

@@ -22,7 +22,6 @@ from .prompts import (
 from .reporting import build_deterministic_report, parse_answer_lines
 from .reward import normalize_answer
 from .settings import PrivacyHopQASettings
-from .timeline import write_timeline_artifacts
 from .utils import extract_json
 
 logger = logging.getLogger(__name__)
@@ -2615,18 +2614,8 @@ class PrivacyHopQAAgent:
             "actions": [action.to_dict() for action in self.action_records],
             "document_memory": self._document_memory_prompt_cards(),
             "error_records": list(self.error_records),
-            "timeline_paths": {},
             "report_path": str(report_path),
         }
-        timeline_paths = write_timeline_artifacts(
-            self.run_root,
-            summary=summary,
-            events=self.timeline_events,
-            trace=trace,
-            report_text=final_report,
-            report_path=str(report_path),
-        )
-        trace["timeline_paths"] = timeline_paths
         trace_path = self.run_root / "trace.json"
         trace_path.write_text(json.dumps(trace, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -2636,7 +2625,6 @@ class PrivacyHopQAAgent:
             "error_summary": error_summary,
             "retrieval_summary": retrieval_summary,
             "trace_path": str(trace_path),
-            "timeline_html": timeline_paths["html_path"],
             "report_path": str(report_path),
         }
         return PrivacyHopQAAgentResult(
