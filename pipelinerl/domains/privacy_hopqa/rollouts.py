@@ -152,14 +152,14 @@ def _build_run_paths(cfg: DictConfig, problem: dict) -> tuple[Path, Path]:
     return root, workspace_dir
 
 
-def _prefix_reward_by_hop(score: dict) -> dict[str, dict[str, float | int | bool]]:
+def _prefix_reward_by_hop(score: dict) -> dict[int, dict[str, float | int | bool]]:
     per_hop = sorted(score.get("per_hop") or [], key=lambda item: item.get("hop") or 0)
     total_hops = max(1, len(per_hop))
     prefix_correct = 0
     prefix_intact = True
     progress: dict[str, dict[str, float | int | bool]] = {}
     for hop_score in per_hop:
-        hop_num = str(hop_score.get("hop"))
+        hop_num = hop_score.get("hop")
         # conditional_correct (correct AND not dependency-blocked) so a blocked hop
         # ends the prefix, matching dependency_aware_metrics. Equivalent in practice
         # since the first blocked hop is always preceded by the first wrong hop.
@@ -177,9 +177,9 @@ def _prefix_reward_by_hop(score: dict) -> dict[str, dict[str, float | int | bool
     return progress
 
 
-def _target_source_by_hop(problem: dict) -> dict[str, str]:
+def _target_source_by_hop(problem: dict) -> dict[int, str]:
     """Return the gold tool/source type for each hop from the dataset L/W pattern."""
-    target: dict[str, str] = {}
+    target: dict[int, str] = {}
     pattern = str(problem.get("pattern") or "")
     for idx, hop in enumerate(problem.get("hops") or [], start=1):
         raw_kind = str(hop.get("hop_type") or hop.get("source") or "").strip().casefold()
@@ -187,7 +187,7 @@ def _target_source_by_hop(problem: dict) -> dict[str, str]:
             raw_kind = pattern[idx - 1].casefold()
         source_type = TARGET_SOURCE_TYPE_BY_HOP_KIND.get(raw_kind)
         if source_type:
-            target[str(hop.get("hop_number") or idx)] = source_type
+            target[int(hop.get("hop_number") or idx)] = source_type
     return target
 
 
@@ -375,8 +375,7 @@ def _assign_training_rewards(
         privacy_meta = trace.metadata.setdefault("privacy_hopqa", {})
         stage = str(privacy_meta.get("log_name") or "")
         hop_number = privacy_meta.get("hop_number")
-        hop_key = str(hop_number) if hop_number is not None else None
-        hop_prefix = prefix_rewards.get(hop_key) if hop_key is not None else None
+        hop_prefix = prefix_rewards.get(hop_number) if hop_number is not None else None
         is_error_trace = False
         if apply_zero_error_step_reward:
             captured_call_index = privacy_meta.get("captured_call_index")
@@ -398,8 +397,8 @@ def _assign_training_rewards(
                 reward = _error_trace_reward(stage)
                 situation = "error"
                 privacy_meta["hop_step_situation"] = situation
-            elif stage in TRAINABLE_CONTROL_STAGES and hop_key is not None:
-                target_source = target_sources.get(hop_key)
+            elif stage in TRAINABLE_CONTROL_STAGES and hop_number is not None:
+                target_source = target_sources.get(hop_number)
                 target_source_searched = False
                 selected_gold_parent = False
                 gold_parent_retrieved = False
