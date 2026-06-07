@@ -83,10 +83,7 @@ def _is_retryable_abort_response(data: dict, collect_logprobs: bool) -> tuple[bo
 
 
 async def llm_async_generate(
-    llm: TrainableLLM,
-    prompt: Prompt,
-    session: aiohttp.ClientSession,
-    parameters_override: dict | None = None,
+    llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
 ) -> LLMCall:
     llm.load_tokenizer()
     headers = {"Content-Type": "application/json"}
@@ -117,9 +114,6 @@ async def llm_async_generate(
 
     if llm.chat_template_kwargs:
         extra_parameters = {**extra_parameters, "chat_template_kwargs": _to_plain_obj(llm.chat_template_kwargs)}
-
-    if parameters_override:
-        extra_parameters = {**extra_parameters, **_to_plain_obj(parameters_override)}
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 

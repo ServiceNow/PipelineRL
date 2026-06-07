@@ -698,11 +698,15 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     # one-reward-per-rollout path below stays close to upstream.
     if config.step_reward_advantages:
         df_stats["step_reward"] = df_stats["rewards"].apply(lambda x: x[0])
-        # Optional per-rollout padding override (privacy_hopqa sets this to the max
-        # prefix reward so error-terminated rollouts pad to last achieved progress
-        # instead of the zero'd error step). Falls back to step_reward.
-        if "padding_reward" in df_init.columns:
-            df_stats["padding_reward"] = df_init["padding_reward"].fillna(df_stats["step_reward"])
+        # Optional per-rollout padding override, read from rollout metadata
+        # (privacy_hopqa sets metadata["padding_reward"] to the max prefix reward so
+        # error-terminated rollouts pad to last achieved progress instead of the
+        # zero'd error step). Falls back to step_reward when absent.
+        if "metadata" in df_init.columns:
+            padding_reward = df_init["metadata"].apply(
+                lambda value: value.get("padding_reward") if isinstance(value, dict) else None
+            )
+            df_stats["padding_reward"] = padding_reward.fillna(df_stats["step_reward"])
         else:
             df_stats["padding_reward"] = df_stats["step_reward"]
         df_advantages = _compute_step_reward_advantages(df_init, df_stats, config)

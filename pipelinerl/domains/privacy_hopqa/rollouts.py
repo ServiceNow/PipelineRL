@@ -1,6 +1,5 @@
 """Rollout entrypoint for the privacy_hopqa domain."""
 
-import asyncio
 import logging
 import time
 import uuid
@@ -9,7 +8,6 @@ from typing import Any
 
 import aiohttp
 from omegaconf import DictConfig
-from pydantic import Field
 
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
@@ -57,7 +55,7 @@ class PrivacyHopQAMetrics(BaseMetrics):
     conditional_hop_accuracy: float = 0.0
     prefix_correct_hops: int = 0
     prefix_hop_accuracy: float = 0.0
-    first_incorrect_hop: int | None = None
+    first_incorrect_hop: int = 0  # hop number of the first wrong evaluable hop, 0 if none
     strict_chain_success: bool = False
     final_correct: bool = False
     chain_complete: bool = False
@@ -116,7 +114,6 @@ class PrivacyHopQAMetrics(BaseMetrics):
     doc_choose_parse_errors: int = 0
     doc_read_parse_errors: int = 0
     hop_resolve_parse_errors: int = 0
-    error: str | None = None
     hop_plan_reward_mean: float = 0.0
     doc_choose_reward_mean: float = 0.0
     hop_plan_training_calls: int = 0
@@ -755,7 +752,6 @@ async def _run_privacy_hopqa_rollout_async(
             static_local_index=static_index,
         )
         agent_result = await agent.run()
-        final_report = agent_result.final_report
         answers = dict(agent_result.parsed_answers)
         report_metadata = dict(agent_result.report_metadata)
         error_records_for_reward = list(agent_result.error_records or [])
@@ -769,7 +765,6 @@ async def _run_privacy_hopqa_rollout_async(
         logger.warning("privacy_hopqa protocol error stopped chain %s: %s", problem.get("chain_id"), exc)
         protocol_error = True
         error = str(exc)
-        final_report = ""
         answers = {}
         if agent is not None:
             answers = {
@@ -803,7 +798,6 @@ async def _run_privacy_hopqa_rollout_async(
             raise
         logger.exception("privacy_hopqa rollout failed for chain %s", problem.get("chain_id"))
         error = str(exc)
-        final_report = ""
         hops_resolved = 0
         searches_total = 0
         docs_read = 0
@@ -948,7 +942,7 @@ async def _run_privacy_hopqa_rollout_async(
         conditional_hop_accuracy=score["conditional_hop_accuracy"],
         prefix_correct_hops=score["prefix_correct_hops"],
         prefix_hop_accuracy=score["prefix_hop_accuracy"],
-        first_incorrect_hop=score["first_incorrect_hop"],
+        first_incorrect_hop=score["first_incorrect_hop"] or 0,
         strict_chain_success=bool(score["strict_chain_success"]),
         final_correct=bool(score["final_correct"]),
         chain_complete=bool(score["chain_complete"]),
@@ -1007,7 +1001,6 @@ async def _run_privacy_hopqa_rollout_async(
         doc_choose_parse_errors=error_summary.get("parse_errors_by_stage", {}).get("doc_choose", 0),
         doc_read_parse_errors=error_summary.get("parse_errors_by_stage", {}).get("doc_read", 0),
         hop_resolve_parse_errors=error_summary.get("parse_errors_by_stage", {}).get("hop_resolve", 0),
-        error=error,
         **stage_reward_metrics,
     )
     return RolloutResult(

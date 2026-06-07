@@ -171,7 +171,6 @@ def preprocess_dataset(
         entry["model_version"] = entry["metadata"]["model_version"]
         entry["rollout_index"] = entry["metadata"]["rollout_index"]
         entry["step_index"] = entry["metadata"]["step_index"]
-        entry["padding_reward"] = entry["metadata"].get("padding_reward")
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
     try:

@@ -1731,7 +1731,7 @@ class PrivacyHopQAAgent:
 
         candidates: list[CandidateDoc] = self._memory_seed_candidates(hop)
         current_action_candidates: list[CandidateDoc] = []
-        for action, per_action_candidates, history_entry in results:
+        for _action, per_action_candidates, history_entry in results:
             hop.search_history.append(history_entry)
             current_action_candidates.extend(per_action_candidates)
             candidates.extend(per_action_candidates)

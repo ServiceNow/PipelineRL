@@ -177,12 +177,16 @@ class PrivacyHopQALLMAdapter:
                 "privacy_hopqa routes domain calls through the rollout LLM. "
                 f"Requested model '{requested_model}' does not match rollout model '{self.llm.model_name}'."
             )
+        # Per-call sampling overrides (e.g. a token budget) ride on a copy of the
+        # rollout LLM, so the shared llm_async_generate keeps its upstream signature.
+        llm = self.llm
+        if parameters_override:
+            llm = llm.model_copy(update={"parameters": {**llm.parameters, **parameters_override}})
         try:
             return await llm_async_generate(
-                self.llm,
+                llm,
                 prompt,
                 self.session,
-                parameters_override=parameters_override,
             )
         except Exception as exc:
             # Infrastructure errors are retried or failed by the actor; prompt

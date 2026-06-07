@@ -14,9 +14,7 @@ def resolve_task_path(path_like: str | Path, data_dir: str | Path = DEFAULT_TASK
         return path
     if path.parts[:3] == ("drbench", "data", "tasks"):
         path = Path(*path.parts[3:]) if len(path.parts) > 3 else Path("")
-    elif path.parts[:2] == ("drbench", "data"):
-        path = Path(*path.parts[2:]) if len(path.parts) > 2 else Path("")
-    elif path.parts[:2] == ("data", "tasks"):
+    elif path.parts[:2] in (("drbench", "data"), ("data", "tasks")):
         path = Path(*path.parts[2:]) if len(path.parts) > 2 else Path("")
     return Path(data_dir).expanduser() / path
 
