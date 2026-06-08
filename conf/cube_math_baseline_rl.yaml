@@ -71,6 +71,10 @@ vllm_config:
 finetune:
   seq_length: 8192
   gradient_accumulation_passes: 32
+  # Fixed run length, MATCHED to cube_math_lamer_rl.yaml so the cosine LR schedule and stopping point
+  # are identical across the two runs (else LR trajectory confounds the comparison). 1 step = 32
+  # samples (bs 1 * grad_accum 32); 1000 steps = 32k samples.
+  max_train_steps: 1000
   rl:
     policy_loss: gspo
     overlong_filtering: true
