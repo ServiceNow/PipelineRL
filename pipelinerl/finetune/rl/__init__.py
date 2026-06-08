@@ -481,9 +481,10 @@ def _compute_step_reward_advantages(
     by position inside each semantic segment, so the k-th step of a segment is
     only compared with other k-th steps. With pad_step_rewards_for_advantage,
     shorter rollouts contribute virtual padding rows (advantage_scale=0) that
-    enter the baseline but produce no gradient, so stopping early is not
-    rewarded. Returns columns (group_id, rollout_index, step_index, group_tokens,
-    advantages) — the same shape the default path produces.
+    enter the baseline but produce no gradient, so each aligned position's
+    baseline is computed over the whole group instead of only the rollouts long
+    enough to reach it. Returns columns (group_id, rollout_index, step_index,
+    group_tokens, advantages) — the same shape the default path produces.
 
     df_stats must already carry num_tokens, step_reward, and padding_reward.
     """
