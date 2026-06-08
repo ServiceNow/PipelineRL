@@ -195,6 +195,14 @@ def get_environment_jobs(cfg: DictConfig, key: str | None = None) -> list[Job]:
     filtered = [job for job in env_jobs if getattr(job, "environment_key", None) == key]
     return filtered or env_jobs
 
+
+def _login_wandb_from_api_key_path() -> None:
+    api_key_path = os.environ.get("WANDB_API_KEY_PATH")
+    if api_key_path is None:
+        return
+    wandb.login(key=Path(api_key_path).read_text().strip())
+
+
 def init_wandb(
     cfg: DictConfig,
     run_dir: Path,
@@ -210,7 +218,14 @@ def init_wandb(
 
     python_env = {}
     for dist in distributions():
-        python_env[dist.metadata["Name"]] = dist.version
+        if dist.metadata is None:
+            continue
+        try:
+            name = dist.metadata["Name"]
+            if name is not None:
+                python_env[name] = dist.version
+        except Exception as e:
+            logger.warning(f"Accessing {dist} resulted in error {e}")
     config_for_wandb["python_env"] = python_env
 
     if cfg.wandb.wandb_resume == "always":
@@ -237,6 +252,7 @@ def init_wandb(
         logger.warning(f"wandb_name: {wandb_name} is longer than 128 characters. Truncating to 128 characters.")
 
     logging.info(f"Initializing W&B with\nname: {wandb_name[:128]}\nid: {wandb_id}\nresume: {resume}")
+    _login_wandb_from_api_key_path()
     run = wandb.init(
         name=wandb_name[:128],  # wandb limits name to 128 characters
         entity=cfg.wandb.wandb_entity_name,

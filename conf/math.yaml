@@ -2,6 +2,13 @@ defaults:
     - base
     - _self_
 
+use_fast_llm: true
+weight_broadcast: true
+
+fast_llm:
+  data:
+    micro_batch_size: 18000
+
 actor:
   rollout_policy: pipelinerl.domains.math.generate_math_rollout
   system_prompt: Please reason step by step, and put your final answer within \boxed{}.

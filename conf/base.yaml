@@ -74,7 +74,7 @@ vllm_config:
 
 world:
   replicas: 1
-  
+
   actor_fraction: 4
   preprocessor_fraction: 0
   finetune_fraction: 4
@@ -83,6 +83,11 @@ world:
 
   actor_group_port: 9000
   environment_start_port: 7777
+  # Unique identifier for this job run, used to namespace the pod IP exchange
+  # directory so stale files from previous runs are never seen.
+  # Defaults to $MASTER_ADDR when null (suitable for EAI and torchrun jobs).
+  run_id: null
+
 # this will be autocreated based on the config
 jobs: []
 
@@ -100,7 +105,7 @@ fsdp:
   reduce_dtype: fp32
   buffer_dtype: fp32
 
-output_dir: ???
+output_dir: null
 force_restart: false
 pop_old_data: true
 max_lag: null
@@ -111,6 +116,93 @@ debug:
   streams_from: null
   place_inference_workers: true
   use_existing_llms: false
+  log_data_pipeline: false
+
+# Fast-LLM integration: when true, fast-llm is used as the trainer.
+# Data flows actors -> Redis (fast_llm_streaming) -> fast-llm training loop.
+# Weight updates are broadcast via NCCL using fast-llm's streaming callback.
+use_fast_llm: true
+# Whether the trainer broadcasts updated weights to vLLM after each training step.
+weight_broadcast: true
+
+# Pure fast-llm config written as-is to a YAML file at launch time.
+# Fields set to null are populated by the launcher at runtime (source noted in the comment) — do not modify them here.
+# This section is only used when use_fast_llm: true.
+fast_llm:
+  training:
+    num_workers: 0
+    train_iters: 100000  # Total number of optimizer steps (provided by pipelinerl)
+    wandb:
+      entity_name: null     # cfg.wandb.wandb_entity_name (null disables wandb)
+      project_name: null    # cfg.wandb.wandb_project_name
+      group_name: null      # cfg.wandb.wandb_group
+    logs:
+      interval: 1  # Logging frequency in optimizer steps
+    checkpoint:
+      interval: 1000
+    export:
+      interval: 1000
+      format: ${fast_llm_finetune.model_format}
+
+  schedule:
+    depth_first_micro_batches: 16  # Gradient accumulation steps (sequential, one sample at a time)
+
+  data:
+    micro_batch_size: 18000  # Tokens per sample; also the max rollout length accepted
+    truncate_documents: false  # Do not truncate RL rollouts
+    shuffle: disabled  # Streaming dataset ignores shuffling
+    datasets:
+      training:
+        type: streaming  # Redis-backed streaming dataset
+        host: null  # cfg.streams.host
+        port: null  # cfg.streams.port
+
+  pretrained:
+    format: ${fast_llm_finetune.model_format}
+    path: null      # cfg.model_path
+    model_weights: true
+
+  model:
+    base_model:
+      head:
+        losses:
+          grpo:
+            type: grpo
+            epsilon_low: 0.2
+            epsilon_high: 0.2
+    multi_stage:
+      zero_stage: 2
+    distributed:
+      compute_dtype: bf16
+      tensor_parallel: 1
+      pipeline_parallel: 1
+      sequence_data_parallel: 1
+
+  run:
+    experiment_dir: null   # exp_dir/finetune
+    experiment_name: null  # derived from exp_dir relative to cfg.wandb.wandb_workspace_root
+
+  # callbacks section is written only when weight_broadcast: true (removed by launcher otherwise)
+  callbacks:
+    streaming:
+      type: streaming
+      host: null  # cfg.streams.host
+      port: null  # cfg.streams.port
+      broadcast:
+        backend: nccl
+        external_world_size: null  # world_map.weight_update_group_size - 1
+        host: null                  # world_map.master_addr
+        port: null                  # cfg.world.actor_group_port
+      export:
+        format: ${fast_llm_finetune.model_format}
+        model_weights: true
+        optimizer_state: false
+
+# Launcher-specific fast-llm settings (not passed to fast-llm itself).
+fast_llm_finetune:
+  model_type: gpt      # fast-llm model type argument: fast-llm train <model_type>
+  model_format: qwen2  # pretrained/export format; interpolated into fast_llm config
+  torchrun_port: 29500  # master port for torchrun rendezvous
 
 me:
   # Which job is this one? This will be autopopulated

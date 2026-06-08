@@ -350,6 +350,17 @@ PipelineRL is organized as a modular, Hydra-driven pipeline with 6 core componen
     - Pull a batch → call `rl_step(...)` (in `pipelinerl/finetune/rl/utils.py`) to compute policy-gradient (+ KL penalty if configured) → `optimizer.step()` → `lr_scheduler.step()`.
     - On rank 0, use `WeightUpdateManager.send_weight_update(version)` to gather model parameters, send `WeightUpdateRequest` to Actor LLMs (HTTP), broadcast tensors via NCCL, and write a `WeightUpdateSuccess` message to the update stream.
 
+#### Fast-LLM trainer path (preview)
+
+When `use_fast_llm: true` (default in `conf/math.yaml`), the DeepSpeed ZeRO-3 trainer above is replaced with [Fast-LLM](https://github.com/ServiceNow/Fast-LLM) (FSDP + sequence-data-parallel) and the per-step weight update over HTTP is replaced with a persistent NCCL broadcast group:
+
+- Trainer: `fast_llm train gpt` launched via torchrun (`pipelinerl/launch.py:run_finetune`); rank 0 also serves the broadcast `TCPStore`.
+- Fast-LLM's `StreamingTrainerCallback` gathers full-precision weights after each optimizer step and broadcasts them on a persistent NCCL group whose name is `WEIGHTS_BROADCAST_PG_NAME`.
+- vLLM workers join the same group via `vllm1.init_actor_update_group(...)` and copy parameters into the model in place.
+- Coordinated NCCL teardown (`pipelinerl/vllm1.py:484-547`) listens to a `training_finished` redis xadd from the trainer and destroys the process group on the vLLM side so `dist.destroy_process_group()` doesn't hang.
+
+This path is **WIP** — see [`docs/FAST_LLM_INTEGRATION.md`](docs/FAST_LLM_INTEGRATION.md) for known issues, configuration knobs, and example interactive-job scripts.
+
 ### 6. Verifier
 - Entrypoint: `pipelinerl/entrypoints/verifier.py`
 - Serves a FastAPI app with:
@@ -360,6 +371,7 @@ PipelineRL is organized as a modular, Hydra-driven pipeline with 6 core componen
 - Defined in `pipelinerl/streams.py`.
 - Implements `SingleStreamSpec` and `StreamRangeSpec` for file-system or Redis-based queues.
 - `write_to_streams(...)` and `read_stream(...)` provide a JSON-line protocol for inter-process messaging.
+- Pass `shared=True` to these helpers when multiple actors must fan-in to a single Redis stream (e.g., ServiceNow/Fast-LLM trainer). The shared mode encodes payloads via `orjson`, tags them with a global index, and lets the trainer perform downstream sharding safely.
 - Available backends:
   - File system: default.
   - Redis: requires Redis server.
@@ -371,3 +383,107 @@ PipelineRL is organized as a modular, Hydra-driven pipeline with 6 core componen
 - `training_data` stream (StreamRangeSpec(topic="training_data")): File- or Redis-backed stream used to transfer processed training micro-batches from the Preprocessor to the Trainer. Configured via `cfg.preprocess.output` and `cfg.finetune.input` (defaulting to "training_data") in `conf/base.yaml`. Written in `pipelinerl/run_preprocess.py` and consumed in `pipelinerl/run_finetune.py`.
 - `actor_test` and `stats_test` streams: analogous streams used for evaluation loops (test samples and test metrics).
 - `stats` stream (SingleStreamSpec(topic="stats")): produced by `ActorLoop.publish_stats` with sliding-window metrics; consumed by external monitoring (e.g. WANDB, logging viewers).
+
+
+
+
+## Multi-Node Requirements
+
+PipelineRL can span multiple nodes, with actor (vLLM) and trainer roles on separate machines. Each role opens outbound TCP connections to other roles; every target port must be reachable from the source node.
+
+### Ports and config params
+
+| Port (default) | Config param | Direction | Purpose |
+|---|---|---|---|
+| `streams.port` (11000) | `conf/streams/redis.yaml` | all nodes → rank-0 node | Redis data streams (actor → preprocessor → trainer) |
+| `world.actor_group_port` (9000) | `conf/base.yaml` | actor node → trainer node | Weight-broadcast process group (NCCL TCPStore rendezvous) |
+| `world.environment_start_port` (7777) | `conf/base.yaml` | actor node → environment node | Remote environment HTTP server |
+| `8080 + gpu_local_idx` | derived from GPU placement | trainer node → actor node | vLLM HTTP endpoints for weight updates, one per GPU |
+| `MASTER_PORT` env var | set by your cluster launcher | trainer nodes ↔ each other | torchrun / accelerate rendezvous between finetune ranks |
+
+### What each node connects to
+
+**Trainer node** opens connections to:
+- `{actor_node_ip}:{8080 + i}` for each vLLM GPU `i` — to POST updated weights after each optimizer step.
+- `{rank_0_ip}:{streams.port}` — to read training batches from Redis (when `streams=redis`).
+
+**Actor node** opens connections to:
+- `{rank_0_ip}:{streams.port}` — to publish rollout data to Redis.
+- `{rank_0_ip}:{world.actor_group_port}` — to join the NCCL weight-broadcast process group (vLLM workers connect as clients; the trainer creates the TCPStore server on this port).
+- `{env_node_ip}:{world.environment_start_port + i}` — to call remote environment servers (if `environments[*].mode=remote`).
+
+**All finetune nodes** connect to each other on `MASTER_PORT` for the distributed training rendezvous (rank-0 finetune node is the server).
+
+### Topology assumptions
+
+- With fast-llm (`use_fast_llm=true`), each component must occupy whole nodes — torchrun requires every finetune rank to see a complete, identical GPU set.
+- With `world.preprocessor_fraction=0`, every node is either a pure actor node or a pure trainer node (no mixing).
+- The DeepSpeed hostfile and `--deepspeed_inclusion_filter` use DNS/hostname names (not IPs), so the cluster rendezvous port (`MASTER_PORT`) must be reachable via those names. All other cross-node connections use IP addresses and are independent of DNS.
+
+### Running and resuming multi-node jobs
+
+**`world.run_id` is required for multi-node jobs.** It must be a string that is unique per job run. It namespaces the pod IP exchange directory on the shared NFS mount so that stale files from a previous run are never picked up by a new one. Any value that your cluster scheduler guarantees to be unique per job works — a job UUID, a replica-group ID, or the job's `MASTER_ADDR` (which is unique per torchrun launch):
+
+```bash
+python -m pipelinerl.launch ... 'world.run_id=${MASTER_ADDR}'
+```
+
+**To resume a preempted run**, reuse the same `output_dir` as the original job. fast-LLM automatically finds the latest checkpoint in `output_dir/finetune/checkpoint/` and resumes from it. WandB also resumes the same run because fast-LLM persists the run ID in `output_dir/finetune/wandb_config.yaml` on the first launch and reloads it on every subsequent launch.
+
+Each resumed job must still use a fresh `world.run_id` (the new job's ID, not the original one), so the pod IP exchange directory is always clean.
+
+# Install FastLLM+PipelineRL
+
+> **Status (2026-05-06):** This integration is WIP — see [`docs/FAST_LLM_INTEGRATION.md`](docs/FAST_LLM_INTEGRATION.md) for the full handover (architecture, known issues, TODO).
+
+### 1. Container image
+
+To **use**: reference the prebuilt image
+```
+registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis
+```
+It bundles the redis server.
+
+To **build** (from the [`ServiceNow/research-interactive-toolkit`](https://github.com/ServiceNow/research-interactive-toolkit/tree/fml/pytorch_vllm014rc1) repo, branch `fml/pytorch_vllm014rc1` — SN-internal, link is gated): set `~/.research-interactive-env` and run the toolkit's build target.
+
+```shell
+USE_ACCOUNT_REPO := 1
+BASE_IMAGE := nvcr.io/nvidia/pytorch:25.12-py3
+IMAGE_REVISION := 25.12-py3-vllm014rc1redis
+EAI_PROFILE := yul201
+```
+
+Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the toolkit branch layers on vLLM 0.14.0rc1, redis, and the EAI helpers.
+
+### 2. Clone + venv + editable installs
+
+Inside a running interactive instance, install both Fast-LLM and PipelineRL into a single venv at `PipelineRL/.venv`:
+
+```shell
+git clone git@github.com:ServiceNow/Fast-LLM.git
+git clone git@github.com:ServiceNow/PipelineRL.git
+
+cd PipelineRL
+/usr/bin/python3.12 -m venv --system-site-packages .venv
+source .venv/bin/activate
+export PIP_CONSTRAINT=""
+
+# Fast-LLM: GSPO branch is the one paired with the PipelineRL fast-llm branch
+cd ../Fast-LLM
+git submodule update --init --recursive
+git checkout gspo
+pip install --no-cache-dir --no-build-isolation -e ".[CORE,OPTIONAL,HUGGINGFACE,SSM,VISION,GENERATION,STREAMING,DEV]" triton==3.5.1
+
+# PipelineRL: fast-llm branch
+cd ../PipelineRL
+git checkout fast-llm
+pip install --no-cache-dir -e ".[lora]"
+```
+
+### 3. Known caveats
+
+- **`pyproject.toml:81-87`** — `[tool.uv]` overrides `transformers>=4.51.0` and `accelerate>=1.7.0` because `tapeagents==0.1.16` pins them lower; the `[tapeagents]` extra is **broken at runtime** until tapeagents bumps support. Track this as a TODO; do not enable `[tapeagents]` on the fast-llm path.
+- **`PIP_CONSTRAINT=""`** is required — the toolkit image sets a constraint file that conflicts with our pinned versions.
+- **Triton must be `==3.5.1`** — newer triton breaks the fast-llm GSPO kernels.
+
+
