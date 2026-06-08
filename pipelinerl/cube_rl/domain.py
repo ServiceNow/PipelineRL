@@ -35,10 +35,12 @@ class CubeRuntimeSpec:
     agent_cfg: dict[str, Any]
     split: str
 
+
 def _copy_model(obj: Any) -> Any:
     if hasattr(obj, "model_copy"):
         return obj.model_copy(deep=True)
     return obj
+
 
 def set_agent_llm_config(agent_config: Any, llm: dict) -> None:
     llm_config = getattr(agent_config, "llm_config")
@@ -54,7 +56,7 @@ def set_agent_llm_config(agent_config: Any, llm: dict) -> None:
     if not llm_config.model_name.startswith("openai/"):
         llm_config.model_name = f"openai/{llm_config.model_name}"
 
-    llm_config.logprobs = llm['collect_logprobs']
+    llm_config.logprobs = llm["collect_logprobs"]
     if llm_config.logprobs:
         llm_config.include_stop_str_in_output = True
         llm_config.skip_special_tokens = False
@@ -65,7 +67,11 @@ def set_agent_llm_config(agent_config: Any, llm: dict) -> None:
         if hasattr(llm_config, param_name):
             setattr(llm_config, param_name, param_value)
         else:
-            logger.warning("Cube-harness Agent LLM parameters does not have attribute '%s', skipping", param_name)
+            logger.warning(
+                "Cube-harness Agent LLM parameters does not have attribute '%s', skipping",
+                param_name,
+            )
+
 
 def _resolve_task_dataset_name(benchmark_obj: Any, task_config: Any) -> str:
     task_metadata = None
@@ -82,12 +88,16 @@ def _resolve_task_dataset_name(benchmark_obj: Any, task_config: Any) -> str:
 
     return ""
 
+
 def make_training_text(llm_tokenizer: Any, llm_call: LLMCall) -> TrainingText:
     # Extract visual features if present
     images = []
     use_processor = False
     visual_features = None
-    assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
+    assistant_msg: dict = {
+        "role": "assistant",
+        "content": llm_call.output.content or "",
+    }
     if llm_call.output.tool_calls:
         assistant_msg["tool_calls"] = [
             {
@@ -159,7 +169,7 @@ def make_training_text(llm_tokenizer: Any, llm_call: LLMCall) -> TrainingText:
             add_generation_prompt=True,
             **tools_kwarg,
         )
-        
+
         text = llm_tokenizer.apply_chat_template(
             full_messages,
             tokenize=False,
@@ -203,13 +213,15 @@ def make_training_text(llm_tokenizer: Any, llm_call: LLMCall) -> TrainingText:
         visual_features=visual_features,
     )
 
+
 def length_penalty(max_length: int, sequence_length: int, buffer_tokens: int) -> float:
     """
     Compute the overlong penalty
     """
     if sequence_length > (max_length - buffer_tokens) and sequence_length <= max_length:
         return ((max_length - buffer_tokens) - sequence_length) / buffer_tokens
-    return 0.
+    return 0.0
+
 
 @ray.remote(max_restarts=0, max_task_retries=0)
 class CubeBenchmarkWorker:
@@ -252,7 +264,9 @@ class CubeBenchmarkWorker:
         self._ray_worker_log_collector = ray_worker_log_collector
 
         worker_log_level = str(getattr(cfg.actor, "ray_worker_log_level", "ERROR"))
-        worker_litellm_log_level = str(getattr(cfg.actor, "ray_worker_litellm_log_level", "WARNING"))
+        worker_litellm_log_level = str(
+            getattr(cfg.actor, "ray_worker_litellm_log_level", "WARNING")
+        )
 
         configure_ray_worker_logging(
             worker_name=self._worker_name,
@@ -275,11 +289,25 @@ class CubeBenchmarkWorker:
         ## Optional config for extra reward
         self._buffer_tokens = int(getattr(cfg.actor, "buffer_tokens", 0))
         self._discount_factor = float(getattr(cfg.actor, "discount_factor", 1.0))
-        artifact_cfg = getattr(getattr(cfg, "cube_params", {}), "rollout_artifacts", None)
-        self._persist_rollout_artifacts = bool(getattr(artifact_cfg, "enabled", False)) if artifact_cfg else False
+        ## LaMer multi-episode reflection rollout (k_episodes==1 -> classic single-episode rollout).
+        self._lamer_k_episodes = int(getattr(cfg.actor, "lamer_k_episodes", 1))
+        # Eval/test rollouts may use a different episode budget (0 = same as train). Lets a
+        # single-episode baseline (train k=1) be evaluated at k>1 i.i.d. for a held-out pass@1..k curve.
+        self._eval_k_episodes = int(getattr(cfg.actor, "eval_k_episodes", 0) or 0)
+        self._lamer_discount_gamma = float(
+            getattr(cfg.actor, "lamer_discount_gamma", 1.0)
+        )
+        artifact_cfg = getattr(
+            getattr(cfg, "cube_params", {}), "rollout_artifacts", None
+        )
+        self._persist_rollout_artifacts = (
+            bool(getattr(artifact_cfg, "enabled", False)) if artifact_cfg else False
+        )
         artifact_dir = getattr(artifact_cfg, "path", None) if artifact_cfg else None
         self._rollout_artifact_dir = (
-            Path(artifact_dir) if artifact_dir else Path(cfg.output_dir) / "actor" / "rollout_artifacts"
+            Path(artifact_dir)
+            if artifact_dir
+            else Path(cfg.output_dir) / "actor" / "rollout_artifacts"
         )
 
     def setup(self) -> dict[str, Any]:
@@ -291,7 +319,9 @@ class CubeBenchmarkWorker:
             self._llm_tokenizer = temp_llm.tokenizer
             self._ready = True
             self._setup_error = None
-            logger.info("%s ready with %d cube specs", self._worker_name, len(self._cube_specs))
+            logger.info(
+                "%s ready with %d cube specs", self._worker_name, len(self._cube_specs)
+            )
             return self.health()
         except Exception as exc:
             self._ready = False
@@ -304,7 +334,12 @@ class CubeBenchmarkWorker:
             try:
                 self._benchmark.close()
             except Exception as exc:
-                logger.warning("%s failed to close cube %s: %s", self._worker_name, self._current_cube_id, exc)
+                logger.warning(
+                    "%s failed to close cube %s: %s",
+                    self._worker_name,
+                    self._current_cube_id,
+                    exc,
+                )
         self._current_cube_id = None
         self._benchmark = None
         self._task_by_id = {}
@@ -345,9 +380,14 @@ class CubeBenchmarkWorker:
         self._current_cube_id = cube_id
         self._benchmark = benchmark_obj
         self._task_by_id = task_by_id
-        logger.info("%s prepared cube %s with %d tasks", self._worker_name, cube_id, len(task_by_id))
+        logger.info(
+            "%s prepared cube %s with %d tasks",
+            self._worker_name,
+            cube_id,
+            len(task_by_id),
+        )
 
-    def rollout(self, *, cube_id: str, task_id: str, rollout_key: str) -> dict:
+    def rollout(self, *, cube_id: str, task_id: str, rollout_key: str, is_training: bool = True) -> dict:
         rollout_log_context = start_worker_rollout_log_context(f"{cube_id}:{task_id}")
         try:
             if not self._ready:
@@ -357,6 +397,9 @@ class CubeBenchmarkWorker:
                 raise KeyError(f"Unknown task_id for cube {cube_id}: {task_id}")
 
             base_task = self._task_by_id[task_id]
+            # Test rollouts use eval_k_episodes when set (e.g. a k=1 baseline evaluated at k>1 i.i.d.);
+            # train rollouts (and unset eval_k) use the training k.
+            k_episodes = self._eval_k_episodes if (not is_training and self._eval_k_episodes) else self._lamer_k_episodes
             task = {
                 "task_config": _copy_model(base_task["task_config"]),
                 "agent_config": _copy_model(base_task["agent_config"]),
@@ -364,6 +407,7 @@ class CubeBenchmarkWorker:
                 "dataset": base_task.get("dataset", None),
                 "runtime_context": self._runtime_context,
                 "container_backend": self._container_backend,
+                "k_episodes": k_episodes,
             }
 
             result = self._rollout(task=_copy_model(task), rollout_key=rollout_key)
@@ -380,154 +424,194 @@ class CubeBenchmarkWorker:
             # opaque RaySystemError). Return an empty result; the train loop drops + retries it.
             return RolloutResult(
                 training_texts=[],
-                metrics=BaseMetrics(reward=0.0, success=False, no_error=False, no_answer=True),
+                metrics=BaseMetrics(
+                    reward=0.0, success=False, no_error=False, no_answer=True
+                ),
                 latency=0.0,
             ).model_dump()
         finally:
             reset_worker_rollout_log_context(rollout_log_context)
 
-    def _rollout(self, task: dict, rollout_key: str) -> RolloutResult:
-        from cube_harness.episode import Episode, MAX_STEPS
+    def _episode_training_texts(
+        self, trajectory: Any, task: dict, episode_index: int
+    ) -> tuple[list, float, list, dict]:
+        """One episode's trajectory -> TrainingTexts (reward assigned later at the rollout level).
+
+        Returns (training_texts, episode_reward, agent_errors, last_step_info). Each llm_call
+        becomes a training text tagged with ``episode_index``; the finalize reflection LLMCall
+        (an AgentOutput step) is included like any other, so reflections are trainable.
+        """
         from cube.core import EnvironmentOutput
         from cube_harness.core import AgentOutput, TerminationReason
 
-        start = time.perf_counter()
-
         task_config = task["task_config"]
-        agent_config = task["agent_config"]
-
-        agent_llm_config = getattr(agent_config, "llm_config")
-        rollout_router = self._llm_router.with_affinity(rollout_key)
-        agent_llm_config.router = rollout_router
-
-        validate_per_step = False
-
-        ep = Episode(
-            id=0,
-            output_dir="",
-            agent_config=agent_config,
-            task_config=task_config,
-            exp_name="default",
-            max_steps=MAX_STEPS,
-            persist_episode=False,
-            runtime_context=self._runtime_context,
-            container_backend=self._container_backend,
-        )
-        try:
-            trajectory = ep.run()
-        finally:
-            try:
-                rollout_router.finish_affinity()
-            except Exception:
-                logger.warning("Failed to finish vLLM rollout affinity", exc_info=True)
-        if self._persist_rollout_artifacts:
-            self._write_rollout_artifact(trajectory, task)
-        logger.info(f"Trajectory completed due to {trajectory.termination_reason}")
         agent_outputs = [
             step.output
             for step in trajectory.steps
             if isinstance(step.output, AgentOutput)
         ]
-        agent_llm_calls = sum(len(output.llm_calls) for output in agent_outputs)
-        agent_errors = [output.error for output in agent_outputs if output.error is not None]
+        agent_errors = [
+            output.error for output in agent_outputs if output.error is not None
+        ]
         if agent_errors:
             logger.error(
-                "Cube rollout agent error: task_id=%s termination=%s steps=%d "
-                "agent_outputs=%d llm_calls=%d error=%s",
+                "Cube rollout agent error: task_id=%s episode=%d termination=%s error=%s",
                 getattr(task_config, "task_id", None),
+                episode_index,
                 trajectory.termination_reason,
-                len(trajectory.steps),
-                len(agent_outputs),
-                agent_llm_calls,
                 agent_errors[-1],
             )
 
-        # last step is always an EnvironmentOutput since Episode._run_loop() ends with evaluate method.
-        last_step = trajectory.steps[-1].output
-        if not isinstance(last_step, EnvironmentOutput):
-            raise ValueError(f"""Last step is always an EnvironmentOutput
-                              since Episode._run_loop() ends with evaluate method., got {type(last_step)}""")
-        last_step_info = last_step.info
+        # The final evaluate() EnvironmentOutput carries task metrics. It is the last step for a
+        # plain agent, but a LaMer agent's finalize() appends a reflection AgentOutput AFTER it,
+        # so take the LAST EnvironmentOutput rather than steps[-1].
+        env_outputs = [
+            step.output
+            for step in trajectory.steps
+            if isinstance(step.output, EnvironmentOutput)
+        ]
+        if not env_outputs:
+            raise ValueError("trajectory has no EnvironmentOutput (evaluate) step")
+        last_step_info = env_outputs[-1].info
 
-        final_reward = trajectory.reward_info['reward']
+        episode_reward = trajectory.reward_info["reward"]
         finished = trajectory.termination_reason == TerminationReason.ENV_DONE
         training_texts = []
-        # trajectory.steps contain a list of AgentOutput/EnvironmentOutput objects in the order they were executed. \\
-        # Within an AgentOutput there is a list of llm_calls. for each llm_call \\
-        # we want to capture a training example, and assign it a reward value. If validate_per_step is True, we instead \\ 
-        # assign each llm_call the reward of the EnvironmentOutput that immediately follows it, which allows for per-step rewards if the task provides them. Otherwise, we assign all calls the final reward of the trajectory.
         for step_i, step in enumerate(trajectory.steps):
             step_output = step.output
-            if isinstance(step_output, AgentOutput):
-                step_reward = final_reward
-                if validate_per_step:
-                    for j in trajectory.steps[step_i + 1:]:
-                        if isinstance(j, EnvironmentOutput):
-                            step_reward = float(j.reward)
-                            break
-                
-                for call_i, call in enumerate(step_output.llm_calls):
-                    training_text = make_training_text(self._llm_tokenizer, call)
-                    training_text.reward = step_reward
-                    training_text.finished = finished
-                    training_text.metadata.update(call.metadata or {})
-                    training_text.metadata.update(
-                        {
-                            "llm_call_id": call.id,
-                            "llm_call_tag": call.tag,
-                            "cube_id": task.get("domain"),
-                            "task_id": getattr(task_config, "task_id", None),
-                            "trajectory_id": trajectory.id,
-                            "agent_step_index": step_i,
-                            "llm_call_index": call_i,
-                            "dataset_name": task.get("dataset"),
-                            "termination_reason": str(trajectory.termination_reason),
-                            "finish_reason": call.finish_reason,
-                            "final_reward": final_reward,
-                            "step_reward": step_reward,
-                            "llm_prompt_tokens": call.prompt_tokens,
-                            "llm_output_tokens": call.output_tokens,
-                        }
-                    )
-                    training_texts.append(training_text)
+            if not isinstance(step_output, AgentOutput):
+                continue
+            for call_i, call in enumerate(step_output.llm_calls):
+                training_text = make_training_text(self._llm_tokenizer, call)
+                training_text.finished = (
+                    finished  # reward set later (rollout-level credit)
+                )
+                training_text.metadata.update(call.metadata or {})
+                training_text.metadata.update(
+                    {
+                        "llm_call_id": call.id,
+                        "llm_call_tag": call.tag,
+                        "cube_id": task.get("domain"),
+                        "task_id": getattr(task_config, "task_id", None),
+                        "trajectory_id": trajectory.id,
+                        "episode_index": episode_index,
+                        "agent_step_index": step_i,
+                        "llm_call_index": call_i,
+                        "dataset_name": task.get("dataset"),
+                        "termination_reason": str(trajectory.termination_reason),
+                        "finish_reason": call.finish_reason,
+                        "episode_reward": episode_reward,
+                        "llm_prompt_tokens": call.prompt_tokens,
+                        "llm_output_tokens": call.output_tokens,
+                    }
+                )
+                training_texts.append(training_text)
+        return training_texts, episode_reward, agent_errors, last_step_info
 
+    def _rollout(self, task: dict, rollout_key: str) -> RolloutResult:
+        from cube_harness.agents.lamer import episodes_to_success, lamer_rollout_credit, run_multi_episode_rollout
 
-        # Apply extra rewards
-        total_output_tokens = sum(getattr(c, "output_tokens", 0) for c in training_texts)
+        start = time.perf_counter()
+
+        task_config = task["task_config"]
+        agent_config = task["agent_config"]
+        agent_llm_config = getattr(agent_config, "llm_config")
+        rollout_router = self._llm_router.with_affinity(rollout_key)
+        agent_llm_config.router = rollout_router
+
+        k_episodes = max(1, int(task.get("k_episodes", self._lamer_k_episodes)))
+        training_texts: list = []
+        episode_rewards: list[float] = []
+        agent_errors: list = []
+        last_step_info: dict = {}
+        try:
+            # The multi-episode loop, per-rollout cross-episode memory file, and early-stop-on-success
+            # are the LaMer agent's shared helper (the same one the recipes use) — single source of the
+            # loop. domain stays generic: it only maps each returned trajectory onto TrainingTexts +
+            # credit below.
+            trajectories = run_multi_episode_rollout(
+                agent_config,
+                task_config,
+                self._runtime_context,
+                k_episodes,
+                exp_name="default",
+                persist_episode=False,
+                container_backend=self._container_backend,
+            )
+            for episode_index, trajectory in enumerate(trajectories):
+                if self._persist_rollout_artifacts:
+                    self._write_rollout_artifact(trajectory, task)
+                ep_texts, ep_reward, ep_errors, ep_info = self._episode_training_texts(
+                    trajectory, task, episode_index
+                )
+                training_texts.extend(ep_texts)
+                episode_rewards.append(ep_reward)
+                agent_errors.extend(ep_errors)
+                last_step_info = ep_info
+                logger.info(
+                    "Episode %d/%d done: reward=%s termination=%s",
+                    episode_index + 1,
+                    len(trajectories),
+                    ep_reward,
+                    trajectory.termination_reason,
+                )
+        finally:
+            try:
+                rollout_router.finish_affinity()
+            except Exception:
+                logger.warning("Failed to finish vLLM rollout affinity", exc_info=True)
+
+        # Rollout-level credit is the LaMer agent's policy (cube_harness.lamer_rollout_credit): solve
+        # turns earn their OWN episode's outcome, reflection turns the EVENTUAL outcome, with gamma
+        # discounting earlier episodes. domain stays generic — it only maps training texts onto that
+        # pure policy. outcome_reward below is the rollout headline used only for metrics.
+        outcome_reward = max(episode_rewards) if episode_rewards else 0.0
+        turns = [
+            (int(t.metadata.get("episode_index", 0)), t.metadata.get("llm_call_tag") == "reflection")
+            for t in training_texts
+        ]
+        for t, r in zip(training_texts, lamer_rollout_credit(episode_rewards, turns, gamma=self._lamer_discount_gamma)):
+            t.reward = r
+
+        # Extra rewards (preserved): token-length discount + length penalty across all texts.
+        total_output_tokens = sum(
+            getattr(c, "output_tokens", 0) for c in training_texts
+        )
         if self._discount_factor != 1.0:
             for t in training_texts:
-                t.reward *= self._discount_factor ** total_output_tokens
-
-        # length penalty
-        max_completion_tokens = int(getattr(agent_llm_config, 'max_completion_tokens', 0))
+                t.reward *= self._discount_factor**total_output_tokens
+        max_completion_tokens = int(
+            getattr(agent_llm_config, "max_completion_tokens", 0)
+        )
         if self._buffer_tokens and max_completion_tokens > 0:
-            len_reward = length_penalty(max_completion_tokens, total_output_tokens, self._buffer_tokens)
+            len_reward = length_penalty(
+                max_completion_tokens, total_output_tokens, self._buffer_tokens
+            )
             for t in training_texts:
                 t.reward += len_reward
 
         if not training_texts:
             logger.warning(
-                "Cube rollout produced empty training_texts: task_id=%s termination=%s "
-                "steps=%d agent_outputs=%d llm_calls=%d summary=%s",
+                "Cube rollout produced empty training_texts: task_id=%s episodes=%d episode_rewards=%s",
                 getattr(task_config, "task_id", None),
-                trajectory.termination_reason,
-                len(trajectory.steps),
-                len(agent_outputs),
-                agent_llm_calls,
-                trajectory.summary_stats,
+                len(episode_rewards),
+                episode_rewards,
             )
 
         latency = time.perf_counter() - start
-        profiling = last_step_info.pop("profiling", {})
+        last_step_info.pop("profiling", {})
         # BaseMetrics requires success/no_error/no_answer. Derive them generically so cubes
         # whose task info doesn't emit them (e.g. arithmetic-cube) work; task-provided values
         # in last_step_info still override these defaults (e.g. math-tool-use).
+        # episodes_to_success (cube_harness.agents.lamer): attempts until first solve, 0 if never.
+        # Logged as episodes_to_success_mean = average attempts-to-success, blended with failures-as-0.
         metrics_kwargs = {
-            'reward': final_reward,
-            'num_steps': len(training_texts),
-            'success': bool(final_reward > 0),
-            'no_error': len(agent_errors) == 0,
-            'no_answer': False,
+            "reward": outcome_reward,
+            "num_steps": len(training_texts),
+            "episodes_to_success": episodes_to_success(episode_rewards),
+            "success": bool(outcome_reward > 0),
+            "no_error": len(agent_errors) == 0,
+            "no_answer": False,
             **last_step_info,
         }
         metrics = BaseMetrics(**metrics_kwargs)
@@ -575,10 +659,17 @@ class CubeBenchmarkWorker:
                 "n_steps": len(trajectory.steps),
                 "llm_calls": llm_calls,
             }
-            artifact_path = self._rollout_artifact_dir / f"{self._worker_name}_{trajectory.id}_{time.time_ns()}.json"
+            artifact_path = (
+                self._rollout_artifact_dir
+                / f"{self._worker_name}_{trajectory.id}_{time.time_ns()}.json"
+            )
             artifact_path.write_text(json.dumps(payload, indent=2, default=str))
         except Exception:
-            logger.exception("%s failed to write rollout artifact for %s", self._worker_name, trajectory.id)
+            logger.exception(
+                "%s failed to write rollout artifact for %s",
+                self._worker_name,
+                trajectory.id,
+            )
 
     def health(self) -> dict[str, Any]:
         return {

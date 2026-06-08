@@ -545,6 +545,33 @@ class CubeActorLoop:
             if ds_overlong and ds_overlong_success and ds_overlong > 0:
                 stats[f"{dataset_name}/success_given_overlong"] = ds_overlong_success / ds_overlong
 
+        # Average attempts among SUCCESSFUL rollouts only. episodes_to_success logs 0 for failures, so
+        # its mean / the success rate = sum(attempts)/num_successes — the clean "speed when it solves"
+        # signal, undiluted by failures (companion to the blended episodes_to_success_mean).
+        eps_mean = calculate_stats(self.stats.get("episodes_to_success", {})).get("mean")
+        success_mean = calculate_stats(self.stats.get("success", {})).get("mean")
+        if eps_mean is not None and success_mean and success_mean > 0:
+            stats[f"{split_name}episodes_to_success_given_success"] = eps_mean / success_mean
+
+        # pass@m curve (m=1..K) PER cube, from episodes_to_success (= first solved attempt, 0 if never):
+        # fraction of that cube's rollouts solved within m attempts. Logged per dataset/cube so the
+        # independent (TirAgent) and reflection (LaMer) test cubes stay separate. K = this loop's episode
+        # budget (eval_k_episodes on the test loop, lamer_k_episodes on the train loop).
+        if self.is_training:
+            pass_k = int(getattr(self.cfg.actor, "lamer_k_episodes", 1))
+        else:
+            pass_k = int(getattr(self.cfg.actor, "eval_k_episodes", 0) or 0) or int(
+                getattr(self.cfg.actor, "lamer_k_episodes", 1)
+            )
+        for ds, by_group in self.stats.get("episodes_to_success", {}).items():
+            # self.stats is metric -> dataset -> group_id -> [values]; flatten the per-group lists.
+            vals = [v for group_vals in by_group.values() for v in group_vals]
+            if not vals:
+                continue
+            label = f"{split_name}{ds}/" if ds else split_name
+            for m in range(1, pass_k + 1):
+                stats[f"{label}pass@{m}"] = round(sum(1 for v in vals if 1 <= v <= m) / len(vals), 4)
+
         stats |= (
             {f"{split_name}{k}": v for k, v in always_or_never_success_stats(self.stats["success"]).items()}
             | {f"{split_name}latency_{k}": v for k, v in calculate_stats(self.latency_list).items()}
@@ -620,7 +647,9 @@ class CubeActorLoop:
             f"{self.scheduler_name}:v{model_version}:g{group_id}:r{rollout_index}:"
             f"{task.cube_id}:{task.task_id}"
         )
-        ref = worker.rollout.remote(cube_id=task.cube_id, task_id=task.task_id, rollout_key=rollout_key)
+        ref = worker.rollout.remote(
+            cube_id=task.cube_id, task_id=task.task_id, rollout_key=rollout_key, is_training=self.is_training
+        )
         self._pending[ref] = PendingRollout(
             group_id=group_id,
             task=task,
@@ -1051,13 +1080,19 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             logger.info("Cube workers are ready; waiting for initial trainer model version before scheduling rollouts")
             trainer_state.wait_for_model_version()
 
-        train_tasks = list(cube_registry.train_tasks)
-        test_tasks = list(cube_registry.test_tasks)
-
+        # Apply subsets PER cube spec (not the concatenated list) so multiple test cubes — e.g. an
+        # independent + a reflection eval cube on the same held-out range — EACH get [begin:end].
+        # (For a single cube this is identical to slicing the concatenation.)
         if cfg.train_subset:
-            train_tasks = train_tasks[cfg.train_subset.begin : cfg.train_subset.end]
+            sl = slice(cfg.train_subset.begin, cfg.train_subset.end)
+            train_tasks = [t for spec in cube_registry.specs if spec.split == "train" for t in spec.task_refs()[sl]]
+        else:
+            train_tasks = list(cube_registry.train_tasks)
         if cfg.test_subset:
-            test_tasks = test_tasks[cfg.test_subset.begin : cfg.test_subset.end]
+            sl = slice(cfg.test_subset.begin, cfg.test_subset.end)
+            test_tasks = [t for spec in cube_registry.specs if spec.split == "test" for t in spec.task_refs()[sl]]
+        else:
+            test_tasks = list(cube_registry.test_tasks)
 
         if not train_tasks:
             raise ValueError("Cube benchmark returned an empty train task list")

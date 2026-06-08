@@ -1,0 +1,171 @@
+# LaMer multi-episode self-reflection RL on math-tool-use.
+#
+# Same as cube_math_rl.yaml (TirAgent + Python sandbox + LaTeX answer) but each rollout is a
+# SEQUENCE of up to `actor.lamer_k_episodes` episodes against the SAME problem: after a failed
+# attempt the agent self-reflects (LaMerTirAgent.finalize, reflection_variant `v1_commit`) and the
+# next attempt sees the lesson. The reflection LLM call is a trajectory step → a trainable example.
+# Credit: reward EVENTUAL success across the rollout's episodes, discounted by episode index
+# (`actor.lamer_discount_gamma`, default 1.0 = uniform). Grouping unchanged (N independent rollouts).
+#
+# Reflection prompt was validated in ~/dev/plans_rl/research/meta_rl_self_reflection (budget=3 +
+# v1_commit; zero-shot reflection delta is ~0 — the cold start this RL run exists to fix).
+#
+# PREREQUISITES (same as cube_math_rl): SANDBOX_ENDPOINT + MATH_TOOL_MAX_TASKS_PER_DATASET, venv
+# ACTIVATED. Launch:
+#   cd ~/dev/rl/PipelineRL && source .venv/bin/activate
+#   python -m pipelinerl.launch --config-name=cube_math_lamer_rl output_dir=results/cube_math_lamer_rl/<name>
+# For a real learning run, override to the 4B on 8 GPUs (Qwen3-4B-Instruct-2507), e.g.:
+#   model_path=/home/toolkit/models/Qwen3-4B-Instruct-2507 \
+#   vllm_config.vllm_kwargs.served_model_name=Qwen3-4B-Instruct-2507 \
+#   world.actor_fraction=4 world.finetune_fraction=4   # (8 GPUs; matches the base math run sheet)
+defaults:
+  - base_4gpu
+  - override rewards: success_and_format
+  - _self_
+
+output_dir: results/cube_math_lamer_rl/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /home/toolkit/models/Qwen2.5-1.5B-Instruct
+litellm_logging_level: info
+ray_debug: 0
+ray_local_mode: false
+
+# Held-out eval (config-only, no cube change): the `orz_test` cube entry below routes the SAME ORZ
+# dataset to the test loop; train_subset/test_subset carve the offline probe's holdout (registry order
+# is numeric, so these ARE ORZ indices [0,2000) train / [2000,4000) test). Eval fires every
+# `eval_every_n_versions` weight versions on `actor.cube_eval_workers_fraction` of the workers and logs
+# test_* metrics (test_reward, test_success, test_episodes_to_success_mean, …).
+# Launch UNCAPPED (do NOT set MATH_TOOL_MAX_TASKS_PER_DATASET) so all ~57k ORZ load: train_subset starts
+# at 4000, so a cap <= 4000 leaves an EMPTY train set. Train = ORZ [4000, end) (~53k); held-out eval =
+# [2000,2500) (the offline probe still scores the full [2000,4000)); [0,4000) minus the test slice unused.
+# NOTE: weight "version" = cumulative training SAMPLES (= 32 * finetune step), so eval_every_n_versions
+# is in sample units — 1600 ≈ every 50 steps.
+eval_every_n_versions: 1600
+train_subset: {begin: 4000, end: 1000000}
+test_subset: {begin: 2000, end: 2500}
+
+actor:
+  launcher: ray
+  ray_num_cpus: null
+  cube_workers_num_cpus: 1.0
+  cube_eval_workers_fraction: 0.5
+  cube_workers: 16
+  llm_max_rollouts: 16
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+  # --- LaMer multi-episode reflection rollout ---
+  # Split credit (cube_harness.agents.lamer.lamer_rollout_credit): solve turns earn their OWN episode's
+  # outcome (a failed attempt earns nothing); reflection turns earn the EVENTUAL outcome (rewarded iff
+  # they precede eventual success). gamma<1 discounts EARLIER episodes more (weight = gamma**(n-1-e)); 1.0 = uniform.
+  lamer_k_episodes: 3        # attempts per rollout (1 == classic single-episode rollout)
+  lamer_discount_gamma: 1.0  # uniform across episodes; <1 down-weights earlier episodes/reflections
+  eval_k_episodes: 3         # held-out eval runs k attempts → test pass@1..k curve (per test cube)
+
+llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 1.0
+    top_p: 0.95
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 8192
+    served_model_name: Qwen2.5-1.5B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+finetune:
+  seq_length: 8192
+  gradient_accumulation_passes: 32
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+    # REQUIRED for LaMer: lamer_rollout_credit gives different rewards to different turns within one
+    # rollout (solve vs reflection, gamma-discounted per episode). Without this, preprocessing asserts
+    # a uniform reward per rollout and crashes on the first successful rollout. Advantage baseline
+    # becomes per-step-index leave-one-out across the group.
+    per_step_rewards: true
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 4
+  shared_memory_entry_size: 100000000
+
+cube_params:
+  resource_guard:
+    actor_memory_gb: 1.25
+    memory_overhead_gb: 8.0
+    memory_usage_threshold: 0.90
+  seed: ${seed}
+  cubes:
+    - id: orz_train
+      split: train
+      dataset_name: open_reasoner_zero_57k   # filters the registry to this dataset (via TaskMetadata.extra_info)
+      benchmark: &orz_benchmark
+        _target_: math_tool_use.benchmark.MathToolUseBenchmarkConfig
+        tool_config:
+          _target_: math_tool_use.tool.MathToolUseToolConfig
+          sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
+      agent: &lamer_agent
+        # LaMer reflection agent (TirAgent + cross-episode self-reflection via finalize()).
+        _target_: cube_harness.agents.lamer.LaMerTirAgentConfig
+        # Domain reflection content lives in the math-tool-use cube; the harness owns only the
+        # generic mechanism. use_verdict=false (default): the reflector self-diagnoses failures (incl.
+        # format) given the task + format contract, rather than being handed a verdict. Set true to
+        # inject the hand-built verdict instead.
+        reflection_provider:
+          _target_: math_tool_use.MathReflectionProviderConfig
+          reflection_variant: v1_commit
+          use_verdict: false
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 4  # retry transient vLLM 5xx in-place (cheaper than dropping the whole rollout)
+          extra_body:
+            return_token_ids: true
+        # Canonical prompt lives in the math-tool-use cube (single source shared with
+        # recipes/passk_reflection_probe.py). Hydra instantiates this no-arg factory to the string.
+        system_prompt:
+          _target_: math_tool_use.math_tir_system_prompt
+        max_actions: 3
+    # Held-out eval — REFLECTION mode: SAME ORZ dataset routed to the test loop; test_subset carves the
+    # held-out slice; reuses the LaMer agent (k=eval_k + reflection) → test_orz_test_refl/pass@1..k.
+    - id: orz_test_refl
+      split: test
+      dataset_name: open_reasoner_zero_57k
+      benchmark: *orz_benchmark
+      agent: *lamer_agent
+    # Held-out eval — INDEPENDENT mode: the SAME trained policy evaluated as a plain TirAgent at
+    # eval_k i.i.d. attempts (no reflection) → test_orz_test_indep/pass@1..k. Directly comparable to the
+    # baseline's orz_test_indep. Same model/prompt as training.
+    - id: orz_test_indep
+      split: test
+      dataset_name: open_reasoner_zero_57k
+      benchmark: *orz_benchmark
+      agent:
+        _target_: cube_harness.agents.tir.TirAgentConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 4
+          extra_body:
+            return_token_ids: true
+        system_prompt:
+          _target_: math_tool_use.math_tir_system_prompt
+        max_actions: 3

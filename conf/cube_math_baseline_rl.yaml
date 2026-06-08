@@ -1,0 +1,124 @@
+# Standard single-episode RL on math-tool-use — the BASELINE for the LaMer comparison.
+#
+# Identical to cube_math_lamer_rl.yaml in every controlled variable (model, data + held-out eval
+# split, vLLM/finetune/llm settings, system prompt) EXCEPT the method: a plain TirAgent, ONE episode
+# per rollout (lamer_k_episodes=1), no reflection, standard per-rollout GRPO (no per_step_rewards —
+# k=1 means a uniform reward per rollout, which standard preprocessing requires).
+#
+# Launch (4B, 8 GPUs), paired with the LaMer run — UNCAPPED (do NOT set
+# MATH_TOOL_MAX_TASKS_PER_DATASET; train_subset starts at 4000, so a cap <= 4000 leaves an EMPTY train set):
+#   cd ~/dev/rl/PipelineRL && source .venv/bin/activate
+#   SANDBOX_ENDPOINT=<url> \
+#   python -m pipelinerl.launch --config-name=cube_math_baseline_rl \
+#     model_path=/home/toolkit/models/Qwen3-4B-Instruct-2507 \
+#     vllm_config.vllm_kwargs.served_model_name=Qwen3-4B-Instruct-2507 \
+#     output_dir=results/oo_lamer/cmp_baseline_k1
+defaults:
+  - base_4gpu
+  - override rewards: success_and_format
+  - _self_
+
+output_dir: results/cube_math_baseline_rl/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /home/toolkit/models/Qwen2.5-1.5B-Instruct
+litellm_logging_level: info
+ray_debug: 0
+ray_local_mode: false
+
+# Held-out eval (same split as the LaMer config): a 2nd cube entry on the SAME ORZ dataset routed to
+# the test loop; train_subset/test_subset carve the SAME split as the LaMer run — train = ORZ [4000, end)
+# (~53k), held-out eval = [2000,2500) (numeric registry order). Launch UNCAPPED (do NOT set
+# MATH_TOOL_MAX_TASKS_PER_DATASET) so all ~57k ORZ load; a cap <= 4000 leaves an EMPTY train set.
+# version = cumulative SAMPLES (=32*step), so eval_every_n_versions=1600 ≈ every 50 steps.
+eval_every_n_versions: 1600
+train_subset: {begin: 4000, end: 1000000}
+test_subset: {begin: 2000, end: 2500}
+
+actor:
+  launcher: ray
+  ray_num_cpus: null
+  cube_workers_num_cpus: 1.0
+  cube_eval_workers_fraction: 0.5
+  cube_workers: 16
+  llm_max_rollouts: 16
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+  lamer_k_episodes: 1   # single-episode standard RL (no reflection)
+  eval_k_episodes: 3    # but EVAL at k i.i.d. attempts → held-out independent pass@1..k curve
+
+llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 1.0
+    top_p: 0.95
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 8192
+    served_model_name: Qwen2.5-1.5B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+finetune:
+  seq_length: 8192
+  gradient_accumulation_passes: 32
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+    # No per_step_rewards: standard single-reward-per-rollout GRPO (k=1 → uniform reward per rollout).
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 4
+  shared_memory_entry_size: 100000000
+
+cube_params:
+  resource_guard:
+    actor_memory_gb: 1.25
+    memory_overhead_gb: 8.0
+    memory_usage_threshold: 0.90
+  seed: ${seed}
+  cubes:
+    - id: orz_train
+      split: train
+      dataset_name: open_reasoner_zero_57k
+      benchmark: &orz_benchmark
+        _target_: math_tool_use.benchmark.MathToolUseBenchmarkConfig
+        tool_config:
+          _target_: math_tool_use.tool.MathToolUseToolConfig
+          sandbox_endpoint: ${oc.env:SANDBOX_ENDPOINT,http://127.0.0.1:8080}
+      agent: &tir_agent
+        # Plain TIR agent (no reflection) — same model/prompt as the LaMer run, single episode.
+        _target_: cube_harness.agents.tir.TirAgentConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 4
+          extra_body:
+            return_token_ids: true
+        # Same single-source prompt as the LaMer config (math_tool_use.MATH_TIR_SYSTEM_PROMPT).
+        system_prompt:
+          _target_: math_tool_use.math_tir_system_prompt
+        max_actions: 3
+    # Held-out eval — INDEPENDENT mode: SAME ORZ dataset routed to the test loop; test_subset carves
+    # the held-out slice. Plain TirAgent at eval_k_episodes i.i.d. attempts → test_orz_test_indep/
+    # pass@1..k (the baseline's natural multi-attempt regime; directly comparable to the LaMer run's
+    # orz_test_indep).
+    - id: orz_test_indep
+      split: test
+      dataset_name: open_reasoner_zero_57k
+      benchmark: *orz_benchmark
+      agent: *tir_agent
