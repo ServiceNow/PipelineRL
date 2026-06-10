@@ -487,7 +487,14 @@ class CubeActorLoop:
             all_metrics = result.metrics.model_dump() | self.compute_domain_agnostic_metrics(result)
             for key, value in all_metrics.items():
                 if isinstance(value, list):
-                    self.stats[key][dataset_name][group_id] += value
+                    # Only aggregate numeric lists (e.g. per-step rewards). A cube may surface a
+                    # non-numeric list as task info (e.g. sokoban-cube's `board` rows, which reach
+                    # BaseMetrics via last_step_info when an episode took 0 steps) — skip it rather
+                    # than crash later in calculate_stats' float(max(...)).
+                    if all(isinstance(v, (float, bool, int)) for v in value):
+                        self.stats[key][dataset_name][group_id] += value
+                    else:
+                        logger.debug("Skipping non-numeric list metric %r (%d items)", key, len(value))
                 elif isinstance(value, (float, bool, int)):
                     self.stats[key][dataset_name][group_id].append(value)
                 else:

@@ -297,6 +297,9 @@ class CubeBenchmarkWorker:
         self._lamer_discount_gamma = float(
             getattr(cfg.actor, "lamer_discount_gamma", 1.0)
         )
+        # Credit scheme: "outcome" (legacy eventual-best; math runs depend on it) or "forward"
+        # (LaMer paper Eq. 4 cross-episode return-to-go — discounts reflections by distance to success).
+        self._lamer_credit_scheme = str(getattr(cfg.actor, "lamer_credit_scheme", "outcome"))
         artifact_cfg = getattr(
             getattr(cfg, "cube_params", {}), "rollout_artifacts", None
         )
@@ -561,16 +564,17 @@ class CubeBenchmarkWorker:
             except Exception:
                 logger.warning("Failed to finish vLLM rollout affinity", exc_info=True)
 
-        # Rollout-level credit is the LaMer agent's policy (cube_harness.lamer_rollout_credit): solve
-        # turns earn their OWN episode's outcome, reflection turns the EVENTUAL outcome, with gamma
-        # discounting earlier episodes. domain stays generic — it only maps training texts onto that
+        # Rollout-level credit is the LaMer agent's policy (cube_harness.lamer_rollout_credit), selected
+        # by self._lamer_credit_scheme: "outcome" (legacy eventual-best, math runs) or "forward" (paper
+        # Eq. 4 cross-episode return-to-go). domain stays generic — it only maps training texts onto that
         # pure policy. outcome_reward below is the rollout headline used only for metrics.
         outcome_reward = max(episode_rewards) if episode_rewards else 0.0
         turns = [
             (int(t.metadata.get("episode_index", 0)), t.metadata.get("llm_call_tag") == "reflection")
             for t in training_texts
         ]
-        for t, r in zip(training_texts, lamer_rollout_credit(episode_rewards, turns, gamma=self._lamer_discount_gamma)):
+        credit = lamer_rollout_credit(episode_rewards, turns, gamma=self._lamer_discount_gamma, scheme=self._lamer_credit_scheme)
+        for t, r in zip(training_texts, credit):
             t.reward = r
 
         # Extra rewards (preserved): token-length discount + length penalty across all texts.

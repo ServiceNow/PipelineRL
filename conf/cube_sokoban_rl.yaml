@@ -1,0 +1,135 @@
+# Standard single-episode RL on the sokoban-cube — "train with the Sokoban tool".
+#
+# Each rollout is ONE episode: the agent plays Sokoban via the move(direction) tool, pushing boxes
+# onto goals on a 6x6 / 2-box level. Reward is PROPORTIONAL — boxes_on_goal / num_boxes (0, 0.5, 1.0)
+# — from the task's evaluate(), so even partial progress gives a learning signal (no all-or-nothing
+# cold start). The episode ends when the level is solved or the agent hits max_actions moves.
+#
+# Unlike the math cube, Sokoban is PURE IN-PROCESS — no sandbox endpoint, no external service. Just
+# activate the venv and launch:
+#   cd ~/dev/rl/PipelineRL && source .venv/bin/activate
+#   python -m pipelinerl.launch --config-name=cube_sokoban_rl output_dir=results/cube_sokoban_rl/<name>
+# For a real learning run, override to the 4B on 8 GPUs (Qwen3-4B-Instruct-2507), e.g.:
+#   model_path=/home/toolkit/models/Qwen3-4B-Instruct-2507 \
+#   vllm_config.vllm_kwargs.served_model_name=Qwen3-4B-Instruct-2507 \
+#   world.actor_fraction=4 world.finetune_fraction=4
+#
+# This is also the BASELINE for the LaMer comparison (cube_sokoban_lamer_rl.yaml): standard k=1 RL,
+# but evaluated at eval_k_episodes i.i.d. attempts for a held-out independent pass@1..k curve.
+defaults:
+  - base_4gpu
+  - override rewards: success_and_format   # inert for cube_rl (reward comes from task.evaluate()); kept for base compat
+  - _self_
+
+output_dir: results/cube_sokoban_rl/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /home/toolkit/models/Qwen2.5-1.5B-Instruct
+litellm_logging_level: info
+ray_debug: 0
+ray_local_mode: false
+
+# Held-out eval (config-only, no cube change): a 2nd cube entry on the SAME sokoban dataset routed to
+# the test loop; train_subset/test_subset carve the 750-level pool by index (registry order is numeric:
+# sokoban-6x6-2b-00000 .. -00749). Held-out eval = levels [0,250), train = [250, end) (~500). To scale
+# the pool, regenerate with cubes/sokoban-cube/scripts/create_task_metadata.py --num N and widen these.
+# version = cumulative SAMPLES (=32*step), so eval_every_n_versions=1600 ≈ every 50 steps.
+eval_every_n_versions: 1600
+train_subset: {begin: 250, end: 1000000}
+test_subset: {begin: 0, end: 250}
+
+actor:
+  launcher: ray
+  ray_num_cpus: null
+  cube_workers_num_cpus: 1.0
+  cube_eval_workers_fraction: 0.5
+  cube_workers: 16
+  llm_max_rollouts: 16
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+  lamer_k_episodes: 1   # single-episode standard RL (no reflection)
+  eval_k_episodes: 3    # but EVAL at k i.i.d. attempts → held-out independent pass@1..k curve
+  # Fair-comparison group size: the LaMer run uses attempts=8 trials × N=3 episodes = 24 trajectories
+  # per group, so the standard-RL baseline uses attempts=24 (24 independent episodes) for the same
+  # trajectory budget per update — the paper's matched setting (§5.1). attempts is read as cfg.attempts.
+
+llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 0.7   # paper uses 0.7 at evaluation (1.0 at rollout)
+    top_p: 0.95
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 8192
+    served_model_name: Qwen2.5-1.5B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+finetune:
+  seq_length: 8192
+  gradient_accumulation_passes: 32
+  attempts: 24   # group size (paper standard-RL = 24; sets group composition, not total samples/update)
+  # Fixed run length so the cosine LR schedule is well-defined and matched to the LaMer run.
+  # 1 step = 32 samples (bs 1 * grad_accum 32); 1000 steps = 32k samples.
+  max_train_steps: 1000
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+    # No per_step_rewards: k=1 → a uniform reward per rollout, which standard preprocessing requires.
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 4
+  shared_memory_entry_size: 100000000
+
+cube_params:
+  resource_guard:
+    actor_memory_gb: 1.25
+    memory_overhead_gb: 8.0
+    memory_usage_threshold: 0.90
+  seed: ${seed}
+  cubes:
+    - id: sokoban_train
+      split: train
+      dataset_name: sokoban_6x6_2b   # filters the registry to this dataset (via TaskMetadata.extra_info)
+      benchmark: &sokoban_benchmark
+        _target_: sokoban_cube.benchmark.SokobanBenchmarkConfig
+        tool_config:
+          _target_: sokoban_cube.tool.SokobanToolConfig
+          sparse_reward: true   # match the LaMer config + paper (1.0 iff solved)
+      agent: &sokoban_agent
+        # Plain TIR (tool-calling) agent — one move(direction) tool call per turn.
+        _target_: cube_harness.agents.tir.TirAgentConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 4  # retry transient vLLM 5xx in-place (cheaper than dropping the whole rollout)
+          extra_body:
+            return_token_ids: true
+        # Canonical prompt lives in the sokoban cube (single source). Hydra instantiates the no-arg factory.
+        system_prompt:
+          _target_: sokoban_cube.sokoban_system_prompt
+        # max_actions = LLM TURNS per episode (not board moves). move(directions) applies a whole
+        # sequence per turn (paper-style multi-action), so a level (solution <= 12 moves) needs only a
+        # few turns; 10 leaves room to observe and correct. Episode also ends early on solve.
+        max_actions: 10
+    # Held-out eval — INDEPENDENT mode: SAME sokoban dataset routed to the test loop; test_subset carves
+    # the held-out slice. TirAgent at eval_k_episodes i.i.d. attempts → test_sokoban_test_indep/pass@1..k.
+    - id: sokoban_test_indep
+      split: test
+      dataset_name: sokoban_6x6_2b
+      benchmark: *sokoban_benchmark
+      agent: *sokoban_agent

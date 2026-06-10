@@ -1,0 +1,162 @@
+# LaMer multi-episode self-reflection RL on the sokoban-cube.
+#
+# Same as cube_sokoban_rl.yaml (TirAgent playing Sokoban via move(direction)) but each rollout is a
+# SEQUENCE of up to `actor.lamer_k_episodes` episodes against the SAME level: after a failed attempt
+# the agent self-reflects (LaMerTirAgent.finalize) on which box got stuck / which push was wrong, and
+# the next attempt sees the lesson. The reflection LLM call is a trajectory step → a trainable example.
+#
+# Reflection is the LaMer paper's Sokoban prompt (Appendix B.1), owned by the cube
+# (sokoban_cube.reflection.SokobanReflectionProvider): it replays the failed attempt (initial board →
+# actions → final board), reasons step-by-step, and commits an improved plan in <remark></remark>;
+# only the <remark> is forwarded as the next attempt's lesson. Credit: paper Eq. 4 cross-episode
+# return-to-go (`actor.lamer_credit_scheme: forward`, `actor.lamer_discount_gamma` = gamma_traj).
+#
+# Pure in-process (no sandbox). Launch:
+#   cd ~/dev/rl/PipelineRL && source .venv/bin/activate
+#   python -m pipelinerl.launch --config-name=cube_sokoban_lamer_rl output_dir=results/cube_sokoban_lamer_rl/<name>
+# For a real run, override to the 4B on 8 GPUs (see cube_sokoban_rl.yaml). Pair it with
+# cube_sokoban_rl.yaml (the k=1 baseline) for the standard-vs-LaMer comparison.
+defaults:
+  - base_4gpu
+  - override rewards: success_and_format   # inert for cube_rl (reward comes from task.evaluate()); kept for base compat
+  - _self_
+
+output_dir: results/cube_sokoban_lamer_rl/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /home/toolkit/models/Qwen2.5-1.5B-Instruct
+litellm_logging_level: info
+ray_debug: 0
+ray_local_mode: false
+
+# Held-out eval — SAME split as cube_sokoban_rl.yaml: train_subset/test_subset carve the 750-level pool
+# by index (registry order sokoban-6x6-2b-00000 .. -00749). Held-out eval = [0,250), train = [250, end).
+# version = cumulative SAMPLES (=32*step), so eval_every_n_versions=1600 ≈ every 50 steps.
+eval_every_n_versions: 1600
+train_subset: {begin: 250, end: 1000000}
+test_subset: {begin: 0, end: 250}
+
+actor:
+  launcher: ray
+  ray_num_cpus: null
+  cube_workers_num_cpus: 1.0
+  cube_eval_workers_fraction: 0.5
+  cube_workers: 16
+  llm_max_rollouts: 16
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+  # --- LaMer multi-episode reflection rollout (paper-faithful credit) ---
+  # cube_harness.agents.lamer.lamer_rollout_credit, scheme="forward" = LaMer paper Eq. 4: each turn is
+  # credited by the gamma_traj-discounted cross-episode return-to-go of its episode; a reflection after
+  # episode e earns the next-episode-onward return (the reward obtained in subsequent episodes). With
+  # sparse reward this equals solve-turn credit gamma**(dist-to-success) and discounts reflections by
+  # their distance to success. gamma_traj is the paper's exploration/exploitation dial (Fig. 5).
+  lamer_k_episodes: 3            # N episodes per trial (paper: N=3)
+  lamer_discount_gamma: 0.6      # gamma_traj — paper default, best for Sokoban (Fig. 5)
+  lamer_credit_scheme: forward   # paper Eq. 4 cross-episode return-to-go (vs legacy "outcome")
+  eval_k_episodes: 3             # held-out eval runs k attempts → test pass@1..k (reflection + independent)
+
+llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 4096
+    max_completion_tokens: 4096
+    temperature: 0.7   # paper uses 0.7 at evaluation (1.0 at rollout)
+    top_p: 0.95
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 8192
+    served_model_name: Qwen2.5-1.5B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+finetune:
+  seq_length: 8192
+  gradient_accumulation_passes: 32
+  attempts: 8   # group size = 8 trials × N=3 episodes = 24 trajectories/group (paper meta-RL; = baseline's 24)
+  # Matched to cube_sokoban_rl.yaml so the cosine LR schedule + stopping point don't confound the
+  # baseline-vs-LaMer comparison. 1 step = 32 samples; 1000 steps = 32k samples.
+  max_train_steps: 1000
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+    # REQUIRED for LaMer: lamer_rollout_credit gives different rewards to different turns within one
+    # rollout (solve vs reflection, gamma-discounted per episode). Without this, preprocessing asserts
+    # a uniform reward per rollout and crashes on the first successful rollout.
+    per_step_rewards: true
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 4
+  shared_memory_entry_size: 100000000
+
+cube_params:
+  resource_guard:
+    actor_memory_gb: 1.25
+    memory_overhead_gb: 8.0
+    memory_usage_threshold: 0.90
+  seed: ${seed}
+  cubes:
+    - id: sokoban_train
+      split: train
+      dataset_name: sokoban_6x6_2b
+      benchmark: &sokoban_benchmark
+        _target_: sokoban_cube.benchmark.SokobanBenchmarkConfig
+        tool_config:
+          _target_: sokoban_cube.tool.SokobanToolConfig
+          sparse_reward: true   # LaMer-paper sparse success reward (1.0 iff solved); makes early-stop exact
+      agent: &lamer_agent
+        # LaMer reflection agent (TirAgent + cross-episode self-reflection via finalize()).
+        _target_: cube_harness.agents.lamer.LaMerTirAgentConfig
+        # LaMer-paper Sokoban reflection (cube-owned): replays the failed attempt (initial board →
+        # actions → final board), reasons step-by-step, commits an improved plan in <remark></remark>;
+        # only the <remark> is forwarded to the next attempt.
+        reflection_provider:
+          _target_: sokoban_cube.reflection.SokobanReflectionProviderConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 4
+          extra_body:
+            return_token_ids: true
+        system_prompt:
+          _target_: sokoban_cube.sokoban_system_prompt
+        max_actions: 10  # LLM turns; move(directions) is multi-action so few turns suffice
+    # Held-out eval — REFLECTION mode: reuses the LaMer agent (k=eval_k + reflection) →
+    # test_sokoban_test_refl/pass@1..k.
+    - id: sokoban_test_refl
+      split: test
+      dataset_name: sokoban_6x6_2b
+      benchmark: *sokoban_benchmark
+      agent: *lamer_agent
+    # Held-out eval — INDEPENDENT mode: SAME trained policy as a plain TirAgent at eval_k i.i.d. attempts
+    # (no reflection) → test_sokoban_test_indep/pass@1..k. Directly comparable to cube_sokoban_rl.yaml.
+    - id: sokoban_test_indep
+      split: test
+      dataset_name: sokoban_6x6_2b
+      benchmark: *sokoban_benchmark
+      agent:
+        _target_: cube_harness.agents.tir.TirAgentConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 4
+          extra_body:
+            return_token_ids: true
+        system_prompt:
+          _target_: sokoban_cube.sokoban_system_prompt
+        max_actions: 10  # LLM turns; move(directions) is multi-action so few turns suffice

@@ -81,4 +81,5 @@ environments = ["sys_platform == 'linux'"]
 [tool.uv.sources]
 cube-harness = { path = "../cube-harness", editable = true }
 math-tool-use = { path = "../cube-harness/cubes/math-tool-use", editable = true }
+sokoban-cube = { path = "../cube-harness/cubes/sokoban-cube", editable = true }
 cube-standard = { path = "../cube-standard" }
