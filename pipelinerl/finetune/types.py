@@ -63,6 +63,7 @@ class PipelineBatchEncoding(BaseModel):
     group_tokens: torch.FloatTensor
     num_labels: torch.FloatTensor 
     overflow: torch.FloatTensor
+    loss_weight_scale: torch.FloatTensor | None = None
     
     model_version: int
     sentinel: bool = False
@@ -97,7 +98,7 @@ class PipelineBatchEncoding(BaseModel):
         return torch.tensor(v, dtype=torch.int)
     
     # TODO: am i needed?
-    @field_validator('rewards', 'advantages', 'ref_logprobs', 'old_logprobs', 'group_tokens', 'num_labels', 'overflow', 'pixel_values', mode='before')
+    @field_validator('rewards', 'advantages', 'ref_logprobs', 'old_logprobs', 'group_tokens', 'num_labels', 'overflow', 'loss_weight_scale', 'pixel_values', mode='before')
     @classmethod
     def convert_to_float_tensor(cls, v: List[float] | torch.Tensor | None) -> torch.FloatTensor | None:
         """Handle initialization of float tensors from different types."""
@@ -167,6 +168,7 @@ class PipelineBatchEncoding(BaseModel):
                 "group_tokens": self.group_tokens[:, bs[i]:bs[i + 1]],
                 "overflow": self.overflow[:, bs[i]:bs[i + 1]],
                 "num_labels": self.num_labels[:, bs[i]:bs[i + 1]],
+                "loss_weight_scale": self.loss_weight_scale[:, bs[i]:bs[i + 1]] if self.loss_weight_scale is not None else None,
                 # metadata
                 "model_version": self.model_version,
                 "sentinel": self.sentinel,

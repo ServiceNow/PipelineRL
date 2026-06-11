@@ -1,0 +1,34 @@
+defaults:
+  - base
+  - /domain_params@privacy_hopqa: privacy_hopqa
+  - _self_
+
+actor:
+  rollout_policy: pipelinerl.domains.privacy_hopqa.generate_privacy_hopqa_rollout
+  llm_max_rollouts: 64
+  shared_memory_entry_size: 1000000000
+  system_prompt: ""
+  task_template: |-
+    {task}
+  task_prompt: ""
+  ensure_boxed_answers: false
+
+finetune:
+  gradient_accumulation_passes: 4128
+  num_warmup_steps: 0
+  rl:
+    step_reward_advantages: false
+    pad_step_rewards_for_advantage: false
+    batch_size_normalization: rollouts
+
+preprocess:
+  shared_memory_entry_size: 1000000000
+
+dataset_loader: pipelinerl.domains.privacy_hopqa.dataset.load_problems
+dataset_loader_params: ${privacy_hopqa}
+
+train_dataset_names:
+  - ${privacy_hopqa.final_train_dataset_path}
+
+test_dataset_names:
+  - ${privacy_hopqa.final_val_dataset_path}

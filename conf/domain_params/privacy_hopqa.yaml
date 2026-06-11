@@ -1,0 +1,95 @@
+# Paths produced by MosaicProject. The default training config reads the train
+# and validation JSONL files below; set final/test when running evaluation jobs
+# that use those aliases.
+final_dataset_path: null
+final_train_dataset_path: ???
+final_val_dataset_path: ???
+final_test_dataset_path: null
+max_examples: null
+
+# DRBench-style task files used by the helper service and optional local search.
+task_data_root: ???
+local_index_root: .privacy_hopqa/local_indices
+local_index_mmap_mode: r
+
+# Current MosaicLeaks training runs use the helper for private-doc retrieval
+# and BrowseComp search. Local private-doc search remains available by setting
+# use_remote_local_search=false and pointing local_index_root at prebuilt indices.
+helper_service_url: ???
+helper_timeout_s: 180.0
+use_remote_local_search: true
+use_remote_browsecomp: true
+
+generation_context_limit_tokens: 16384
+generation_context_margin_tokens: 128
+hop_plan_max_tokens: 4096
+doc_choose_max_tokens: 4096
+doc_read_max_tokens: 4096
+hop_resolve_max_tokens: 4096
+
+capture_mode: planning_only
+answer_match_f1_threshold: 0.75
+answer_match_mode: exact_or_f1
+reward_mode: hop_accuracy
+training_reward_mode: outcome
+
+# For hop_step_situational training, set:
+#   privacy_hopqa.training_reward_mode=hop_step_situational
+#   finetune.rl.step_reward_advantages=true
+#   finetune.rl.filter_zero_advantage_groups=true
+# Privacy-reward runs also set privacy_reward_weight>0 and
+# privacy_reward_service_url to the reward-model helper.
+hop_step_source_bonus: 0.25
+hop_step_doc_bonus: 0.25
+privacy_reward_service_url: null
+privacy_reward_timeout_s: 30.0
+privacy_reward_weight: 0.0
+privacy_reward_threshold: 0.5
+privacy_reward_context_hops: 2
+
+constrained_resolver: false
+stop_after_incorrect_hop: false
+zero_error_step_reward: true
+max_iterations: 14
+iteration_budget_per_hop: 2
+hop_plan_attempts: 1
+enable_generic_retrieval_fallback: false
+enable_local_search_bootstrap: false
+max_parallel_retrieval_actions: 3
+retrieval_top_k: 5
+choose_top_k: 3
+max_candidate_cards: 20
+chooser_excerpt_chars: 500
+reader_excerpt_chars: 2500
+retrieval_context_mode: windowed_evidence
+retrieval_source_chars: 0
+retrieval_chunk_chars: 4000
+retrieval_chunk_overlap_chars: 800
+reader_window_chars: 10000
+reader_window_overlap_chars: 1000
+max_windows_per_parent: 0
+large_parent_window_policy: top_with_neighbors
+read_all_windows_max_count: 5
+large_parent_top_windows: 4
+large_parent_neighbor_windows: 1
+large_parent_max_read_windows: 0
+max_history_entries: 10
+local_search_threshold: 0.0
+semantic_threshold: 0.7
+
+browsecomp_enabled: true
+browsecomp_top_k: 5
+browsecomp_max_chars: 8000
+
+llm_provider: vllm
+embedding_provider: huggingface
+embedding_model: Qwen/Qwen3-Embedding-4B
+embedding_base_url: null
+embedding_api_key: null
+embedding_device: null
+log_prompts: false
+verbose: false
+no_web: false
+parallel_searches: true
+max_parallel_doc_reads: 5
+planner_privacy_prompt: false

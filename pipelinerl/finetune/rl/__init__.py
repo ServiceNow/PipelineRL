@@ -29,6 +29,7 @@ RL_DATA_COLUMNS = [
     "overflow",
     "group_tokens",
     "num_labels",
+    "loss_weight_scale",
     "rewards",
     "advantages",
     "old_logprobs",
@@ -94,6 +95,18 @@ class RLConfig(BaseModel):
     filter_zero_advantage_groups: bool = Field(
         default=False,
         description="Filter out groups where all advantages are zero during preprocessing",
+    )
+    step_reward_advantages: bool = Field(
+        default=False,
+        description="Compute leave-one-out advantages by (group_id, step_index), allowing different rewards per rollout step",
+    )
+    pad_step_rewards_for_advantage: bool = Field(
+        default=False,
+        description="When step_reward_advantages is enabled, pad each rollout's reward sequence with its final reward for advantage statistics only",
+    )
+    batch_size_normalization: str = Field(
+        default="training_texts",
+        description="Loss denominator unit: training_texts counts every trainable call; rollouts groups sub-calls from the same rollout attempt",
     )
     value_loss_coef: float = Field(
         default=0.0,
@@ -249,6 +262,10 @@ def rl_step(
         # filter out sequences that do not have eos_token_id
         overflow = torch.tensor(overflow, device=overflow.device)
         tokens_weights = tokens_weights * (1 - overflow)
+    if batch.loss_weight_scale is not None:
+        # Stepwise domains can emit multiple trainable texts for one rollout.
+        # This scale preserves the configured loss denominator after packing.
+        tokens_weights = tokens_weights * batch.loss_weight_scale[:, 1:].to(tokens_weights.device)
 
     assert new_logprobs.shape == ref_logprobs.shape
 
@@ -428,6 +445,11 @@ def rl_step(
         "token_weight": sum_sum(tokens_weights / num_labels_in_seq, masks_shifted, segments).item(),
         "max_token_weight": tokens_weights[masks_shifted].max().item(),
         "min_token_weight": tokens_weights[masks_shifted].min().item(),
+        "rollout_weight_scale": (
+            sum_sum(batch.loss_weight_scale[:, 1:] / num_labels_in_seq, masks_shifted, segments).item()
+            if batch.loss_weight_scale is not None
+            else 1.0
+        ),
         "kl_coef": num_sequences * kl_coef,
         "entropy_bonus_coef": num_sequences * entropy_bonus_coef,
         "num_output_tokens_sum": masks_shifted.sum().item(),
@@ -446,75 +468,295 @@ def rl_step(
     return final_loss, stats
 
 
-def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
-    """Populate RL-specific columns (advantages, overflow, num_labels) using a leave-one-out baseline."""
-    # Convert to pandas for processing
-    df_init = pd.DataFrame(dataset)
-    assert isinstance(df_init, pd.DataFrame)
+def _compute_step_reward_advantages(
+    df_init: pd.DataFrame, df_stats: pd.DataFrame, config: RLConfig
+) -> pd.DataFrame:
+    """Leave-one-out advantages for per-step rewards (rare; privacy_hopqa only today).
 
-    # Step 1: calculate group-level statistics
-    df_stats = df_init[["group_id", "rollout_index", "step_index"]].copy()
-    df_stats["num_tokens"] = df_init["input_ids"].apply(len)
-    # We assume that rewards for all tokens are the same
-    df_stats["rollout_reward"] = df_init["rewards"].apply(lambda x: x[0])
-    # Check that the reward is the same for each step in the rollout
-    assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1
-    # Only keep step_index == 0
-    df_stats = df_stats[df_stats["step_index"] == 0].drop(columns=["step_index"])
+    Unlike the default one-reward-per-rollout estimator, every trainable step
+    carries its own reward and the LOO baseline is computed within an "advantage
+    bucket" instead of across the whole group. The bucket is the global step
+    index ("step:{i}") by default; domains that attach step_advantage_group
+    metadata (privacy_hopqa groups by (hop, stage)) instead get buckets aligned
+    by position inside each semantic segment, so the k-th step of a segment is
+    only compared with other k-th steps. With pad_step_rewards_for_advantage,
+    shorter rollouts contribute virtual padding rows (advantage_scale=0) that
+    enter the baseline but produce no gradient, so each aligned position's
+    baseline is computed over the whole group instead of only the rollouts long
+    enough to reach it. Returns columns (group_id, rollout_index, step_index,
+    group_tokens, advantages) — the same shape the default path produces.
+
+    df_stats must already carry num_tokens, step_reward, and padding_reward.
+    """
+    # group_tokens baseline = mean trainable tokens per rollout in the group.
+    df_rollouts = (
+        df_stats.groupby(["group_id", "rollout_index"])
+        .agg(rollout_tokens=("num_tokens", "sum"))
+        .reset_index()
+    )
+    df_group_tokens = (
+        df_rollouts.groupby("group_id")
+        .agg(group_tokens=("rollout_tokens", "mean"))
+        .reset_index()
+    )
+    df_reward_stats = df_stats[
+        ["group_id", "rollout_index", "step_index", "rewards", "step_reward", "padding_reward"]
+    ].copy()
+    df_reward_stats["is_padding"] = False
+    # Default bucket: each step is compared only against the same global step index.
+    df_reward_stats["advantage_bucket"] = df_reward_stats["step_index"].map(lambda value: f"step:{int(value)}")
+    df_reward_stats["advantage_scale"] = 1.0
+
+    # Optional per-step metadata lets a domain define its own (custom) buckets.
+    if "metadata" in df_init.columns:
+        metadata = df_init["metadata"].apply(lambda value: value if isinstance(value, dict) else {})
+        df_reward_stats["step_advantage_group"] = metadata.apply(lambda value: value.get("step_advantage_group"))
+        df_reward_stats["step_advantage_local_index"] = metadata.apply(
+            lambda value: value.get("step_advantage_local_index")
+        )
+        df_reward_stats["step_advantage_segment_length"] = metadata.apply(
+            lambda value: value.get("step_advantage_segment_length")
+        )
+        df_reward_stats["step_advantage_padding_value"] = metadata.apply(
+            lambda value: value.get("step_advantage_padding_value")
+        )
+    else:
+        df_reward_stats["step_advantage_group"] = None
+        df_reward_stats["step_advantage_local_index"] = None
+        df_reward_stats["step_advantage_segment_length"] = None
+        df_reward_stats["step_advantage_padding_value"] = None
+
+    custom_mask = df_reward_stats["step_advantage_group"].notna()
+    padded_rows = []
+    if custom_mask.any():
+        # Custom buckets: compare steps within a semantic segment (e.g. a hop's
+        # planning stage), aligned to the segment END so segments of different
+        # lengths still line up — last step with last step, second-to-last, etc.
+        custom = df_reward_stats[custom_mask].copy()
+        custom["_row_id"] = custom.index
+        max_lengths = (
+            custom.groupby(["group_id", "step_advantage_group"])
+            .agg(max_segment_length=("step_advantage_segment_length", "max"))
+            .reset_index()
+        )
+        custom = pd.merge(custom, max_lengths, on=["group_id", "step_advantage_group"], how="left")
+        aligned_position = (
+            custom["max_segment_length"].astype(int)
+            - custom["step_advantage_segment_length"].astype(int)
+            + custom["step_advantage_local_index"].astype(int)
+        )
+        custom["advantage_bucket"] = (
+            custom["step_advantage_group"].astype(str)
+            + ":pos:"
+            + aligned_position.astype(int).astype(str)
+        )
+        df_reward_stats.loc[custom["_row_id"], "advantage_bucket"] = custom["advantage_bucket"].to_numpy()
+
+        if config.pad_step_rewards_for_advantage:
+            # Pad each short segment up to the group's max length so every aligned
+            # position has the same population; scale 0 keeps padding out of the loss.
+            segment_rows = (
+                custom.sort_values(["step_index", "step_advantage_local_index"])
+                .groupby(["group_id", "rollout_index", "step_advantage_group"], as_index=False)
+                .first()
+            )
+            for row in segment_rows.itertuples(index=False):
+                segment_length = int(row.step_advantage_segment_length)
+                max_segment_length = int(row.max_segment_length)
+                pad_value = (
+                    float(row.step_advantage_padding_value)
+                    if pd.notna(row.step_advantage_padding_value)
+                    else float(row.step_reward)
+                )
+                for padded_position in range(max_segment_length - segment_length):
+                    padded_rows.append(
+                        {
+                            "group_id": row.group_id,
+                            "rollout_index": row.rollout_index,
+                            "step_index": -1,
+                            "rewards": [],
+                            "step_reward": pad_value,
+                            "padding_reward": pad_value,
+                            "is_padding": True,
+                            "advantage_bucket": f"{row.step_advantage_group}:pos:{padded_position}",
+                            "step_advantage_group": row.step_advantage_group,
+                            "step_advantage_local_index": None,
+                            "step_advantage_segment_length": segment_length,
+                            "step_advantage_padding_value": pad_value,
+                            "advantage_scale": 0.0,
+                        }
+                    )
+
+    default_mask = df_reward_stats["step_advantage_group"].isna()
+    if config.pad_step_rewards_for_advantage and default_mask.any():
+        # Same idea for globally-indexed steps: pad each rollout up to the group's
+        # max step so every "step:{i}" bucket sees every rollout.
+        max_step_by_group = df_stats.groupby("group_id")["step_index"].max().to_dict()
+        last_steps = (
+            df_reward_stats[default_mask]
+            .sort_values("step_index")
+            .groupby(["group_id", "rollout_index"], as_index=False)
+            .tail(1)
+        )
+        for row in last_steps.itertuples(index=False):
+            max_step = int(max_step_by_group[row.group_id])
+            last_step = int(row.step_index)
+            pad_value = getattr(row, "padding_reward", row.step_reward)
+            for padded_step in range(last_step + 1, max_step + 1):
+                padded_rows.append(
+                    {
+                        "group_id": row.group_id,
+                        "rollout_index": row.rollout_index,
+                        "step_index": padded_step,
+                        "rewards": [],
+                        "step_reward": pad_value,
+                        "padding_reward": pad_value,
+                        "is_padding": True,
+                        "advantage_bucket": f"step:{padded_step}",
+                        "step_advantage_group": None,
+                        "step_advantage_local_index": None,
+                        "step_advantage_segment_length": None,
+                        "step_advantage_padding_value": None,
+                        "advantage_scale": 0.0,
+                    }
+                )
+    if padded_rows:
+        df_reward_stats = pd.concat([df_reward_stats, pd.DataFrame(padded_rows)], ignore_index=True)
+
+    # Baseline stats per bucket (padding rows included so the mean is stable).
     df_grouped = (
-        df_stats.groupby("group_id")
+        df_reward_stats.groupby(["group_id", "advantage_bucket"])
         .agg(
-            rollout_reward_sum=("rollout_reward", "sum"),
-            rollout_reward_count=("rollout_reward", "count"),
-            rollout_reward_std=("rollout_reward", "std"),
-            group_tokens=("num_tokens", "mean"),
+            step_reward_sum=("step_reward", "sum"),
+            step_reward_count=("step_reward", "count"),
+            step_reward_std=("step_reward", "std"),
         )
         .reset_index()
     )
+    assert df_group_tokens.columns.tolist() == ["group_id", "group_tokens"]
     assert df_grouped.columns.tolist() == [
         "group_id",
-        "rollout_reward_sum",
-        "rollout_reward_count",
-        "rollout_reward_std",
-        "group_tokens",
+        "advantage_bucket",
+        "step_reward_sum",
+        "step_reward_count",
+        "step_reward_std",
     ]
-
-    # Step 2: calculate advantages for each sample
+    # Only real (non-padding) rows receive advantages; padding only shaped the baseline.
+    df_real_reward_stats = df_reward_stats[~df_reward_stats["is_padding"]].copy()
     df_advantages = pd.merge(
-        df_init[["group_id", "rollout_index", "step_index", "rewards"]],
+        df_real_reward_stats[
+            ["group_id", "rollout_index", "step_index", "rewards", "step_reward", "advantage_bucket", "advantage_scale"]
+        ],
         df_grouped,
-        on="group_id",
+        on=["group_id", "advantage_bucket"],
         how="left"
     )
-    assert len(df_advantages) == len(df_init)
+    df_advantages = pd.merge(df_advantages, df_group_tokens, on="group_id", how="left")
+
     def calculate_advantages(row):
         rewards = row["rewards"]
-        group_sum = row["rollout_reward_sum"]
-        group_count = row["rollout_reward_count"]
-        current_reward = rewards[0]
+        group_sum = row["step_reward_sum"]
+        group_count = row["step_reward_count"]
+        current_reward = row["step_reward"]
+        # Leave-one-out baseline within the bucket.
         if group_count > 1:
             loo_mean = (group_sum - current_reward) / (group_count - 1)
         else:
             loo_mean = current_reward
-        std = row["rollout_reward_std"]
+        std = row["step_reward_std"]
         if config.divide_advantage_by_std:
-            return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
-        return [(r - loo_mean) for r in rewards]
+            advantages = [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
+        else:
+            advantages = [(r - loo_mean) for r in rewards]
+        scale = float(row.get("advantage_scale", 1.0))
+        return [advantage * scale for advantage in advantages]
 
     df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
-    df_advantages = df_advantages.drop(
-        columns=["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
+    return df_advantages.drop(
+        columns=[
+            "rewards",
+            "step_reward",
+            "advantage_bucket",
+            "advantage_scale",
+            "step_reward_sum",
+            "step_reward_count",
+            "step_reward_std",
+        ]
     )
-    assert df_advantages.columns.tolist() == [
-        "group_id",
-        "rollout_index",
-        "step_index",
-        "group_tokens",
-        "advantages",
-    ]
+
+
+def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
+    """Populate RL columns (advantages, overflow, num_labels) using a leave-one-out baseline."""
+    df_init = pd.DataFrame(dataset)
+    assert isinstance(df_init, pd.DataFrame)
+
+    # Step 1: per-(group, rollout, step) stats shared by both advantage modes.
+    df_stats = df_init[["group_id", "rollout_index", "step_index", "rewards"]].copy()
+    df_stats["num_tokens"] = df_init["input_ids"].apply(len)
+
+    # Step 2: advantages. step_reward_advantages is a rare opt-in (privacy_hopqa)
+    # that rewards each step; that logic lives in its own helper so the default
+    # one-reward-per-rollout path below stays close to upstream.
+    if config.step_reward_advantages:
+        df_stats["step_reward"] = df_stats["rewards"].apply(lambda x: x[0])
+        # Optional per-rollout padding override, read from rollout metadata
+        # (privacy_hopqa sets metadata["padding_reward"] to the max prefix reward so
+        # error-terminated rollouts pad to last achieved progress instead of the
+        # zero'd error step). Falls back to step_reward when absent.
+        if "metadata" in df_init.columns:
+            padding_reward = df_init["metadata"].apply(
+                lambda value: value.get("padding_reward") if isinstance(value, dict) else None
+            )
+            df_stats["padding_reward"] = padding_reward.fillna(df_stats["step_reward"])
+        else:
+            df_stats["padding_reward"] = df_stats["step_reward"]
+        df_advantages = _compute_step_reward_advantages(df_init, df_stats, config)
+    else:
+        # One reward per rollout (all steps share it); LOO baseline over the group.
+        df_stats["rollout_reward"] = df_stats["rewards"].apply(lambda x: x[0])
+        assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1
+        df_rollout_stats = df_stats[df_stats["step_index"] == 0].drop(columns=["step_index"])
+        df_grouped = (
+            df_rollout_stats.groupby("group_id")
+            .agg(
+                rollout_reward_sum=("rollout_reward", "sum"),
+                rollout_reward_count=("rollout_reward", "count"),
+                rollout_reward_std=("rollout_reward", "std"),
+                group_tokens=("num_tokens", "mean"),
+            )
+            .reset_index()
+        )
+        df_advantages = pd.merge(
+            df_init[["group_id", "rollout_index", "step_index", "rewards"]],
+            df_grouped,
+            on="group_id",
+            how="left"
+        )
+        assert len(df_advantages) == len(df_init)
+
+        def calculate_advantages(row):
+            rewards = row["rewards"]
+            group_sum = row["rollout_reward_sum"]
+            group_count = row["rollout_reward_count"]
+            current_reward = rewards[0]
+            if group_count > 1:
+                loo_mean = (group_sum - current_reward) / (group_count - 1)
+            else:
+                loo_mean = current_reward
+            std = row["rollout_reward_std"]
+            if config.divide_advantage_by_std:
+                return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
+            return [(r - loo_mean) for r in rewards]
+
+        df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
+        df_advantages = df_advantages.drop(
+            columns=["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
+        )
+    assert len(df_advantages) == len(df_init)
 
     # Step 3: bring advantages and group level stats back to the main df
-    df = df_init.drop(columns=["advantages", "group_tokens"])
+    drop_columns = [column for column in ["advantages", "group_tokens"] if column in df_init.columns]
+    df = df_init.drop(columns=drop_columns)
     df = pd.merge(df, df_advantages, on=["group_id", "rollout_index", "step_index"], how="left")
     # Debug print lengths of all dataframes
     assert len(df) == len(df_init)
@@ -538,17 +780,29 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df["num_labels"] = df.apply(
         lambda row: [sum(1 for label in row["labels"] if label != -100)] * len(row["input_ids"]), axis=1
     )
+    loss_weight_scale = 1.0
+    if config.batch_size_normalization == "rollouts":
+        # A rollout attempt may produce several trainable traces. Scaling by
+        # trainable_texts / rollouts makes each attempt count once in the loss.
+        rollout_count = len(df[["group_id", "rollout_index"]].drop_duplicates())
+        if rollout_count > 0:
+            loss_weight_scale = len(df) / rollout_count
+    elif config.batch_size_normalization != "training_texts":
+        raise ValueError(f"unknown RL batch_size_normalization: {config.batch_size_normalization}")
+    df["loss_weight_scale"] = df["input_ids"].apply(lambda input_ids: [loss_weight_scale] * len(input_ids))
 
     # Step 5: move the results back to the dataset
     advantages_list = df["advantages"].tolist()
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()
     num_labels_list = df["num_labels"].tolist()
+    loss_weight_scale_list = df["loss_weight_scale"].tolist()
     for i, entry in enumerate(dataset):
         entry["advantages"] = advantages_list[i]
         entry["group_tokens"] = group_tokens_list[i]
         entry["overflow"] = overflow_list[i]
         entry["num_labels"] = num_labels_list[i]
+        entry["loss_weight_scale"] = loss_weight_scale_list[i]
     return dataset
 
 
@@ -573,4 +827,5 @@ def prepare_rl_fields(
     encoding["overflow"] = [0] * len(encoding["labels"])  # place holder
     encoding["group_tokens"] = [0] * len(encoding["labels"])  # place holder
     encoding["num_labels"] = [1 if label != -100 else 0 for label in encoding["labels"]]  # count only output tokens
+    encoding["loss_weight_scale"] = [1.0] * len(encoding["labels"])  # place holder
     return encoding
