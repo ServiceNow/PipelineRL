@@ -1,0 +1,172 @@
+# Hint-conditioned RL on MiniWoB — arm T_A2: hint mix {good, none, distractor}.
+#
+# Variant A of plans_rl/research/hint_conditioned_rl: train Qwen2.5-7B (Genny agent) with
+# GRPO/GSPO on MiniWoB rollouts whose prompt carries a pre-mined hint. Three cubes = the
+# three hint conditions; a GRPO group is `attempts` rollouts of ONE (cube, task), so groups
+# never mix conditions. The distractor cube (a real hint for the WRONG task) teaches
+# "a hint is optional evidence" — the regression-killer. Reward = task success from
+# the cube's evaluate(). Hints: conf/hint_banks/miniwob_7b_r8.json (mined by the frozen
+# JefHinter 7B miner from the 8-repeat eval run; see the research thread).
+#
+# REQUIREMENTS (cluster):
+#   - cube-harness checked out at branch `oo/jefhinter-workarena` (miniwob port=0 free-port
+#     fix; each Ray worker self-hosts its own MiniWob http server) + `pip install -e
+#     cube-harness/cubes/miniwob` into the PipelineRL venv + `playwright install chromium`.
+#   - Browsers run on CPU in the Ray workers (cube_workers below is sized for that).
+#
+# Launch:
+#   python -m pipelinerl.launch --config-name=cube_miniwob_hint_ta2 output_dir=results/hint_rl/ta2
+#
+# Sibling arms: cube_miniwob_hint_b1 (no hints), cube_miniwob_hint_ta1 ({good, none}).
+# All three share model/finetune/llm blocks — matched compute via max_train_steps.
+defaults:
+  - base
+  - override rewards: success_and_format   # inert for cube_rl (reward comes from task.evaluate())
+  - _self_
+
+output_dir: results/cube_miniwob_hint_ta2/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /mnt/llmd/base_models/Qwen2.5-7B-Instruct
+litellm_logging_level: info
+ray_debug: 0
+ray_local_mode: false
+
+# Held-out on-the-fly eval: T_eval tasks, NO hints (lift itself is measured post-hoc by the
+# frozen JefHinter harness). version = cumulative samples; with grad_accum 1024 this is ~every
+# 16 optimizer steps.
+eval_every_n_versions: 16384
+
+wandb:
+  wandb_project_name: jeffhinter
+  wandb_group: hint-rl-7b
+  tags: [training, ta2]
+
+actor:
+  launcher: ray
+  ray_num_cpus: null
+  cube_workers_num_cpus: 1.0
+  cube_eval_workers_fraction: 0.25
+  cube_workers: 32          # each rollout runs a headless Chromium — far heavier than math
+  llm_max_rollouts: 32
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+
+llm:
+  parameters:
+    max_tokens: 2048
+    max_completion_tokens: 2048   # per-turn budget; web-agent turns are short
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 2048
+    max_completion_tokens: 2048
+    temperature: 0.7              # matches the frozen eval-harness protocol
+    top_p: 0.95
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 32000
+    served_model_name: Qwen2.5-7B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+finetune:
+  seq_length: 32000
+  seq_parallel: 8
+  gradient_accumulation_passes: 1024
+  attempts: 8                     # GRPO group size: 8 rollouts of the same (cube, task, hint)
+  max_train_steps: 1000           # fixed run length -> matched compute across arms
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 8
+  shared_memory_entry_size: 1000000000
+
+cube_params:
+  resource_guard:
+    actor_memory_gb: 3.0          # Chromium per concurrent rollout
+    memory_overhead_gb: 8.0
+    memory_usage_threshold: 0.90
+  seed: ${seed}
+  cubes:
+    # ---- condition: GOOD (the task's own mined hint) -------------------------------
+    - id: miniwob_train_good
+      split: train
+      benchmark: &miniwob_train_benchmark
+        _target_: pipelinerl.cube_rl.hint_bank.make_miniwob_benchmark
+        split: train
+        port: 0                   # auto free port per Ray worker
+      agent: &genny_agent_base
+        _target_: cube_harness.agents.genny.GennyConfig
+        llm_config:
+          _target_: cube_harness.llm.RoutedLLMConfig
+          model_name: ${vllm_config.vllm_kwargs.served_model_name}
+          tokenizer_name: ${model_path}
+          max_model_len: ${vllm_config.vllm_kwargs.max_model_len}
+          timeout: 600.0
+          num_retries: 4
+          extra_body:
+            return_token_ids: true
+        # Prompt scaffold IDENTICAL to the frozen JefHinter eval harness
+        # (cube_harness.jefhinter.build_genny_agent) so trained policies stay
+        # protocol-matched to the eval instrument.
+        system_prompt: >-
+          You are an expert web agent operating a real browser through an accessibility
+          tree. Solve the user's task with the fewest, most deliberate actions. Read the
+          observation carefully before acting; prefer precise element interactions over
+          guessing. When a hint is provided, follow it.
+        goal_template: |-
+          {{task}}
+
+          Suggested approach:
+          1. Explore: inspect the environment — read relevant files, run diagnostic commands, or reproduce the issue before making changes.
+          2. Act: execute the minimal steps needed to complete the task.
+          3. Verify: confirm the result meets the requirement. If it does not, make a focused adjustment and try again.
+        flat_history: false
+        enable_summarize: true    # rolling summaries -> bounded context for web obs
+        max_obs_chars: 40000
+        max_format_errors: 3
+        budget:
+          _target_: cube_harness.agents.genny.BudgetConfig
+          max_actions: 10
+          cost_limit: 5.0
+        task_hints:
+          _target_: pipelinerl.cube_rl.hint_bank.load_hint_map
+          bank_path: ${hydra:runtime.cwd}/conf/hint_banks/miniwob_7b_r8.json
+          condition: good
+          split: train
+    # ---- condition: NONE (no hint) ---------------------------------------------------
+    - id: miniwob_train_none
+      split: train
+      benchmark: *miniwob_train_benchmark
+      agent:
+        <<: *genny_agent_base
+        task_hints: {}
+    # ---- condition: DISTRACTOR (a real hint mined for a DIFFERENT task) ---------------
+    - id: miniwob_train_distractor
+      split: train
+      benchmark: *miniwob_train_benchmark
+      agent:
+        <<: *genny_agent_base
+        task_hints:
+          _target_: pipelinerl.cube_rl.hint_bank.load_hint_map
+          bank_path: ${hydra:runtime.cwd}/conf/hint_banks/miniwob_7b_r8.json
+          condition: distractor
+          split: train
+    # ---- held-out eval: T_eval tasks, no hints ----------------------------------------
+    - id: miniwob_eval_nohint
+      split: test
+      benchmark:
+        _target_: pipelinerl.cube_rl.hint_bank.make_miniwob_benchmark
+        split: eval
+        port: 0
+      agent:
+        <<: *genny_agent_base
+        task_hints: {}
