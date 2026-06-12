@@ -1,12 +1,12 @@
 # Hint-conditioned RL on MiniWoB — arm T_A1: hint mix {good, none} (no distractor).
 #
-# Variant A of plans_rl/research/hint_conditioned_rl: train Qwen2.5-7B (Genny agent) with
+# Variant A of plans_rl/research/hint_conditioned_rl: train Qwen2.5-3B (Genny agent; learner locked Exp 0.7, split v2) with
 # GRPO/GSPO on MiniWoB rollouts whose prompt carries a pre-mined hint. Three cubes = the
 # three hint conditions; a GRPO group is `attempts` rollouts of ONE (cube, task), so groups
 # never mix conditions. The distractor cube (a real hint for the WRONG task) teaches
 # "a hint is optional evidence" — the regression-killer. Reward = task success from
-# the cube's evaluate(). Hints: conf/hint_banks/miniwob_7b_r8.json (mined by the frozen
-# JefHinter 7B miner from the 8-repeat eval run; see the research thread).
+# the cube's evaluate(). Hints: conf/hint_banks/miniwob_3b_v2.json (mined by the frozen
+# JefHinter 3B-self miner offline from the task-screen trajectories; see the research thread).
 #
 # REQUIREMENTS (cluster):
 #   - cube-harness checked out at branch `oo/jefhinter-workarena` (miniwob port=0 free-port
@@ -25,7 +25,7 @@ defaults:
   - _self_
 
 output_dir: results/cube_miniwob_hint_ta1/${now:%Y-%m-%d}/${now:%H-%M-%S}
-model_path: /mnt/llmd/base_models/Qwen2.5-7B-Instruct
+model_path: /mnt/checkpoints/pretrained_models/Qwen2.5-3B-Instruct
 litellm_logging_level: info
 ray_debug: 0
 ray_local_mode: false
@@ -37,7 +37,7 @@ eval_every_n_versions: 16384
 
 wandb:
   wandb_project_name: jeffhinter
-  wandb_group: hint-rl-7b
+  wandb_group: hint-rl-3b
   tags: [training, ta1]
 
 actor:
@@ -45,8 +45,8 @@ actor:
   ray_num_cpus: null
   cube_workers_num_cpus: 1.0
   cube_eval_workers_fraction: 0.25
-  cube_workers: 32          # each rollout runs a headless Chromium — far heavier than math
-  llm_max_rollouts: 32
+  cube_workers: 40          # each rollout runs a headless Chromium — far heavier than math
+  llm_max_rollouts: 40
   ray_worker_log_enabled: true
   ray_worker_log_path: null
   ray_worker_log_level: WARNING
@@ -68,7 +68,7 @@ test_llm:
 vllm_config:
   vllm_kwargs:
     max_model_len: 32000
-    served_model_name: Qwen2.5-7B-Instruct
+    served_model_name: Qwen2.5-3B-Instruct
     enable-auto-tool-choice: ""
     tool-call-parser: rl_tool
     tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
@@ -139,7 +139,7 @@ cube_params:
           cost_limit: 5.0
         task_hints:
           _target_: pipelinerl.cube_rl.hint_bank.load_hint_map
-          bank_path: ${hydra:runtime.cwd}/conf/hint_banks/miniwob_7b_r8.json
+          bank_path: ${hydra:runtime.cwd}/conf/hint_banks/miniwob_3b_v2.json
           condition: good
           split: train
     # ---- condition: NONE (no hint) ---------------------------------------------------
