@@ -75,7 +75,7 @@ vllm_config:
 
 finetune:
   seq_length: 32000
-  seq_parallel: 8
+  seq_parallel: 4   # single-node 8-GPU world: 4 finetune GPUs (math config runs multi-node with 8)
   gradient_accumulation_passes: 1024
   attempts: 8                     # GRPO group size: 8 rollouts of the same (cube, task, hint)
   max_train_steps: 1000           # fixed run length -> matched compute across arms

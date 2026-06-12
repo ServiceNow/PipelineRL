@@ -34,15 +34,18 @@ class CubeRayWorkerLogCollector:
         self._file = self._log_path.open("a", buffering=1, encoding="utf-8")
 
     def write(self, event: dict[str, Any]) -> None:
-        timestamp = datetime.fromtimestamp(float(event["timestamp"])).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
-        message = str(event["message"]).replace("\n", " | ")
-        context_parts = [f"actor={event['actor']}", f"entry_id={event['entry_id']}"]
+        # Tolerate events missing context keys — a KeyError here kills the collector task
+        # and silently swallows every worker log line (incl. the tracebacks that explain
+        # empty rollout results).
+        timestamp = datetime.fromtimestamp(float(event.get("timestamp", 0.0))).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        message = str(event.get("message", "")).replace("\n", " | ")
+        context_parts = [f"actor={event.get('actor', '?')}", f"entry_id={event.get('entry_id', '?')}"]
         if event.get("task_id"):
             context_parts.append(f"task_id={event['task_id']}")
         if event.get("rollout_id"):
             context_parts.append(f"rollout_id={event['rollout_id']}")
         line = (
-            f"[ray_worker]: {timestamp} - {event['logger']} - {event['level']} - "
+            f"[ray_worker]: {timestamp} - {event.get('logger', '?')} - {event.get('level', '?')} - "
             f"{message} ({' '.join(context_parts)})"
         )
         exception = event.get("exception")
