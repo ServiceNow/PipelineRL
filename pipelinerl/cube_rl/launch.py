@@ -47,6 +47,7 @@ class PendingRollout:
     llm_index: int
     worker_index: int
     model_version: int
+    hint_version: int | None = None
 
 
 def _calculate_train_steps(finetune_cfg: DictConfig, interrupt_train_steps: int) -> int:
@@ -148,6 +149,7 @@ def _launch_cube_workers(
     test_llm: dict[str, Any] | None = None,
     llm_router: Any | None = None,
     ray_worker_log_collector: Any | None = None,
+    hint_refresh_actor: Any | None = None,
 ) -> list[Any]:
     if instances < 1:
         raise ValueError("cube worker instance count must be >= 1")
@@ -166,6 +168,7 @@ def _launch_cube_workers(
             test_llm=test_llm,
             llm_router=llm_router,
             ray_worker_log_collector=ray_worker_log_collector,
+            hint_refresh_actor=hint_refresh_actor,
         )
         workers.append(worker)
 
@@ -282,6 +285,7 @@ class CubeActorLoop:
         scheduler_name: str,
         is_training: bool,
         vllm_router: Any | None = None,
+        hint_refresh_actor: Any | None = None,
     ) -> None:
         self.cfg = cfg
         self.llms = llms
@@ -292,6 +296,7 @@ class CubeActorLoop:
         self.scheduler_name = scheduler_name
         self.is_training = is_training
         self.vllm_router = vllm_router
+        self.hint_refresh_actor = hint_refresh_actor
         self.debug_mode = bool(cfg.debug.mode)
         self.is_scheduling_paused = False
 
@@ -333,7 +338,7 @@ class CubeActorLoop:
         self._tasks: list[CubeTaskRef] = []
         self._expected_groups = -1
         self._pending: dict[Any, PendingRollout] = {}
-        self._retry_rollouts: deque[tuple[int, CubeTaskRef, int]] = deque()
+        self._retry_rollouts: deque[tuple[int, CubeTaskRef, int, int | None]] = deque()
         self._active_rollouts: list[int] = [0] * len(self.llms)
         self._active_rollouts_by_worker: list[int] = [0] * len(self.cube_workers)
         self._current_cube_by_worker: list[str | None] = [None] * len(self.cube_workers)
@@ -345,6 +350,7 @@ class CubeActorLoop:
         self._group_id = -1
         self._group_rollout_index = self.attempts
         self._current_task: CubeTaskRef | None = None
+        self._current_hint_version: int | None = None
         self._next_task_index = 0
         self._loop_start_time = 0.0
         self._last_logged = 0.0
@@ -639,7 +645,25 @@ class CubeActorLoop:
         self.stats_writer.write(stats)
         self.init_stats()
 
-    def _submit_one_rollout(self, *, group_id: int, task: CubeTaskRef, rollout_index: int) -> bool:
+    def _fetch_hint_version(self) -> int | None:
+        """Current hint-map version, pinned once per GRPO group so all `attempts` rollouts
+        of the group share the same hints (the worker fetches the map for exactly this
+        version). None (no actor / fetch failure) -> workers fall back to a TTL cache."""
+        if self.hint_refresh_actor is None:
+            return None
+        try:
+            return int(ray.get(self.hint_refresh_actor.get_version.remote(), timeout=10.0))
+        except Exception:
+            logger.warning(
+                "%s: failed to fetch hint version; workers fall back to TTL-cached hints",
+                self.scheduler_name,
+                exc_info=True,
+            )
+            return None
+
+    def _submit_one_rollout(
+        self, *, group_id: int, task: CubeTaskRef, rollout_index: int, hint_version: int | None = None
+    ) -> bool:
         worker_indices = self._allowed_worker_indices_or_all()
         if sum(self._active_rollouts_by_worker[idx] for idx in worker_indices) >= self._max_pending_for_allowed_workers():
             return False
@@ -655,7 +679,11 @@ class CubeActorLoop:
             f"{task.cube_id}:{task.task_id}"
         )
         ref = worker.rollout.remote(
-            cube_id=task.cube_id, task_id=task.task_id, rollout_key=rollout_key, is_training=self.is_training
+            cube_id=task.cube_id,
+            task_id=task.task_id,
+            rollout_key=rollout_key,
+            is_training=self.is_training,
+            hint_version=hint_version,
         )
         self._pending[ref] = PendingRollout(
             group_id=group_id,
@@ -664,6 +692,7 @@ class CubeActorLoop:
             llm_index=next_llm,
             worker_index=worker_index,
             model_version=model_version,
+            hint_version=hint_version,
         )
         self._active_rollouts[next_llm] += 1
         self._active_rollouts_by_worker[worker_index] += 1
@@ -793,11 +822,12 @@ class CubeActorLoop:
         
         while len(self._pending) < self._max_pending_for_allowed_workers():
             if self._retry_rollouts:
-                group_id, task, rollout_index = self._retry_rollouts[0]
+                group_id, task, rollout_index, hint_version = self._retry_rollouts[0]
                 if not self._submit_one_rollout(
                     group_id=group_id,
                     task=task,
                     rollout_index=rollout_index,
+                    hint_version=hint_version,
                 ):
                     break
                 self._retry_rollouts.popleft()
@@ -812,6 +842,8 @@ class CubeActorLoop:
                         break
                     self._group_id += 1
                     self._current_task = random.choice(self._tasks)
+                    # Pin the hint version once per group: all `attempts` rollouts share it.
+                    self._current_hint_version = self._fetch_hint_version()
                     self._group_rollouts[self._group_id] = []
                     self._group_rollout_index = 0
                     self._run_submitted_groups += 1
@@ -821,6 +853,7 @@ class CubeActorLoop:
                     group_id=self._group_id,
                     task=self._current_task,
                     rollout_index=self._group_rollout_index,
+                    hint_version=self._current_hint_version,
                 ):
                     break
                 self._group_rollout_index += 1
@@ -889,7 +922,7 @@ class CubeActorLoop:
                     info.rollout_index,
                     info.model_version,
                 )
-                self._retry_rollouts.append((info.group_id, info.task, info.rollout_index))
+                self._retry_rollouts.append((info.group_id, info.task, info.rollout_index, info.hint_version))
                 continue
 
             for step_index, sample in enumerate(rollout_result.training_texts):
@@ -1048,6 +1081,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     )
     cube_workers: list[Any] = []
     vllm_router = None
+    hint_refresh_actor = None
     try:
         trainer_state = TrainerState(exp_path)
         if cfg.debug.mode:
@@ -1068,6 +1102,22 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         ray_vllm_router = RayVLLMRouter(vllm_router)
         logger.info("Started cube vLLM router: %s", ray.get(vllm_router.snapshot.remote()))
 
+        # In-training hint re-mining (Exp 1.5 / v2): one actor holds rolling transcript
+        # buffers + versioned hint maps; refresh is triggered below on the same trainer
+        # version cadence pattern as evals. Disabled (the default) leaves all existing
+        # configs unchanged.
+        hint_refresh_cfg = cfg.cube_params.get("hint_refresh", None) if cfg.get("cube_params") else None
+        if hint_refresh_cfg is not None and bool(hint_refresh_cfg.get("enabled", False)):
+            from pipelinerl.cube_rl.hint_refresh import HintRefreshActor
+
+            hint_refresh_actor = HintRefreshActor.remote(
+                llm_info=_build_llm_kwargs(train_llms[0]),
+                refresh_min_episodes=int(hint_refresh_cfg.get("min_episodes", 4)),
+                max_per_task=int(hint_refresh_cfg.get("max_buffer_per_task", 16)),
+                seed=int(getattr(cfg.cube_params, "seed", cfg.seed)),
+            )
+            logger.info("Started hint refresh actor: %s", hint_refresh_cfg)
+
         cube_workers = _launch_cube_workers(
             cfg,
             instances=worker_instances,
@@ -1076,6 +1126,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             test_llm=_build_llm_kwargs(test_llms[0]),
             llm_router=ray_vllm_router,
             ray_worker_log_collector=ray_worker_log_collector,
+            hint_refresh_actor=hint_refresh_actor,
         )
         health_timeout = float(getattr(cfg.actor, "cube_health_timeout", 600.0))
         _wait_for_cube_workers(cube_workers, timeout_s=health_timeout)
@@ -1128,6 +1179,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 scheduler_name="cube_train_scheduler",
                 is_training=True,
                 vllm_router=vllm_router,
+                hint_refresh_actor=hint_refresh_actor,
             )
             test_loop = CubeActorLoop(
                 cfg=cfg,
@@ -1145,6 +1197,10 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             current_eval = -1
             test_loop_active = False
             eval_every_n_versions = int(getattr(cfg, "eval_every_n_versions", 0) or 0)
+            last_hint_refresh = -1
+            hint_refresh_every_n_versions = (
+                int(hint_refresh_cfg.get("every_n_versions", 0) or 0) if hint_refresh_actor is not None else 0
+            )
             eval_test_worker_fraction = float(getattr(cfg.actor, "cube_eval_workers_fraction", 1.0))
             eval_test_worker_fraction = min(1.0, max(0.0, eval_test_worker_fraction))
             all_worker_indices = list(range(len(cube_workers)))
@@ -1165,6 +1221,19 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
 
             train_loop.start(tasks=train_tasks)
             while True:
+                if hint_refresh_every_n_versions > 0:
+                    next_hint_refresh = (
+                        int(trainer_state.propagated_weight_version or 0)
+                        if last_hint_refresh == -1
+                        else last_hint_refresh + hint_refresh_every_n_versions
+                    )
+                    if int(trainer_state.propagated_weight_version or 0) >= next_hint_refresh:
+                        # Fire-and-forget: the threaded actor keeps serving report/get_hints
+                        # while it mines; new groups pick up the bumped version when it lands.
+                        logger.info("Triggering hint refresh at model version %s", next_hint_refresh)
+                        hint_refresh_actor.refresh.remote()
+                        last_hint_refresh = next_hint_refresh
+
                 next_regular_eval = (
                     int(trainer_state.propagated_weight_version or 0)
                     if last_regular_eval == -1
@@ -1226,6 +1295,8 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             kill_ray_actor_best_effort(ray_worker_log_collector, logger, "Ray worker log collector")
         if vllm_router is not None:
             kill_ray_actor_best_effort(vllm_router, logger, "cube vLLM router")
+        if hint_refresh_actor is not None:
+            kill_ray_actor_best_effort(hint_refresh_actor, logger, "hint refresh actor")
         if should_shutdown_ray and ray.is_initialized():
             try:
                 ray.shutdown()

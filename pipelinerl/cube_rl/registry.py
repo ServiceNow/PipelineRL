@@ -23,6 +23,7 @@ class CubeSpec:
     benchmark_cfg: dict[str, Any]
     agent_cfg: dict[str, Any]
     task_ids: tuple[str, ...]
+    hint_condition: str | None = None
 
     def runtime_payload(self) -> dict[str, Any]:
         return {
@@ -30,6 +31,7 @@ class CubeSpec:
             "split": self.split,
             "benchmark_cfg": self.benchmark_cfg,
             "agent_cfg": self.agent_cfg,
+            "hint_condition": self.hint_condition,
         }
 
     def task_refs(self) -> list[CubeTaskRef]:
@@ -65,6 +67,20 @@ def _cube_split(cube_cfg: Any) -> str:
     if split not in {"train", "test"}:
         raise ValueError(f"Cube {_cube_id(cube_cfg)!r} has invalid split {split!r}; expected 'train' or 'test'")
     return split
+
+
+def _cube_hint_condition(cube_cfg: Any) -> str | None:
+    """Optional per-cube hint condition consumed by the in-training hint refresh."""
+    hint_condition = getattr(cube_cfg, "hint_condition", None)
+    if hint_condition is None:
+        return None
+    hint_condition = str(hint_condition)
+    if hint_condition not in {"good", "none", "distractor"}:
+        raise ValueError(
+            f"Cube {_cube_id(cube_cfg)!r} has invalid hint_condition {hint_condition!r}; "
+            "expected 'good', 'none' or 'distractor'"
+        )
+    return hint_condition
 
 
 def _metadata_dataset(benchmark_obj: Any, task_id: str) -> str:
@@ -141,6 +157,7 @@ def build_cube_registry(cfg: DictConfig) -> CubeRegistry:
                 benchmark_cfg=benchmark_cfg,
                 agent_cfg=agent_cfg,
                 task_ids=task_ids,
+                hint_condition=_cube_hint_condition(cube_cfg),
             )
         )
 

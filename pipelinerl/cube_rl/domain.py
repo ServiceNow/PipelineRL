@@ -34,6 +34,7 @@ class CubeRuntimeSpec:
     benchmark_cfg: dict[str, Any]
     agent_cfg: dict[str, Any]
     split: str
+    hint_condition: str | None = None
 
 
 def _copy_model(obj: Any) -> Any:
@@ -246,6 +247,7 @@ class CubeBenchmarkWorker:
         test_llm: dict[str, Any] | None = None,
         llm_router: Any | None = None,
         ray_worker_log_collector: Any | None = None,
+        hint_refresh_actor: Any | None = None,
     ):
         self._cube_specs = {
             str(spec["cube_id"]): CubeRuntimeSpec(
@@ -253,6 +255,7 @@ class CubeBenchmarkWorker:
                 benchmark_cfg=spec["benchmark_cfg"],
                 agent_cfg=spec["agent_cfg"],
                 split=str(spec["split"]),
+                hint_condition=spec.get("hint_condition"),
             )
             for spec in cube_specs
         }
@@ -262,6 +265,13 @@ class CubeBenchmarkWorker:
         self._test_llm = test_llm or llm
         self._llm_router = llm_router
         self._ray_worker_log_collector = ray_worker_log_collector
+        # In-training hint refresh (Exp 1.5 / v2): live hint maps fetched from the
+        # HintRefreshActor, cached per (condition, version). version=None entries (no
+        # per-group pin from the scheduler) expire after a TTL as an approximation.
+        self._hint_refresh_actor = hint_refresh_actor
+        hint_refresh_cfg = getattr(getattr(cfg, "cube_params", {}), "hint_refresh", None)
+        self._hint_cache_ttl_s = float(getattr(hint_refresh_cfg, "cache_ttl_s", 30.0) if hint_refresh_cfg else 30.0)
+        self._hint_cache: dict[tuple[str, int | None], tuple[float, int, dict[str, str]]] = {}
 
         worker_log_level = str(getattr(cfg.actor, "ray_worker_log_level", "ERROR"))
         worker_litellm_log_level = str(
@@ -390,7 +400,15 @@ class CubeBenchmarkWorker:
             len(task_by_id),
         )
 
-    def rollout(self, *, cube_id: str, task_id: str, rollout_key: str, is_training: bool = True) -> dict:
+    def rollout(
+        self,
+        *,
+        cube_id: str,
+        task_id: str,
+        rollout_key: str,
+        is_training: bool = True,
+        hint_version: int | None = None,
+    ) -> dict:
         rollout_log_context = start_worker_rollout_log_context(f"{cube_id}:{task_id}")
         try:
             if not self._ready:
@@ -400,6 +418,7 @@ class CubeBenchmarkWorker:
                 raise KeyError(f"Unknown task_id for cube {cube_id}: {task_id}")
 
             base_task = self._task_by_id[task_id]
+            spec = self._cube_specs[cube_id]
             # Test rollouts use eval_k_episodes when set (e.g. a k=1 baseline evaluated at k>1 i.i.d.);
             # train rollouts (and unset eval_k) use the training k.
             k_episodes = self._eval_k_episodes if (not is_training and self._eval_k_episodes) else self._lamer_k_episodes
@@ -411,7 +430,13 @@ class CubeBenchmarkWorker:
                 "runtime_context": self._runtime_context,
                 "container_backend": self._container_backend,
                 "k_episodes": k_episodes,
+                # Hint refresh: train-split episodes feed the miner's transcript buffers.
+                "report_hints": self._hint_refresh_actor is not None and spec.split == "train" and is_training,
             }
+            if self._hint_refresh_actor is not None and spec.hint_condition is not None:
+                version, hints = self._fetch_hints(spec.hint_condition, hint_version)
+                if version > 0:  # version 0 = no refresh yet; keep the statically seeded bank hints
+                    task["agent_config"].task_hints = dict(hints)
 
             result = self._rollout(task=_copy_model(task), rollout_key=rollout_key)
             return result.model_dump()
@@ -434,6 +459,28 @@ class CubeBenchmarkWorker:
             ).model_dump()
         finally:
             reset_worker_rollout_log_context(rollout_log_context)
+
+    def _fetch_hints(self, condition: str, hint_version: int | None) -> tuple[int, dict[str, str]]:
+        """Hint map for one condition from the HintRefreshActor, cached per (condition, version).
+
+        ``hint_version`` is the per-GRPO-group pin from the scheduler — exact-version
+        entries never expire (the actor keeps a short map history), so every rollout of
+        a group sees identical hints. ``hint_version=None`` falls back to a TTL cache.
+        """
+        key = (condition, hint_version)
+        now = time.monotonic()
+        cached = self._hint_cache.get(key)
+        if cached is not None and (hint_version is not None or now - cached[0] < self._hint_cache_ttl_s):
+            return cached[1], cached[2]
+        try:
+            version, hints = ray.get(self._hint_refresh_actor.get_hints.remote(condition, hint_version))
+        except Exception:
+            logger.warning("%s failed to fetch hints for condition %s", self._worker_name, condition, exc_info=True)
+            return (cached[1], cached[2]) if cached is not None else (0, {})
+        if len(self._hint_cache) > 64:
+            self._hint_cache.clear()
+        self._hint_cache[key] = (now, int(version), dict(hints))
+        return int(version), dict(hints)
 
     def _episode_training_texts(
         self, trajectory: Any, task: dict, episode_index: int
@@ -513,6 +560,7 @@ class CubeBenchmarkWorker:
 
     def _rollout(self, task: dict, rollout_key: str) -> RolloutResult:
         from cube_harness.agents.lamer import episodes_to_success, lamer_rollout_credit, run_multi_episode_rollout
+        from cube_harness.jefhinter import render_trajectory
 
         start = time.perf_counter()
 
@@ -551,6 +599,16 @@ class CubeBenchmarkWorker:
                 episode_rewards.append(ep_reward)
                 agent_errors.extend(ep_errors)
                 last_step_info = ep_info
+                if task.get("report_hints"):
+                    # Fire-and-forget: feed the hint miner's rolling transcript buffers.
+                    try:
+                        self._hint_refresh_actor.report.remote(
+                            str(getattr(task_config, "task_id", "")),
+                            float(ep_reward),
+                            render_trajectory(trajectory),
+                        )
+                    except Exception:
+                        logger.warning("Failed to report episode transcript for hint refresh", exc_info=True)
                 logger.info(
                     "Episode %d/%d done: reward=%s termination=%s",
                     episode_index + 1,
