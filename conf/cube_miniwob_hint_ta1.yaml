@@ -76,9 +76,10 @@ vllm_config:
 finetune:
   seq_length: 32000
   seq_parallel: 4   # single-node 8-GPU world: 4 finetune GPUs (math config runs multi-node with 8)
-  gradient_accumulation_passes: 1024
-  attempts: 8                     # GRPO group size: 8 rollouts of the same (cube, task, hint)
-  max_train_steps: 1000           # fixed run length -> matched compute across arms
+  gradient_accumulation_passes: 256   # v3: ~4x more updates (rollout-bound)
+  attempts: 8
+  num_warmup_steps: 20            # v3: short warmup (was 50; whole 6h run was warmup)
+  max_train_steps: 500            # v3: calibrated to ~12h budget
   rl:
     policy_loss: gspo
     overlong_filtering: true
