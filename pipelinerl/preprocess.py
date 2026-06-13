@@ -434,6 +434,8 @@ def run_preprocessing_loop(
     final_train_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
+    served_model_name = cfg.vllm_config.vllm_kwargs.get("served_model_name") if cfg.vllm_config.vllm_kwargs else None
+
     # Load published samples from state file
     llms = [
         TrainableLLM(
@@ -441,6 +443,7 @@ def run_preprocessing_loop(
             model_name=cfg.finetune.config_name,
             tokenizer_name=cfg.finetune.config_name,
             parameters=cfg.llm.parameters,
+            served_model_name=served_model_name,
         )
         for url in llm_urls
     ]

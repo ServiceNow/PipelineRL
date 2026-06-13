@@ -187,3 +187,5 @@ data/
 cache/
 dump.rdb
 scripts/
+results_viewer/
+Makefile

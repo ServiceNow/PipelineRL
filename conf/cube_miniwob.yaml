@@ -1,0 +1,97 @@
+defaults:
+  - base
+  - override rewards: success_and_format
+  - _self_
+
+output_dir: results/cube_math_tool/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_path: /mnt/llmd/base_models/Qwen2.5-7B-Instruct
+litellm_logging_level: info
+ray_local_mode: false
+
+actor:
+  launcher: ray
+  rollout_backend: ray
+  rollout_policy: pipelinerl.domains.cube.worker.CubeRolloutWorker
+  max_steps: 10
+  ray_num_cpus: null
+  ray_worker_num_cpus: 0.25
+  ray_workers: 128
+  ray_options: {}
+  eval:
+    ray_workers: 64
+    resource_policy: elastic_train
+    drain_to_target: true
+  llm_max_rollouts: 128
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+
+llm:
+  parameters:
+    max_tokens: 16000
+    max_completion_tokens: 16000
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: 16000
+    max_completion_tokens: 16000
+    temperature: 1.0
+    top_p: 0.95
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 32000
+    served_model_name: Qwen2.5-7B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: hermes
+
+finetune:
+  seq_length: 32000
+  seq_parallel: 8
+  gradient_accumulation_passes: 1024
+  rl:
+    policy_loss: gspo
+    overlong_filtering: true
+
+preprocess:
+  input: actor
+  output: training_data
+  n_workers: 8
+  shared_memory_entry_size: 1000000000
+
+dataset_loader: pipelinerl.domains.cube.dataset.load_datasets
+train_dataset_names:
+  - miniwob_train
+test_dataset_names:
+  # - miniwob_test
+
+# cube_params:
+#   resource_guard:
+#     actor_memory_gb: 1.25
+#     memory_overhead_gb: 8.0
+#     memory_usage_threshold: 0.90
+#   seed: ${seed}
+dataset_loader_params:
+  miniwob_train:
+    benchmark: &miniwob_benchmark
+      _type: miniwob_cube.benchmark.MiniWobBenchmarkConfig
+      port: 8010
+      tool_config:
+          _type: cube_browser_tool.bgym_tool.BgymToolConfig
+          use_html: true
+          use_axtree: false
+          use_screenshot: false
+    agent: &react_agent
+      _type: cube_harness.agents.react.ReactAgentConfig
+      llm_config:
+        _type: cube_harness.rl.llm.RolloutLLMConfig
+        model_name: ${vllm_config.vllm_kwargs.served_model_name}
+        tokenizer_name: ${model_path}
+        timeout: 3600.0
+        num_retries: 1
+      max_actions: 10
+  miniwob_test:
+    benchmark: *miniwob_benchmark
+    agent: *react_agent

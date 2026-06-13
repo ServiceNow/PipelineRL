@@ -1,5 +1,6 @@
+from dataclasses import dataclass
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict, Sequence
 import numpy as np
 
 class BaseMetrics(BaseModel):
@@ -7,6 +8,9 @@ class BaseMetrics(BaseModel):
     success: bool
     no_error: bool
     no_answer: bool
+    # Allow domain-specific metrics (e.g., num_steps, num_python_calls, penalty)
+    # to flow through RolloutResult model validation without being dropped.
+    model_config = {"extra": "allow"}
 
 
 class TrainingText(BaseModel):
@@ -65,3 +69,43 @@ class RolloutResult(BaseModel):
     dataset_name: str | None = None
     group_id: str | None = None
     domain: str | None = None
+
+class RolloutRequest(BaseModel):
+    request_id: str
+    dataset_item: dict[str, Any]
+    model_version: int
+    group_id: str | None = None
+    rollout_index: int = 0
+    seed: int | None = None
+    max_steps: int | None = None
+    affinity_key: str | None = None
+    extras: dict[str, Any] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TrainingTextSummary:
+    prompt_tokens: list[int]
+    output_tokens: list[int]
+    overflow: bool
+    num_turns: int
+
+
+def apply_rollout_reward(training_texts: Sequence[TrainingText], reward: float) -> list[TrainingText]:
+    texts = list(training_texts)
+    for training_text in texts:
+        training_text.reward = reward
+    return texts
+
+
+def rollout_has_overflow(training_texts: Sequence[TrainingText]) -> bool:
+    return any(not training_text.finished for training_text in training_texts)
+
+
+def summarize_training_texts(training_texts: Sequence[TrainingText]) -> TrainingTextSummary:
+    texts = list(training_texts)
+    return TrainingTextSummary(
+        prompt_tokens=[training_text.prompt_tokens for training_text in texts],
+        output_tokens=[training_text.output_tokens for training_text in texts],
+        overflow=rollout_has_overflow(texts),
+        num_turns=len(texts),
+    )

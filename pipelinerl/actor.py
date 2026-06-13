@@ -19,6 +19,7 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 
 import wandb
+from pipelinerl.metrics import SlidingWindowAggregator
 from pipelinerl.async_llm import RetryableAbortedCompletionError
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.domains.math.rollouts import length_penalty
@@ -57,55 +58,6 @@ class SlidingWindowData(BaseModel):
         description="Output token counts for each chunk in the window",
     )
     timestamps: list[float] = Field(default_factory=list)
-
-
-class SlidingWindowAggregator:
-    def __init__(self, window_size: int):
-        self.window_size = window_size
-        self.data = SlidingWindowData()
-
-    def update(self, prompt_tokens: list[int], output_tokens: list[int]):
-        self.data.prompt_tokens_window.append(prompt_tokens)
-        self.data.output_tokens_window.append(output_tokens)
-        self.data.timestamps.append(time.time())
-        if len(self.data.prompt_tokens_window) > self.window_size:
-            self.data.prompt_tokens_window.pop(0)
-            self.data.output_tokens_window.pop(0)
-            self.data.timestamps.pop(0)
-
-    def get_stats(self):
-        if len(self.data.prompt_tokens_window) < self.window_size:
-            return None
-
-        # 1. How many samples do we produce per second?
-        # 2. How many output tokens do we produce per second?
-        # 3. How many prompt tokens do we produce per second?
-        # 4. How many total tokens do we produce per second?
-        null_stats = {
-            "samples_per_second": 0,
-            "output_tokens_per_second": 0,
-            "prompt_tokens_per_second": 0,
-            "total_tokens_per_second": 0,
-        }
-        if not self.data.timestamps:
-            return null_stats
-
-        time_span = self.data.timestamps[-1] - self.data.timestamps[0]
-        if time_span < 1e-6:
-            return null_stats
-
-        num_samples = sum(len(tokens) for tokens in self.data.prompt_tokens_window)
-        total_output_tokens = sum(sum(tokens) for tokens in self.data.output_tokens_window)
-        total_prompt_tokens = sum(sum(tokens) for tokens in self.data.prompt_tokens_window)
-
-        return {
-            "samples_per_second": num_samples / time_span,
-            "output_tokens_per_second": total_output_tokens / time_span,
-            "prompt_tokens_per_second": total_prompt_tokens / time_span,
-            "total_tokens_per_second": (total_output_tokens + total_prompt_tokens) / time_span,
-        }
-
-
 
 def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
@@ -817,6 +769,8 @@ def run_actor_loop(cfg: DictConfig):
     else:
         actor_model_path = cfg.model_path
     
+    served_model_name = cfg.vllm_config.vllm_kwargs.get("served_model_name") if cfg.vllm_config.vllm_kwargs else None
+    
     train_llms = [
         TrainableLLM(
             base_url=url,
@@ -824,6 +778,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.llm.parameters,
             collect_logprobs=True,
+            served_model_name=served_model_name,
             chat_template_kwargs=cfg.llm.get("chat_template_kwargs", {}),
         )
         for url in llm_urls
@@ -835,6 +790,7 @@ def run_actor_loop(cfg: DictConfig):
             tokenizer_name=str(actor_model_path),
             parameters=cfg.test_llm.parameters,
             collect_logprobs=True,
+            served_model_name=served_model_name,
             chat_template_kwargs=cfg.test_llm.get("chat_template_kwargs", {}),
         )
         for url in llm_urls
