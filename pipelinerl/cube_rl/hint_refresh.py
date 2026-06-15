@@ -163,8 +163,10 @@ class HintRefreshState:
                         del self._history[min(self._history)]
                 # Observability: log each newly mined/updated hint's text + whether the
                 # literal heuristic still flags it (should be False when reject_literals is on).
+                # WARNING level on purpose: this runs inside a Ray actor whose root logger
+                # defaults to WARNING, so INFO here would be silently dropped.
                 for _t, _h in changed.items():
-                    logger.info("MINED_HINT task=%s literal=%s text=%r", _t, hint_has_literal(_h), _h)
+                    logger.warning("MINED_HINT task=%s literal=%s text=%r", _t, hint_has_literal(_h), _h)
                 logger.info(
                     "hint refresh: %d tasks eligible, %d hints mined, %d changed -> version %d (%d good hints)",
                     len(items),
