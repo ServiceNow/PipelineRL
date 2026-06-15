@@ -1115,6 +1115,10 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 refresh_min_episodes=int(hint_refresh_cfg.get("min_episodes", 4)),
                 max_per_task=int(hint_refresh_cfg.get("max_buffer_per_task", 16)),
                 seed=int(getattr(cfg.cube_params, "seed", cfg.seed)),
+                # Instance-general re-miner (default off -> unchanged): the literal-forbidding
+                # prompt + heuristic literal rejection (cube_harness.jefhinter).
+                general_prompt=bool(hint_refresh_cfg.get("general_prompt", False)),
+                reject_literals=bool(hint_refresh_cfg.get("reject_literals", False)),
             )
             logger.info("Started hint refresh actor: %s", hint_refresh_cfg)
 

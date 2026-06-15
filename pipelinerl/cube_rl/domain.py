@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +43,26 @@ def _copy_model(obj: Any) -> Any:
     if hasattr(obj, "model_copy"):
         return obj.model_copy(deep=True)
     return obj
+
+
+# rollout_key is built in cube_rl.launch._submit_one_rollout as
+#   "{scheduler}:v{model_version}:g{group_id}:r{rollout_index}:{cube_id}:{task_id}".
+# Dropping the ":r{rollout_index}" segment yields a key shared by all `attempts` of one
+# GRPO group (same scheduler/version/group/cube/task), so every attempt hashes to one seed
+# while different groups (different group_id, and different model_version each loop) differ.
+_ROLLOUT_INDEX_RE = re.compile(r":r\d+:")
+
+
+def _group_seed_from_rollout_key(rollout_key: str) -> int:
+    """Stable non-negative 31-bit seed shared across a GRPO group's attempts.
+
+    Uses a hashlib digest of the group key (forbidden: time/random) so the value is
+    deterministic and identical for every attempt of the group. 31 bits keeps it a safe
+    positive int for ``Math.seedrandom`` and JSON.
+    """
+    group_key = _ROLLOUT_INDEX_RE.sub(":", rollout_key, count=1)
+    digest = hashlib.sha256(group_key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
 
 
 def set_agent_llm_config(agent_config: Any, llm: dict) -> None:
@@ -295,6 +317,12 @@ class CubeBenchmarkWorker:
         self._runtime_context = None
         self._container_backend = None
         self._llm_tokenizer = None
+
+        # Multi-instance MiniWoB: when true, the per-rollout path overrides the deep-copied
+        # task_config.seed with a stable per-GRPO-group seed (all `attempts` of a group share
+        # one seed -> one instance; different groups -> different instances). Default False
+        # leaves task_config.seed at its cube default (42), reproducing the historical pin.
+        self._vary_instance_seed = bool(getattr(cfg.actor, "vary_instance_seed", False))
 
         ## Optional config for extra reward
         self._buffer_tokens = int(getattr(cfg.actor, "buffer_tokens", 0))
@@ -566,6 +594,12 @@ class CubeBenchmarkWorker:
 
         task_config = task["task_config"]
         agent_config = task["agent_config"]
+        # Multi-instance: override the deep-copied task_config seed with a per-GRPO-group
+        # seed so all `attempts` of a group share one instance, but groups differ. Only when
+        # the flag is on AND the cube's task_config exposes a `seed` (e.g. MiniWoB); the
+        # task_id is left untouched so hint-keying is unaffected.
+        if self._vary_instance_seed and hasattr(task_config, "seed"):
+            task_config.seed = _group_seed_from_rollout_key(rollout_key)
         agent_llm_config = getattr(agent_config, "llm_config")
         rollout_router = self._llm_router.with_affinity(rollout_key)
         agent_llm_config.router = rollout_router

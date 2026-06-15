@@ -31,7 +31,7 @@ import threading
 from collections import deque
 
 import ray
-from cube_harness.jefhinter import mine_hint_from_transcripts
+from cube_harness.jefhinter import MINER_SYSTEM_PROMPT, MINER_SYSTEM_PROMPT_GENERAL, mine_hint_from_transcripts
 from cube_harness.llm import LLM, LLMConfig
 
 logger = logging.getLogger(__name__)
@@ -64,11 +64,24 @@ def build_miner_llm_config(llm_info: dict) -> LLMConfig:
 class HintRefreshState:
     """Rolling transcript buffers + versioned good/distractor hint maps."""
 
-    def __init__(self, llm: LLM, refresh_min_episodes: int, max_per_task: int, seed: int) -> None:
+    def __init__(
+        self,
+        llm: LLM,
+        refresh_min_episodes: int,
+        max_per_task: int,
+        seed: int,
+        general_prompt: bool = False,
+        reject_literals: bool = False,
+    ) -> None:
         self._llm = llm
         self._refresh_min_episodes = int(refresh_min_episodes)
         self._max_per_task = int(max_per_task)
         self._seed = int(seed)
+        # Instance-general miner knobs (default off -> original behavior). general_prompt
+        # selects the literal-forbidding system prompt; reject_literals drops any mined hint
+        # that still carries instance-specific tokens.
+        self._system_prompt = MINER_SYSTEM_PROMPT_GENERAL if general_prompt else MINER_SYSTEM_PROMPT
+        self._reject_literals = bool(reject_literals)
         self._lock = threading.Lock()
         self._buffers: dict[str, deque[tuple[float, str]]] = {}
         self._version = 0
@@ -124,7 +137,14 @@ class HintRefreshState:
             items = self._mining_items()
             mined: dict[str, str] = {}
             for task_id, failed_transcript, passed_transcript in items:
-                hint = mine_hint_from_transcripts(self._llm, task_id, failed_transcript, passed_transcript)
+                hint = mine_hint_from_transcripts(
+                    self._llm,
+                    task_id,
+                    failed_transcript,
+                    passed_transcript,
+                    system_prompt=self._system_prompt,
+                    reject_literals=self._reject_literals,
+                )
                 if hint is not None and hint.text.strip():
                     mined[task_id] = hint.text.strip()
             with self._lock:
@@ -166,12 +186,22 @@ def _build_distractor(good: dict[str, str], seed: int) -> dict[str, str]:
 class HintRefreshActor:
     """Threaded Ray wrapper over :class:`HintRefreshState` (state is lock-guarded)."""
 
-    def __init__(self, llm_info: dict, refresh_min_episodes: int, max_per_task: int, seed: int) -> None:
+    def __init__(
+        self,
+        llm_info: dict,
+        refresh_min_episodes: int,
+        max_per_task: int,
+        seed: int,
+        general_prompt: bool = False,
+        reject_literals: bool = False,
+    ) -> None:
         self._state = HintRefreshState(
             llm=build_miner_llm_config(llm_info).make(),
             refresh_min_episodes=refresh_min_episodes,
             max_per_task=max_per_task,
             seed=seed,
+            general_prompt=general_prompt,
+            reject_literals=reject_literals,
         )
 
     def report(self, task_id: str, reward: float, transcript: str) -> None:
