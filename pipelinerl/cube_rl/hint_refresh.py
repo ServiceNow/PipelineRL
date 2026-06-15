@@ -31,7 +31,12 @@ import threading
 from collections import deque
 
 import ray
-from cube_harness.jefhinter import MINER_SYSTEM_PROMPT, MINER_SYSTEM_PROMPT_GENERAL, mine_hint_from_transcripts
+from cube_harness.jefhinter import (
+    MINER_SYSTEM_PROMPT,
+    MINER_SYSTEM_PROMPT_GENERAL,
+    hint_has_literal,
+    mine_hint_from_transcripts,
+)
 from cube_harness.llm import LLM, LLMConfig
 
 logger = logging.getLogger(__name__)
@@ -156,6 +161,10 @@ class HintRefreshState:
                     self._history[self._version] = {"good": good, "distractor": _build_distractor(good, self._seed)}
                     while len(self._history) > _HISTORY_LIMIT:
                         del self._history[min(self._history)]
+                # Observability: log each newly mined/updated hint's text + whether the
+                # literal heuristic still flags it (should be False when reject_literals is on).
+                for _t, _h in changed.items():
+                    logger.info("MINED_HINT task=%s literal=%s text=%r", _t, hint_has_literal(_h), _h)
                 logger.info(
                     "hint refresh: %d tasks eligible, %d hints mined, %d changed -> version %d (%d good hints)",
                     len(items),
