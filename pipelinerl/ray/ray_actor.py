@@ -19,7 +19,6 @@ class RolloutActorImpl:
         worker_id: int,
         worker_name: str | None = None,
         context_extras: dict | None = None,
-        llm_router=None,
         log_collector=None,
     ):
         self.worker_id = worker_id
@@ -39,7 +38,6 @@ class RolloutActorImpl:
         self.context = RolloutWorkerContext(
             worker_id=worker_id,
             worker_name=self.worker_name,
-            llm_router=llm_router,
             extras=self.context_extras,
         )
         self.ready = False

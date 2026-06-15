@@ -26,13 +26,22 @@ class _WorkerSlot:
     actor: Any
     active_ref: Any | None = None
     active_request: RolloutRequest | None = None
-    current_affinity: str | None = None
     retiring: bool = False
     ready: bool = False
 
     @property
     def idle(self) -> bool:
         return self.active_ref is None
+
+
+
+
+class RolloutExecutionError(RuntimeError):
+    def __init__(self, request: RolloutRequest, worker_index: int, cause: BaseException):
+        super().__init__(f"rollout worker {worker_index} failed request {request.request_id}: {cause}")
+        self.request = request
+        self.worker_index = worker_index
+        self.__cause__ = cause
 
 
 class RayRolloutManager:
@@ -44,7 +53,6 @@ class RayRolloutManager:
         num_workers: int,
         ray_options: dict[str, Any] | None = None,
         execution_backend: str = "ray",
-        llm_router: Any | None = None,
         log_collector: Any | None = None,
         context_extras: dict[str, Any] | None = None,
         worker_name_prefix: str = "ray_rollout_worker",
@@ -56,7 +64,6 @@ class RayRolloutManager:
         self.worker_config = worker_config
         self.ray_options = ray_options or {}
         self.backend = self._make_backend(execution_backend)
-        self.llm_router = llm_router
         self.log_collector = log_collector
         self.context_extras = context_extras or {}
         self.worker_name_prefix = worker_name_prefix
@@ -162,34 +169,23 @@ class RayRolloutManager:
         self.backend.close_actor(slot.actor, logger, f"Ray rollout worker {slot.index}")
         self.backend.kill_actor(slot.actor, logger, f"Ray rollout worker {slot.index}")
 
-    def _select_idle_slot(self, affinity_key: str | None) -> _WorkerSlot | None:
+    def _select_idle_slot(self) -> _WorkerSlot | None:
         candidates = [slot for slot in self._slots if slot.ready and slot.idle and not slot.retiring]
         if not candidates:
             return None
-
-        def score(slot: _WorkerSlot) -> tuple[int, int]:
-            if affinity_key and slot.current_affinity == affinity_key:
-                affinity = 0
-            elif slot.current_affinity is None:
-                affinity = 1
-            else:
-                affinity = 2
-            return (affinity, slot.index)
-
-        return min(candidates, key=score)
+        return min(candidates, key=lambda slot: slot.index)
 
     def try_submit(self, request: RolloutRequest) -> bool:
         if self.max_pending is not None and self.active_count >= self.max_pending:
             return False
         if len(self._slots) < self._target_workers:
             self._start_one_worker()
-        slot = self._select_idle_slot(request.affinity_key)
+        slot = self._select_idle_slot()
         if slot is None:
             return False
         ref = slot.actor.generate.remote(request)
         slot.active_ref = ref
         slot.active_request = request
-        slot.current_affinity = request.affinity_key
         return True
 
     def wait_completed(self, *, timeout_s: float = 0.01, num_returns: int = 1) -> list[CompletedRollout]:
@@ -203,9 +199,18 @@ class RayRolloutManager:
             request = slot.active_request
             if request is None:
                 raise RuntimeError("completed Ray ref has no active request")
-            payload = self.backend.get(ref)
-            result = RolloutResult.model_validate(payload)
-            completed.append(CompletedRollout(request=request, result=result, worker_index=slot.index))
+            try:
+                payload = self.backend.get(ref)
+                result = RolloutResult.model_validate(payload)
+                completed.append(CompletedRollout(request=request, result=result, worker_index=slot.index))
+            except Exception as exc:
+                slot.active_ref = None
+                slot.active_request = None
+                if slot.retiring:
+                    self._close_slot(slot)
+                    self._slots.remove(slot)
+                self._retire_excess_idle_workers()
+                raise RolloutExecutionError(request, slot.index, exc) from exc
             slot.active_ref = None
             slot.active_request = None
             if slot.retiring:
@@ -226,7 +231,6 @@ class RayRolloutManager:
             worker_index,
             worker_name,
             self.context_extras,
-            self.llm_router,
             self.log_collector,
         )
 

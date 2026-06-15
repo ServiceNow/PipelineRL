@@ -13,10 +13,10 @@ import hydra
 import ray
 from omegaconf import DictConfig, OmegaConf
 
-from pipelinerl.metrics import SlidingWindowAggregator
-from pipelinerl.llm_router import VLLMRouter, VLLMRouterActor
+from pipelinerl.utils import always_or_never_success_stats, calculate_stats, SlidingWindowAggregator
+from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.ray.logging import RayWorkerLogCollector
-from pipelinerl.ray.manager import RayRolloutManager
+from pipelinerl.ray.manager import RayRolloutManager, RolloutExecutionError
 from pipelinerl.ray.utils import (
     check_local_ray_worker_resources,
     close_ray_actor_best_effort,
@@ -169,18 +169,48 @@ def _build_eval_llms(cfg: DictConfig, llm_urls: list[str], actor_model_path: Pat
     ]
 
 
+class LLMLoadBalancer:
+    def __init__(self, *, max_rollouts_per_url: int):
+        if max_rollouts_per_url < 1:
+            raise ValueError("actor.llm_max_rollouts must be >= 1")
+        self.max_rollouts_per_url = max_rollouts_per_url
+        self._active: dict[str, int] = defaultdict(int)
+
+    def try_acquire(self, llms: list[Any]) -> dict[str, Any] | None:
+        if not llms:
+            return None
+        candidates = sorted((_build_llm_kwargs(llm) for llm in llms), key=lambda item: (self._active[item["base_url"]], item["base_url"]))
+        selected = candidates[0]
+        base_url = selected["base_url"]
+        if self._active[base_url] >= self.max_rollouts_per_url:
+            return None
+        self._active[base_url] += 1
+        return selected
+
+    def release(self, llm: dict[str, Any] | None) -> None:
+        if not llm:
+            return
+        base_url = llm.get("base_url")
+        if base_url is None:
+            return
+        current = self._active.get(base_url, 0)
+        if current <= 1:
+            self._active.pop(base_url, None)
+        else:
+            self._active[base_url] = current - 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "max_rollouts_per_url": self.max_rollouts_per_url,
+            "active": dict(sorted(self._active.items())),
+        }
+
+
 def _write_group_result(rollout_results: list[RolloutResult], attempts: int, data_writer: Any) -> int:
     assert len(rollout_results) == attempts, f"Expected {attempts} rollouts, got {len(rollout_results)}"
     payload = [text.model_dump() for result in rollout_results for text in result.training_texts]
     data_writer.write(payload)
     return len(payload)
-
-
-def _dataset_affinity_key(dataset: RolloutDataset, item: dict[str, Any]) -> str | None:
-    affinity = getattr(dataset, "affinity_key", None)
-    if affinity is None:
-        return None
-    return affinity(item)
 
 
 class RayActorLoop:
@@ -195,7 +225,8 @@ class RayActorLoop:
         stats_writer: Any,
         scheduler_name: str,
         is_training: bool,
-        vllm_router: Any | None = None,
+        llm_load_balancer: LLMLoadBalancer,
+        llms: list[Any],
     ) -> None:
         self.cfg = cfg
         self.dataset = dataset
@@ -205,7 +236,8 @@ class RayActorLoop:
         self.stats_writer = stats_writer
         self.scheduler_name = scheduler_name
         self.is_training = is_training
-        self.vllm_router = vllm_router
+        self.llm_load_balancer = llm_load_balancer
+        self.llms = llms
         self.debug_mode = bool(cfg.debug.mode)
         
         self.attempts = int(cfg.attempts) if is_training else 1
@@ -258,6 +290,15 @@ class RayActorLoop:
             self.groups_per_update = math.ceil(total_update_size / self.attempts)
             lag_groups = math.ceil(self.max_lag / self.attempts)
             self.can_submit_before_update = lag_groups + self.groups_per_update
+
+        self.domain_sampler = None
+        if self.is_training:
+            domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
+            if domain_mix_cfg:
+                mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
+                if not isinstance(mix_weights, dict):
+                    raise ValueError("actor.domain_mix must be a mapping from domain to weight")
+                self.domain_sampler = DomainWeightedSampler(self.dataset, mix_weights)
 
     @property
     def is_running(self) -> bool:
@@ -329,8 +370,6 @@ class RayActorLoop:
                 self.sliding_stats[key].append(value)
 
     def publish_stats(self, loop_stats: dict[str, Any]) -> None:
-        from pipelinerl.utils import always_or_never_success_stats, calculate_stats
-
         split_name = "test_" if not self.is_training else ""
         hidden_metrics = {"overlong_success"}
         stats: dict[str, Any] = defaultdict(float)
@@ -370,20 +409,10 @@ class RayActorLoop:
             | {f"{split_name}model_version_{k}": v for k, v in calculate_stats(self.model_versions_list).items()}
         )
         stats |= loop_stats
-        if self.vllm_router is not None:
-            try:
-                router_snapshot = ray.get(self.vllm_router.snapshot.remote(), timeout=2.0)
-                for server in router_snapshot.get("servers", []):
-                    server_id = server.get("server_id")
-                    prefix = f"{split_name}vllm_router/server_{server_id}"
-                    for key in ("inflight", "active_tokens", "latency_ema", "errors", "requests", "suppressed", "suppressed_remaining_s", "affinities"):
-                        value = server.get(key)
-                        if isinstance(value, (bool, int, float)):
-                            stats[f"{prefix}/{key}"] = value
-                stats[f"{split_name}vllm_router/max_inflight_per_server"] = router_snapshot.get("max_inflight_per_server", 0)
-                stats[f"{split_name}vllm_router/active_affinities"] = router_snapshot.get("active_affinities", 0)
-            except Exception:
-                logger.exception("%s: failed to collect vLLM router stats", self.scheduler_name)
+        balancer_snapshot = self.llm_load_balancer.snapshot()
+        stats[f"{split_name}llm_load_balancer/max_rollouts_per_url"] = balancer_snapshot["max_rollouts_per_url"]
+        for base_url, active in balancer_snapshot["active"].items():
+            stats[f"{split_name}llm_load_balancer/active/{base_url}"] = active
 
         total_domain_samples = sum(self.domain_counts.values())
         if total_domain_samples:
@@ -410,14 +439,24 @@ class RayActorLoop:
             rollout_index=rollout_index,
             seed=int(self.cfg.seed) + group_id * max(1, self.attempts) + rollout_index,
             max_steps=getattr(self.cfg.actor, "max_steps", None),
-            affinity_key=_dataset_affinity_key(self.dataset, item),
             extras={"local_group_id": group_id, "scheduler_name": self.scheduler_name},
         )
 
+    def _release_request_llm(self, request: RolloutRequest) -> None:
+        llm = request.extras.pop("llm", None)
+        self.llm_load_balancer.release(llm)
+
     def _submit_request(self, request: RolloutRequest) -> bool:
+        if self.manager.idle_count <= 0:
+            return False
+        selected_llm = self.llm_load_balancer.try_acquire(self.llms)
+        if selected_llm is None:
+            return False
+        request.extras["llm"] = selected_llm
         if self.manager.try_submit(request):
             self._started_rollouts += 1
             return True
+        self._release_request_llm(request)
         return False
 
     def start(self, *, scheduler_name: str | None = None) -> str:
@@ -523,7 +562,12 @@ class RayActorLoop:
                     if blocked_by_lag:
                         break
                     self._group_id += 1
-                    self._current_item = self.dataset[random.randrange(len(self.dataset))]
+
+                    if self.domain_sampler is not None:
+                        self._current_item = self.domain_sampler.sample()
+                    else:
+                        self._current_item = self.dataset[random.randrange(len(self.dataset))]
+                        
                     self._group_rollouts[self._group_id] = []
                     self._group_rollout_index = 0
                     self._run_submitted_groups += 1
@@ -563,7 +607,13 @@ class RayActorLoop:
             return "running"
 
         timeout = self.rollout_timeout_s if self.rollout_timeout_s and self.rollout_timeout_s > 0 else 0.01
-        completed = self.manager.wait_completed(timeout_s=timeout)
+        try:
+            completed = self.manager.wait_completed(timeout_s=timeout)
+        except RolloutExecutionError as exc:
+            logger.warning("Rollout failed and will be retried: request_id=%s", exc.request.request_id, exc_info=True)
+            self._release_request_llm(exc.request)
+            self._retry_requests.append(exc.request)
+            return "running"
         if not completed:
             if time.time() - self._last_logged > 10.0 and self.manager.active_count:
                 logger.info(
@@ -583,6 +633,7 @@ class RayActorLoop:
             request = item.request
             result = item.result
             local_group_id = int(request.extras["local_group_id"])
+            self._release_request_llm(request)
             result.model_version = request.model_version
             result.group_id = request.group_id
             if not result.training_texts:
@@ -600,6 +651,13 @@ class RayActorLoop:
                 group_results = self._group_rollouts.pop(local_group_id)
                 if self.attempts > 1:
                     random.shuffle(group_results)
+
+                # Track completions per domain for adaptive sampling
+                if self.domain_sampler is not None:
+                    for r in group_results:
+                        if r.domain:
+                            self.domain_sampler.record_completion(r.domain)
+
                 self.length_penalty_adjustment(group_results)
                 group_samples = _write_group_result(group_results, self.attempts, self.data_writer)
                 self._run_finished_groups += 1
@@ -629,13 +687,12 @@ class RayActorLoop:
         return "running"
 
 
-def _worker_config(cfg: DictConfig, llm: Any, mode: str) -> dict[str, Any]:
+def _worker_config(cfg: DictConfig, mode: str) -> dict[str, Any]:
     actor_cfg = OmegaConf.to_container(cfg.actor, resolve=True)
     cube_params = cfg.get("cube_params", {})
     artifact_cfg = getattr(cube_params, "rollout_artifacts", None)
     return {
         "mode": mode,
-        "llm": _build_llm_kwargs(llm),
         "actor": actor_cfg,
         "output_dir": str(cfg.output_dir),
         "rollout_artifacts": OmegaConf.to_container(artifact_cfg, resolve=True) if artifact_cfg else {},
@@ -683,7 +740,8 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     ray_worker_log_collector = None
     train_manager = None
     eval_manager = None
-    vllm_router = None
+    train_dataset = None
+    eval_dataset = None
 
     if cfg.wandb.use_wandb:
         run = init_wandb(cfg, exp_path / "actor", flatten_dict_config(cfg))  # type: ignore[arg-type]
@@ -729,20 +787,18 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         logger.info("Loaded %d eval rollout items", len(eval_dataset) if eval_dataset is not None else 0)
 
         llm_max_rollouts = int(cfg.actor.llm_max_rollouts)
-        vllm_router = VLLMRouterActor.remote([_build_llm_kwargs(llm) for llm in train_llms], max_inflight_per_server=llm_max_rollouts)
-        vllm_route_adapter = VLLMRouter(vllm_router)
-        logger.info("Started vLLM router: %s", ray.get(vllm_router.snapshot.remote()))
+        llm_load_balancer = LLMLoadBalancer(max_rollouts_per_url=llm_max_rollouts)
+        logger.info("Using actor-local LLM load balancer: %s", llm_load_balancer.snapshot())
 
         worker_cls = hydra.utils.get_class(cfg.actor.rollout_policy)
         rollout_backend = str(getattr(cfg.actor, "rollout_backend", "ray"))
         logger.info("Using rollout backend: %s", rollout_backend)
         train_manager = RayRolloutManager(
             worker_cls=worker_cls,
-            worker_config=_worker_config(cfg, train_llms[0], "train"),
+            worker_config=_worker_config(cfg, "train"),
             num_workers=train_workers,
             ray_options=_manager_ray_options(cfg, mode="train"),
             execution_backend=rollout_backend,
-            llm_router=vllm_route_adapter,
             log_collector=ray_worker_log_collector,
             worker_name_prefix="train_rollout_worker",
         )
@@ -771,7 +827,8 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 stats_writer=stats_writer,
                 scheduler_name="ray_train_scheduler",
                 is_training=True,
-                vllm_router=vllm_router,
+                llm_load_balancer=llm_load_balancer,
+                llms=train_llms,
             )
             train_loop.start()
 
@@ -793,11 +850,10 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                             train_loop.step()
                     eval_manager = RayRolloutManager(
                         worker_cls=worker_cls,
-                        worker_config=_worker_config(cfg, eval_llms[0], "eval"),
+                        worker_config=_worker_config(cfg, "eval"),
                         num_workers=max(1, eval_workers),
                         ray_options=_manager_ray_options(cfg, mode="eval"),
                         execution_backend=rollout_backend,
-                        llm_router=vllm_route_adapter,
                         log_collector=ray_worker_log_collector,
                         worker_name_prefix=f"eval_v{current_eval}_rollout_worker",
                     )
@@ -811,7 +867,8 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                             stats_writer=eval_stats_writer,
                             scheduler_name=f"ray_eval_scheduler_v{current_eval}",
                             is_training=False,
-                            vllm_router=vllm_router,
+                            llm_load_balancer=llm_load_balancer,
+                            llms=eval_llms,
                         )
                         eval_loop.start()
 
@@ -847,8 +904,13 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         if ray_worker_log_collector is not None:
             close_ray_actor_best_effort(ray_worker_log_collector, logger, "Ray worker log collector")
             kill_ray_actor_best_effort(ray_worker_log_collector, logger, "Ray worker log collector")
-        if vllm_router is not None:
-            kill_ray_actor_best_effort(vllm_router, logger, "vLLM router")
+        for dataset in (eval_dataset, train_dataset):
+            close = getattr(dataset, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.exception("Failed to close rollout dataset")
         if should_shutdown_ray and ray.is_initialized():
             try:
                 ray.shutdown()

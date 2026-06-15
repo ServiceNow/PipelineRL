@@ -19,7 +19,7 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field
 
 import wandb
-from pipelinerl.metrics import SlidingWindowAggregator
+from pipelinerl.utils import SlidingWindowAggregator
 from pipelinerl.async_llm import RetryableAbortedCompletionError
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.domains.math.rollouts import length_penalty
