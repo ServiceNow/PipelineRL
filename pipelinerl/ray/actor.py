@@ -81,7 +81,7 @@ def _init_ray_runtime(cfg: DictConfig, owner_name: str, min_num_cpus: int = 1) -
             address=str(ray_address),
             ignore_reinit_error=True,
             log_to_driver=False,
-            local_mode=cfg.ray_local_mode,
+            local_mode=False,
         )
         logger.info("%s: connected to ray at configured address %s", owner_name, ray_address)
         _log_ray_cpu_capacity(owner_name, required_num_cpus=min_num_cpus)
@@ -92,7 +92,7 @@ def _init_ray_runtime(cfg: DictConfig, owner_name: str, min_num_cpus: int = 1) -
             address="auto",
             ignore_reinit_error=True,
             log_to_driver=False,
-            local_mode=cfg.ray_local_mode,
+            local_mode=False,
         )
         logger.info("%s: connected to existing auto-discovered ray cluster", owner_name)
         _log_ray_cpu_capacity(owner_name, required_num_cpus=min_num_cpus)
@@ -113,7 +113,7 @@ def _init_ray_runtime(cfg: DictConfig, owner_name: str, min_num_cpus: int = 1) -
             include_dashboard=False,
             ignore_reinit_error=True,
             log_to_driver=False,
-            local_mode=cfg.ray_local_mode,
+            local_mode=False,
         )
         logger.info("%s: started local ray runtime with %d CPUs", owner_name, ray_num_cpus)
 

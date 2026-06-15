@@ -6,7 +6,6 @@ defaults:
 output_dir: results/cube_math_tool/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: /mnt/llmd/base_models/Qwen2.5-7B-Instruct
 litellm_logging_level: info
-ray_local_mode: false
 
 actor:
   launcher: ray
