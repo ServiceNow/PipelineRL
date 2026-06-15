@@ -1,58 +1,30 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
-import hydra
+from cube_harness.rl.event_publisher import EventPublisher
 
-from pipelinerl.domains.cube.episode_runner import CubeEpisodeRunner
-from pipelinerl.rollouts import RolloutRequest, RolloutResult
+from pipelinerl.domains.cube.result_builder import (
+    apply_rollout_rewards,
+    build_payload,
+    rollout_result_from_events,
+    run_rollout,
+    write_rollout_artifact,
+)
 from pipelinerl.ray.worker import RolloutWorker, RolloutWorkerContext
+from pipelinerl.rollouts import RolloutRequest, RolloutResult
 
 logger = logging.getLogger(__name__)
 
 
-def set_agent_llm_config(agent_config: Any, llm: dict) -> None:
-    llm_config = getattr(agent_config, "llm_config")
-
-    llm_config.api_base = llm["base_url"]
-    if not llm_config.api_base.endswith("/v1"):
-        llm_config.api_base += "/v1"
-
-    llm_config.api_key = "EMPTY"
-    llm_config.model_name = llm.get("served_model_name") or llm["model_name"]
-    llm_config.tokenizer_name = llm.get("tokenizer_name", llm_config.model_name)
-    if not llm_config.model_name.startswith("openai/"):
-        llm_config.model_name = f"openai/{llm_config.model_name}"
-
-    llm_config.logprobs = llm["collect_logprobs"]
-    if llm_config.logprobs:
-        llm_config.include_stop_str_in_output = True
-        llm_config.skip_special_tokens = False
-
-    llm_parameters = llm.get("parameters", {})
-    for param_name, param_value in llm_parameters.items():
-        if hasattr(llm_config, param_name):
-            setattr(llm_config, param_name, param_value)
-        else:
-            logger.warning("Cube-harness Agent LLM parameters does not have attribute '%s', skipping", param_name)
-
-
 class CubeRolloutWorker(RolloutWorker):
-    """CUBE rollout worker with lazy benchmark materialization."""
+    """Runs one cube-harness episode per request via `RolloutTaskRunner`."""
 
     def __init__(self, config: dict[str, Any]):
         super().__init__(config)
-        if self.llm is None:
-            raise ValueError("CubeRolloutWorker requires an llm config")
-        self._current_cube_id: str | None = None
-        self._benchmark = None
-        self._agent = None
-        self._runtime_context = None
-        self._container_backend = None
-        self._runner: CubeEpisodeRunner | None = None
-
         actor_cfg = config.get("actor", {})
         self._buffer_tokens = int(actor_cfg.get("buffer_tokens", 0))
         self._discount_factor = float(actor_cfg.get("discount_factor", 1.0))
@@ -72,88 +44,54 @@ class CubeRolloutWorker(RolloutWorker):
             logger.exception("%s failed during setup", self.worker_name)
             raise
 
-    def _close_current_cube(self) -> None:
-        if self._benchmark is not None:
-            try:
-                self._benchmark.close()
-            except Exception as exc:
-                logger.warning("%s failed to close cube %s: %s", self.worker_name, self._current_cube_id, exc)
-        self._current_cube_id = None
-        self._benchmark = None
-        self._agent = None
-        self._runtime_context = None
-        self._container_backend = None
-        self._runner = None
-
-    def _lazy_cube_init(self, item: dict[str, Any]) -> None:
-        cube_id = str(item["cube_id"])
-        if self._current_cube_id == cube_id:
-            return
-
-        self._close_current_cube()
-        benchmark_obj = hydra.utils.instantiate(item["benchmark_cfg"])
-        benchmark_obj.install()
-        benchmark_obj.setup()
-
-        self._runtime_context = getattr(benchmark_obj, "_runtime_context", None)
-        self._container_backend = getattr(benchmark_obj, "container_backend", None)
-        agent_template = hydra.utils.instantiate(item["agent_cfg"])
-        set_agent_llm_config(agent_template, self.llm)
-        self._agent = agent_template
-
-        self._current_cube_id = cube_id
-        self._benchmark = benchmark_obj
-
-        logger.info("%s prepared cube %s", self.worker_name, cube_id)
-
-    def _episode_runner(self) -> CubeEpisodeRunner:
-        if self.llm_tokenizer is None:
-            raise RuntimeError(f"{self.worker_name} tokenizer is not loaded")
-        if self.llm is None:
-            raise RuntimeError(f"{self.worker_name} llm config is not set")
-        if self._runner is None:
-            self._runner = CubeEpisodeRunner(
-                llm_tokenizer=self.llm_tokenizer,
-                llm_config=self.llm,
-                llm_router=self.llm_router,
-                worker_name=self.worker_name,
-                runtime_context=self._runtime_context,
-                container_backend=self._container_backend,
-                buffer_tokens=self._buffer_tokens,
-                discount_factor=self._discount_factor,
-                persist_rollout_artifacts=self._persist_rollout_artifacts,
-                rollout_artifact_dir=self._rollout_artifact_dir,
-            )
-        return self._runner
-
     def generate(self, request: RolloutRequest) -> RolloutResult:
         item = request.dataset_item
-        cube_id = str(item["cube_id"])
         task_id = str(item["task_id"])
+        domain = item.get("domain")
+        if not self.ready:
+            raise RuntimeError(f"{self.worker_name} not ready")
+
+        rollout_dir = self._rollout_artifact_dir / request.request_id
+        payload = build_payload(
+            request=request,
+            item=item,
+            llm=request.extras.get("llm"),
+            output_dir=rollout_dir,
+        )
+
+        logger.info("%s starting rollout for domain=%s task_id=%s", self.worker_name, domain, task_id)
+        publisher = EventPublisher()
+        start = time.perf_counter()
         try:
-            if not self.ready:
-                raise RuntimeError(f"{self.worker_name} not ready")
-            self._lazy_cube_init(item)
-            if self._benchmark is None or self._agent is None:
-                raise RuntimeError(f"{self.worker_name} cube is not initialized")
-
-            logger.error("%s starting rollout for cube_id=%s task_id=%s", self.worker_name, cube_id, task_id)
-
-            task = {
-                "task_config": self._benchmark.get_task_config(task_id),
-                "max_steps": request.max_steps,
-                "domain": item.get("domain", None),
-                "dataset": item.get("dataset", None),
-            }
-
-            return self._episode_runner().run_terminal(
-                task=task,
-                agent_config=self._agent,
-                rollout_key=request.request_id,
-            )
+            run_rollout(payload, publisher)
         except Exception:
-            logger.exception("%s rollout failed for cube_id=%s task_id=%s", self.worker_name, cube_id, task_id)
+            logger.exception("%s rollout failed for domain=%s task_id=%s", self.worker_name, domain, task_id)
             raise
 
+        events = publisher.events_from(0)
+        result = rollout_result_from_events(
+            events,
+            latency=time.perf_counter() - start,
+            dataset=item.get("dataset"),
+            domain=domain,
+        )
+        apply_rollout_rewards(
+            result.training_texts,
+            agent_config=item["agent_cfg"],
+            buffer_tokens=self._buffer_tokens,
+            discount_factor=self._discount_factor,
+        )
+        if self._persist_rollout_artifacts:
+            write_rollout_artifact(
+                events=events,
+                artifact_dir=self._rollout_artifact_dir,
+                worker_name=self.worker_name,
+                trajectory_id=request.request_id,
+                task_id=task_id,
+                domain=domain,
+                dataset=item.get("dataset"),
+            )
+        return result
+
     def close(self) -> None:
-        self._close_current_cube()
+        return None

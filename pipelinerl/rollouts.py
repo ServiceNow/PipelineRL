@@ -78,7 +78,6 @@ class RolloutRequest(BaseModel):
     rollout_index: int = 0
     seed: int | None = None
     max_steps: int | None = None
-    affinity_key: str | None = None
     extras: dict[str, Any] = Field(default_factory=dict)
 
 

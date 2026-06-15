@@ -27,6 +27,10 @@ actor:
   ray_worker_log_level: WARNING
   ray_worker_litellm_log_level: CRITICAL
 
+  domain_mix:
+    miniwob_html: 0.5
+    miniwob_axtree: 0.5
+
 llm:
   parameters:
     max_tokens: 16000
@@ -63,22 +67,17 @@ preprocess:
 
 dataset_loader: pipelinerl.domains.cube.dataset.load_datasets
 train_dataset_names:
-  - miniwob_train
+  - miniwob_html
+  - miniwob_axtree
 test_dataset_names:
   # - miniwob_test
 
-# cube_params:
-#   resource_guard:
-#     actor_memory_gb: 1.25
-#     memory_overhead_gb: 8.0
-#     memory_usage_threshold: 0.90
-#   seed: ${seed}
 dataset_loader_params:
-  miniwob_train:
+  miniwob_html:
     benchmark: &miniwob_benchmark
       _type: miniwob_cube.benchmark.MiniWobBenchmarkConfig
       port: 8010
-      tool_config:
+      tool_config: &miniwob_tool_config
           _type: cube_browser_tool.bgym_tool.BgymToolConfig
           use_html: true
           use_axtree: false
@@ -92,6 +91,13 @@ dataset_loader_params:
         timeout: 3600.0
         num_retries: 1
       max_actions: 10
-  miniwob_test:
-    benchmark: *miniwob_benchmark
+  miniwob_axtree:
+    benchmark:
+      <<: *miniwob_benchmark
+      port: 8011
+      tool_config:
+        <<: *miniwob_tool_config
+        use_html: false
+        use_axtree: true
+        use_screenshot: false
     agent: *react_agent
