@@ -1,16 +1,13 @@
 defaults:
   - base
   - override rewards: success_and_format
+  - cubes: base
   - _self_
 
 output_dir: results/cube_math_tool/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_path: /mnt/llmd/base_models/Qwen2.5-7B-Instruct
-litellm_logging_level: info
 
 actor:
-  launcher: ray
-  rollout_backend: ray
-  rollout_policy: pipelinerl.domains.cube.worker.CubeRolloutWorker
   max_steps: 10
   ray_num_cpus: null
   ray_worker_num_cpus: 0.25
@@ -64,7 +61,6 @@ preprocess:
   n_workers: 8
   shared_memory_entry_size: 1000000000
 
-dataset_loader: pipelinerl.domains.cube.dataset.load_datasets
 train_dataset_names:
   - miniwob_html
   - miniwob_axtree

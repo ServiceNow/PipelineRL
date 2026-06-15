@@ -1,0 +1,28 @@
+litellm_logging_level: info
+dataset_loader: pipelinerl.domains.cube.dataset.load_datasets
+
+actor:
+  launcher: ray
+  rollout_backend: ray
+  rollout_policy: pipelinerl.domains.cube.worker.CubeRolloutWorker
+  max_steps: 10
+  ray_num_cpus: null
+  ray_worker_num_cpus: 0.25
+  ray_workers: 128
+  ray_options: {}
+  eval:
+    ray_workers: 64
+    resource_policy: elastic_train
+    drain_to_target: true
+  llm_max_rollouts: 128
+  ray_worker_log_enabled: true
+  ray_worker_log_path: null
+  ray_worker_log_level: WARNING
+  ray_worker_litellm_log_level: CRITICAL
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 32000
+    served_model_name: Qwen2.5-7B-Instruct
+    enable-auto-tool-choice: ""
+    tool-call-parser: hermes
