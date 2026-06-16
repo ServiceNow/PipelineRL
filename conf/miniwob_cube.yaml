@@ -1,7 +1,7 @@
 defaults:
   - base
-  - override rewards: success_and_format
   - cubes: base
+  - override rewards: success_and_format
   - _self_
 
 output_dir: results/cube_math_tool/${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -45,7 +45,8 @@ vllm_config:
     max_model_len: 32000
     served_model_name: Qwen2.5-7B-Instruct
     enable-auto-tool-choice: ""
-    tool-call-parser: hermes
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
 
 finetune:
   seq_length: 32000
