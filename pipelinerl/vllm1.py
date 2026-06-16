@@ -269,7 +269,10 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     # Cleanup
     if not args.disable_weight_updates:
-        await weight_update_manager.close_communicator()
+        try:
+            await weight_update_manager.close_communicator()
+        except Exception:
+            logger.warning("Failed to close weight update communicator during vLLM shutdown", exc_info=True)
     sock.close()
 
 

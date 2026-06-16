@@ -15,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from pipelinerl.ray.ray_cluster import configure_actor_ray_address, launch_ray_cluster_node
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import SingleStreamSpec, connect_to_redis, read_stream, set_streams_backend, write_to_streams
-from pipelinerl.utils import terminate_with_children
+from pipelinerl.utils import request_terminate_with_children, terminate_with_children, wait_for_process_tree
 from pipelinerl.world import Job, WorldMap
 
 logger = logging.getLogger(__name__)
@@ -504,10 +504,12 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
     # Wait for all processes to complete
     def gently_stop_all_processes():
         logger.info("\nShutting down processes...")
-        # Terminate all running processes
         for proc in processes:
-            logger.info(f"Terminating {proc.handle.args}")
-            terminate_with_children(proc.handle.pid, parent_timeout=60.0)
+            logger.info(f"Requesting termination for {proc.handle.args}")
+            request_terminate_with_children(proc.handle.pid)
+        for proc in processes:
+            logger.info(f"Waiting for {proc.handle.args} to stop")
+            wait_for_process_tree(proc.handle.pid, parent_timeout=60.0)
 
     logger.info("I have launched everyone, waiting for them to finish...")
 
@@ -539,9 +541,10 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                     continue
                 logger.info(f"Trainer completion detected; stopping remaining {len(alive)} service process(es)")
                 for proc in list(alive):
-                    logger.info(f"Terminating service process {proc.handle.args}")
-                    terminate_with_children(proc.handle.pid, parent_timeout=60.0)
+                    logger.info(f"Requesting termination for service process {proc.handle.args}")
+                    request_terminate_with_children(proc.handle.pid)
                 for proc in list(alive):
+                    wait_for_process_tree(proc.handle.pid, parent_timeout=60.0)
                     try:
                         proc.handle.wait(timeout=10)
                     except subprocess.TimeoutExpired:

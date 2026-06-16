@@ -545,43 +545,89 @@ def better_crashing(entrypoint_name: str):
         logger.error(f"Traceback: {traceback.format_exc()}")
         # get process if of the current process
         process_id = os.getpid()
-        terminate_with_children(process_id)
-        logger.error("I should not even be here...")
+        terminate_with_children(process_id, terminate_parent=False)
         import sys
 
         sys.exit(1)
 
 
-def terminate_with_children(process_id: int, *, child_timeout: float = 5.0, parent_timeout: float = 3.0):
-    """Terminate the process and all its children."""
+def request_terminate_with_children(process_id: int, *, terminate_parent: bool = True):
+    """Send SIGTERM to a process tree without waiting."""
     try:
         parent = psutil.Process(process_id)
         children = parent.children(recursive=True)
-
-        # First attempt graceful termination of children
         for child in children:
-            child.terminate()
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        if terminate_parent:
+            parent.terminate()
+    except psutil.NoSuchProcess:
+        pass
+    except Exception as e:
+        logger.error(f"Error requesting process stop for {process_id}: {e}")
 
-        # Wait for children to terminate
-        _, alive = psutil.wait_procs(children, timeout=child_timeout)
 
-        if alive:
-            logger.info(f"{len(alive)} children still alive, trying SIGKILL")
-            for child in alive:
+def wait_for_process_tree(
+    process_id: int,
+    *,
+    child_timeout: float = 5.0,
+    parent_timeout: float = 3.0,
+    terminate_parent: bool = True,
+):
+    """Wait for a process tree after SIGTERM, then SIGKILL remaining processes."""
+    try:
+        parent = psutil.Process(process_id)
+    except psutil.NoSuchProcess:
+        return
+
+    try:
+        children = parent.children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
+
+    _, alive = psutil.wait_procs(children, timeout=child_timeout)
+    if alive:
+        logger.info(f"{len(alive)} children still alive, trying SIGKILL")
+        for child in alive:
+            try:
                 child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(alive, timeout=child_timeout)
 
-        # Terminate parent process
-        parent.terminate()
+    if not terminate_parent:
+        return
+
+    try:
         parent.wait(timeout=parent_timeout)
-
-        # Force kill parent if still alive
-        if parent.is_running():
+    except psutil.TimeoutExpired:
+        try:
             parent.kill()
             logger.info(f"Trying SIGKILL on parent process {process_id}")
             parent.wait()
             logger.info(f"Parent process {process_id} finished.")
-
+        except psutil.NoSuchProcess:
+            pass
     except psutil.NoSuchProcess:
         pass
     except Exception as e:
-        logger.error(f"Error stopping process {process_id}: {e}")
+        logger.error(f"Error waiting for process {process_id}: {e}")
+
+
+def terminate_with_children(
+    process_id: int,
+    *,
+    child_timeout: float = 5.0,
+    parent_timeout: float = 3.0,
+    terminate_parent: bool = True,
+):
+    """Terminate the process and all its children."""
+    request_terminate_with_children(process_id, terminate_parent=terminate_parent)
+    wait_for_process_tree(
+        process_id,
+        child_timeout=child_timeout,
+        parent_timeout=parent_timeout,
+        terminate_parent=terminate_parent,
+    )
