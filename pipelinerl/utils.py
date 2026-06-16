@@ -552,8 +552,8 @@ def better_crashing(entrypoint_name: str):
         sys.exit(1)
 
 
-def terminate_with_children(process_id: int):
-    """Terminate the process and all its children"""
+def terminate_with_children(process_id: int, *, child_timeout: float = 5.0, parent_timeout: float = 3.0):
+    """Terminate the process and all its children."""
     try:
         parent = psutil.Process(process_id)
         children = parent.children(recursive=True)
@@ -563,7 +563,7 @@ def terminate_with_children(process_id: int):
             child.terminate()
 
         # Wait for children to terminate
-        _, alive = psutil.wait_procs(children, timeout=5)
+        _, alive = psutil.wait_procs(children, timeout=child_timeout)
 
         if alive:
             logger.info(f"{len(alive)} children still alive, trying SIGKILL")
@@ -572,7 +572,7 @@ def terminate_with_children(process_id: int):
 
         # Terminate parent process
         parent.terminate()
-        parent.wait(timeout=3)
+        parent.wait(timeout=parent_timeout)
 
         # Force kill parent if still alive
         if parent.is_running():

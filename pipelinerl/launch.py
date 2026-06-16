@@ -507,7 +507,7 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         # Terminate all running processes
         for proc in processes:
             logger.info(f"Terminating {proc.handle.args}")
-            terminate_with_children(proc.handle.pid)
+            terminate_with_children(proc.handle.pid, parent_timeout=60.0)
 
     logger.info("I have launched everyone, waiting for them to finish...")
 
@@ -540,13 +540,13 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                 logger.info(f"Trainer completion detected; stopping remaining {len(alive)} service process(es)")
                 for proc in list(alive):
                     logger.info(f"Terminating service process {proc.handle.args}")
-                    terminate_with_children(proc.handle.pid)
+                    terminate_with_children(proc.handle.pid, parent_timeout=60.0)
                 for proc in list(alive):
                     try:
                         proc.handle.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         logger.warning(f"Service process {proc.handle.args} did not stop; forcing termination")
-                        terminate_with_children(proc.handle.pid)
+                        terminate_with_children(proc.handle.pid, parent_timeout=60.0)
                         proc.handle.wait(timeout=10)
                     logger.info(f"Service process {proc.handle.args} stopped")
                     alive.remove(proc)

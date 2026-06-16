@@ -552,9 +552,13 @@ def run_finetuning_loop(
             )
         if weight_update_manager is not None:
             weight_update_manager.shutdown()
-        # PyNcclCommunicator doesn't need explicit destroy like torch.distributed process groups
-        if actor_update_group:
-            dist.destroy_process_group(actor_update_group)
+        # actor_update_group is a vLLM PyNcclCommunicator backed by a
+        # StatelessProcessGroup, not a torch.distributed ProcessGroup.
+        if seq_parallel_group is not None and dist.is_initialized():
+            try:
+                dist.destroy_process_group(seq_parallel_group)
+            except ValueError:
+                logger.warning("Sequence-parallel process group was already destroyed")
         if memory_debug is not None:
             memory_debug.close()
 
