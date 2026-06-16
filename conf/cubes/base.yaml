@@ -1,3 +1,4 @@
+# @package _global_
 litellm_logging_level: info
 dataset_loader: pipelinerl.domains.cube.dataset.load_datasets
 
@@ -25,4 +26,5 @@ vllm_config:
     max_model_len: 32000
     served_model_name: Qwen2.5-7B-Instruct
     enable-auto-tool-choice: ""
-    tool-call-parser: hermes
+    tool-call-parser: rl_tool
+    tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
