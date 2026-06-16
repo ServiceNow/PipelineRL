@@ -8,18 +8,23 @@ from transformers import Adafactor, PreTrainedModel
 def get_grouped_params(
     model: PreTrainedModel | PeftModel,
     weight_decay: float,
-    no_decay: list[str] = ["bias", "LayerNorm.weight"],
+    no_decay: list[str] | None = None,
 ):
+    no_decay = no_decay or ["bias", "layernorm.weight", "norm.weight"]
     params_with_wd, params_without_wd = [], []
     for n, p in model.named_parameters():
-        if any(nd in n for nd in no_decay):
+        name = n.lower()
+        if any(nd.lower() in name for nd in no_decay):
             params_without_wd.append(p)
         else:
             params_with_wd.append(p)
-    return [
-        {"params": params_with_wd, "weight_decay": weight_decay},
-        {"params": params_without_wd, "weight_decay": 0.0},
-    ]
+
+    groups = []
+    if params_with_wd:
+        groups.append({"params": params_with_wd, "weight_decay": weight_decay})
+    if params_without_wd:
+        groups.append({"params": params_without_wd, "weight_decay": 0.0})
+    return groups
 
 
 def get_optimizer(name, model, learning_rate, weight_decay):
