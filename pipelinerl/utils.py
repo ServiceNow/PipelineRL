@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import time
 from pathlib import Path
 import traceback
@@ -551,8 +552,29 @@ def better_crashing(entrypoint_name: str):
         sys.exit(1)
 
 
+def _signal_pgroup(process_id: int, sig: int):
+    """Best-effort: deliver `sig` to the whole process group led by `process_id`.
+
+    Only works for processes launched with start_new_session=True (or otherwise
+    their own pgid). Silently no-ops otherwise.
+    """
+    try:
+        pgid = os.getpgid(process_id)
+        if pgid != process_id:
+            return
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except Exception as e:
+        logger.error(f"Error signaling process group for {process_id}: {e}")
+
+
 def request_terminate_with_children(process_id: int, *, terminate_parent: bool = True):
     """Send SIGTERM to a process tree without waiting."""
+    # If the parent leads its own process group (start_new_session=True), hit
+    # the whole group in one shot — catches detached vLLM/Ray workers that
+    # psutil's child-walk may miss.
+    _signal_pgroup(process_id, signal.SIGTERM)
     try:
         parent = psutil.Process(process_id)
         children = parent.children(recursive=True)
@@ -590,6 +612,9 @@ def wait_for_process_tree(
     _, alive = psutil.wait_procs(children, timeout=child_timeout)
     if alive:
         logger.info(f"{len(alive)} children still alive, trying SIGKILL")
+        # Hammer the whole process group first — covers descendants that
+        # psutil's parent-walk lost track of.
+        _signal_pgroup(process_id, signal.SIGKILL)
         for child in alive:
             try:
                 child.kill()
@@ -604,6 +629,7 @@ def wait_for_process_tree(
         parent.wait(timeout=parent_timeout)
     except psutil.TimeoutExpired:
         try:
+            _signal_pgroup(process_id, signal.SIGKILL)
             parent.kill()
             logger.info(f"Trying SIGKILL on parent process {process_id}")
             parent.wait()

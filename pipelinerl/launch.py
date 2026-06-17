@@ -48,6 +48,11 @@ def _popen(
         env=env,
         stdout=stdout,
         stderr=stderr,
+        # Put each top-level child in its own session/process group so we can
+        # signal the entire subtree (incl. detached vLLM/Ray workers) via killpg,
+        # and so Ctrl-C in the terminal isn't broadcast to children behind the
+        # launcher's back.
+        start_new_session=True,
     )
 
 
@@ -502,14 +507,28 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         trainer_state = None
 
     # Wait for all processes to complete
-    def gently_stop_all_processes():
+    def gently_stop_all_processes(parent_timeout: float = 10.0, child_timeout: float = 5.0):
+        import threading
+
         logger.info("\nShutting down processes...")
         for proc in processes:
             logger.info(f"Requesting termination for {proc.handle.args}")
             request_terminate_with_children(proc.handle.pid)
+        # Wait for all process trees in parallel — sequential waits multiplied
+        # the worst-case shutdown time by the number of top-level procs.
+        threads = []
         for proc in processes:
             logger.info(f"Waiting for {proc.handle.args} to stop")
-            wait_for_process_tree(proc.handle.pid, parent_timeout=60.0)
+            t = threading.Thread(
+                target=wait_for_process_tree,
+                args=(proc.handle.pid,),
+                kwargs={"parent_timeout": parent_timeout, "child_timeout": child_timeout},
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
 
     logger.info("I have launched everyone, waiting for them to finish...")
 
@@ -544,12 +563,12 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                     logger.info(f"Requesting termination for service process {proc.handle.args}")
                     request_terminate_with_children(proc.handle.pid)
                 for proc in list(alive):
-                    wait_for_process_tree(proc.handle.pid, parent_timeout=60.0)
+                    wait_for_process_tree(proc.handle.pid, parent_timeout=10.0)
                     try:
                         proc.handle.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         logger.warning(f"Service process {proc.handle.args} did not stop; forcing termination")
-                        terminate_with_children(proc.handle.pid, parent_timeout=60.0)
+                        terminate_with_children(proc.handle.pid, parent_timeout=10.0)
                         proc.handle.wait(timeout=10)
                     logger.info(f"Service process {proc.handle.args} stopped")
                     alive.remove(proc)
@@ -564,7 +583,8 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
             #     sys.exit(1)
             time.sleep(1.0)
     except KeyboardInterrupt:
-        gently_stop_all_processes()
+        # User asked to abort — be aggressive, don't make them wait.
+        gently_stop_all_processes(parent_timeout=3.0, child_timeout=3.0)
 
 
 def debug_link_streams(cfg: DictConfig, topics: list[str]):
