@@ -1,7 +1,6 @@
 defaults:
   - base
   - cubes: base
-  - override rewards: success_and_format
   - _self_
 
 output_dir: results/cube_math_tool/${now:%Y-%m-%d}/${now:%H-%M-%S}

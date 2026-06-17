@@ -8,12 +8,12 @@ from typing import Any
 from cube_harness.rl.event_publisher import EventPublisher
 
 from pipelinerl.domains.cube.result_builder import (
-    apply_rollout_rewards,
+    apply_reward_shaping,
     build_payload,
     rollout_result_from_events,
     run_rollout,
-    write_rollout_artifact,
 )
+from pipelinerl.domains.cube.reward_shaping import RewardShapingConfig
 from pipelinerl.ray.worker import RolloutWorker, RolloutWorkerContext
 from pipelinerl.rollouts import RolloutRequest, RolloutResult
 
@@ -23,17 +23,15 @@ logger = logging.getLogger(__name__)
 class CubeRolloutWorker(RolloutWorker):
     """Runs one cube-harness episode per request via `RolloutTaskRunner`."""
 
-    def __init__(self, config: dict[str, Any]):
-        super().__init__(config)
-        actor_cfg = config.get("actor", {})
+    def __init__(self, worker_config: dict[str, Any]):
+        super().__init__(worker_config)
+        actor_cfg = worker_config.get("actor", {})
         self._buffer_tokens = int(actor_cfg.get("buffer_tokens", 0))
         self._discount_factor = float(actor_cfg.get("discount_factor", 1.0))
-        artifact_cfg = config.get("rollout_artifacts") or {}
-        self._persist_rollout_artifacts = bool(artifact_cfg.get("enabled", False))
-        artifact_dir = artifact_cfg.get("path")
-        self._rollout_artifact_dir = (
-            Path(artifact_dir) if artifact_dir else Path(config["output_dir"]) / "actor" / "rollout_artifacts"
+        self._reward_shaping_config = RewardShapingConfig.from_mapping(
+            worker_config.get("reward_shaping")
         )
+        self.output_dir = Path(worker_config.get("output_dir"))
 
     def setup(self, context: RolloutWorkerContext) -> None:
         try:
@@ -51,12 +49,11 @@ class CubeRolloutWorker(RolloutWorker):
         if not self.ready:
             raise RuntimeError(f"{self.worker_name} not ready")
 
-        rollout_dir = self._rollout_artifact_dir / request.request_id
         payload = build_payload(
             request=request,
             item=item,
             llm=request.extras.get("llm"),
-            output_dir=rollout_dir,
+            output_dir=self.output_dir,
         )
 
         logger.info("%s starting rollout for domain=%s task_id=%s", self.worker_name, domain, task_id)
@@ -74,23 +71,15 @@ class CubeRolloutWorker(RolloutWorker):
             latency=time.perf_counter() - start,
             dataset=item.get("dataset"),
             domain=domain,
+            reward_shaping_config=self._reward_shaping_config,
         )
-        apply_rollout_rewards(
+        apply_reward_shaping(
             result.training_texts,
             agent_config=item["agent_cfg"],
             buffer_tokens=self._buffer_tokens,
             discount_factor=self._discount_factor,
+            reward_shaping_config=self._reward_shaping_config,
         )
-        if self._persist_rollout_artifacts:
-            write_rollout_artifact(
-                events=events,
-                artifact_dir=self._rollout_artifact_dir,
-                worker_name=self.worker_name,
-                trajectory_id=request.request_id,
-                task_id=task_id,
-                domain=domain,
-                dataset=item.get("dataset"),
-            )
         return result
 
     def close(self) -> None:

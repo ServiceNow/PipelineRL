@@ -28,3 +28,24 @@ vllm_config:
     enable-auto-tool-choice: ""
     tool-call-parser: rl_tool
     tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
+
+# Generic per-LLM-call reward shaping for tool-calling agents.
+# Disabled by default — existing runs are unaffected unless overridden.
+# Each component is added to every trainable LLM call's reward (after the
+# terminal reward / discount / length-buffer pipeline). See
+# pipelinerl/domains/cube/reward_shaping.py for the implementation.
+reward_shaping:
+  enabled: false
+  format:
+    enabled: false
+    weight: 0.0
+    required_tokens: []      # substrings that must all appear in the assistant text
+    forbidden_tokens: []     # substrings that must NOT appear
+    require_tool_call: false # require at least one structured tool_call
+  correctness:
+    enabled: false
+    weight: 0.0
+    reward_valid: 1.0          # known tool + matching arg schema
+    penalty_unknown_tool: -1.0 # tool name not exposed for this call
+    penalty_bad_args: -1.0     # unknown / missing-required / malformed args
+    penalty_no_tool_call: -1.0  # output had no tool_call at all

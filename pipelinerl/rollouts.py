@@ -38,6 +38,7 @@ class TrainingText(BaseModel):
     text: str
     n_predicted: int
     reward: float = 0.0
+    step_reward: float = 0.0
     logprobs: List[float] = Field(default_factory=list)
     ref_logprobs: List[float] = Field(default_factory=list)
     input_ids: List[int] = Field(default_factory=list)

@@ -19,6 +19,7 @@ from cube_harness.rl.event_publisher import EventPublisher
 from cube_harness.rl.events import EventContext, TerminalEvent
 from cube_harness.rl.task_runner import RolloutTaskRunner
 
+from pipelinerl.domains.cube.reward_shaping import RewardShapingConfig, compute_call_shaping
 from pipelinerl.rollouts import BaseMetrics, RolloutResult, TrainingText
 MASKED_TOKEN_ID = -100
 
@@ -122,6 +123,7 @@ def rollout_result_from_events(
     latency: float,
     dataset: str | None,
     domain: str | None,
+    reward_shaping_config: RewardShapingConfig | None = None,
 ) -> RolloutResult:
     """Map a cube-harness RL event stream to a PipelineRL `RolloutResult`."""
     training_texts: list[TrainingText] = []
@@ -141,7 +143,9 @@ def rollout_result_from_events(
             call = (event.get("event") or {}).get("call")
             if call is None:
                 continue
-            training_texts.append(_training_text_from_event(event, call))
+            training_texts.append(
+                _training_text_from_event(event, call, reward_shaping_config=reward_shaping_config)
+            )
         elif event_type in {"agent_error", "tool_call"}:
             payload = event.get("event") or {}
             if payload.get("error"):
@@ -188,14 +192,17 @@ def rollout_result_from_events(
     )
 
 
-def apply_rollout_rewards(
+def apply_reward_shaping(
     training_texts: list[TrainingText],
     *,
     agent_config: Any,
     buffer_tokens: int = 0,
     discount_factor: float = 1.0,
+    reward_shaping_config: RewardShapingConfig | None = None,
 ) -> None:
-    """Apply discount + length-buffer reward shaping in-place."""
+    """Apply discount + length-buffer + per-call format/correctness shaping in-place."""
+
+
     total_output_tokens = sum(getattr(t, "output_tokens", 0) for t in training_texts)
     if discount_factor != 1.0:
         scale = discount_factor**total_output_tokens
@@ -209,61 +216,18 @@ def apply_rollout_rewards(
         for text in training_texts:
             text.reward += penalty
 
+    if reward_shaping_config and reward_shaping_config.is_active:
+        for text in training_texts:
+            shaping = text.metadata.get("reward_shaping")
+            if isinstance(shaping, dict):
+                text.step_reward += float(shaping.get("total", 0.0))
 
-def write_rollout_artifact(
+def _training_text_from_event(
+    event: dict[str, Any],
+    call: dict[str, Any],
     *,
-    events: list[dict[str, Any]],
-    artifact_dir: Path,
-    worker_name: str,
-    trajectory_id: str,
-    task_id: str | None,
-    domain: str | None,
-    dataset: str | None,
-) -> None:
-    """Persist a compact per-rollout summary derived from the event stream."""
-    try:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        llm_calls = []
-        terminal: dict[str, Any] | None = None
-        for event in events:
-            event_type = event.get("type")
-            if event_type == "llm_call":
-                call = (event.get("event") or {}).get("call") or {}
-                rl = event.get("rl") or {}
-                llm_calls.append(
-                    {
-                        "step_index": event.get("event_index"),
-                        "llm_call_index": rl.get("llm_call_index"),
-                        "llm_call_id": call.get("id"),
-                        "tag": call.get("tag"),
-                        "timestamp": call.get("timestamp"),
-                        "prompt_tokens": call.get("prompt_tokens"),
-                        "output_tokens": call.get("output_tokens"),
-                        "finish_reason": call.get("finish_reason"),
-                        "metadata": call.get("metadata"),
-                    }
-                )
-            elif event_type == "terminal":
-                terminal = event
-
-        payload = {
-            "trajectory_id": trajectory_id,
-            "domain": domain,
-            "dataset_name": dataset,
-            "task_id": task_id,
-            "termination_reason": terminal.get("rollout_status") if terminal else None,
-            "reward_info": {"final_reward": terminal.get("final_reward")} if terminal else None,
-            "summary_stats": terminal.get("summary") if terminal else None,
-            "n_steps": len(llm_calls),
-            "llm_calls": llm_calls,
-        }
-        artifact_path = artifact_dir / f"{worker_name}_{trajectory_id}_{time.time_ns()}.json"
-        artifact_path.write_text(json.dumps(payload, indent=2, default=str))
-    except Exception:
-        logger.exception("%s failed to write rollout artifact for %s", worker_name, trajectory_id)
-
-
-def _training_text_from_event(event: dict[str, Any], call: dict[str, Any]) -> TrainingText:
+    reward_shaping_config: RewardShapingConfig | None = None,
+) -> TrainingText:
     prompt_token_ids = call.get("prompt_token_ids") or []
     completion_token_ids = call.get("completion_token_ids") or []
     logprobs = call.get("logprobs") or []
@@ -295,6 +259,8 @@ def _training_text_from_event(event: dict[str, Any], call: dict[str, Any]) -> Tr
             "llm_output_tokens": call.get("output_tokens"),
         }
     )
+    if reward_shaping_config and reward_shaping_config.is_active:
+        metadata["reward_shaping"] = compute_call_shaping(call, reward_shaping_config)
     return TrainingText(
         text=text,
         n_predicted=n_predicted,
