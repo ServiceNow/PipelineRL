@@ -71,6 +71,7 @@ class CubeRolloutWorker(RolloutWorker):
             latency=time.perf_counter() - start,
             dataset=item.get("dataset"),
             domain=domain,
+            task_id=task_id,
             reward_shaping_config=self._reward_shaping_config,
         )
         apply_reward_shaping(

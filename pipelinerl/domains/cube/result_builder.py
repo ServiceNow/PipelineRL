@@ -121,6 +121,7 @@ def rollout_result_from_events(
     events: list[dict[str, Any]],
     *,
     latency: float,
+    task_id: str,
     dataset: str | None,
     domain: str | None,
     reward_shaping_config: RewardShapingConfig | None = None,
@@ -164,6 +165,7 @@ def rollout_result_from_events(
         text.metadata["rollout_status"] = rollout_status
         text.metadata["domain"] = domain
         text.metadata["dataset_name"] = dataset
+        text.metadata["task_id"] = task_id
 
     summary_info = ((terminal.get("summary") or {}).get("info") or {})
     filtered_info = {
