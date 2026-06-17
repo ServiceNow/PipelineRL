@@ -171,12 +171,18 @@ class HermesRLToolParser(ToolParser):
                 if tc is not None:
                     tool_calls.append(tc)
 
-            if tool_calls and final_response_match:
-                content = ""
+            if tool_calls:
+                if final_response_match:
+                    content = ""
+                else:
+                    idx = content_to_search.find(self.tool_call_start_token)
+                    content = content_to_search[:idx].rstrip() if idx >= 0 else ""
             elif final_response_match:
                 content = final_response_match.group(1).strip()
             else:
                 content = model_output
+
+            content = content.replace("<|im_end|>", "").rstrip()
 
             return ExtractedToolCallInformation(
                 tools_called=bool(tool_calls),
