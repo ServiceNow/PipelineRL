@@ -15,6 +15,7 @@ from queue import Empty
 from typing import List
 
 import datasets
+import numpy as np
 import transformers
 from litellm import BaseModel, Field
 
@@ -486,6 +487,10 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
+    # Accumulate shaping signals between stats emits (cleared on each emit).
+    recent_step_advantage: list[float] = []
+    recent_step_reward: list[float] = []
+
     with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
@@ -564,6 +569,10 @@ def run_preprocessing_loop(
                             raise Exception(dataset['error'])
                         for entry in dataset:
                             buffer.append(entry)
+                            if "step_advantage" in entry:
+                                recent_step_advantage.append(float(entry["step_advantage"]))
+                            if "step_reward" in entry:
+                                recent_step_reward.append(float(entry["step_reward"]))
                         processed_chunks += 1
 
                     if len(buffer) < cfg.preprocess.dataset_buffer_size:
@@ -682,6 +691,17 @@ def run_preprocessing_loop(
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
+                        if recent_step_advantage:
+                            arr = np.asarray(recent_step_advantage, dtype=np.float64)
+                            stats["preprocessor/step_advantage_mean"] = float(arr.mean())
+                            stats["preprocessor/step_advantage_std"] = float(arr.std())
+                            stats["preprocessor/step_advantage_abs_mean"] = float(np.abs(arr).mean())
+                            recent_step_advantage.clear()
+                        if recent_step_reward:
+                            arr = np.asarray(recent_step_reward, dtype=np.float64)
+                            stats["preprocessor/step_reward_mean"] = float(arr.mean())
+                            stats["preprocessor/step_reward_std"] = float(arr.std())
+                            recent_step_reward.clear()
                         if wandb_run is not None:
                             wandb_run.log(stats)
                         stats_writer.write(stats)

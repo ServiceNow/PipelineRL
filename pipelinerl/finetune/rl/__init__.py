@@ -494,9 +494,42 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         how="left"
     )
     assert len(df_advantages) == len(df_init)
+
+    # === EXPERIMENTAL: per-rollout step_reward baselining ===
+    # Collapse step_reward to a per-rollout mean, then subtract the per-group
+    # mean so the shaping signal is zero-mean across each GRPO group. We
+    # baseline at the rollout level (not per step_index) because rollouts in
+    # a group are only prefix-matched at step 0 — once trajectories diverge,
+    # comparing step k across siblings isn't valid. Consequence: every step
+    # of a given rollout receives the same `step_advantage` (uniform credit
+    # assignment within the rollout). If you want true step-level credit
+    # assignment, delete this block and either go back to adding raw
+    # `step_reward` to the advantage, or wire in a per-step critic / GAE.
+    if has_step_reward:
+        rollout_step = (
+            df_advantages.groupby(["group_id", "rollout_index"])["step_reward"]
+            .mean()
+            .rename("rollout_step_mean")
+            .reset_index()
+        )
+        group_step = (
+            rollout_step.groupby("group_id")["rollout_step_mean"]
+            .mean()
+            .rename("group_step_mean")
+            .reset_index()
+        )
+        df_advantages = df_advantages.merge(rollout_step, on=["group_id", "rollout_index"], how="left")
+        df_advantages = df_advantages.merge(group_step, on="group_id", how="left")
+        df_advantages["step_advantage"] = (
+            df_advantages["rollout_step_mean"] - df_advantages["group_step_mean"]
+        )
+    else:
+        df_advantages["step_advantage"] = 0.0
+    # === END EXPERIMENTAL ===
+
     def calculate_advantages(row):
         rewards = row["rewards"]
-        step_reward = float(row["step_reward"]) if has_step_reward else 0.0
+        step_advantage = float(row["step_advantage"])
         group_sum = row["rollout_reward_sum"]
         group_count = row["rollout_reward_count"]
         current_reward = rewards[0]
@@ -506,19 +539,25 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             loo_mean = current_reward
         std = row["rollout_reward_std"]
         if config.divide_advantage_by_std:
-            return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) + step_reward for r in rewards]
-        return [(r - loo_mean) + step_reward for r in rewards]
+            return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) + step_advantage for r in rewards]
+        return [(r - loo_mean) + step_advantage for r in rewards]
 
     df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
-    drop_cols = ["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
+    drop_cols = [
+        "rewards",
+        "rollout_reward_sum",
+        "rollout_reward_count",
+        "rollout_reward_std",
+    ]
     if has_step_reward:
-        drop_cols.append("step_reward")
+        drop_cols.extend(["step_reward", "rollout_step_mean", "group_step_mean"])
     df_advantages = df_advantages.drop(columns=drop_cols)
     assert df_advantages.columns.tolist() == [
         "group_id",
         "rollout_index",
         "step_index",
         "group_tokens",
+        "step_advantage",
         "advantages",
     ]
 
@@ -553,11 +592,13 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()
     num_labels_list = df["num_labels"].tolist()
+    step_advantage_list = df["step_advantage"].tolist()
     for i, entry in enumerate(dataset):
         entry["advantages"] = advantages_list[i]
         entry["group_tokens"] = group_tokens_list[i]
         entry["overflow"] = overflow_list[i]
         entry["num_labels"] = num_labels_list[i]
+        entry["step_advantage"] = float(step_advantage_list[i])
     return dataset
 
 
