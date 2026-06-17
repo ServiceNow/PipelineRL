@@ -292,7 +292,7 @@ class RayActorLoop:
             self.can_submit_before_update = lag_groups + self.groups_per_update
 
         self.domain_sampler = None
-        if self.is_training:
+        if self.is_training and len(cfg.train_dataset_names) > 1:
             domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
             if domain_mix_cfg:
                 mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
