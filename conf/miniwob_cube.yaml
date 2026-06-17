@@ -63,7 +63,6 @@ preprocess:
 
 train_dataset_names:
   - miniwob_html
-  - miniwob_axtree
 test_dataset_names:
   # - miniwob_test
 
@@ -77,8 +76,8 @@ dataset_loader_params:
           use_html: true
           use_axtree: false
           use_screenshot: false
-    agent: &react_agent
-      _type: cube_harness.agents.react.ReactAgentConfig
+    agent: &simple_agent
+      _type: pipelinerl.domains.cube.agents.SimpleAgentConfig
       llm_config:
         _type: cube_harness.rl.llm.RolloutLLMConfig
         model_name: ${vllm_config.vllm_kwargs.served_model_name}
@@ -95,4 +94,4 @@ dataset_loader_params:
         use_html: false
         use_axtree: true
         use_screenshot: false
-    agent: *react_agent
+    agent: *simple_agent
