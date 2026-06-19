@@ -125,16 +125,52 @@ def rollout_result_from_events(
     dataset: str | None,
     domain: str | None,
     reward_shaping_config: RewardShapingConfig | None = None,
+    debug_env_response: bool = False,
 ) -> RolloutResult:
     """Map a cube-harness RL event stream to a PipelineRL `RolloutResult`."""
     training_texts: list[TrainingText] = []
     event_errors: list[Any] = []
     terminal: dict[str, Any] | None = None
+    env_response_buffer: list[dict[str, Any]] = []
+    env_eval_buffer: list[dict[str, Any]] = []
+
+    def flush_env_response() -> None:
+        if not debug_env_response or not env_response_buffer or not training_texts:
+            env_response_buffer.clear()
+            return
+        training_texts[-1].metadata["env_response"] = [
+            {
+                "type": item.get("type"),
+                "event_index": item.get("event_index"),
+                "timestamp": item.get("timestamp"),
+                "payload": item.get("event"),
+            }
+            for item in env_response_buffer
+        ]
+        env_response_buffer.clear()
+
+    def flush_env_eval() -> None:
+        if not debug_env_response or not env_eval_buffer or not training_texts:
+            env_eval_buffer.clear()
+            return
+        training_texts[-1].metadata["env_evaluation"] = [
+            {
+                "type": item.get("type"),
+                "event_index": item.get("event_index"),
+                "timestamp": item.get("timestamp"),
+                "payload": item.get("event"),
+            }
+            for item in env_eval_buffer
+        ]
+        env_eval_buffer.clear()
+
     for event in events:
         event_type = event.get("type")
         if event_type == "terminal":
             terminal = event
         elif event_type == "llm_call":
+            flush_env_response()
+            flush_env_eval()
             rl = event.get("rl") or {}
             if not rl.get("trainable"):
                 payload = event.get("event") or {}
@@ -147,10 +183,17 @@ def rollout_result_from_events(
             training_texts.append(
                 _training_text_from_event(event, call, reward_shaping_config=reward_shaping_config)
             )
-        elif event_type in {"agent_error", "tool_call"}:
+        elif event_type in {"agent_error", "tool_call", "evaluation"}:
             payload = event.get("event") or {}
             if payload.get("error"):
                 event_errors.append(payload["error"])
+            if event_type == "tool_call" and training_texts:
+                env_response_buffer.append(event)
+            if event_type == "evaluation" and training_texts:
+                env_eval_buffer.append(event)
+
+    flush_env_response()
+    flush_env_eval()
 
     if terminal is None:
         raise RuntimeError("Cube rollout ended without terminal event")

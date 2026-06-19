@@ -28,6 +28,7 @@ class CubeRolloutWorker(RolloutWorker):
         actor_cfg = worker_config.get("actor", {})
         self._buffer_tokens = int(actor_cfg.get("buffer_tokens", 0))
         self._discount_factor = float(actor_cfg.get("discount_factor", 1.0))
+        self._debug_env_response = bool(actor_cfg.get("debug_env_response", False))
         self._reward_shaping_config = RewardShapingConfig.from_mapping(
             worker_config.get("reward_shaping")
         )
@@ -73,6 +74,7 @@ class CubeRolloutWorker(RolloutWorker):
             domain=domain,
             task_id=task_id,
             reward_shaping_config=self._reward_shaping_config,
+            debug_env_response=self._debug_env_response,
         )
         apply_reward_shaping(
             result.training_texts,
