@@ -241,6 +241,10 @@ class RayActorLoop:
         self.debug_mode = bool(cfg.debug.mode)
         
         self.attempts = int(cfg.attempts) if is_training else 1
+        self.rollout_once = bool(getattr(cfg.actor, "rollout_once", False)) and self.is_training
+        self.max_empty_retries = int(getattr(cfg.actor, "max_empty_retries", 3))
+        if self.max_empty_retries < 0:
+            raise ValueError(f"actor.max_empty_retries must be >= 0, got {self.max_empty_retries}")
         self.rollout_timeout_s = getattr(cfg.actor, "rollout_timeout", None)
         self.rollout_timeout_s = float(self.rollout_timeout_s) if self.rollout_timeout_s is not None else None
         self.sliding_aggregator = SlidingWindowAggregator(window_size=int(cfg.actor.throughput_window_size))
@@ -262,6 +266,8 @@ class RayActorLoop:
         self._expected_groups = -1
         self._retry_requests: deque[RolloutRequest] = deque()
         self._group_rollouts: dict[int, list[RolloutResult]] = {}
+        self._empty_retry_counts: dict[int, int] = {}
+        self._abandoned_groups: set[int] = set()
         self._started_rollouts = 0
         self._finished_rollouts = 0
         self._run_submitted_groups = 0
@@ -295,6 +301,8 @@ class RayActorLoop:
         if self.is_training and len(cfg.train_dataset_names) > 1:
             domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
             if domain_mix_cfg:
+                if self.rollout_once:
+                    raise ValueError("actor.rollout_once=true is incompatible with actor.domain_mix")
                 mix_weights = OmegaConf.to_container(domain_mix_cfg, resolve=True)
                 if not isinstance(mix_weights, dict):
                     raise ValueError("actor.domain_mix must be a mapping from domain to weight")
@@ -446,6 +454,16 @@ class RayActorLoop:
         llm = request.extras.pop("llm", None)
         self.llm_load_balancer.release(llm)
 
+    def _abandon_group(self, local_group_id: int) -> None:
+        self._abandoned_groups.add(local_group_id)
+        self._group_rollouts.pop(local_group_id, None)
+        self._empty_retry_counts.pop(local_group_id, None)
+        self._retry_requests = deque(
+            r for r in self._retry_requests if int(r.extras.get("local_group_id", -1)) != local_group_id
+        )
+        self._run_finished_groups += 1
+        self.total_finished_groups += 1
+
     def _submit_request(self, request: RolloutRequest) -> bool:
         if self.manager.idle_count <= 0:
             return False
@@ -468,9 +486,12 @@ class RayActorLoop:
         if self._is_running:
             return "running"
         assert self.trainer_state.propagated_weight_version is not None
-        self._expected_groups = -1 if self.is_training else len(self.dataset)
+        unbounded_training = self.is_training and not self.rollout_once
+        self._expected_groups = -1 if unbounded_training else len(self.dataset)
         self._retry_requests = deque()
         self._group_rollouts = {}
+        self._empty_retry_counts = {}
+        self._abandoned_groups = set()
         self._started_rollouts = 0
         self._finished_rollouts = 0
         self._run_submitted_groups = 0
@@ -561,13 +582,17 @@ class RayActorLoop:
                     blocked_by_lag = self.total_submitted_groups >= self.can_submit_before_update
                     if blocked_by_lag:
                         break
-                    self._group_id += 1
-
-                    if self.domain_sampler is not None:
-                        self._current_item = self.domain_sampler.sample()
+                    if self.rollout_once:
+                        if self._next_item_index >= len(self.dataset):
+                            break
+                        next_item = self.dataset[self._next_item_index]
+                        self._next_item_index += 1
+                    elif self.domain_sampler is not None:
+                        next_item = self.domain_sampler.sample()
                     else:
-                        self._current_item = self.dataset[random.randrange(len(self.dataset))]
-                        
+                        next_item = self.dataset[random.randrange(len(self.dataset))]
+                    self._group_id += 1
+                    self._current_item = next_item
                     self._group_rollouts[self._group_id] = []
                     self._group_rollout_index = 0
                     self._run_submitted_groups += 1
@@ -601,7 +626,7 @@ class RayActorLoop:
                 return "running"
             if self.is_training and trainer_finished:
                 return self._finish("trainer_finished")
-            if (not self.is_training) and self._next_item_index >= len(self.dataset):
+            if (self.rollout_once or not self.is_training) and self._next_item_index >= len(self.dataset):
                 return self._finish("completed")
             time.sleep(0.01)
             return "running"
@@ -610,7 +635,15 @@ class RayActorLoop:
         try:
             completed = self.manager.wait_completed(timeout_s=timeout)
         except RolloutExecutionError as exc:
-            logger.warning("Rollout failed and will be retried: request_id=%s", exc.request.request_id, exc_info=True)
+            failed_item = exc.request.dataset_item or {}
+            logger.warning(
+                "Rollout failed and will be retried: task_id=%s domain=%s dataset=%s request_id=%s",
+                failed_item.get("task_id"),
+                failed_item.get("domain"),
+                failed_item.get("dataset"),
+                exc.request.request_id,
+                exc_info=True,
+            )
             self._release_request_llm(exc.request)
             self._retry_requests.append(exc.request)
             return "running"
@@ -636,8 +669,27 @@ class RayActorLoop:
             self._release_request_llm(request)
             result.model_version = request.model_version
             result.group_id = request.group_id
+            if local_group_id in self._abandoned_groups:
+                self._finished_rollouts += 1
+                continue
             if not result.training_texts:
-                logger.warning("Dropping empty rollout result and retrying: request_id=%s group_id=%s", request.request_id, request.group_id)
+                item = request.dataset_item or {}
+                task_id = item.get("task_id")
+                domain = item.get("domain")
+                dataset_name = item.get("dataset")
+                retry_count = self._empty_retry_counts.get(local_group_id, 0) + 1
+                if retry_count > self.max_empty_retries:
+                    logger.error(
+                        "Abandoning group %s after %d empty rollouts: task_id=%s domain=%s dataset=%s",
+                        request.group_id, retry_count, task_id, domain, dataset_name,
+                    )
+                    self._abandon_group(local_group_id)
+                    continue
+                self._empty_retry_counts[local_group_id] = retry_count
+                logger.warning(
+                    "Dropping empty rollout result and retrying (%d/%d): task_id=%s domain=%s dataset=%s",
+                    retry_count, self.max_empty_retries, task_id, domain, dataset_name
+                )
                 self._retry_requests.append(request)
                 continue
             for step_index, sample in enumerate(result.training_texts):
@@ -649,6 +701,7 @@ class RayActorLoop:
             self._finished_rollouts += 1
             if len(self._group_rollouts[local_group_id]) == self.attempts:
                 group_results = self._group_rollouts.pop(local_group_id)
+                self._empty_retry_counts.pop(local_group_id, None)
                 if self.attempts > 1:
                     random.shuffle(group_results)
 
@@ -664,10 +717,12 @@ class RayActorLoop:
                 self.total_finished_groups += 1
                 self.total_published_samples += group_samples
                 self.update_stats(group_results)
-                should_publish_train_stats = self.is_training and (self._trainer_version_to_publish is not None or self.debug_mode)
+                rollout_once_final = self.rollout_once and self._run_finished_groups == self._expected_groups
+                should_publish_train_stats = self.is_training and (self._trainer_version_to_publish is not None or self.debug_mode or rollout_once_final)
                 should_publish_eval_stats = (not self.is_training) and self._run_finished_groups == self._expected_groups
                 if should_publish_train_stats or should_publish_eval_stats:
                     if self.is_training:
+                        trainer_version_for_stats = self._trainer_version_to_publish if self._trainer_version_to_publish is not None else self._last_trainer_version
                         loop_stats = {
                             "published_samples": self.total_published_samples,
                             "submitted_groups": self.total_submitted_groups,
@@ -675,14 +730,14 @@ class RayActorLoop:
                             "pending_rollouts": self.manager.active_count,
                             "active_rollouts": self.manager.active_count,
                             "time_since_start": time.time() - self._loop_start_time,
-                            "trainer_model_version": self._trainer_version_to_publish,
+                            "trainer_model_version": trainer_version_for_stats,
                         }
                         self._trainer_version_to_publish = None
                     else:
                         loop_stats = {"trainer_model_version": self._last_trainer_version}
                     self.publish_stats(loop_stats)
 
-        if (not self.is_training) and self._run_finished_groups == self._expected_groups and self.manager.active_count == 0 and not self._retry_requests:
+        if (self.rollout_once or not self.is_training) and self._run_finished_groups == self._expected_groups and self.manager.active_count == 0 and not self._retry_requests:
             return self._finish("completed")
         return "running"
 
@@ -711,7 +766,7 @@ def _manager_ray_options(cfg: DictConfig, *, mode: str) -> dict[str, Any]:
 def _launch_ray_worker_log_collector(cfg: DictConfig, exp_path: Path) -> Any | None:
     if not bool(getattr(cfg.actor, "ray_worker_log_enabled", True)):
         return None
-    worker_log_path = getattr(cfg.actor, "ray_worker_log_path", None) or str(exp_path / "actor" / "ray_workers.jsonl")
+    worker_log_path = getattr(cfg.actor, "ray_worker_log_path", None) or str(exp_path / "actor" / "ray_workers.log")
     collector = RayWorkerLogCollector.remote(str(worker_log_path))
     logger.info("Ray worker logs will be collected in %s", worker_log_path)
     return collector
@@ -887,7 +942,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                         logger.info("Stopping Ray actor loop because a Ray worker node is shutting down")
                         break
                     raise
-                if train_status == "trainer_finished":
+                if train_status in ("trainer_finished", "completed"):
                     break
     finally:
         if run is not None:

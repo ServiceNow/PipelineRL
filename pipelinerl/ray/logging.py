@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import contextvars
-import json
 import logging
 import os
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,8 +35,31 @@ class RayWorkerLogCollector:
         self._file = self._log_path.open("a", buffering=1, encoding="utf-8")
 
     def write(self, event: dict[str, Any]) -> None:
-        event.setdefault("written_at", datetime.now(timezone.utc).isoformat())
-        self._file.write(json.dumps(event, default=str, sort_keys=True) + "\n")
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            ts_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        else:
+            ts_str = str(timestamp or "")
+        worker = event.get("worker") or "ray_worker"
+        logger_name = event.get("logger") or "?"
+        level = event.get("level") or "INFO"
+        message = event.get("message") or ""
+        rollout_id = event.get("rollout_id") or ""
+        task_id = event.get("task_id") or ""
+        context_bits = []
+        if task_id:
+            context_bits.append(f"task_id={task_id}")
+        if rollout_id:
+            context_bits.append(f"rollout_id={rollout_id}")
+        context_suffix = f" [{' '.join(context_bits)}]" if context_bits else ""
+        line = f"[{worker}] {ts_str} - {logger_name} - {level} - {message}{context_suffix}\n"
+        self._file.write(line)
+        exception = event.get("exception")
+        if exception:
+            self._file.write(exception if exception.endswith("\n") else exception + "\n")
+        stack = event.get("stack")
+        if stack:
+            self._file.write(stack if stack.endswith("\n") else stack + "\n")
 
     def close(self) -> None:
         self._file.flush()

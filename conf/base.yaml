@@ -26,6 +26,8 @@ actor:
   log_each_n_secs: 0
   llm_max_rollouts: 64
   rollout_workers: 1
+  rollout_once: false
+  max_empty_retries: 5
   discount_factor: 1
   problem_queue_size: 64
   result_queue_size: 64
