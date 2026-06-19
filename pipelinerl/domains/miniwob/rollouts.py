@@ -18,9 +18,9 @@ from tapeagents.orchestrator import async_execute_agent
 from tapeagents.remote_environment import AsyncRemoteEnvironment
 from tapeagents.tools.simple_browser import PageObservation
 
-from pipelinerl.async_llm import make_training_text
+from pipelinerl.async_llm import make_training_texts_from_llm_calls
 from pipelinerl.llm import LLMCall, TrainableLLM
-from pipelinerl.rollouts import BaseMetrics, RolloutResult
+from pipelinerl.rollouts import BaseMetrics, RolloutResult, summarize_training_texts
 from pipelinerl.world import Job
 
 from .steps import WebTape
@@ -271,13 +271,8 @@ async def _execute_rollout_with_timeout(
     ]
 
     # (4) # For each LLM interaction in the tape, make a training example.
-    all_finished = 1
-    prompt_tokens = [llm_call.prompt_length_tokens for llm_call in llm_calls]
-    output_tokens = [llm_call.output_length_tokens for llm_call in llm_calls]
-    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
-    for text in training_texts:
-        text.reward = reward
-        all_finished &= 1 if text.input_ids[-1] == llm.tokenizer.eos_token_id else 0
+    training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
+    training_summary = summarize_training_texts(training_texts)
 
     latency = time.time() - start_time
     agent_time = tape.metadata.result.get("agent_execution_time", -1.0)
@@ -289,7 +284,7 @@ async def _execute_rollout_with_timeout(
         success=reward > 0.5,
         no_error=no_error,
         no_answer=reward < 0,
-        overflow=not all_finished,
+        overflow=training_summary.overflow,
         n_llm_calls=n_llm_calls,
         n_step_errors=n_step_errors,
         n_page_observations=n_page_observations,
@@ -307,8 +302,6 @@ async def _execute_rollout_with_timeout(
         latency=latency,
         dataset_name=problem["dataset"],
         domain="miniwob",
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
     )
 
 
@@ -340,6 +333,4 @@ def _create_failed_rollout_result(problem: dict, start_time: float, error_type: 
         latency=latency,
         dataset_name=problem["dataset"],
         domain="miniwob",
-        prompt_tokens=[],
-        output_tokens=[],
     )

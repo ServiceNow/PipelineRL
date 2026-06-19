@@ -3,12 +3,13 @@ import io
 import logging
 
 import aiohttp
+import litellm
 import numpy as np
 from PIL import Image
 from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
 
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
-from pipelinerl.rollouts import TrainingText
+from pipelinerl.rollouts import TrainingText, apply_rollout_reward
 from pipelinerl.processor_factory import get_processor
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -83,7 +84,10 @@ def _is_retryable_abort_response(data: dict, collect_logprobs: bool) -> tuple[bo
 
 
 async def llm_async_generate(
-    llm: TrainableLLM, prompt: Prompt, session: aiohttp.ClientSession
+    llm: TrainableLLM,
+    prompt: Prompt,
+    session: aiohttp.ClientSession,
+    max_tokens_override: int | None = None,
 ) -> LLMCall:
     llm.load_tokenizer()
     headers = {"Content-Type": "application/json"}
@@ -116,6 +120,12 @@ async def llm_async_generate(
         extra_parameters = {**extra_parameters, "chat_template_kwargs": _to_plain_obj(llm.chat_template_kwargs)}
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
+
+    if prompt.tools:
+        data["tools"] = _to_plain_obj(prompt.tools)
+
+    if max_tokens_override is not None:
+        data["max_tokens"] = max_tokens_override
 
     # Merge extra_parameters first so that data (model, messages, logprobs settings) takes precedence
     payload = _to_plain_obj({**extra_parameters, **data})
@@ -161,7 +171,8 @@ async def llm_async_generate(
 
     try:
         content = response_data["choices"][0]["message"]["content"]
-        if not content:
+        raw_tool_calls = response_data["choices"][0]["message"].get("tool_calls", [])
+        if not content and not raw_tool_calls:
             logger.warning(f"Empty completion {response_data}")
 
         parsed_logprobs = []
@@ -188,7 +199,9 @@ async def llm_async_generate(
         logger.exception(f"Failed to parse llm response: {response_data}")
         raise
 
-    output = LLMOutput(content=content)
+    output = LLMOutput(content=content or "")
+    if raw_tool_calls:
+        output.tool_calls = [litellm.ChatCompletionMessageToolCall(**tc) for tc in raw_tool_calls]
     llm_call = llm.log_output(prompt, output, count_tokens=False)
     llm_call.prompt_length_tokens = response_data["usage"]["prompt_tokens"]
     llm_call.output_length_tokens = response_data["usage"]["completion_tokens"]
@@ -210,9 +223,20 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     images = []
     use_processor = False
     visual_features = None
-    full_messages = llm_call.prompt.messages + [
-        {"role": "assistant", "content": llm_call.output.content}
-    ]
+    assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
+    if llm_call.output.tool_calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in llm_call.output.tool_calls
+        ]
+    full_messages = llm_call.prompt.messages + [assistant_msg]
 
     if hasattr(llm_call.prompt, "messages"):
         images = extract_images_from_messages(llm_call.prompt.messages)
@@ -265,6 +289,8 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     else:
         # Use tokenizer for text-only models
         chat_kwargs = _to_plain_obj(llm.chat_template_kwargs) if llm.chat_template_kwargs else {}
+        if llm_call.prompt.tools:
+            chat_kwargs = {**chat_kwargs, "tools": _to_plain_obj(llm_call.prompt.tools)}
         prompt_text = llm.tokenizer.apply_chat_template(
             conversation=llm_call.prompt.messages,
             tokenize=False,
@@ -285,7 +311,6 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
 
     output_text = text[len(prompt_text) :]
 
-    # Get the appropriate tokenizer (from processor if using vision model)
     tokenizer = processor.tokenizer if use_processor else llm.tokenizer
 
     if tokenizer.bos_token and text.startswith(tokenizer.bos_token):
@@ -304,7 +329,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         finished = finish_reason != "length"
     else:
         eos_token = tokenizer.eos_token or ""
-        finished = bool(eos_token) and llm_call.output.content.endswith(eos_token)
+        finished = bool(eos_token) and (llm_call.output.content or "").endswith(eos_token)
     prompt_tokens = llm_call.prompt_length_tokens
     output_tokens = llm_call.output_length_tokens
 
@@ -319,3 +344,14 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         output_tokens=output_tokens,
         visual_features=visual_features,
     )
+
+
+def make_training_texts_from_llm_calls(
+    llm: TrainableLLM,
+    llm_calls: list[LLMCall],
+    reward: float | None = None,
+) -> list[TrainingText]:
+    training_texts = [make_training_text(llm, llm_call) for llm_call in llm_calls]
+    if reward is not None:
+        training_texts = apply_rollout_reward(training_texts, reward)
+    return training_texts
