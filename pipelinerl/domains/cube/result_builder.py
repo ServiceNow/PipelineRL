@@ -8,6 +8,7 @@ straight from cube-harness — we do not reconstruct them here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -314,8 +315,28 @@ def _training_text_from_event(
         logprobs=list(logprobs),
         prompt_tokens=int(call.get("prompt_tokens") or 0),
         output_tokens=int(call.get("output_tokens") or 0),
+        anchor_obs=_compute_anchor_obs(call),
         metadata=metadata,
     )
+
+
+def _compute_anchor_obs(call: dict[str, Any]) -> str:
+    """SHA1 of the last user message — the observation the LLM acted on.
+
+    GiGPO clusters steps that share an anchor state across sibling rollouts;
+    for an LLM agent the observation is whatever the env put in the last user
+    message (HTML, AXTree, tool output). Hash so we don't carry full DOMs
+    through the dataframe.
+    """
+    messages = ((call.get("prompt") or {}).get("messages")) or []
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            if content is None:
+                return ""
+            blob = json.dumps(content, sort_keys=True, default=str, separators=(",", ":"))
+            return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    return ""
 
 
 def _inspection_text(call: dict[str, Any]) -> tuple[str, int]:

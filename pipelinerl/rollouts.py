@@ -39,6 +39,10 @@ class TrainingText(BaseModel):
     n_predicted: int
     reward: float = 0.0
     step_reward: float = 0.0
+    # Hash of the observation that preceded this action. Empty when the domain
+    # does not emit one. GiGPO uses (group_id, anchor_obs) to form step-level
+    # advantage clusters across sibling rollouts.
+    anchor_obs: str = ""
     logprobs: List[float] = Field(default_factory=list)
     ref_logprobs: List[float] = Field(default_factory=list)
     input_ids: List[int] = Field(default_factory=list)

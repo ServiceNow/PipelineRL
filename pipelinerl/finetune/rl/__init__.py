@@ -13,6 +13,7 @@ from transformers import PreTrainedModel
 from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.rl.utils import per_segment_sums
 
+from .advantages import AdvantageConfig, GigpoConfig, GrpoLooConfig, compute_advantages
 from .utils import (
     sum_sum,
     mean_sum,
@@ -78,9 +79,16 @@ class RLConfig(BaseModel):
         default=10,
         description="Clamp the log ratio ref new value",
     )
+    # Global flag historically consumed by GRPO-LOO. Kept at the top level
+    # because other LOO-family estimators (e.g. RLOO) want it too; estimators
+    # that don't normalize by std (e.g. raw REINFORCE) can simply ignore it.
     divide_advantage_by_std: bool = Field(
         default=True,
         description="Normalize the advantage by the standard deviation",
+    )
+    advantage: AdvantageConfig = Field(
+        default_factory=GrpoLooConfig,
+        description="Advantage estimator selection (discriminated by `type`).",
     )
     overlong_filtering: bool = Field(default=False, description="Filter out sequence that do not have eos_token_id")
     group_normalization: bool = Field(
@@ -91,6 +99,10 @@ class RLConfig(BaseModel):
         default=1.0,
         description="Temperature for the training log probs",
     )
+    # Top-level flag (not estimator-specific): it's a post-processing filter
+    # applied to whatever advantages the estimator produced. Estimators that
+    # don't yield per-group scalar advantages (e.g. a future GAE variant) may
+    # render this a no-op — that's fine.
     filter_zero_advantage_groups: bool = Field(
         default=False,
         description="Filter out groups where all advantages are zero during preprocessing",
@@ -446,128 +458,50 @@ def rl_step(
     return final_loss, stats
 
 
+def _build_group_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute generic per-group features that all estimators consume.
+
+    Currently just `group_tokens` (mean number of tokens per rollout in the
+    group), used by the policy loss for group normalization. Estimator-specific
+    aggregates (reward stats, step-reward baselines, anchor-state buckets, ...)
+    live inside each estimator.
+    """
+    num_tokens = df["input_ids"].apply(len)
+    step0_mask = df["step_index"] == 0
+    group_tokens = (
+        pd.DataFrame({"group_id": df.loc[step0_mask, "group_id"], "num_tokens": num_tokens[step0_mask]})
+        .groupby("group_id")["num_tokens"]
+        .mean()
+        .rename("group_tokens")
+        .reset_index()
+    )
+    return group_tokens
+
+
 def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
-    """Populate RL-specific columns (advantages, overflow, num_labels) using a leave-one-out baseline."""
-    # Convert to pandas for processing
+    """Populate RL-specific columns (advantages, overflow, num_labels).
+
+    Pipeline:
+      1. Build generic group features (estimator-agnostic).
+      2. Dispatch to the configured advantage estimator (config.advantage.type).
+      3. Attach token-level overflow + num_labels.
+      4. Write the results back onto the input dataset.
+    """
     df_init = pd.DataFrame(dataset)
     assert isinstance(df_init, pd.DataFrame)
 
-    # Step 1: calculate group-level statistics
-    df_stats = df_init[["group_id", "rollout_index", "step_index"]].copy()
-    df_stats["num_tokens"] = df_init["input_ids"].apply(len)
-    # We assume that rewards for all tokens are the same
-    df_stats["rollout_reward"] = df_init["rewards"].apply(lambda x: x[0])
-    # Check that the (terminal) reward is the same for each step in the rollout.
-    # Per-step shaping must go through `step_reward`, not `rewards`.
-    assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1, (
-        "Terminal `rewards` differ across steps within a rollout; per-step signal belongs in `step_reward`."
-    )
-    # Only keep step_index == 0
-    df_stats = df_stats[df_stats["step_index"] == 0].drop(columns=["step_index"])
-    df_grouped = (
-        df_stats.groupby("group_id")
-        .agg(
-            rollout_reward_sum=("rollout_reward", "sum"),
-            rollout_reward_count=("rollout_reward", "count"),
-            rollout_reward_std=("rollout_reward", "std"),
-            group_tokens=("num_tokens", "mean"),
-        )
-        .reset_index()
-    )
-    assert df_grouped.columns.tolist() == [
-        "group_id",
-        "rollout_reward_sum",
-        "rollout_reward_count",
-        "rollout_reward_std",
-        "group_tokens",
-    ]
+    group_tokens = _build_group_features(df_init)
+    df_adv = compute_advantages(df_init, config)
 
-    # Step 2: calculate advantages for each sample
-    init_cols = ["group_id", "rollout_index", "step_index", "rewards"]
-    has_step_reward = "step_reward" in df_init.columns
-    if has_step_reward:
-        init_cols.append("step_reward")
-    df_advantages = pd.merge(
-        df_init[init_cols],
-        df_grouped,
-        on="group_id",
-        how="left"
-    )
-    assert len(df_advantages) == len(df_init)
+    expected_cols = {"group_id", "rollout_index", "step_index", "advantages", "step_advantage"}
+    missing = expected_cols - set(df_adv.columns)
+    assert not missing, f"Estimator '{config.advantage.type}' is missing columns: {missing}"
 
-    # === EXPERIMENTAL: per-rollout step_reward baselining ===
-    # Collapse step_reward to a per-rollout mean, then subtract the per-group
-    # mean so the shaping signal is zero-mean across each GRPO group. We
-    # baseline at the rollout level (not per step_index) because rollouts in
-    # a group are only prefix-matched at step 0 — once trajectories diverge,
-    # comparing step k across siblings isn't valid. Consequence: every step
-    # of a given rollout receives the same `step_advantage` (uniform credit
-    # assignment within the rollout). If you want true step-level credit
-    # assignment, delete this block and either go back to adding raw
-    # `step_reward` to the advantage, or wire in a per-step critic / GAE.
-    if has_step_reward:
-        rollout_step = (
-            df_advantages.groupby(["group_id", "rollout_index"])["step_reward"]
-            .mean()
-            .rename("rollout_step_mean")
-            .reset_index()
-        )
-        group_step = (
-            rollout_step.groupby("group_id")["rollout_step_mean"]
-            .mean()
-            .rename("group_step_mean")
-            .reset_index()
-        )
-        df_advantages = df_advantages.merge(rollout_step, on=["group_id", "rollout_index"], how="left")
-        df_advantages = df_advantages.merge(group_step, on="group_id", how="left")
-        df_advantages["step_advantage"] = (
-            df_advantages["rollout_step_mean"] - df_advantages["group_step_mean"]
-        )
-    else:
-        df_advantages["step_advantage"] = 0.0
-    # === END EXPERIMENTAL ===
-
-    def calculate_advantages(row):
-        rewards = row["rewards"]
-        step_advantage = float(row["step_advantage"])
-        group_sum = row["rollout_reward_sum"]
-        group_count = row["rollout_reward_count"]
-        current_reward = rewards[0]
-        if group_count > 1:
-            loo_mean = (group_sum - current_reward) / (group_count - 1)
-        else:
-            loo_mean = current_reward
-        std = row["rollout_reward_std"]
-        if config.divide_advantage_by_std:
-            return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) + step_advantage for r in rewards]
-        return [(r - loo_mean) + step_advantage for r in rewards]
-
-    df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
-    drop_cols = [
-        "rewards",
-        "rollout_reward_sum",
-        "rollout_reward_count",
-        "rollout_reward_std",
-    ]
-    if has_step_reward:
-        drop_cols.extend(["step_reward", "rollout_step_mean", "group_step_mean"])
-    df_advantages = df_advantages.drop(columns=drop_cols)
-    assert df_advantages.columns.tolist() == [
-        "group_id",
-        "rollout_index",
-        "step_index",
-        "group_tokens",
-        "step_advantage",
-        "advantages",
-    ]
-
-    # Step 3: bring advantages and group level stats back to the main df
     df = df_init.drop(columns=["advantages", "group_tokens"])
-    df = pd.merge(df, df_advantages, on=["group_id", "rollout_index", "step_index"], how="left")
-    # Debug print lengths of all dataframes
+    df = pd.merge(df, df_adv, on=["group_id", "rollout_index", "step_index"], how="left")
+    df = pd.merge(df, group_tokens, on="group_id", how="left")
     assert len(df) == len(df_init)
 
-    # Step 4: make token-level overflow and mean group length information
     def _overflow_from_finish_reason(row):
         length = len(row["overflow"])
         finish_reason = row.get("finish_reason")
@@ -587,7 +521,6 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         lambda row: [sum(1 for label in row["labels"] if label != -100)] * len(row["input_ids"]), axis=1
     )
 
-    # Step 5: move the results back to the dataset
     advantages_list = df["advantages"].tolist()
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()

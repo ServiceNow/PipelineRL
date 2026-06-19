@@ -112,3 +112,6 @@ rl:
   temperature: ${...llm.parameters.temperature}
   aggregate_loss: sum
   overlong_filtering: false
+  advantage:
+    type: grpo_loo
+
