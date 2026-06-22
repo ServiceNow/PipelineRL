@@ -77,7 +77,7 @@ dataset_loader_params:
           use_axtree: false
           use_screenshot: false
     agent: &simple_agent
-      _type: pipelinerl.domains.cube.agents.SimpleAgentConfig
+      _type: dev_cubes.agents.SimpleAgentConfig
       llm_config:
         _type: cube_harness.rl.llm.RolloutLLMConfig
         model_name: ${vllm_config.vllm_kwargs.served_model_name}

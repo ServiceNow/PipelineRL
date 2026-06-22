@@ -1,0 +1,1252 @@
+[
+  {
+    "id": "ascending-numbers",
+    "split": "test",
+    "abstract_description": "Click on the numbers in ascending order.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "bisect-angle",
+    "split": "test",
+    "abstract_description": "Find the line that bisects an angle evenly in two.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "book-flight",
+    "split": "test",
+    "abstract_description": "Search for flight results.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "book-flight-nodelay",
+    "split": "test",
+    "abstract_description": "[book-flight] Removed animation.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "buy-ticket",
+    "split": "test",
+    "abstract_description": "Buy a ticket that matches the requested criteria.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "choose-date",
+    "split": "test",
+    "abstract_description": "Learn to operate a date picker tool.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "choose-date-easy",
+    "split": "test",
+    "abstract_description": "[choose-date] December only.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "choose-date-medium",
+    "split": "test",
+    "abstract_description": "[choose-date] December or November only.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "choose-date-nodelay",
+    "split": "test",
+    "abstract_description": "[choose-date] Removed animation.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "choose-list",
+    "split": "test",
+    "abstract_description": "Choose an item from a drop down list.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "circle-center",
+    "split": "test",
+    "abstract_description": "Find the center of a circle.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-button",
+    "split": "test",
+    "abstract_description": "Click on a specific button in a generated form.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-button-sequence",
+    "split": "test",
+    "abstract_description": "Click on buttons in a certain order.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-checkboxes",
+    "split": "test",
+    "abstract_description": "Click desired checkboxes.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-checkboxes-large",
+    "split": "test",
+    "abstract_description": "[click-checkboxes] Click at least 5 out of up to 12 checkboxes.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-checkboxes-soft",
+    "split": "test",
+    "abstract_description": "[click-checkboxes] Paraphrased entries.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-checkboxes-transfer",
+    "split": "test",
+    "abstract_description": "[click-checkboxes] Train and test on different number of targets.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-collapsible",
+    "split": "test",
+    "abstract_description": "Click a collapsible element to expand it.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-collapsible-2",
+    "split": "test",
+    "abstract_description": "Find and click on a specified link, from collapsible elements.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-collapsible-2-nodelay",
+    "split": "test",
+    "abstract_description": "[click-collapsible-2] Removed animation.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-collapsible-nodelay",
+    "split": "test",
+    "abstract_description": "[click-collapsible] Removed animation.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-color",
+    "split": "test",
+    "abstract_description": "Click the specified color.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-dialog",
+    "split": "test",
+    "abstract_description": "Click the button to close the dialog box.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-dialog-2",
+    "split": "test",
+    "abstract_description": "Click a specific button in a dialog box.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-link",
+    "split": "test",
+    "abstract_description": "Click on a specified link in text.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-menu",
+    "split": "test",
+    "abstract_description": "Click menu items.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-menu-2",
+    "split": "test",
+    "abstract_description": "Find a specific item from a menu.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-option",
+    "split": "test",
+    "abstract_description": "Click option boxes.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-pie",
+    "split": "test",
+    "abstract_description": "Click items on a pie menu.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": true,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-pie-nodelay",
+    "split": "test",
+    "abstract_description": "[click-pie] Removed animation.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": true,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-scroll-list",
+    "split": "test",
+    "abstract_description": "Click multiple items from a scroll list.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-shades",
+    "split": "test",
+    "abstract_description": "Click the shades that match a specified color.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-shape",
+    "split": "test",
+    "abstract_description": "Click on a specific shape.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-tab",
+    "split": "test",
+    "abstract_description": "Click on a tab element.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-tab-2",
+    "split": "test",
+    "abstract_description": "Click a link inside a specific tab element.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-tab-2-easy",
+    "split": "test",
+    "abstract_description": "[click-tab-2] One 1 tab.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-tab-2-hard",
+    "split": "test",
+    "abstract_description": "[click-tab-2] Varying number of tabs from 2 to 6.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-tab-2-medium",
+    "split": "test",
+    "abstract_description": "[click-tab-2] Choose between a link or \u2018no match\u2019.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-test",
+    "split": "test",
+    "abstract_description": "Click on a single button.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-test-2",
+    "split": "test",
+    "abstract_description": "Click on one of two buttons.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-test-transfer",
+    "split": "test",
+    "abstract_description": "[click-test] Different buttons during train and test.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "click-widget",
+    "split": "test",
+    "abstract_description": "Click on a specific widget in a generated form.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "copy-paste",
+    "split": "test",
+    "abstract_description": "Copy text and paste it into an input.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "copy-paste-2",
+    "split": "test",
+    "abstract_description": "Copy text from a specific textarea and paste it into an input.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "count-shape",
+    "split": "test",
+    "abstract_description": "Count number of shapes.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "count-sides",
+    "split": "test",
+    "abstract_description": "Count the number of sides on a shape.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "daily-calendar",
+    "split": "test",
+    "abstract_description": "Create an event on a daily calendar.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-box",
+    "split": "test",
+    "abstract_description": "Drag the smaller box into the larger box.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-circle",
+    "split": "test",
+    "abstract_description": "Drag an item in a specified direction.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-cube",
+    "split": "test",
+    "abstract_description": "Drag a 3D cube to show a specific face.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-items",
+    "split": "test",
+    "abstract_description": "Drag items in a list, in a specified direction",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-items-grid",
+    "split": "test",
+    "abstract_description": "Drag items in a 2D grid around.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-shapes",
+    "split": "test",
+    "abstract_description": "Drag shapes into a box.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-shapes-2",
+    "split": "test",
+    "abstract_description": "Drag shapes into boxes, categorized by type.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-single-shape",
+    "split": "test",
+    "abstract_description": "Drag a randomly generated shape in a specified direction.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "drag-sort-numbers",
+    "split": "test",
+    "abstract_description": "Drag numbers into sorted ascending order.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "draw-circle",
+    "split": "test",
+    "abstract_description": "Draw a circle around a marked point.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "draw-line",
+    "split": "test",
+    "abstract_description": "Draw a line through a marked point.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox",
+    "split": "test",
+    "abstract_description": "Navigate through an email inbox and perform some actions.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-delete",
+    "split": "test",
+    "abstract_description": "[email-inbox] No scrolling + 1 subtask.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-forward",
+    "split": "test",
+    "abstract_description": "[email-inbox] No scrolling + 1 subtask.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-forward-nl",
+    "split": "test",
+    "abstract_description": "[email-inbox-forward] varied instruction texts (30 templates).",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-forward-nl-turk",
+    "split": "test",
+    "abstract_description": "[email-inbox-forward] varied instruction texts (100 templates).",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-important",
+    "split": "test",
+    "abstract_description": "[email-inbox] No scrolling + 1 subtask.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-nl-turk",
+    "split": "test",
+    "abstract_description": "[email-inbox] varied instruction texts (100 templates for each subtask).",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-noscroll",
+    "split": "test",
+    "abstract_description": "[email-inbox] No scrolling.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-reply",
+    "split": "test",
+    "abstract_description": "[email-inbox] No scrolling + 1 subtask.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "email-inbox-star-reply",
+    "split": "test",
+    "abstract_description": "[email-inbox] No scrolling + 2 subtasks.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "enter-date",
+    "split": "test",
+    "abstract_description": "Use the date input to pick the correct date.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "enter-password",
+    "split": "test",
+    "abstract_description": "Enter the password into the form.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "enter-text",
+    "split": "test",
+    "abstract_description": "Enter given text to a textfield.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "enter-text-2",
+    "split": "test",
+    "abstract_description": "Convert given text to upper or lower case.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "enter-text-dynamic",
+    "split": "test",
+    "abstract_description": "Enter dynamically generated text to a textfield.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "enter-time",
+    "split": "test",
+    "abstract_description": "Enter the specified time into the input.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "find-greatest",
+    "split": "test",
+    "abstract_description": "Find the card with the greatest number.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "find-midpoint",
+    "split": "test",
+    "abstract_description": "Find the shortest mid-point of two points.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "find-word",
+    "split": "test",
+    "abstract_description": "Find nth word in a block of text.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "focus-text",
+    "split": "test",
+    "abstract_description": "Focus into a text input.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "focus-text-2",
+    "split": "test",
+    "abstract_description": "Focus on a specific text input.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "form-sequence",
+    "split": "test",
+    "abstract_description": "Perform a series of instructions on a form.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "form-sequence-2",
+    "split": "test",
+    "abstract_description": "Perform a series of instructions on a form.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "form-sequence-3",
+    "split": "test",
+    "abstract_description": "Perform a series of instructions on a form.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "generate-number",
+    "split": "test",
+    "abstract_description": "Generate a random number that meets certain criteria.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "grid-coordinate",
+    "split": "test",
+    "abstract_description": "Find the Cartesian coordinates on a grid.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "guess-number",
+    "split": "test",
+    "abstract_description": "Guess the number.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "highlight-text",
+    "split": "test",
+    "abstract_description": "Highlight all the text.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "highlight-text-2",
+    "split": "test",
+    "abstract_description": "Highlight the specified paragraph.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "hot-cold",
+    "split": "test",
+    "abstract_description": "Find and click on the hot area.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "identify-shape",
+    "split": "test",
+    "abstract_description": "Identify a randomly generated shape.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "login-user",
+    "split": "test",
+    "abstract_description": "Enter user login details into the form.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "login-user-popup",
+    "split": "test",
+    "abstract_description": "[login-user] Random popup.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "multi-layouts",
+    "split": "test",
+    "abstract_description": "Fill in forms of varying layouts.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "multi-orderings",
+    "split": "test",
+    "abstract_description": "Fill in forms with shuffled field orderings.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "navigate-tree",
+    "split": "test",
+    "abstract_description": "Navigate a file tree to find a specified file or folder.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "number-checkboxes",
+    "split": "test",
+    "abstract_description": "Draw a given number using checkboxes.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "odd-or-even",
+    "split": "test",
+    "abstract_description": "Mark each number as odd or even.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "order-food",
+    "split": "test",
+    "abstract_description": "Order food items from a menu.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "phone-book",
+    "split": "test",
+    "abstract_description": "Find a contact in a phone book.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "read-table",
+    "split": "test",
+    "abstract_description": "Read information out from a table.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "read-table-2",
+    "split": "test",
+    "abstract_description": "Read multiple pieces of information out from a table.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "resize-textarea",
+    "split": "test",
+    "abstract_description": "Resize a textarea in a given direction.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "right-angle",
+    "split": "test",
+    "abstract_description": "Given two points, add a third point to create a right angle.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "scroll-text",
+    "split": "test",
+    "abstract_description": "Scroll through a text area element and enter last word into text area.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "scroll-text-2",
+    "split": "test",
+    "abstract_description": "Scroll through a text area in a given direction.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "search-engine",
+    "split": "test",
+    "abstract_description": "Search through a bunch of results to find a specified link.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "sign-agreement",
+    "split": "test",
+    "abstract_description": "Sign a user agreement.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "simple-algebra",
+    "split": "test",
+    "abstract_description": "Solve for X.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "simple-arithmetic",
+    "split": "test",
+    "abstract_description": "Perform some arithmetic math operations.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "social-media",
+    "split": "test",
+    "abstract_description": "Interact with a social media feed.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "social-media-all",
+    "split": "test",
+    "abstract_description": "[social-media] Do some action on all matching entries.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "social-media-some",
+    "split": "test",
+    "abstract_description": "[social-media] Do some action on some matching entries.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "stock-market",
+    "split": "test",
+    "abstract_description": "Buy from the stock market below a specified price.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "terminal",
+    "split": "test",
+    "abstract_description": "Use the terminal to delete a file.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": true,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "text-editor",
+    "split": "test",
+    "abstract_description": "Modify a text's style in a text-editor.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "text-transform",
+    "split": "test",
+    "abstract_description": "Enter slightly transformed text into a text box.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "tic-tac-toe",
+    "split": "test",
+    "abstract_description": "Win a game of tic-tac-toe.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "unicode-test",
+    "split": "test",
+    "abstract_description": "Click on the button with the correct Unicode text.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "use-autocomplete",
+    "split": "test",
+    "abstract_description": "Use autocomplete element efficiently.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "use-autocomplete-nodelay",
+    "split": "test",
+    "abstract_description": "[use-autocomplete] Removed delay.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "use-colorwheel",
+    "split": "test",
+    "abstract_description": "Use a color wheel.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "use-colorwheel-2",
+    "split": "test",
+    "abstract_description": "Use a color wheel given specific random color.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "use-slider",
+    "split": "test",
+    "abstract_description": "Use a slider to select a particular value.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "use-slider-2",
+    "split": "test",
+    "abstract_description": "Use sliders to create a given combination.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "use-spinner",
+    "split": "test",
+    "abstract_description": "Use a spinner to select given number.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": false,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  },
+  {
+    "id": "visual-addition",
+    "split": "test",
+    "abstract_description": "Count the total number of blocks.",
+    "recommended_max_steps": null,
+    "container_config": null,
+    "extra_info": {},
+    "nondeterministic": true,
+    "_type": "miniwob_cube.task.MiniWobTaskMetadata"
+  }
+]

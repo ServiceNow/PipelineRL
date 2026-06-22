@@ -3016,7 +3016,7 @@ wheels = [
 [[package]]
 name = "miniwob-cube"
 version = "1.0.0"
-source = { editable = "../cube-harness/cubes/miniwob" }
+source = { editable = "dev_cubes/miniwob" }
 dependencies = [
     { name = "cube-browser-tool", extra = ["bgym"] },
     { name = "cube-standard" },
@@ -4217,7 +4217,7 @@ requires-dist = [
     { name = "langdetect", marker = "extra == 'ifeval'" },
     { name = "litellm", specifier = ">=1.61.0" },
     { name = "math-verify", extras = ["antlr4-9-3"], specifier = "==0.8.0" },
-    { name = "miniwob-cube", marker = "extra == 'cube'", editable = "../cube-harness/cubes/miniwob" },
+    { name = "miniwob-cube", marker = "extra == 'cube'", editable = "dev_cubes/miniwob" },
     { name = "orjson", specifier = "~=3.11.0" },
     { name = "packaging", specifier = ">=23.0" },
     { name = "pandas", specifier = ">=2.2.0" },

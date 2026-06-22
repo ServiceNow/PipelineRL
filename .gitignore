@@ -192,5 +192,5 @@ Makefile
 
 
 # internal cubes with modified code
-dev_cubes/
+# dev_cubes/
 debug/

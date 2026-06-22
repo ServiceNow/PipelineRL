@@ -1,0 +1,2 @@
+from dev_cubes.agents.simple_agent import SimpleAgentConfig
+from dev_cubes.agents.simple_agent import SimpleAgent
