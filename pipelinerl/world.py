@@ -201,6 +201,16 @@ class WorldMap:
         # Scale environment servers to be the same as llm servers
         base_start_port = cfg.world.environment_start_port
         llms_per_actor = getattr(self, "llms_per_actor", 1) or 1
+        # Keep the CPU/disk-heavy environment servers on inference nodes so their
+        # sandbox builds don't contend with the finetune workers. Inference nodes
+        # are those already fully claimed by actor/preprocessor LLMs; finetune
+        # later takes whatever GPUs remain, so a node with leftover GPUs will host
+        # finetune and is excluded. Fall back to all nodes if none qualify (e.g.
+        # single-node or debug placements).
+        inference_nodes = sorted(
+            {job.node_rank for job in self.get_all_jobs() if job.kind in ("actor_llm", "preprocessor_llm")}
+        )
+        env_nodes = [node for node in inference_nodes if not self.available_gpus[node]] or None
         global_replica_idx = 0
         for spec_idx, spec in enumerate(environment_specs):
             if spec["mode"] != "remote":
@@ -213,7 +223,7 @@ class WorldMap:
             else:
                 total_env_replicas = getattr(cfg.world, "env_replicas", cfg.world.replicas * llms_per_actor)
             for replica_offset in range(total_env_replicas):
-                node = self.get_least_busy_node()
+                node = self.get_least_busy_node(candidates=env_nodes)
                 envs_at_node = len([job for job in self.job_map[node] if job.kind == "environment"])
                 self.add_job(
                     kind="environment",
@@ -267,11 +277,15 @@ class WorldMap:
                     url=ref_url,
                 )
 
-    def get_least_busy_node(self):
-        """Get the node with the least number of CPU-heavy jobs."""
-        result = 0 
-        for node, cpu_heavy_jobs in self.cpu_heavy_jobs.items():
-            if cpu_heavy_jobs < self.cpu_heavy_jobs[result]:
+    def get_least_busy_node(self, candidates: list[int] | None = None):
+        """Get the node with the least number of CPU-heavy jobs.
+
+        If ``candidates`` is given, only those nodes are considered.
+        """
+        nodes = candidates if candidates is not None else list(self.cpu_heavy_jobs.keys())
+        result = nodes[0]
+        for node in nodes:
+            if self.cpu_heavy_jobs[node] < self.cpu_heavy_jobs[result]:
                 result = node
         return result
 
