@@ -24,6 +24,18 @@ from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import MixedPrecision
 from transformers import PreTrainedTokenizerFast, get_scheduler, set_seed
+
+# ring_flash_attn 0.1.8 (latest) imports is_flash_attn_greater_or_equal_2_10 from
+# transformers.modeling_flash_attention_utils, but transformers 5.x relocated it to
+# transformers.utils. Restore it under the old path so the import resolves; the private
+# _flash_attention_forward it patches still exists and matches its v3 variant signature.
+import transformers.modeling_flash_attention_utils as _fa_utils
+
+if not hasattr(_fa_utils, "is_flash_attn_greater_or_equal_2_10"):
+    from transformers.utils import is_flash_attn_greater_or_equal_2_10
+
+    _fa_utils.is_flash_attn_greater_or_equal_2_10 = is_flash_attn_greater_or_equal_2_10
+
 from ring_flash_attn import substitute_hf_flash_attn, update_ring_flash_attn_params
 
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead
