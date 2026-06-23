@@ -12,11 +12,21 @@ with a unique completion marker so we can recover stdout and the exit code. The
 session is long-lived on purpose: tasks that start a background daemon (the
 def's ``/.singularity.d/env/*.sh`` startup hooks, sourced at session start) keep
 that daemon alive across agent commands, which is what the verifier checks.
+
+Fast-reset (mirrors tmax ``_materialize_writable_home_user``): the built task
+rootfs (base + ``%post``) is created once per ``(base, container_def)`` and kept
+read-only, shared across all env-server processes on the node via a file lock.
+proot has no copy-on-write layer, so per session we bind a fresh small writable
+``/home/user`` (and ``/tmp``) over the read-only base instead of copying the
+whole 620MB tree. This keeps local ephemeral usage tiny under high concurrency
+and avoids rebuilding the same task once per rollout (group size 32).
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
+import hashlib
 import logging
 import os
 import pty
@@ -31,7 +41,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +59,19 @@ _CONTAINER_ENV = [
     "LANG=C.UTF-8",
 ]
 
+#: Node-local root for the shared, read-only per-task rootfs cache. Kept on
+#: local disk (not the shared mount) so proot I/O stays fast; override with
+#: PL_TERMINAL_CACHE_DIR if local ephemeral is tight.
+_CACHE_ROOT = Path(os.environ.get("PL_TERMINAL_CACHE_DIR", Path(tempfile.gettempdir()) / "pl_terminal_cache"))
 
-def _proot_argv(proot_bin: str, rootfs: Path, cwd: str) -> List[str]:
+
+def _proot_argv(proot_bin: str, rootfs: Path, cwd: str, binds: Sequence[str] = ()) -> List[str]:
     argv = [proot_bin, "-0", "-r", str(rootfs)]
     for b in _BIND_PATHS:
         if Path(b).exists():
             argv += ["-b", b]
+    for spec in binds:
+        argv += ["-b", spec]
     argv += ["-w", cwd, "--kill-on-exit", "/usr/bin/env", "-i", *_CONTAINER_ENV]
     return argv
 
@@ -70,6 +87,35 @@ def _post_body(def_text: str) -> str:
         if in_post:
             body.append(line)
     return "\n".join(body)
+
+
+def _task_key(base_name: str, container_def: str) -> str:
+    h = hashlib.sha256()
+    h.update(base_name.encode("utf-8"))
+    h.update(b"\0")
+    h.update(container_def.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+@contextlib.contextmanager
+def _locked(lock_path: Path):
+    """Exclusive cross-process lock. The lock file lives outside the cached
+    rootfs dir so eviction can remove the rootfs without dropping the lock."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _force_rmtree(path: Path) -> None:
+    """Remove a tree that may have had its write bits stripped (read-only base)."""
+    if path.exists():
+        subprocess.run(["chmod", "-R", "u+w", str(path)], check=False)
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class ProotTerminalEnvironment:
@@ -96,7 +142,15 @@ class ProotTerminalEnvironment:
 
         self._owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="terminal_env_"))
-        self.rootfs = self.work_dir / "rootfs"
+
+        self._sid = uuid.uuid4().hex
+        # Set by build(): the shared read-only task rootfs and this session's
+        # small writable overlay dirs bound over it.
+        self.rootfs: Optional[Path] = None
+        self._cache_dir: Optional[Path] = None
+        self._ref: Optional[Path] = None
+        self.session_home = self.work_dir / "home"
+        self.session_tmp = self.work_dir / "tmp"
 
         self.shell_process: Optional[subprocess.Popen] = None
         self.master_fd: Optional[int] = None
@@ -107,30 +161,74 @@ class ProotTerminalEnvironment:
         self._marker = f"__CMD_DONE__{uuid.uuid4().hex}__"
 
     # ------------------------------------------------------------------
-    # build
+    # build (shared, read-only) + per-session writable overlay
     # ------------------------------------------------------------------
     def build(self, container_def: str) -> Tuple[bool, str]:
-        """Clone the base rootfs and apply the task's ``%post``."""
+        """Ensure the shared task rootfs exists, then materialize this session's
+        writable ``/home/user``. The rootfs (base + ``%post``) is built once per
+        ``(base, container_def)`` and shared read-only across processes."""
         t0 = time.perf_counter()
+        key = _task_key(self.base_rootfs.name, container_def)
+        self._cache_dir = _CACHE_ROOT / key
+        task_rootfs = self._cache_dir / "rootfs"
+        ready = self._cache_dir / ".ready"
+        lock = _CACHE_ROOT / "_locks" / f"{key}.lock"
+
+        with _locked(lock):
+            if not ready.exists():
+                ok, err = self._build_shared_rootfs(task_rootfs, container_def, t0)
+                if not ok:
+                    return False, err
+                ready.touch()
+            # Register this session before releasing the lock so a concurrent
+            # eviction cannot remove the rootfs out from under us.
+            self._ref = self._cache_dir / "refs" / self._sid
+            self._ref.parent.mkdir(parents=True, exist_ok=True)
+            self._ref.write_text("")
+
+        self.rootfs = task_rootfs
+        # Materialize a small writable /home/user for this session from the
+        # read-only base, plus a writable /tmp. cp -a preserves the stripped
+        # write bits, so restore them on the copy.
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        if self.rootfs.exists():
-            shutil.rmtree(self.rootfs, ignore_errors=True)
-        subprocess.run(["cp", "-a", str(self.base_rootfs), str(self.rootfs)], check=True)
-        resolv = self.rootfs / "etc/resolv.conf"
+        if self.session_home.exists():
+            _force_rmtree(self.session_home)
+        src_home = task_rootfs / "home/user"
+        if src_home.exists():
+            subprocess.run(["cp", "-a", str(src_home), str(self.session_home)], check=True)
+            subprocess.run(["chmod", "-R", "u+w", str(self.session_home)], check=False)
+        else:
+            self.session_home.mkdir(parents=True, exist_ok=True)
+        self.session_tmp.mkdir(parents=True, exist_ok=True)
+        return True, ""
+
+    def _build_shared_rootfs(self, task_rootfs: Path, container_def: str, t0: float) -> Tuple[bool, str]:
+        """Clone the base rootfs and apply ``%post`` once, then make it read-only.
+        Caller holds the per-task build lock."""
+        _force_rmtree(task_rootfs)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["cp", "-a", str(self.base_rootfs), str(task_rootfs)], check=True)
+        resolv = task_rootfs / "etc/resolv.conf"
         resolv.unlink(missing_ok=True)
         resolv.write_text(f"nameserver {self.nameserver}\noptions ndots:0\n")
 
         post = _post_body(container_def)
-        proc = self._proot_run(post, cwd="/root", timeout=self.build_timeout)
+        argv = _proot_argv(self.proot_bin, task_rootfs, cwd="/root") + ["/bin/bash", "-c", post]
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=self.build_timeout)
         logger.info("Built task rootfs in %.1fs (rc=%d)", time.perf_counter() - t0, proc.returncode)
         if proc.returncode != 0:
+            _force_rmtree(task_rootfs)
             return False, ((proc.stderr or proc.stdout) or "")[-1000:]
+        # Strip write bits so concurrent sessions sharing this base cannot
+        # corrupt it; each session writes only to its bound /home/user and /tmp.
+        subprocess.run(["chmod", "-R", "a-w", str(task_rootfs)], check=False)
         return True, ""
 
-    def _proot_run(self, script: str, cwd: str = "/home/user", timeout: float = 600.0) -> subprocess.CompletedProcess:
-        """Run a script in a throwaway (non-persistent) proot invocation."""
-        argv = _proot_argv(self.proot_bin, self.rootfs, cwd) + ["/bin/bash", "-c", script]
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    def _session_binds(self) -> List[str]:
+        return [
+            f"{self.session_home}:/home/user",
+            f"{self.session_tmp}:/tmp",
+        ]
 
     # ------------------------------------------------------------------
     # persistent shell (PTY) lifecycle — ported from tmax env.py
@@ -186,6 +284,9 @@ class ProotTerminalEnvironment:
 
     def start(self, source_startup_hooks: bool = True) -> bool:
         """Start the persistent proot bash session on a PTY."""
+        if self.rootfs is None:
+            logger.error("start() called before build()")
+            return False
         self.master_fd, self.slave_fd = pty.openpty()
         try:
             attrs = termios.tcgetattr(self.slave_fd)
@@ -194,7 +295,7 @@ class ProotTerminalEnvironment:
         except Exception:
             pass
 
-        argv = _proot_argv(self.proot_bin, self.rootfs, "/home/user") + ["/bin/bash"]
+        argv = _proot_argv(self.proot_bin, self.rootfs, "/home/user", binds=self._session_binds()) + ["/bin/bash"]
         self.shell_process = subprocess.Popen(
             argv, stdin=self.slave_fd, stdout=self.slave_fd, stderr=self.slave_fd,
             close_fds=True, start_new_session=True,
@@ -259,11 +360,10 @@ class ProotTerminalEnvironment:
     # verifiers
     # ------------------------------------------------------------------
     def _run_pytest(self, test_text: str, name: str) -> Tuple[bool, str]:
-        host_path = self.work_dir / name
-        host_path.write_text(test_text, encoding="utf-8")
-        container_path = f"/home/user/{name}"
-        shutil.copy(host_path, self.rootfs / "home/user" / name)
-        q = shlex.quote(container_path)
+        # /home/user is bound to the writable session home, so write the test
+        # file straight into it instead of touching the read-only base.
+        (self.session_home / name).write_text(test_text, encoding="utf-8")
+        q = shlex.quote(f"/home/user/{name}")
         return self.exec(
             f"cd /home/user && python3 -m pytest -q --no-header {q}",
             timeout=self.verifier_timeout,
@@ -299,8 +399,35 @@ class ProotTerminalEnvironment:
                 except OSError:
                     pass
         self.master_fd = self.slave_fd = None
+
+        # Release this session's hold on the shared rootfs and evict it once no
+        # session is using it, so the node-local cache stays bounded.
+        self._release_shared_rootfs()
+
         if self._owns_work_dir and self.work_dir.exists():
             shutil.rmtree(self.work_dir, ignore_errors=True)
+
+    def _release_shared_rootfs(self) -> None:
+        if self._cache_dir is None:
+            return
+        key = self._cache_dir.name
+        lock = _CACHE_ROOT / "_locks" / f"{key}.lock"
+        try:
+            with _locked(lock):
+                if self._ref is not None:
+                    try:
+                        self._ref.unlink()
+                    except FileNotFoundError:
+                        pass
+                refs_dir = self._cache_dir / "refs"
+                remaining = list(refs_dir.glob("*")) if refs_dir.exists() else []
+                if not remaining:
+                    _force_rmtree(self._cache_dir)
+        except Exception:
+            logger.warning("shared rootfs cleanup failed for %s", self._cache_dir, exc_info=True)
+        finally:
+            self._cache_dir = None
+            self._ref = None
 
     def __enter__(self) -> "ProotTerminalEnvironment":
         return self
