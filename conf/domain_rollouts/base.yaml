@@ -9,3 +9,4 @@ livecodebench: pipelinerl.domains.coding.generate_coding_rollout
 fn_calling: pipelinerl.domains.fn_calling.generate_fn_calling_rollout
 logic: pipelinerl.domains.logic.generate_logic_rollout
 ifeval: pipelinerl.domains.ifeval.generate_ifeval_rollout
+terminal: pipelinerl.domains.terminal.generate_terminal_rollout
