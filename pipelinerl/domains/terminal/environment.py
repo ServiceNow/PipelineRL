@@ -35,6 +35,7 @@ class TerminalSession:
         verifier_timeout: float,
         max_observation_chars: int,
         check_initial_state: bool,
+        cache_dir: Optional[str | Path] = None,
     ):
         self.bases_dir = bases_dir
         self.proot_bin = proot_bin
@@ -43,6 +44,7 @@ class TerminalSession:
         self.verifier_timeout = verifier_timeout
         self.max_observation_chars = max_observation_chars
         self.check_initial_state = check_initial_state
+        self.cache_dir = cache_dir
 
         self._env: Optional[ProotTerminalEnvironment] = None
         self._final_test: str = ""
@@ -72,6 +74,7 @@ class TerminalSession:
             proot_bin=self.proot_bin,
             nameserver=self.nameserver,
             verifier_timeout=self.verifier_timeout,
+            cache_dir=self.cache_dir,
         )
         build_ok, build_err = self._env.build(task["container_def"])
         if not build_ok:

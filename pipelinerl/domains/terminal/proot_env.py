@@ -34,6 +34,7 @@ import queue
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import termios
@@ -59,10 +60,15 @@ _CONTAINER_ENV = [
     "LANG=C.UTF-8",
 ]
 
-#: Node-local root for the shared, read-only per-task rootfs cache. Kept on
-#: local disk (not the shared mount) so proot I/O stays fast; override with
-#: PL_TERMINAL_CACHE_DIR if local ephemeral is tight.
-_CACHE_ROOT = Path(os.environ.get("PL_TERMINAL_CACHE_DIR", Path(tempfile.gettempdir()) / "pl_terminal_cache"))
+#: Default root for the shared, read-only per-task rootfs cache when no
+#: ``cache_dir`` is given: node-local disk. A mounted ``cache_dir`` (see
+#: ``ProotTerminalEnvironment``) moves the big trees off the local ephemeral
+#: quota. Override the local default with PL_TERMINAL_CACHE_DIR.
+_DEFAULT_ROOTFS_ROOT = Path(os.environ.get("PL_TERMINAL_CACHE_DIR", Path(tempfile.gettempdir()) / "pl_terminal_cache"))
+#: Locks and refcounts always live on node-local disk: the lock only needs to
+#: coordinate the env-server processes on one node, and keeping it off the shared
+#: mount avoids relying on NFS file locking.
+_META_ROOT = Path(tempfile.gettempdir()) / "pl_terminal_meta"
 
 
 def _proot_argv(proot_bin: str, rootfs: Path, cwd: str, binds: Sequence[str] = ()) -> List[str]:
@@ -131,6 +137,7 @@ class ProotTerminalEnvironment:
         build_timeout: float = 1800.0,
         verifier_timeout: float = 180.0,
         work_dir: Optional[str | Path] = None,
+        cache_dir: Optional[str | Path] = None,
     ):
         self.base_rootfs = Path(base_rootfs).resolve()
         self.proot_bin = proot_bin
@@ -143,11 +150,21 @@ class ProotTerminalEnvironment:
         self._owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="terminal_env_"))
 
+        # Where the big read-only task rootfs trees live. A mounted ``cache_dir``
+        # keeps them off the 16GiB local ephemeral quota; scope by hostname so
+        # nodes sharing the mount don't collide or evict each other's trees.
+        if cache_dir:
+            self._rootfs_root = Path(cache_dir) / socket.gethostname()
+        else:
+            self._rootfs_root = _DEFAULT_ROOTFS_ROOT
+
         self._sid = uuid.uuid4().hex
-        # Set by build(): the shared read-only task rootfs and this session's
-        # small writable overlay dirs bound over it.
+        # Set by build(): the shared read-only task rootfs (under _rootfs_root),
+        # its node-local meta dir (refcounts), and this session's small writable
+        # overlay dirs bound over the read-only base.
         self.rootfs: Optional[Path] = None
-        self._cache_dir: Optional[Path] = None
+        self._task_cache_dir: Optional[Path] = None
+        self._task_meta_dir: Optional[Path] = None
         self._ref: Optional[Path] = None
         self.session_home = self.work_dir / "home"
         self.session_tmp = self.work_dir / "tmp"
@@ -169,20 +186,22 @@ class ProotTerminalEnvironment:
         ``(base, container_def)`` and shared read-only across processes."""
         t0 = time.perf_counter()
         key = _task_key(self.base_rootfs.name, container_def)
-        self._cache_dir = _CACHE_ROOT / key
-        task_rootfs = self._cache_dir / "rootfs"
-        ready = self._cache_dir / ".ready"
-        lock = _CACHE_ROOT / "_locks" / f"{key}.lock"
+        self._task_cache_dir = self._rootfs_root / key
+        self._task_meta_dir = _META_ROOT / key
+        task_rootfs = self._task_cache_dir / "rootfs"
+        ready = self._task_cache_dir / ".ready"
+        lock = _META_ROOT / "_locks" / f"{key}.lock"
 
         with _locked(lock):
             if not ready.exists():
                 ok, err = self._build_shared_rootfs(task_rootfs, container_def, t0)
                 if not ok:
                     return False, err
+                self._task_cache_dir.mkdir(parents=True, exist_ok=True)
                 ready.touch()
             # Register this session before releasing the lock so a concurrent
             # eviction cannot remove the rootfs out from under us.
-            self._ref = self._cache_dir / "refs" / self._sid
+            self._ref = self._task_meta_dir / "refs" / self._sid
             self._ref.parent.mkdir(parents=True, exist_ok=True)
             self._ref.write_text("")
 
@@ -206,7 +225,7 @@ class ProotTerminalEnvironment:
         """Clone the base rootfs and apply ``%post`` once, then make it read-only.
         Caller holds the per-task build lock."""
         _force_rmtree(task_rootfs)
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._task_cache_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(["cp", "-a", str(self.base_rootfs), str(task_rootfs)], check=True)
         resolv = task_rootfs / "etc/resolv.conf"
         resolv.unlink(missing_ok=True)
@@ -408,10 +427,10 @@ class ProotTerminalEnvironment:
             shutil.rmtree(self.work_dir, ignore_errors=True)
 
     def _release_shared_rootfs(self) -> None:
-        if self._cache_dir is None:
+        if self._task_meta_dir is None:
             return
-        key = self._cache_dir.name
-        lock = _CACHE_ROOT / "_locks" / f"{key}.lock"
+        key = self._task_meta_dir.name
+        lock = _META_ROOT / "_locks" / f"{key}.lock"
         try:
             with _locked(lock):
                 if self._ref is not None:
@@ -419,14 +438,19 @@ class ProotTerminalEnvironment:
                         self._ref.unlink()
                     except FileNotFoundError:
                         pass
-                refs_dir = self._cache_dir / "refs"
+                refs_dir = self._task_meta_dir / "refs"
                 remaining = list(refs_dir.glob("*")) if refs_dir.exists() else []
                 if not remaining:
-                    _force_rmtree(self._cache_dir)
+                    # No session is using this task: drop both the read-only
+                    # rootfs (on the mount) and the node-local meta dir.
+                    if self._task_cache_dir is not None:
+                        _force_rmtree(self._task_cache_dir)
+                    _force_rmtree(self._task_meta_dir)
         except Exception:
-            logger.warning("shared rootfs cleanup failed for %s", self._cache_dir, exc_info=True)
+            logger.warning("shared rootfs cleanup failed for %s", self._task_cache_dir, exc_info=True)
         finally:
-            self._cache_dir = None
+            self._task_cache_dir = None
+            self._task_meta_dir = None
             self._ref = None
 
     def __enter__(self) -> "ProotTerminalEnvironment":

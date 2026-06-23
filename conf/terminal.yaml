@@ -56,6 +56,10 @@ environments:
     replicas_per_actor: ${world.env_replicas_per_actor}
     _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
     bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
+    # Shared read-only task rootfs trees live on the mounted results dir (off the
+    # 16GiB local ephemeral quota); proot_env scopes them by hostname. Per-session
+    # writable /home/user and the lock/refcounts stay node-local.
+    cache_dir: ${output_dir}/env_cache
     n_envs: 3                 # concurrent proot sessions per server; keep >= actor.llm_max_rollouts
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}

@@ -44,6 +44,7 @@ class TerminalEnvironmentServer:
         verifier_timeout: float = 180.0,
         max_observation_chars: int = 4000,
         check_initial_state: bool = True,
+        cache_dir: str | None = None,
     ):
         self.bases_dir = Path(bases_dir)
         self.n_envs = n_envs
@@ -54,6 +55,7 @@ class TerminalEnvironmentServer:
         self.verifier_timeout = verifier_timeout
         self.max_observation_chars = max_observation_chars
         self.check_initial_state = check_initial_state
+        self.cache_dir = cache_dir
 
         self._sessions: Dict[str, TerminalSession] = {}
         self._lock = asyncio.Lock()
@@ -86,6 +88,7 @@ class TerminalEnvironmentServer:
             verifier_timeout=self.verifier_timeout,
             max_observation_chars=self.max_observation_chars,
             check_initial_state=self.check_initial_state,
+            cache_dir=self.cache_dir,
         )
         try:
             flags = await self._run(session.start, task)
