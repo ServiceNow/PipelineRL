@@ -37,6 +37,36 @@ RL_DATA_COLUMNS = [
 ]
 
 
+class RLStatsAccumulator:
+    """Accumulate RL-owned per-sample summaries (step_advantage, step_reward) between stats emits."""
+
+    def __init__(self):
+        self._step_advantages: list[float] = []
+        self._step_rewards: list[float] = []
+
+    def update(self, dataset: list[dict[str, Any]]) -> None:
+        for entry in dataset:
+            if "step_advantage" in entry:
+                self._step_advantages.append(float(entry["step_advantage"]))
+            if "step_reward" in entry:
+                self._step_rewards.append(float(entry["step_reward"]))
+
+    def pop_stats(self, prefix: str = "preprocessor/") -> dict[str, float]:
+        stats: dict[str, float] = {}
+        if self._step_advantages:
+            arr = np.asarray(self._step_advantages, dtype=np.float64)
+            self._step_advantages.clear()
+            stats[f"{prefix}step_advantage_mean"] = float(arr.mean())
+            stats[f"{prefix}step_advantage_std"] = float(arr.std())
+            stats[f"{prefix}step_advantage_abs_mean"] = float(np.abs(arr).mean())
+        if self._step_rewards:
+            arr = np.asarray(self._step_rewards, dtype=np.float64)
+            self._step_rewards.clear()
+            stats[f"{prefix}step_reward_mean"] = float(arr.mean())
+            stats[f"{prefix}step_reward_std"] = float(arr.std())
+        return stats
+
+
 class RLConfig(BaseModel):
     policy_loss: str = Field(
         default="ppo",

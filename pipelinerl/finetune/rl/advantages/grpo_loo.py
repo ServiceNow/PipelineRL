@@ -4,12 +4,17 @@ Episode advantage per rollout:
     A_i = (R_i - mean_{j!=i}(R_j))                 if not divide_by_std
     A_i = (R_i - mean_{j!=i}(R_j)) / (std(R)+1e-4) if divide_by_std
 
-If `step_reward` is present, an experimental rollout-level shaping baseline
-is added: collapse step_reward to a per-rollout mean, subtract the per-group
-mean, and add that residual to every token of the rollout. Sibling rollouts
-in a group are only prefix-matched at step 0, so we don't compare step k
-across siblings — credit assignment within a rollout stays uniform. For
-true step-level credit assignment over revisited states, use GiGPO.
+This episode advantage is broadcast to every token of every step in the
+rollout. If `step_reward` is present, the per-step `step_reward` is centered
+within its group (mean over all steps in the group_id) and added to the
+broadcast episode advantage, scaled by `step_reward_lambda`:
+
+    step_advantage = λ * (step_reward - mean_{rows in group}(step_reward))
+
+Group-centering mirrors the LOO baseline on the episode side: it removes
+any per-batch bias in raw step_reward (which is often systematically
+positive for progress-style shaping), so the step term has zero mean within
+each group and only contributes a *relative* signal.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ from typing import ClassVar, Literal, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from pipelinerl.finetune.rl import RLConfig
@@ -25,6 +30,10 @@ if TYPE_CHECKING:
 
 class GrpoLooConfig(BaseModel):
     type: Literal["grpo_loo"] = "grpo_loo"
+    step_reward_lambda: float = Field(
+        default=0.2,
+        description="Coefficient on the per-step `step_reward` term added to the episode advantage.",
+    )
 
 
 class GrpoLoo:
@@ -37,6 +46,9 @@ class GrpoLoo:
     )
 
     def compute(self, df: pd.DataFrame, config: "RLConfig") -> pd.DataFrame:
+        cfg = config.advantage
+        assert isinstance(cfg, GrpoLooConfig), f"Expected GrpoLooConfig, got {type(cfg).__name__}"
+
         df_stats = df[["group_id", "rollout_index", "step_index"]].copy()
         df_stats["rollout_reward"] = df["rewards"].apply(lambda x: x[0])
         assert df_stats.groupby(["group_id", "rollout_index"])["rollout_reward"].nunique().max() == 1, (
@@ -60,21 +72,15 @@ class GrpoLoo:
         df_adv = pd.merge(df[init_cols], df_grouped, on="group_id", how="left")
 
         if has_step_reward:
-            rollout_step = (
-                df_adv.groupby(["group_id", "rollout_index"])["step_reward"]
-                .mean()
-                .rename("rollout_step_mean")
-                .reset_index()
-            )
-            group_step = (
-                rollout_step.groupby("group_id")["rollout_step_mean"]
+            group_step_mean = (
+                df_adv.groupby("group_id")["step_reward"]
                 .mean()
                 .rename("group_step_mean")
                 .reset_index()
             )
-            df_adv = df_adv.merge(rollout_step, on=["group_id", "rollout_index"], how="left")
-            df_adv = df_adv.merge(group_step, on="group_id", how="left")
-            df_adv["step_advantage"] = df_adv["rollout_step_mean"] - df_adv["group_step_mean"]
+            df_adv = df_adv.merge(group_step_mean, on="group_id", how="left")
+            centered = df_adv["step_reward"].astype(float) - df_adv["group_step_mean"].astype(float)
+            df_adv["step_advantage"] = cfg.step_reward_lambda * centered
         else:
             df_adv["step_advantage"] = 0.0
 
@@ -92,8 +98,10 @@ class GrpoLoo:
                 loo_mean = current
             std = row["rollout_reward_std"]
             if divide_by_std:
-                return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) + step_adv for r in rewards]
-            return [(r - loo_mean) + step_adv for r in rewards]
+                episode_adv = (current - loo_mean) / (np.nan_to_num(std) + 1e-4)
+            else:
+                episode_adv = current - loo_mean
+            return [episode_adv + step_adv for _ in rewards]
 
         df_adv["advantages"] = df_adv.apply(_calc, axis=1)
         return df_adv[["group_id", "rollout_index", "step_index", "advantages", "step_advantage"]]
