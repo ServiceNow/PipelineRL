@@ -8,13 +8,13 @@ canonical MiniWoB observation).
 """
 
 from cube.core import ConfigRegistry
-from cube_browser_tool.bgym_tool import BgymToolConfig
 from miniwob_cube.benchmark import MiniWobBenchmarkConfig
+from miniwob_cube.tools import MiniWobBgymToolConfig
 
 MINIWOB_CONFIGS: ConfigRegistry[MiniWobBenchmarkConfig] = ConfigRegistry(
     {
         "default": MiniWobBenchmarkConfig(
-            tool_config=BgymToolConfig(use_html=True, use_axtree=False, use_screenshot=True)
+            tool_config=MiniWobBgymToolConfig(use_html=True, use_axtree=False, use_screenshot=True)
         ),
     }
 )

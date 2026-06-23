@@ -71,8 +71,9 @@ dataset_loader_params:
     benchmark: &miniwob_benchmark
       _type: miniwob_cube.benchmark.MiniWobBenchmarkConfig
       port: 8010
+      enable_step_verifier_rewards: true
       tool_config: &miniwob_tool_config
-          _type: cube_browser_tool.bgym_tool.BgymToolConfig
+          _type: miniwob_cube.tools.MiniWobBgymToolConfig
           use_html: true
           use_axtree: false
           use_screenshot: false
