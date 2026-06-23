@@ -48,6 +48,15 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
+def resolve_weight_update_name(model: Any, name: str) -> str:
+    if name.startswith(("model.language_model.", "model.visual.")):
+        return name
+    if hasattr(model, "language_model") and not hasattr(model, "model"):
+        if name.startswith(("model.", "lm_head.")):
+            return f"language_model.{name}"
+    return name
+
+
 @runtime_checkable
 class LikeWorker(Protocol):
     rank: int
@@ -113,15 +122,20 @@ class WorkerExtension:
         logger.info("Start receiving weight update")
         expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
 
+        logged_name_remap = False
         for info in request.parameters_info:
             target_dtype = string_to_dtype(info.dtype)
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
             buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
             self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
-            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])  # type: ignore
+            weight_name = resolve_weight_update_name(self.model_runner.model, info.name)
+            if weight_name != info.name and not logged_name_remap:
+                logger.info("Remapping trainer weight names for vLLM language_model wrapper")
+                logged_name_remap = True
+            loaded_params = self.model_runner.model.load_weights(weights=[(weight_name, buffer)])  # type: ignore
             if len(loaded_params) != 1:
-                raise ValueError(f"model {info.name} not found in model state dict")
+                raise ValueError(f"model {weight_name} from {info.name} not found in model state dict")
 
         pipelinerl.vllm_quantization.invalidate_fp32_cache()
         logger.info("Weight update received")

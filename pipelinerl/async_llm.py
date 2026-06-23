@@ -304,7 +304,8 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         )
         prompt_token_ids = llm.tokenizer.apply_chat_template(
             llm_call.prompt.messages,
-            add_special_tokens=True,
+            tokenize=True,
+            return_dict=False,
             add_generation_prompt=True,
             **chat_kwargs,
         )
