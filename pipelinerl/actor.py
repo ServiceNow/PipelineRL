@@ -352,12 +352,26 @@ class ActorLoop:
         self.smm = SharedMemoryManager()
         self.smm.start()
 
-        # Use SharedMemoryQueue instead of separate problem_queue, result_queue, and io_buffer
-        self.problem_queue = SharedMemoryQueue(self.smm, self.cfg.actor.problem_queue_size, cfg.actor.shared_memory_entry_size)
-        self.result_queue = SharedMemoryQueue(self.smm, self.cfg.actor.result_queue_size, cfg.actor.shared_memory_entry_size)
+        problem_entry_size = self.cfg.actor.get(
+            "problem_shared_memory_entry_size", self.cfg.actor.shared_memory_entry_size
+        )
+        result_entry_size = self.cfg.actor.get(
+            "result_shared_memory_entry_size", self.cfg.actor.shared_memory_entry_size
+        )
+        self.problem_queue = SharedMemoryQueue(
+            self.smm, self.cfg.actor.problem_queue_size, problem_entry_size
+        )
+        self.result_queue = SharedMemoryQueue(
+            self.smm, self.cfg.actor.result_queue_size, result_entry_size
+        )
 
         logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
         logger.info(f"Problem queue size: {self.problem_queue.max_size}, result queue size: {self.result_queue.max_size}")
+        logger.info(
+            f"Problem queue entry size: {problem_entry_size} bytes, "
+            f"result queue entry size: {result_entry_size} bytes"
+        )
+        logger.info(f"Problem queue buffer size: {self.problem_queue.get_memory_size() / 2**30} Gb")
         logger.info(f"Result queue buffer size: {self.result_queue.get_memory_size() / 2**30} Gb")
 
         self.rollout_processes = []
@@ -599,6 +613,21 @@ class ActorLoop:
                     for r in rollout_results:
                         if r.domain:
                             domain_sampler.record_completion(r.domain)
+
+                if group_samples == 0:
+                    self.update_stats(rollout_results=rollout_results)
+                    finished_groups += 1
+                    in_progress = submitted_groups - finished_groups
+                    logger.warning(
+                        f"Dropping 0-sample {'train' if self.is_training else 'test'} group"
+                        f" from {self.data_stream}, total {published_samples} samples so far,"
+                        f" {self.result_queue.qsize() * attempts} samples in the result queue,"
+                        f" {in_progress} groups in progress"
+                    )
+                    if finished_groups == expected_rollouts:
+                        logger.info(f"Finished {expected_rollouts} rollouts, stopping actor loop")
+                        break
+                    continue
 
                 # --- Difficulty-aware length penalty adjustment ---
                 # Reduces the overlong penalty for SUCCESSFUL rollouts on hard problems,

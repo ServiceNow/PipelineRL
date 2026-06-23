@@ -545,6 +545,10 @@ def run_preprocessing_loop(
                         dataset = output_queue.get(timeout=0.001)
                         if isinstance(dataset, Exception):
                             raise dataset
+                        if isinstance(dataset, dict) and "error" in dataset:
+                            logger.error(f"Got exception from the result queue: {dataset['error']}")
+                            logger.error(f"Traceback: {dataset['traceback']}")
+                            raise Exception(dataset["error"])
                         if rl_config.filter_zero_advantage_groups:
                             dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
                             total_filtered_out += num_filtered_out
@@ -555,10 +559,6 @@ def run_preprocessing_loop(
                         pass
                     
                     if dataset:
-                        if isinstance(dataset, dict) and "error" in dataset:
-                            logger.error(f"Got exception from the result queue: {dataset['error']}")
-                            logger.error(f"Traceback: {dataset['traceback']}")
-                            raise Exception(dataset['error'])
                         for entry in dataset:
                             buffer.append(entry)
                         processed_chunks += 1

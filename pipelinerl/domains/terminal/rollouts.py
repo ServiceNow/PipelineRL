@@ -70,10 +70,17 @@ def _failed_result(problem: dict, start_time: float, metrics: TerminalMetrics) -
     )
 
 
+class EnvironmentCapacityError(RuntimeError):
+    pass
+
+
 async def _post(session: aiohttp.ClientSession, url: str, payload: dict, timeout: float) -> dict:
     async with session.post(url, json=payload, timeout=timeout) as resp:
         if resp.status != 200:
-            raise RuntimeError(f"{url} -> HTTP {resp.status}: {await resp.text()}")
+            text = await resp.text()
+            if resp.status == 503 and "capacity reached" in text:
+                raise EnvironmentCapacityError(f"{url} -> HTTP {resp.status}: {text}")
+            raise RuntimeError(f"{url} -> HTTP {resp.status}: {text}")
         return await resp.json()
 
 
@@ -102,22 +109,52 @@ async def generate_terminal_rollout(
         return _failed_result(problem, start_time, TerminalMetrics(
             reward=tcfg.reward_fail, success=False, no_error=False, no_answer=True, build_ok=False))
 
-    urls = [f"http://{job.hostname}:{job.port}" for job in env_jobs]
-    random.shuffle(urls)
-    for url in urls:
-        if not await _check_env_health(url, session):
+    capacity_retry_sleep = float(getattr(tcfg, "capacity_retry_sleep", 2.0))
+    deadline = time.time() + rollout_timeout
+    logged_capacity_wait = False
+    logged_no_healthy_wait = False
+    while time.time() < deadline:
+        urls = [f"http://{job.hostname}:{job.port}" for job in env_jobs]
+        random.shuffle(urls)
+        saw_capacity = False
+        saw_healthy = False
+        for url in urls:
+            if not await _check_env_health(url, session):
+                continue
+            saw_healthy = True
+            try:
+                return await asyncio.wait_for(
+                    _execute_rollout(cfg, llm, problem, session, start_time, url),
+                    timeout=max(1.0, deadline - time.time()),
+                )
+            except EnvironmentCapacityError:
+                saw_capacity = True
+                continue
+            except asyncio.TimeoutError:
+                logger.warning("rollout timed out for %s on %s, trying next server", problem.get("task_id"), url)
+                continue
+            except Exception:
+                logger.warning("rollout failed for %s on %s: %s", problem.get("task_id"), url, traceback.format_exc())
+                continue
+
+        if saw_capacity:
+            if not logged_capacity_wait:
+                logger.info("terminal env capacity saturated for %s; waiting", problem.get("task_id"))
+                logged_capacity_wait = True
+            await asyncio.sleep(min(capacity_retry_sleep, max(0.0, deadline - time.time())))
             continue
-        try:
-            return await asyncio.wait_for(
-                _execute_rollout(cfg, llm, problem, session, start_time, url),
-                timeout=rollout_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("rollout timed out for %s on %s, trying next server", problem.get("task_id"), url)
+
+        if not saw_healthy:
+            if not logged_no_healthy_wait:
+                logger.warning(
+                    "no healthy terminal environment servers for %s; waiting",
+                    problem.get("task_id"),
+                )
+                logged_no_healthy_wait = True
+            await asyncio.sleep(min(capacity_retry_sleep, max(0.0, deadline - time.time())))
             continue
-        except Exception:
-            logger.warning("rollout failed for %s on %s: %s", problem.get("task_id"), url, traceback.format_exc())
-            continue
+
+        break
 
     logger.error("all terminal environment servers failed for %s", problem.get("task_id"))
     return _failed_result(problem, start_time, TerminalMetrics(
