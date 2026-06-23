@@ -191,6 +191,8 @@ def rollout_result_from_events(
             if event_type == "tool_call" and training_texts:
                 env_response_buffer.append(event)
             if event_type == "evaluation" and training_texts:
+                step_reward = float(payload['info'].get("step_reward") or 0.0)
+                training_texts[-1].step_reward += step_reward
                 env_eval_buffer.append(event)
 
     flush_env_response()
@@ -307,6 +309,7 @@ def _training_text_from_event(
     )
     if reward_shaping_config and reward_shaping_config.is_active:
         metadata["reward_shaping"] = compute_call_shaping(call, reward_shaping_config)
+    
     return TrainingText(
         text=text,
         n_predicted=n_predicted,
