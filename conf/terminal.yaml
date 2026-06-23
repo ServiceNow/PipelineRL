@@ -27,10 +27,17 @@ actor:
   task_template: "{task}"
   task_prompt: ""
   ensure_boxed_answers: false
-  # Concurrent rollouts per actor LLM. Keep <= environment.n_envs so a saturated
-  # actor does not exhaust its sandbox pool.
-  llm_max_rollouts: 32
+  # Concurrent rollouts per actor LLM. Each active terminal rollout owns a
+  # copied rootfs, so keep this low under EAI's local ephemeral storage limit.
+  # This only limits parallelism; finetune.attempts still controls group size.
+  llm_max_rollouts: 2
   rollout_workers: 8
+  # Problems are small; completed terminal groups can be large. Keep result
+  # buffering shallow so long trajectories are allowed without preallocating
+  # result_queue_size * max_group_bytes in local shared memory.
+  problem_shared_memory_entry_size: 4000000
+  result_shared_memory_entry_size: 1000000000
+  result_queue_size: 2
   shared_memory_entry_size: 1000000000
 
 # Rollout-side knobs (read by generate_terminal_rollout).
@@ -38,6 +45,7 @@ terminal:
   max_turns: 64              # TMax: 64 max tool calls
   rollout_timeout: 1200      # hard cap per rollout, seconds
   env_call_timeout: 300      # per HTTP call to the env server
+  capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
   reward_pass: 1.0
   reward_fail: -1.0
 
@@ -48,7 +56,7 @@ environments:
     replicas_per_actor: ${world.env_replicas_per_actor}
     _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
     bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
-    n_envs: 48                # concurrent proot sessions per server; keep >= actor.llm_max_rollouts
+    n_envs: 3                 # concurrent proot sessions per server; keep >= actor.llm_max_rollouts
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
@@ -97,12 +105,15 @@ finetune:
 
 preprocess:
   n_workers: 8
-  chunk_n_groups: 8
+  chunk_n_groups: 1
+  input_queue_size: 2
+  output_queue_size: 2
   shared_memory_entry_size: 1000000000
 
 vllm_config:
   vllm_kwargs:
     max_model_len: 65536
+    mm-processor-cache-gb: 0
 
 llm:
   parameters:
