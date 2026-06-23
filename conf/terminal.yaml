@@ -1,0 +1,129 @@
+defaults:
+  - base
+  - override streams: files
+  - _self_
+
+# Qwen3.5-9B terminal-agent RL run (TMax recipe) for 4 nodes x 8 H100.
+# Prerequisites (staged on the shared data mount, available in the job):
+#   - proot binary at ${PROOT_BIN}
+#   - per-domain base rootfs trees under ${TERMINAL_BASES_DIR}, built once with:
+#       python -m pipelinerl.domains.terminal.base_builder \
+#         --defs-dir <tmax>/rl_data/containers --out-dir <bases> --proot <proot>
+#     A single base_software_engineering tree acts as a universal fallback.
+model_path: /mnt/llmd/base_models/Qwen3.5-9B
+force_restart: true
+pop_old_data: true
+max_lag: null
+eval_every_n_versions: 0
+
+wandb:
+  use_wandb: true
+  wandb_project_name: tmax_terminal
+  wandb_workspace_root: /mnt/llmd/results
+
+actor:
+  rollout_policy: pipelinerl.domains.terminal.generate_terminal_rollout
+  system_prompt: ""
+  task_template: "{task}"
+  task_prompt: ""
+  ensure_boxed_answers: false
+  # Concurrent rollouts per actor LLM. Keep <= environment.n_envs so a saturated
+  # actor does not exhaust its sandbox pool.
+  llm_max_rollouts: 32
+  rollout_workers: 8
+  shared_memory_entry_size: 1000000000
+
+# Rollout-side knobs (read by generate_terminal_rollout).
+terminal:
+  max_turns: 64              # TMax: 64 max tool calls
+  rollout_timeout: 1200      # hard cap per rollout, seconds
+  env_call_timeout: 300      # per HTTP call to the env server
+  reward_pass: 1.0
+  reward_fail: -1.0
+
+# Remote terminal sandbox servers (one kind="environment" job per actor LLM).
+environments:
+  - key: terminal
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
+    bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
+    n_envs: 48                # concurrent proot sessions per server; keep >= actor.llm_max_rollouts
+    host: "0.0.0.0"
+    proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
+    nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
+    command_timeout: 60.0
+    verifier_timeout: 180.0
+    max_observation_chars: 4000
+    check_initial_state: true
+
+environment_key: terminal
+
+dataset_loader: pipelinerl.domains.terminal.load_problems
+dataset_loader_params:
+  repo_id: allenai/TMax-15K
+  train_ratio: 0.95
+  # First run: light, proot-friendly domains. Set null for the full 15k corpus
+  # once per-domain base rootfs trees (rust/services) are built.
+  tmax_domains:
+    - file_operations
+    - data_processing
+    - debugging
+  limit: null
+  seed: 0
+# The loader derives the split from the names (a name containing "test" -> held-out).
+train_dataset_names:
+  - tmax-15k
+test_dataset_names:
+  - tmax-15k-test
+
+finetune:
+  learning_rate: 1.0e-6      # TMax constant LR
+  attempts: 32               # TMax group size
+  max_train_steps: 500       # TMax
+  save_checkpoint_steps: 9999999
+  also_save_steps: [100, 200, 300, 400, 500]
+  save_final_training_state: false
+  seq_length: 65536          # TMax
+  seq_parallel: 8
+  gradient_accumulation_passes: 1024
+  gradient_clipping_threshold: 0.1
+  rl:
+    policy_loss: gspo
+    epsilon_low: 3e-3
+    epsilon_high: 4e-3
+    overlong_filtering: true
+    filter_zero_advantage_groups: true
+
+preprocess:
+  n_workers: 8
+  chunk_n_groups: 8
+  shared_memory_entry_size: 1000000000
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 65536
+
+llm:
+  parameters:
+    max_tokens: 16000
+    temperature: 1.0
+  chat_template_kwargs:
+    enable_thinking: false    # TMax uses interleaved thinking; off for the first run
+
+test_llm:
+  parameters:
+    max_tokens: 16000
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 50
+  chat_template_kwargs:
+    enable_thinking: false
+
+world:
+  replicas: 1
+  actor_fraction: 4
+  preprocessor_fraction: 0
+  finetune_fraction: 4
+  # One env server per actor LLM, spread across nodes by least-busy placement.
+  env_replicas_per_actor: 1
