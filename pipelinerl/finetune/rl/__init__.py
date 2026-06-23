@@ -38,14 +38,17 @@ RL_DATA_COLUMNS = [
 
 
 class RLStatsAccumulator:
-    """Accumulate RL-owned per-sample summaries (step_advantage, step_reward) between stats emits."""
+    """Accumulate RL-owned per-sample summaries (episode/step advantage, step_reward) between stats emits."""
 
     def __init__(self):
+        self._episode_advantages: list[float] = []
         self._step_advantages: list[float] = []
         self._step_rewards: list[float] = []
 
     def update(self, dataset: list[dict[str, Any]]) -> None:
         for entry in dataset:
+            if "episode_advantage" in entry:
+                self._episode_advantages.append(float(entry["episode_advantage"]))
             if "step_advantage" in entry:
                 self._step_advantages.append(float(entry["step_advantage"]))
             if "step_reward" in entry:
@@ -53,6 +56,12 @@ class RLStatsAccumulator:
 
     def pop_stats(self, prefix: str = "preprocessor/") -> dict[str, float]:
         stats: dict[str, float] = {}
+        if self._episode_advantages:
+            arr = np.asarray(self._episode_advantages, dtype=np.float64)
+            self._episode_advantages.clear()
+            stats[f"{prefix}episode_advantage_mean"] = float(arr.mean())
+            stats[f"{prefix}episode_advantage_std"] = float(arr.std())
+            stats[f"{prefix}episode_advantage_abs_mean"] = float(np.abs(arr).mean())
         if self._step_advantages:
             arr = np.asarray(self._step_advantages, dtype=np.float64)
             self._step_advantages.clear()
@@ -523,7 +532,14 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     group_tokens = _build_group_features(df_init)
     df_adv = compute_advantages(df_init, config)
 
-    expected_cols = {"group_id", "rollout_index", "step_index", "advantages", "step_advantage"}
+    expected_cols = {
+        "group_id",
+        "rollout_index",
+        "step_index",
+        "advantages",
+        "episode_advantage",
+        "step_advantage",
+    }
     missing = expected_cols - set(df_adv.columns)
     assert not missing, f"Estimator '{config.advantage.type}' is missing columns: {missing}"
 
@@ -555,12 +571,14 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     group_tokens_list = df["group_tokens"].tolist()
     overflow_list = df["overflow"].tolist()
     num_labels_list = df["num_labels"].tolist()
+    episode_advantage_list = df["episode_advantage"].tolist()
     step_advantage_list = df["step_advantage"].tolist()
     for i, entry in enumerate(dataset):
         entry["advantages"] = advantages_list[i]
         entry["group_tokens"] = group_tokens_list[i]
         entry["overflow"] = overflow_list[i]
         entry["num_labels"] = num_labels_list[i]
+        entry["episode_advantage"] = float(episode_advantage_list[i])
         entry["step_advantage"] = float(step_advantage_list[i])
     return dataset
 

@@ -6,15 +6,18 @@ Episode advantage per rollout:
 
 This episode advantage is broadcast to every token of every step in the
 rollout. If `step_reward` is present, the per-step `step_reward` is centered
-within its group (mean over all steps in the group_id) and added to the
-broadcast episode advantage, scaled by `step_reward_lambda`:
+along the configured axis and added to the broadcast episode advantage,
+scaled by `step_reward_lambda`:
 
-    step_advantage = λ * (step_reward - mean_{rows in group}(step_reward))
+    step_advantage = λ * (step_reward - center_mean(step_reward))
 
-Group-centering mirrors the LOO baseline on the episode side: it removes
-any per-batch bias in raw step_reward (which is often systematically
-positive for progress-style shaping), so the step term has zero mean within
-each group and only contributes a *relative* signal.
+`step_advantage_centering` chooses the center axis:
+  - "group"   : mean over all rows in the group_id (mirrors LOO baseline)
+  - "rollout" : mean over all steps in this trajectory only — measures
+                "which step inside this rollout was unusually good"
+
+Both `episode_advantage` and `step_advantage` are returned as separate
+per-row scalar columns so they can be monitored independently downstream.
 """
 from __future__ import annotations
 
@@ -33,6 +36,14 @@ class GrpoLooConfig(BaseModel):
     step_reward_lambda: float = Field(
         default=0.2,
         description="Coefficient on the per-step `step_reward` term added to the episode advantage.",
+    )
+    step_advantage_centering: Literal["group", "rollout"] = Field(
+        default="group",
+        description=(
+            "Axis to center step_reward against before scaling. 'group' subtracts "
+            "the mean over all rows in the group_id; 'rollout' subtracts the mean "
+            "over this trajectory's steps only (within-rollout credit)."
+        ),
     )
 
 
@@ -72,23 +83,26 @@ class GrpoLoo:
         df_adv = pd.merge(df[init_cols], df_grouped, on="group_id", how="left")
 
         if has_step_reward:
-            group_step_mean = (
-                df_adv.groupby("group_id")["step_reward"]
+            if cfg.step_advantage_centering == "rollout":
+                center_keys = ["group_id", "rollout_index"]
+            else:
+                center_keys = ["group_id"]
+            step_center = (
+                df_adv.groupby(center_keys)["step_reward"]
                 .mean()
-                .rename("group_step_mean")
+                .rename("step_reward_center")
                 .reset_index()
             )
-            df_adv = df_adv.merge(group_step_mean, on="group_id", how="left")
-            centered = df_adv["step_reward"].astype(float) - df_adv["group_step_mean"].astype(float)
+            df_adv = df_adv.merge(step_center, on=center_keys, how="left")
+            centered = df_adv["step_reward"].astype(float) - df_adv["step_reward_center"].astype(float)
             df_adv["step_advantage"] = cfg.step_reward_lambda * centered
         else:
             df_adv["step_advantage"] = 0.0
 
         divide_by_std = config.divide_advantage_by_std
 
-        def _calc(row):
+        def _episode_adv(row):
             rewards = row["rewards"]
-            step_adv = float(row["step_advantage"])
             group_sum = row["rollout_reward_sum"]
             group_count = row["rollout_reward_count"]
             current = rewards[0]
@@ -98,10 +112,18 @@ class GrpoLoo:
                 loo_mean = current
             std = row["rollout_reward_std"]
             if divide_by_std:
-                episode_adv = (current - loo_mean) / (np.nan_to_num(std) + 1e-4)
-            else:
-                episode_adv = current - loo_mean
-            return [episode_adv + step_adv for _ in rewards]
+                return (current - loo_mean) / (np.nan_to_num(std) + 1e-4)
+            return current - loo_mean
 
-        df_adv["advantages"] = df_adv.apply(_calc, axis=1)
-        return df_adv[["group_id", "rollout_index", "step_index", "advantages", "step_advantage"]]
+        df_adv["episode_advantage"] = df_adv.apply(_episode_adv, axis=1).astype(float)
+        df_adv["advantages"] = [
+            [float(ep + step)] * len(rewards)
+            for ep, step, rewards in zip(
+                df_adv["episode_advantage"].tolist(),
+                df_adv["step_advantage"].tolist(),
+                df_adv["rewards"].tolist(),
+            )
+        ]
+        return df_adv[
+            ["group_id", "rollout_index", "step_index", "advantages", "episode_advantage", "step_advantage"]
+        ]

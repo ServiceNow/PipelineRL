@@ -22,8 +22,9 @@ class AdvantageEstimator(Protocol):
 
     def compute(self, df: pd.DataFrame, config: "RLConfig") -> pd.DataFrame:
         """Return a dataframe keyed by (group_id, rollout_index, step_index) with:
-          - advantages       : list[float] of len(input_ids)
-          - step_advantage   : float per row (0.0 if estimator has no notion)
+          - advantages         : list[float] of len(input_ids)
+          - episode_advantage  : float per row (terminal-reward baseline component)
+          - step_advantage     : float per row (0.0 if estimator has no notion)
         Estimators may attach extra debug columns; the dispatcher will merge
         them back onto the main df by the three-key prefix.
         """

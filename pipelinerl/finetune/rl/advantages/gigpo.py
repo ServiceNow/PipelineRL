@@ -103,4 +103,6 @@ class Gigpo:
         df["advantages"] = [
             [float(a)] * len(ids) for a, ids in zip(scalar_adv.tolist(), df["input_ids"].tolist())
         ]
-        return df[["group_id", "rollout_index", "step_index", "advantages", "step_advantage"]]
+        return df[
+            ["group_id", "rollout_index", "step_index", "advantages", "episode_advantage", "step_advantage"]
+        ]
