@@ -127,6 +127,18 @@ def _start_local_disk_logger() -> None:
                             logger.info("[disk] du -shx %s -> %s", mnt, out.stdout.split()[0])
                     except Exception as e:
                         logger.warning("[disk] du %s failed: %s", mnt, e)
+                # /tmp is on the overlay and is the observed consumer; drill into it
+                # to name the producer (terminal_env_* sessions vs vLLM/torch JIT
+                # scratch like torchinductor_*/triton/tmp*).
+                try:
+                    out = subprocess.run(
+                        "du -xhd1 /tmp 2>/dev/null | sort -rh | head -15",
+                        shell=True, capture_output=True, text=True, timeout=45,
+                    )
+                    if out.stdout.strip():
+                        logger.info("[disk] du -xhd1 /tmp (top):\n%s", out.stdout)
+                except Exception as e:
+                    logger.warning("[disk] /tmp drill failed: %s", e)
             except Exception:
                 logger.warning("[disk] logger iteration failed", exc_info=True)
             time.sleep(interval)
