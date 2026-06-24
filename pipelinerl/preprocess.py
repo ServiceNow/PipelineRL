@@ -67,23 +67,28 @@ def _validate_reference_logprob_setup(rl_config: RLConfig, llm_urls: list[str]):
 
 
 
-def _drop_incomplete_groups(texts: list[dict], group_size: int) -> list[dict]:
-    """Keep only groups with exactly ``group_size`` distinct rollouts.
+def _filter_usable_groups(texts: list[dict], group_size: int, min_group_size: int = 2) -> list[dict]:
+    """Keep groups with at least ``min_group_size`` distinct rollouts.
 
-    A group is ``attempts`` rollouts of one task; a rollout may emit several texts
-    (one per turn), so completeness is counted over distinct ``rollout_index``. When
-    a rollout fails (e.g. an env/build error), its slot is missing and the group is
-    incomplete. Dropping such groups keeps the preprocessor alive instead of raising
-    on the whole chunk, mirroring the actor's empty-group drop."""
+    A group is ``group_size`` attempts of one task; a rollout may emit several texts
+    (one per turn), so size is counted over distinct ``rollout_index``. Some attempts
+    fail (env/build errors) and produce no samples, so groups commonly arrive partial
+    (e.g. 28/32). The leave-one-out advantage baseline in finetune/rl adapts to the
+    actual rollout count, so a partial group is still valid RL signal. A strict
+    ``== group_size`` check discarded ~every group when even one attempt failed and
+    starved the trainer; here we keep partials and drop only groups too small for a
+    leave-one-out baseline (<2)."""
     indices = defaultdict(set)
     for text in texts:
         indices[text["group_id"]].add(text["metadata"]["rollout_index"])
-    complete = {gid for gid, idxs in indices.items() if len(idxs) == group_size}
-    dropped = len(indices) - len(complete)
+    keep = {gid for gid, idxs in indices.items() if len(idxs) >= min_group_size}
+    dropped = len(indices) - len(keep)
+    partial = sum(1 for gid in keep if len(indices[gid]) < group_size)
     if dropped:
-        sizes = {gid: len(idxs) for gid, idxs in indices.items() if gid not in complete}
-        logger.warning("Dropping %d incomplete group(s) (expected %d rollouts): %s", dropped, group_size, sizes)
-    return [t for t in texts if t["group_id"] in complete]
+        logger.warning("Dropping %d group(s) with <%d distinct rollouts", dropped, min_group_size)
+    if partial:
+        logger.info("Keeping %d partial group(s) (<%d rollouts; LOO baseline adapts)", partial, group_size)
+    return [t for t in texts if t["group_id"] in keep]
 
 
 def batch_annotate_traces_with_ref_logprobs(llm: TrainableLLM, traces: List[dict]):
@@ -211,7 +216,7 @@ def run_dataset_loader(
                     n_groups += 1
                     if n_groups == chunk_n_groups:
                         break
-                buffer = _drop_incomplete_groups(buffer, check_group_size)
+                buffer = _filter_usable_groups(buffer, check_group_size)
                 if not buffer:
                     continue
                 try:
