@@ -551,27 +551,49 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                     sys.exit(1)
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
-            if alive and all(is_service_process(proc) for proc in alive):
-                # shut down long-running services after training is complete
-                if trainer_state is not None and not trainer_state.training_done:
-                    # check if training is completed
+                if proc.kind == "finetune" and trainer_state is not None and not trainer_state.training_done:
+                    # Belt and suspenders: the stream listener may race or fail
+                    # silently. A clean finetune exit means training is done.
+                    logger.info("Finetune exited cleanly; marking training as done")
+                    trainer_state.mark_training_done()
+            if alive:
+                # Decide whether to tear down what's left.
+                #   - Training done: kill *everything* that's still alive.
+                #     Services (vLLM/Ray/env) never exit on their own; the
+                #     preprocessor sometimes hangs in its own cleanup, so don't
+                #     wait for it either.
+                #   - Debug mode (no trainer_state) with only services left:
+                #     same as before — stop the services.
+                training_done = trainer_state is not None and trainer_state.training_done
+                only_services_left = all(is_service_process(proc) for proc in alive)
+                shutdown_now = training_done or (trainer_state is None and only_services_left)
+
+                if not shutdown_now and only_services_left and trainer_state is not None:
+                    # Non-service procs all exited cleanly but training_done
+                    # not yet signalled — wait briefly, then re-check.
                     logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
                     trainer_state.wait_for_training_done(timeout=5.0)
                     continue
-                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} service process(es)")
-                for proc in list(alive):
-                    logger.info(f"Requesting termination for service process {proc.handle.args}")
-                    request_terminate_with_children(proc.handle.pid)
-                for proc in list(alive):
-                    wait_for_process_tree(proc.handle.pid, parent_timeout=10.0)
-                    try:
-                        proc.handle.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        logger.warning(f"Service process {proc.handle.args} did not stop; forcing termination")
-                        terminate_with_children(proc.handle.pid, parent_timeout=10.0)
-                        proc.handle.wait(timeout=10)
-                    logger.info(f"Service process {proc.handle.args} stopped")
-                    alive.remove(proc)
+
+                if shutdown_now:
+                    reason = "trainer completion" if training_done else "all non-service processes exited (debug mode)"
+                    logger.info(f"Stopping remaining {len(alive)} process(es) ({reason}): {[p.kind for p in alive]}")
+                    for proc in list(alive):
+                        logger.info(f"Requesting termination for {proc.kind} process {proc.handle.args}")
+                        request_terminate_with_children(proc.handle.pid)
+                    for proc in list(alive):
+                        wait_for_process_tree(proc.handle.pid, parent_timeout=10.0)
+                        try:
+                            proc.handle.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            logger.warning(f"{proc.kind} process {proc.handle.args} did not stop; forcing termination")
+                            terminate_with_children(proc.handle.pid, parent_timeout=10.0)
+                            try:
+                                proc.handle.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                logger.error(f"{proc.kind} process {proc.handle.args} still alive after SIGKILL; giving up")
+                        logger.info(f"{proc.kind} process {proc.handle.args} stopped")
+                        alive.remove(proc)
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
             #     and (version := trainer_state.propagated_weight_version is not None)

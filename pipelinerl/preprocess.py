@@ -705,8 +705,19 @@ def run_preprocessing_loop(
                         writing_took = 0
                         num_filtered_out = 0
             finally:
-                # Clean up worker processes
+                # Clean up worker processes. Terminating workers mid-IPC can
+                # leave the SharedMemoryQueue's underlying multiprocessing
+                # Queues in a state where SharedMemoryManager.__exit__ hangs,
+                # so be aggressive: SIGTERM, brief grace period, then SIGKILL,
+                # and wait until they're really gone.
                 for worker in workers:
                     if worker.is_alive():
                         worker.terminate()
-                        worker.join(timeout=1.0)
+                for worker in workers:
+                    worker.join(timeout=2.0)
+                    if worker.is_alive():
+                        logger.warning(f"Preprocessor worker {worker.pid} did not stop after SIGTERM; sending SIGKILL")
+                        worker.kill()
+                        worker.join(timeout=5.0)
+                        if worker.is_alive():
+                            logger.error(f"Preprocessor worker {worker.pid} still alive after SIGKILL")

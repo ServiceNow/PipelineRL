@@ -28,6 +28,9 @@ class TrainerState:
     def debug_mode_init(self):
         self.propagated_weight_version = 0
         self.samples_processed = 0
+        self.mark_training_done()
+
+    def mark_training_done(self):
         self.training_done = True
         self._training_done_event.set()
 
@@ -35,16 +38,20 @@ class TrainerState:
         stream = SingleStreamSpec(exp_path=self.exp_path, topic=TRAINER_TOPIC)
 
         def listen():
-            with read_stream(stream) as reader:
-                for line in reader.read():
-                    message = TypeAdapter(TrainerMessage).validate_python(line)
-                    if isinstance(message, WeightUpdateSuccess):
-                        self.propagated_weight_version = message.version
-                    if isinstance(message, SamplesProcessed):
-                        self.samples_processed = message.samples_processed
-                    if isinstance(message, TrainingDone):
-                        self.training_done = True
-                        self._training_done_event.set()
+            try:
+                with read_stream(stream) as reader:
+                    for line in reader.read():
+                        message = TypeAdapter(TrainerMessage).validate_python(line)
+                        if isinstance(message, WeightUpdateSuccess):
+                            self.propagated_weight_version = message.version
+                        if isinstance(message, SamplesProcessed):
+                            self.samples_processed = message.samples_processed
+                        if isinstance(message, TrainingDone):
+                            self.mark_training_done()
+            except Exception:
+                # Daemon threads die silently otherwise — surfacing this makes
+                # shutdown hangs caused by a dead listener debuggable.
+                logger.exception("Trainer state listener thread crashed")
 
         self._thread = threading.Thread(target=listen, daemon=True)
         self._thread.start()
