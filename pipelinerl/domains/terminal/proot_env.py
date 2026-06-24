@@ -273,8 +273,16 @@ class ProotTerminalEnvironment:
             # Strip write bits so concurrent sessions sharing this base cannot
             # corrupt it; each session writes only to its bound /home/user and /tmp.
             subprocess.run(["chmod", "-R", "a-w", str(tmp_rootfs)], check=False)
-            # Atomic swap into place; clear any stale/partial tree first.
+            # Atomic swap into place. Clear any stale tree first; on NFS rmtree can
+            # partial-fail (silly-renamed .nfs* when a file is still held open),
+            # leaving task_rootfs present so os.replace would hit EEXIST. If it
+            # survives, rename it aside to a unique name (a directory rename succeeds
+            # even with open files) to free the target, then drop the trash.
             _force_rmtree(task_rootfs)
+            if task_rootfs.exists():
+                trash = self._task_cache_dir / f".trash.{self._sid}"
+                os.rename(task_rootfs, trash)
+                _force_rmtree(trash)
             os.replace(tmp_rootfs, task_rootfs)
             return True, ""
         except Exception:
