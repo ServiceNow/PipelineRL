@@ -67,20 +67,23 @@ def _validate_reference_logprob_setup(rl_config: RLConfig, llm_urls: list[str]):
 
 
 
-def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
-    """Check that each group_id occures exactly group_size times."""
-    group_rollouts = defaultdict(set)
+def _drop_incomplete_groups(texts: list[dict], group_size: int) -> list[dict]:
+    """Keep only groups with exactly ``group_size`` distinct rollouts.
+
+    A group is ``attempts`` rollouts of one task; a rollout may emit several texts
+    (one per turn), so completeness is counted over distinct ``rollout_index``. When
+    a rollout fails (e.g. an env/build error), its slot is missing and the group is
+    incomplete. Dropping such groups keeps the preprocessor alive instead of raising
+    on the whole chunk, mirroring the actor's empty-group drop."""
+    indices = defaultdict(set)
     for text in texts:
-        group_id = text["group_id"]
-        rollout_index = text["metadata"]["rollout_index"]
-        group_rollouts[group_id].add(rollout_index)
-
-    for group_id, rollout_ids in group_rollouts.items():
-        if len(rollout_ids) != group_size:
-            logger.error(f"Group sizes are wrong: {group_rollouts}")
-            return False
-
-    return True
+        indices[text["group_id"]].add(text["metadata"]["rollout_index"])
+    complete = {gid for gid, idxs in indices.items() if len(idxs) == group_size}
+    dropped = len(indices) - len(complete)
+    if dropped:
+        sizes = {gid: len(idxs) for gid, idxs in indices.items() if gid not in complete}
+        logger.warning("Dropping %d incomplete group(s) (expected %d rollouts): %s", dropped, group_size, sizes)
+    return [t for t in texts if t["group_id"] in complete]
 
 
 def batch_annotate_traces_with_ref_logprobs(llm: TrainableLLM, traces: List[dict]):
@@ -208,8 +211,9 @@ def run_dataset_loader(
                     n_groups += 1
                     if n_groups == chunk_n_groups:
                         break
-                if not _check_group_sizes(buffer, check_group_size):
-                    raise ValueError("Invalid group sizes in data")
+                buffer = _drop_incomplete_groups(buffer, check_group_size)
+                if not buffer:
+                    continue
                 try:
                     raw_chunk_queue.put_nowait(buffer)
                 except queue.Full:
