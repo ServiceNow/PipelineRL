@@ -245,25 +245,41 @@ class ProotTerminalEnvironment:
 
     def _build_shared_rootfs(self, task_rootfs: Path, container_def: str, t0: float) -> Tuple[bool, str]:
         """Clone the base rootfs and apply ``%post`` once, then make it read-only.
-        Caller holds the per-task build lock."""
-        _force_rmtree(task_rootfs)
-        self._task_cache_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["cp", "-a", str(self.base_rootfs), str(task_rootfs)], check=True)
-        resolv = task_rootfs / "etc/resolv.conf"
-        resolv.unlink(missing_ok=True)
-        resolv.write_text(f"nameserver {self.nameserver}\noptions ndots:0\n")
 
-        post = _post_body(container_def)
-        argv = _proot_argv(self.proot_bin, task_rootfs, cwd="/root") + ["/bin/bash", "-c", post]
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=self.build_timeout)
-        logger.info("Built task rootfs in %.1fs (rc=%d)", time.perf_counter() - t0, proc.returncode)
-        if proc.returncode != 0:
+        Build into a unique per-session temp dir and atomically rename into place.
+        Building directly into ``task_rootfs`` was fragile: ``_force_rmtree`` uses
+        ``ignore_errors=True``, and on NFS a file still held open by a lingering
+        proot leaves a silly-renamed ``.nfs*`` entry so the dir is not fully
+        removed; the next ``cp -a base task_rootfs`` then nests inside the survivor,
+        yielding a rootfs with no ``/etc`` (the observed HTTP 500 on
+        ``etc/resolv.conf``). A fresh sid-scoped temp never nests. Caller holds the
+        per-task build lock."""
+        self._task_cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp_rootfs = self._task_cache_dir / f".building.{self._sid}"
+        _force_rmtree(tmp_rootfs)
+        try:
+            subprocess.run(["cp", "-a", str(self.base_rootfs), str(tmp_rootfs)], check=True)
+            etc = tmp_rootfs / "etc"
+            etc.mkdir(parents=True, exist_ok=True)
+            (etc / "resolv.conf").write_text(f"nameserver {self.nameserver}\noptions ndots:0\n")
+
+            post = _post_body(container_def)
+            argv = _proot_argv(self.proot_bin, tmp_rootfs, cwd="/root") + ["/bin/bash", "-c", post]
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=self.build_timeout)
+            logger.info("Built task rootfs in %.1fs (rc=%d)", time.perf_counter() - t0, proc.returncode)
+            if proc.returncode != 0:
+                _force_rmtree(tmp_rootfs)
+                return False, ((proc.stderr or proc.stdout) or "")[-1000:]
+            # Strip write bits so concurrent sessions sharing this base cannot
+            # corrupt it; each session writes only to its bound /home/user and /tmp.
+            subprocess.run(["chmod", "-R", "a-w", str(tmp_rootfs)], check=False)
+            # Atomic swap into place; clear any stale/partial tree first.
             _force_rmtree(task_rootfs)
-            return False, ((proc.stderr or proc.stdout) or "")[-1000:]
-        # Strip write bits so concurrent sessions sharing this base cannot
-        # corrupt it; each session writes only to its bound /home/user and /tmp.
-        subprocess.run(["chmod", "-R", "a-w", str(task_rootfs)], check=False)
-        return True, ""
+            os.replace(tmp_rootfs, task_rootfs)
+            return True, ""
+        except Exception:
+            _force_rmtree(tmp_rootfs)
+            raise
 
     def _session_binds(self) -> List[str]:
         return [
