@@ -323,6 +323,11 @@ class ProotTerminalEnvironment:
             time.sleep(0.002)
         return "".join(buf), None
 
+    @property
+    def disk_exceeded(self) -> bool:
+        """True if this session was aborted for exceeding its scratch cap."""
+        return self._disk_exceeded.is_set()
+
     def _disk_monitor_loop(self) -> None:
         """Abort the session if its writable scratch exceeds the cap.
 

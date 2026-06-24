@@ -100,13 +100,18 @@ class TerminalSession:
             "output": truncate(output, self.max_observation_chars) or "(no output)",
             "success": success,
             "exit_code": 0 if success else 1,
+            "disk_exceeded": self._env.disk_exceeded,
         }
 
     def finish(self) -> dict:
         if self._env is None:
             raise RuntimeError("session not started")
         passed, output = self._env.run_final_tests(self._final_test)
-        return {"passed": passed, "output": truncate(output, self.max_observation_chars)}
+        return {
+            "passed": passed,
+            "output": truncate(output, self.max_observation_chars),
+            "disk_exceeded": self._env.disk_exceeded,
+        }
 
     def close(self) -> None:
         if self._env is not None:

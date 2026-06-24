@@ -46,6 +46,7 @@ class TerminalMetrics(BaseMetrics):
     build_ok: bool = True
     init_ok: bool = True
     overflow: bool = False
+    disk_aborted: bool = False
     n_turns: int = 0
     n_llm_calls: int = 0
 
@@ -191,6 +192,7 @@ async def _execute_rollout(
             {"role": "user", "content": problem["task"]},
         ]
         llm_calls: List[LLMCall] = []
+        disk_aborted = False
         for _ in range(tcfg.max_turns):
             llm_call = await llm_async_generate(llm, Prompt(messages=messages), session)
             llm_calls.append(llm_call)
@@ -202,9 +204,13 @@ async def _execute_rollout(
                 break
             obs = await _post(session, f"{env_url}/step", {"session_id": session_id, "command": command}, call_timeout)
             messages.append({"role": "user", "content": obs["output"]})
+            if obs.get("disk_exceeded"):
+                disk_aborted = True
+                break
 
         verifier = await _post(session, f"{env_url}/finish", {"session_id": session_id}, call_timeout)
         verifier_pass = bool(verifier["passed"])
+        disk_aborted = disk_aborted or bool(verifier.get("disk_exceeded"))
     finally:
         try:
             await _post(session, f"{env_url}/close", {"session_id": session_id}, 30)
@@ -222,6 +228,7 @@ async def _execute_rollout(
         no_answer=len(llm_calls) == 0,
         verifier_pass=verifier_pass,
         overflow=summary.overflow,
+        disk_aborted=disk_aborted,
         n_turns=len(messages) // 2,
         n_llm_calls=len(llm_calls),
     )
