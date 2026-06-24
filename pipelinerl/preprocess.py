@@ -315,41 +315,32 @@ def process_chunk(
 
 def filter_zero_advantage_groups(dataset: list[dict], epsilon: float = 1e-6) -> tuple[list[dict], int]:
     """
-    Filter out groups where all advantages are zero.
-    
-    Args:
-        dataset: List of dataset entries with group_id and advantages
-        epsilon: Threshold for considering advantage non-zero
-        
-    Returns:
-        Tuple of (filtered_entries, num_filtered_out)
+    Filter out groups whose siblings all share the same terminal reward.
+
+    Decision is made on `episode_advantage` only — a group where every row has
+    `|episode_advantage| < epsilon` is one with no outcome variance among its
+    sibling rollouts (all-success or all-fail), so the outcome reward provides
+    no learnable signal. Step-level shaping (`step_advantage`) is intentionally
+    ignored here: a flat-outcome group has no information about *task success*,
+    regardless of what step_reward says, and including it would dilute the
+    outcome gradient with rows that only have process signal.
     """
     filtered_entries = []
-    groups = {}
-    
-    # Group entries by group_id
+    groups: dict = {}
+
     for entry in dataset:
-        group_id = entry["group_id"]
-        if group_id not in groups:
-            groups[group_id] = []
-        groups[group_id].append(entry)
-    
+        groups.setdefault(entry["group_id"], []).append(entry)
+
     num_filtered_out = 0
-    
-    # Filter groups based on advantage values
-    for group_id, entries in groups.items():
-        has_non_zero_advantage = False
-        for entry in entries:
-            # advantages is a list, check if any absolute value is > epsilon
-            if any(abs(adv) > epsilon for adv in entry["advantages"]):
-                has_non_zero_advantage = True
-                break
-        
-        if has_non_zero_advantage:
+    for entries in groups.values():
+        has_outcome_signal = any(
+            abs(float(entry.get("episode_advantage", 0.0))) > epsilon for entry in entries
+        )
+        if has_outcome_signal:
             filtered_entries.extend(entries)
         else:
             num_filtered_out += len(entries)
-    
+
     return filtered_entries, num_filtered_out
 
 
