@@ -71,25 +71,62 @@ def _start_local_disk_logger() -> None:
             if not _claim():
                 return
 
+    # k8s ephemeral-storage = container writable layer + emptyDir + pod logs. An
+    # emptyDir is its own mount, which `du -x /` skips, so enumerate every
+    # non-NFS/non-virtual mount and du each one. That surfaces a scratch volume
+    # the overlay-only view misses.
+    _SKIP_FSTYPES = {
+        "nfs", "nfs4", "proc", "sysfs", "cgroup", "cgroup2", "devpts", "mqueue",
+        "devtmpfs", "tmpfs", "fusectl", "debugfs", "tracefs", "securityfs",
+        "pstore", "bpf", "configfs", "autofs", "binfmt_misc", "hugetlbfs", "rpc_pipefs",
+    }
+
+    def _local_mounts() -> list[str]:
+        points: list[str] = []
+        try:
+            for line in Path("/proc/mounts").read_text().splitlines():
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt, fstype = parts[1], parts[2]
+                if fstype in _SKIP_FSTYPES:
+                    continue
+                points.append(mnt)
+        except Exception:
+            points = ["/"]
+        # de-dup, keep "/" first
+        seen, ordered = set(), []
+        for p in (["/"] + points):
+            if p not in seen:
+                seen.add(p)
+                ordered.append(p)
+        return ordered
+
     def _loop() -> None:
+        first = True
         while True:
             try:
                 du = shutil.disk_usage("/")
-                used, total = du.used, du.total
                 logger.info(
-                    "[disk] ephemeral '/' used=%.2f GiB / %.2f GiB (%.0f%%)",
-                    used / 2**30, total / 2**30, 100 * used / max(total, 1),
+                    "[disk] backing fs '/' used=%.2f GiB / %.2f GiB (%.0f%%)",
+                    du.used / 2**30, du.total / 2**30, 100 * du.used / max(du.total, 1),
                 )
-                # Top local dirs. -x stays on the overlay fs (won't descend NFS
-                # mounts or /proc,/sys,/dev). /tmp logged separately in case it is
-                # a distinct mount.
-                for cmd in (["du", "-xhd1", "/"], ["du", "-shx", "/tmp"]):
+                if first:
                     try:
-                        out = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-                        lines = [l for l in out.stdout.splitlines() if l.strip()]
-                        logger.info("[disk] %s:\n%s", " ".join(cmd), "\n".join(lines[-20:]))
+                        out = subprocess.run(["df", "-h"], capture_output=True, text=True, timeout=20)
+                        logger.info("[disk] df -h:\n%s", out.stdout)
                     except Exception as e:
-                        logger.warning("[disk] %s failed: %s", " ".join(cmd), e)
+                        logger.warning("[disk] df failed: %s", e)
+                    first = False
+                # Per-mount usage for local (non-NFS) mounts: the ephemeral-counted
+                # bytes live here. -x so each du stays within its own mount.
+                for mnt in _local_mounts():
+                    try:
+                        out = subprocess.run(["du", "-shx", mnt], capture_output=True, text=True, timeout=45)
+                        if out.stdout.strip():
+                            logger.info("[disk] du -shx %s -> %s", mnt, out.stdout.split()[0])
+                    except Exception as e:
+                        logger.warning("[disk] du %s failed: %s", mnt, e)
             except Exception:
                 logger.warning("[disk] logger iteration failed", exc_info=True)
             time.sleep(interval)
