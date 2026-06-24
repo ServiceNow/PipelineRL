@@ -43,7 +43,7 @@ actor:
 # Rollout-side knobs (read by generate_terminal_rollout).
 terminal:
   max_turns: 64              # TMax: 64 max tool calls
-  rollout_timeout: 1200      # hard cap per rollout, seconds
+  rollout_timeout: 1800      # hard cap per rollout, seconds (raised: long 64-turn rollouts were timing out at 1200 -> incomplete groups dropped)
   env_call_timeout: 300      # per HTTP call to the env server (/step, /finish)
   env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
   capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
@@ -129,6 +129,10 @@ vllm_config:
   vllm_kwargs:
     max_model_len: 65536
     mm-processor-cache-gb: 0
+    # Terminal rollouts have long, growing multi-turn contexts. The base default of
+    # 1024 prefilled them in tiny chunks, so 64-turn rollouts blew the rollout
+    # timeout; 8192 prefills ~8x faster. (GPU-compute bound, not disk.)
+    max-num-batched-tokens: 8192
     # Route Qwen3.5 GDN prefill to the bundled Triton/FLA kernel. The default
     # ("auto") picks FlashInfer on H100, which lazily JIT-compiles gdn_prefill_sm90
     # on the first prefill and hit an in-thread FileLock reentrancy deadlock that

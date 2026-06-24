@@ -178,6 +178,8 @@ class TerminalEnvironmentServer:
         self._lock = asyncio.Lock()
         # Each concurrent session may have one blocking proot call in flight.
         self._executor = ThreadPoolExecutor(max_workers=n_envs + 4)
+        # Background cleanup tasks (kept referenced so they aren't GC'd mid-flight).
+        self._bg_tasks: set = set()
 
     async def _run(self, fn, *args):
         return await asyncio.get_event_loop().run_in_executor(self._executor, partial(fn, *args))
@@ -248,11 +250,16 @@ class TerminalEnvironmentServer:
     async def close(self, request: web.Request) -> web.Response:
         body = await request.json()
         session_id = body["session_id"]
-        session = self._sessions.get(session_id)
-        if session is not None:
-            await self._run(session.close)
+        # Free the slot immediately, then run cleanup off the response path. Session
+        # cleanup includes the shared-rootfs eviction rmtree (NFS), which can exceed
+        # the client's /close timeout and was holding the slot; the refcount+lock in
+        # cleanup keep eviction race-safe even with the slot already reused.
         async with self._lock:
-            self._sessions.pop(session_id, None)
+            session = self._sessions.pop(session_id, None)
+        if session is not None:
+            task = asyncio.create_task(self._run(session.close))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
         return web.json_response({"status": "ok"})
 
     def launch(self, port: int):
