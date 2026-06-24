@@ -104,7 +104,7 @@ test_dataset_names:
 
 finetune:
   learning_rate: 1.0e-6      # TMax constant LR
-  attempts: 8                # GSPO group size (project norm; TMax used 32 but that 4x'd group-assembly latency and slot oversubscription)
+  attempts: 16               # GSPO group size. 8 completed fast but ~75% of groups were all-pass (model aces easy tasks) -> zero-advantage filtered. 16 has more reward variance (fewer all-pass) while still 2x faster than TMax's 32.
   max_train_steps: 500       # TMax
   save_checkpoint_steps: 9999999
   also_save_steps: [100, 200, 300, 400, 500]
