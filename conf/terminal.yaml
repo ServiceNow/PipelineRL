@@ -129,6 +129,11 @@ vllm_config:
   vllm_kwargs:
     max_model_len: 65536
     mm-processor-cache-gb: 0
+    # Route Qwen3.5 GDN prefill to the bundled Triton/FLA kernel. The default
+    # ("auto") picks FlashInfer on H100, which lazily JIT-compiles gdn_prefill_sm90
+    # on the first prefill and hit an in-thread FileLock reentrancy deadlock that
+    # killed the EngineCore mid-generation (gspo_15).
+    gdn-prefill-backend: triton
 
 llm:
   parameters:
