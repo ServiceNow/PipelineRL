@@ -73,6 +73,12 @@ environments:
     verifier_timeout: 180.0
     max_observation_chars: 4000
     check_initial_state: true
+    # Hard cap on each session's node-local writable scratch. One runaway agent
+    # command can otherwise fill the node's 16GiB ephemeral quota and evict the
+    # replica (observed: a single session wrote 18GiB). At ~8 sessions/node this
+    # bounds local scratch to ~12GiB. A session over the cap is aborted and scored
+    # as a normal negative outcome.
+    max_session_disk_bytes: 1610612736   # 1.5 GiB
 
 environment_key: terminal
 

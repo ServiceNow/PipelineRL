@@ -160,6 +160,7 @@ class TerminalEnvironmentServer:
         max_observation_chars: int = 4000,
         check_initial_state: bool = True,
         cache_dir: str | None = None,
+        max_session_disk_bytes: int = 1536 * 2**20,
     ):
         self.bases_dir = Path(bases_dir)
         self.n_envs = n_envs
@@ -171,6 +172,7 @@ class TerminalEnvironmentServer:
         self.max_observation_chars = max_observation_chars
         self.check_initial_state = check_initial_state
         self.cache_dir = cache_dir
+        self.max_session_disk_bytes = max_session_disk_bytes
 
         self._sessions: Dict[str, TerminalSession] = {}
         self._lock = asyncio.Lock()
@@ -204,6 +206,7 @@ class TerminalEnvironmentServer:
             max_observation_chars=self.max_observation_chars,
             check_initial_state=self.check_initial_state,
             cache_dir=self.cache_dir,
+            max_session_disk_bytes=self.max_session_disk_bytes,
         )
         try:
             flags = await self._run(session.start, task)

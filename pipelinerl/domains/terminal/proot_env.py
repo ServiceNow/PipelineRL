@@ -149,6 +149,8 @@ class ProotTerminalEnvironment:
         verifier_timeout: float = 180.0,
         work_dir: Optional[str | Path] = None,
         cache_dir: Optional[str | Path] = None,
+        max_session_disk_bytes: int = 1536 * 2**20,
+        disk_check_interval: float = 3.0,
     ):
         self.base_rootfs = Path(base_rootfs).resolve()
         self.proot_bin = proot_bin
@@ -157,6 +159,13 @@ class ProotTerminalEnvironment:
         self.shell_init_timeout = shell_init_timeout
         self.build_timeout = build_timeout
         self.verifier_timeout = verifier_timeout
+        # Hard cap on this session's node-local writable scratch (/home/user +
+        # /tmp binds). A single runaway agent command (e.g. ``cat /dev/zero >f``)
+        # can otherwise fill the node's 16GiB ephemeral quota and evict the whole
+        # replica. proot can't mount a quota'd fs, so a monitor thread enforces it
+        # by aborting and freeing the session. 0 disables.
+        self.max_session_disk_bytes = max_session_disk_bytes
+        self.disk_check_interval = disk_check_interval
 
         self._owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="terminal_env_"))
@@ -186,6 +195,8 @@ class ProotTerminalEnvironment:
         self.output_queue: "queue.Queue[str]" = queue.Queue()
         self.reader_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._disk_exceeded = threading.Event()
+        self._disk_monitor_thread: Optional[threading.Thread] = None
         self._marker = f"__CMD_DONE__{uuid.uuid4().hex}__"
 
     # ------------------------------------------------------------------
@@ -312,6 +323,32 @@ class ProotTerminalEnvironment:
             time.sleep(0.002)
         return "".join(buf), None
 
+    def _disk_monitor_loop(self) -> None:
+        """Abort the session if its writable scratch exceeds the cap.
+
+        Frees the scratch immediately on trip so the node's ephemeral quota is
+        released without waiting for ``/close``. Marks the session via
+        ``_disk_exceeded`` so ``exec``/verifier return a clean failure."""
+        cap = self.max_session_disk_bytes
+        while not self._stop_event.wait(self.disk_check_interval):
+            if not self.shell_process or self.shell_process.poll() is not None:
+                return
+            size = _dir_size_bytes(self.work_dir)
+            if size < 0 or size <= cap:
+                continue
+            logger.warning(
+                "session %s scratch %.1f MiB exceeded cap %.1f MiB; aborting",
+                self._sid, size / 2**20, cap / 2**20,
+            )
+            self._disk_exceeded.set()
+            proc = self.shell_process
+            if proc and proc.poll() is None:
+                proc.kill()
+            # Reclaim the node-local bytes now, not at /close.
+            _force_rmtree(self.session_home)
+            _force_rmtree(self.session_tmp)
+            return
+
     def start(self, source_startup_hooks: bool = True) -> bool:
         """Start the persistent proot bash session on a PTY."""
         if self.rootfs is None:
@@ -357,10 +394,16 @@ class ProotTerminalEnvironment:
             self.exec(
                 'for f in /.singularity.d/env/*.sh; do [ -f "$f" ] && source "$f" 2>/dev/null; done; true'
             )
+
+        if self.max_session_disk_bytes > 0:
+            self._disk_monitor_thread = threading.Thread(target=self._disk_monitor_loop, daemon=True)
+            self._disk_monitor_thread.start()
         return True
 
     def exec(self, command: str, timeout: Optional[float] = None) -> Tuple[bool, str]:
         """Run a command in the persistent shell, returning (success, output)."""
+        if self._disk_exceeded.is_set():
+            return False, "session aborted: local scratch disk limit exceeded"
         if not self.shell_process or self.shell_process.poll() is not None:
             return False, "shell is not running"
         if not self.reader_thread or not self.reader_thread.is_alive():
@@ -390,6 +433,8 @@ class ProotTerminalEnvironment:
     # verifiers
     # ------------------------------------------------------------------
     def _run_pytest(self, test_text: str, name: str) -> Tuple[bool, str]:
+        if self._disk_exceeded.is_set():
+            return False, "session aborted: local scratch disk limit exceeded"
         # /home/user is bound to the writable session home, so write the test
         # file straight into it instead of touching the read-only base.
         (self.session_home / name).write_text(test_text, encoding="utf-8")
@@ -415,6 +460,9 @@ class ProotTerminalEnvironment:
         if self.reader_thread:
             self.reader_thread.join(timeout=1.0)
             self.reader_thread = None
+        if self._disk_monitor_thread:
+            self._disk_monitor_thread.join(timeout=1.0)
+            self._disk_monitor_thread = None
         if self.shell_process and self.shell_process.poll() is None:
             try:
                 os.write(self.master_fd, b"exit\n")
