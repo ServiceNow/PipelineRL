@@ -19,6 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -30,6 +36,66 @@ from aiohttp import web
 from .environment import TerminalSession
 
 logger = logging.getLogger(__name__)
+
+
+def _start_local_disk_logger() -> None:
+    """Diagnostic: periodically log node-local ephemeral usage and its breakdown.
+
+    The 16 GiB EAI ephemeral cap is per node, but 8 env servers run per inference
+    node, so elect a single logger via an atomic node-local marker to avoid 8x
+    duplicate output. Set ``PL_TERMINAL_DISK_LOG_INTERVAL=0`` to disable.
+    """
+    interval = float(os.environ.get("PL_TERMINAL_DISK_LOG_INTERVAL", "60"))
+    if interval <= 0:
+        return
+    marker = Path(tempfile.gettempdir()) / "pl_terminal_disk_logger.lock"
+
+    def _claim() -> bool:
+        try:
+            fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            return False
+
+    if not _claim():
+        # Marker exists: take over only if the holder is dead (stale from a prior
+        # run on a reused node); otherwise another live env server owns logging.
+        try:
+            holder = int(marker.read_text().strip() or "-1")
+            os.kill(holder, 0)
+            return
+        except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError):
+            marker.unlink(missing_ok=True)
+            if not _claim():
+                return
+
+    def _loop() -> None:
+        while True:
+            try:
+                du = shutil.disk_usage("/")
+                used, total = du.used, du.total
+                logger.info(
+                    "[disk] ephemeral '/' used=%.2f GiB / %.2f GiB (%.0f%%)",
+                    used / 2**30, total / 2**30, 100 * used / max(total, 1),
+                )
+                # Top local dirs. -x stays on the overlay fs (won't descend NFS
+                # mounts or /proc,/sys,/dev). /tmp logged separately in case it is
+                # a distinct mount.
+                for cmd in (["du", "-xhd1", "/"], ["du", "-shx", "/tmp"]):
+                    try:
+                        out = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                        lines = [l for l in out.stdout.splitlines() if l.strip()]
+                        logger.info("[disk] %s:\n%s", " ".join(cmd), "\n".join(lines[-20:]))
+                    except Exception as e:
+                        logger.warning("[disk] %s failed: %s", " ".join(cmd), e)
+            except Exception:
+                logger.warning("[disk] logger iteration failed", exc_info=True)
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, daemon=True, name="disk-logger").start()
+    logger.info("[disk] local ephemeral logger started (interval=%.0fs)", interval)
 
 
 class TerminalEnvironmentServer:
@@ -152,4 +218,5 @@ class TerminalEnvironmentServer:
             "TerminalEnvironmentServer on %s:%d (n_envs=%d, bases=%s)",
             self.host, port, self.n_envs, self.bases_dir,
         )
+        _start_local_disk_logger()
         web.run_app(app, host=self.host, port=port, access_log=None)
