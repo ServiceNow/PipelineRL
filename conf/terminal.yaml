@@ -61,13 +61,13 @@ environments:
     # 16GiB local ephemeral quota); proot_env scopes them by hostname. Per-session
     # writable /home/user and the lock/refcounts stay node-local.
     cache_dir: ${output_dir}/env_cache
-    # Concurrent proot sessions per server. 8 servers/inference-node, so n_envs:2 ->
-    # 16 sessions/node. With the per-session scratch cap below at 0.9GiB that bounds
-    # node-local to ~14.4GiB (<16GiB). n_envs:1 (16 slots fleet-wide) was the
-    # throughput ceiling: 8 schedulers x 32 attempts oversubscribe slots ~16x, so no
-    # 32-attempt group ever finished. 2 -> 32 slots, matching llm_max_rollouts(2) x
-    # 16 LLMs = 32 desired concurrent rollouts.
-    n_envs: 2
+    # Concurrent proot sessions per server. n_envs:2 (16 sessions/node) OOM-killed the
+    # inference replica (exit 137, host memory: 16 concurrent bash agents on top of 8
+    # vLLM engines) even though disk was fine. n_envs:1 (8 sessions/node) ran stably
+    # for 75min in gspo_19. Keep 1 for memory stability; the keep-partial fix is what
+    # actually unblocks the trainer. Throughput (n_envs:2 + a memory guard) is post-step
+    # tuning.
+    n_envs: 1
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
