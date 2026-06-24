@@ -124,6 +124,17 @@ def _force_rmtree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _dir_size_bytes(path: Path) -> int:
+    """Apparent local-disk usage of a tree, or -1 if it can't be measured."""
+    try:
+        out = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True, timeout=30)
+        if out.returncode == 0 and out.stdout.strip():
+            return int(out.stdout.split()[0])
+    except Exception:
+        pass
+    return -1
+
+
 class ProotTerminalEnvironment:
     """Persistent proot bash session for a single terminal task."""
 
@@ -424,6 +435,12 @@ class ProotTerminalEnvironment:
         self._release_shared_rootfs()
 
         if self._owns_work_dir and self.work_dir.exists():
+            # Report the node-local writable scratch this session held (per-session
+            # /home/user + /tmp). Aggregated across concurrent sessions this is the
+            # quantity that overflows the 16GiB ephemeral cap, so log it to size n_envs.
+            size = _dir_size_bytes(self.work_dir)
+            if size >= 0:
+                logger.info("session %s local scratch at close: %.1f MiB", self._sid, size / (1024 * 1024))
             shutil.rmtree(self.work_dir, ignore_errors=True)
 
     def _release_shared_rootfs(self) -> None:

@@ -171,8 +171,13 @@ async def _execute_rollout(
 ) -> RolloutResult:
     tcfg = cfg.terminal
     call_timeout = getattr(tcfg, "env_call_timeout", 300)
+    # /start_task triggers the one-time per-task rootfs build, which reads the
+    # base over NFS and can take several minutes. Give it a longer timeout than
+    # /step so a cold build is not abandoned mid-flight (which would leak the
+    # server-side session and its capacity slot).
+    start_timeout = getattr(tcfg, "env_start_timeout", 900)
 
-    start = await _post(session, f"{env_url}/start_task", {"task_data": problem}, call_timeout)
+    start = await _post(session, f"{env_url}/start_task", {"task_data": problem}, start_timeout)
     session_id = start.get("session_id")
     if not session_id or not start.get("started") or not start.get("init_ok"):
         logger.warning("task %s not runnable (start=%s), dropping", problem.get("task_id"), start)

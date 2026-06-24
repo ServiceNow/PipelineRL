@@ -44,7 +44,8 @@ actor:
 terminal:
   max_turns: 64              # TMax: 64 max tool calls
   rollout_timeout: 1200      # hard cap per rollout, seconds
-  env_call_timeout: 300      # per HTTP call to the env server
+  env_call_timeout: 300      # per HTTP call to the env server (/step, /finish)
+  env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
   capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
   reward_pass: 1.0
   reward_fail: -1.0
@@ -60,7 +61,11 @@ environments:
     # 16GiB local ephemeral quota); proot_env scopes them by hostname. Per-session
     # writable /home/user and the lock/refcounts stay node-local.
     cache_dir: ${output_dir}/env_cache
-    n_envs: 3                 # concurrent proot sessions per server; keep >= actor.llm_max_rollouts
+    # Concurrent proot sessions per server. Each session holds node-local writable
+    # scratch (/home/user + /tmp). At 8 servers/inference-node, n_envs:3 -> 24
+    # sessions/node overflowed the 16GiB local ephemeral cap; 1 -> ~8 sessions/node.
+    # Below actor.llm_max_rollouts the actor sees 503s, absorbed by capacity_retry_sleep.
+    n_envs: 1
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
