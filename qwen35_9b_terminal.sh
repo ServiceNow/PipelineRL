@@ -11,7 +11,7 @@
 
 TIMESTAMP=$(date +%s)
 OUTPUT_DIR_BASE=/mnt/llmd/results/exps/rafa/terminal
-JOB_NAME=terminal_qwen35_9b_gspo_22
+JOB_NAME=terminal_qwen35_9b_gspo_23
 CONDA_ENV=${CONDA_ENV:-pipeline-rl}
 CONDA_EXE=${CONDA_EXE:-/opt/conda/bin/conda}
 
