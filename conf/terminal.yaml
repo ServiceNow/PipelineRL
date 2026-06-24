@@ -42,7 +42,7 @@ actor:
 
 # Rollout-side knobs (read by generate_terminal_rollout).
 terminal:
-  max_turns: 64              # TMax: 64 max tool calls
+  max_turns: 40              # TMax uses 64; avg rollout is ~13 turns, so 40 trims the slow tail while keeping headroom
   rollout_timeout: 1800      # hard cap per rollout, seconds (raised: long 64-turn rollouts were timing out at 1200 -> incomplete groups dropped)
   env_call_timeout: 300      # per HTTP call to the env server (/step, /finish)
   env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
@@ -104,7 +104,7 @@ test_dataset_names:
 
 finetune:
   learning_rate: 1.0e-6      # TMax constant LR
-  attempts: 32               # TMax group size
+  attempts: 8                # GSPO group size (project norm; TMax used 32 but that 4x'd group-assembly latency and slot oversubscription)
   max_train_steps: 500       # TMax
   save_checkpoint_steps: 9999999
   also_save_steps: [100, 200, 300, 400, 500]
@@ -143,10 +143,10 @@ vllm_config:
 
 llm:
   parameters:
-    max_tokens: 16000
+    max_tokens: 4096          # bring-up: thinking is off so a command fits in 4096; restore ~16000 when enabling thinking
     temperature: 1.0
   chat_template_kwargs:
-    enable_thinking: false    # TMax uses interleaved thinking; off for the first run
+    enable_thinking: false    # bring-up simplification (NOT a TMax rec; TMax uses interleaved thinking). Turn on + raise max_tokens for the real run.
 
 test_llm:
   parameters:
