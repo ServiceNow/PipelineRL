@@ -61,11 +61,13 @@ environments:
     # 16GiB local ephemeral quota); proot_env scopes them by hostname. Per-session
     # writable /home/user and the lock/refcounts stay node-local.
     cache_dir: ${output_dir}/env_cache
-    # Concurrent proot sessions per server. Each session holds node-local writable
-    # scratch (/home/user + /tmp). At 8 servers/inference-node, n_envs:3 -> 24
-    # sessions/node overflowed the 16GiB local ephemeral cap; 1 -> ~8 sessions/node.
-    # Below actor.llm_max_rollouts the actor sees 503s, absorbed by capacity_retry_sleep.
-    n_envs: 1
+    # Concurrent proot sessions per server. 8 servers/inference-node, so n_envs:2 ->
+    # 16 sessions/node. With the per-session scratch cap below at 0.9GiB that bounds
+    # node-local to ~14.4GiB (<16GiB). n_envs:1 (16 slots fleet-wide) was the
+    # throughput ceiling: 8 schedulers x 32 attempts oversubscribe slots ~16x, so no
+    # 32-attempt group ever finished. 2 -> 32 slots, matching llm_max_rollouts(2) x
+    # 16 LLMs = 32 desired concurrent rollouts.
+    n_envs: 2
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
@@ -75,10 +77,10 @@ environments:
     check_initial_state: true
     # Hard cap on each session's node-local writable scratch. One runaway agent
     # command can otherwise fill the node's 16GiB ephemeral quota and evict the
-    # replica (observed: a single session wrote 18GiB). At ~8 sessions/node this
-    # bounds local scratch to ~12GiB. A session over the cap is aborted and scored
-    # as a normal negative outcome.
-    max_session_disk_bytes: 1610612736   # 1.5 GiB
+    # replica (observed: a single session wrote 18GiB). At n_envs:2 = 16 sessions/node
+    # this bounds local scratch to ~14.4GiB (<16GiB). A session over the cap is aborted
+    # and scored as a normal negative outcome. Most tasks use <1MiB, so 0.9GiB is ample.
+    max_session_disk_bytes: 966367641   # 0.9 GiB
 
 environment_key: terminal
 
