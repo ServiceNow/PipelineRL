@@ -172,8 +172,17 @@ test_llm:
 
 world:
   replicas: 1
-  actor_fraction: 4
+  # 6/2 (was 4/4): 3 of 4 nodes generate, 1 trains. gspo_29 on 4/4 did a 3-step
+  # burst off the warmup backlog then starved for step 4 (generation-bound, mirrors
+  # gspo_27). 6/2 -> int(32*0.75)=24 actor GPUs (24 vLLM) + 8 finetune GPUs (one
+  # seq_parallel=8 lead group). Concurrent rollout capacity is env-slot-bound
+  # 16->24 (~1.5x); per-node env density unchanged (24 servers/3 nodes = 8/node).
+  # Trainer fits on 8 GPUs (ZeRO-3 bf16 shards optimizer; seq_parallel shards the
+  # 65536-token activations). grad_accum_per_gpu 64->128 (~2x step wall-clock, fine
+  # while generation is the bottleneck). 8 trainer GPUs = 1 lead group also masks
+  # the inter-lead all_gather starvation mode in Phase A.
+  actor_fraction: 6
   preprocessor_fraction: 0
-  finetune_fraction: 4
+  finetune_fraction: 2
   # One env server per actor LLM, spread across nodes by least-busy placement.
   env_replicas_per_actor: 1
