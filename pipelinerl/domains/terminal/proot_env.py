@@ -135,6 +135,19 @@ def _dir_size_bytes(path: Path) -> int:
     return -1
 
 
+def _proc_group_rss_bytes(pgid: int) -> int:
+    """Sum resident memory (bytes) of the session's process group, or -1 if it
+    can't be measured. The proot shell is started with ``start_new_session=True``,
+    so its pid == pgid and the agent's child processes inherit it; ``ps -g`` sums
+    them. -1 is treated as 'unknown' by the caller (never triggers an abort)."""
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-g", str(pgid)], capture_output=True, text=True, timeout=10)
+        kb = sum(int(x) for x in out.stdout.split())
+        return kb * 1024 if out.stdout.strip() else -1
+    except Exception:
+        return -1
+
+
 class ProotTerminalEnvironment:
     """Persistent proot bash session for a single terminal task."""
 
@@ -150,6 +163,7 @@ class ProotTerminalEnvironment:
         work_dir: Optional[str | Path] = None,
         cache_dir: Optional[str | Path] = None,
         max_session_disk_bytes: int = 1536 * 2**20,
+        max_session_rss_bytes: int = 16 * 2**30,
         disk_check_interval: float = 3.0,
     ):
         self.base_rootfs = Path(base_rootfs).resolve()
@@ -165,6 +179,12 @@ class ProotTerminalEnvironment:
         # replica. proot can't mount a quota'd fs, so a monitor thread enforces it
         # by aborting and freeing the session. 0 disables.
         self.max_session_disk_bytes = max_session_disk_bytes
+        # Hard cap on this session's process-group resident memory. A memory-heavy
+        # agent command (e.g. a 'complex' task loading a huge dataset, or a runaway
+        # allocation) can OOM-kill the whole inference replica (exit 137) since the
+        # disk cap only bounds /tmp, not RAM. The monitor thread aborts the session
+        # if its process-group RSS exceeds this. 0 disables.
+        self.max_session_rss_bytes = max_session_rss_bytes
         self.disk_check_interval = disk_check_interval
 
         self._owns_work_dir = work_dir is None
@@ -353,25 +373,33 @@ class ProotTerminalEnvironment:
         return self._disk_exceeded.is_set()
 
     def _disk_monitor_loop(self) -> None:
-        """Abort the session if its writable scratch exceeds the cap.
+        """Abort the session if its node-local scratch OR its process-group RSS
+        exceeds the cap.
 
-        Frees the scratch immediately on trip so the node's ephemeral quota is
-        released without waiting for ``/close``. Marks the session via
-        ``_disk_exceeded`` so ``exec``/verifier return a clean failure."""
-        cap = self.max_session_disk_bytes
+        Disk: a runaway write can fill the node's ephemeral quota. RSS: a
+        memory-heavy agent command can OOM-kill the whole replica (exit 137). On a
+        trip, free the scratch immediately and mark the session via ``_disk_exceeded``
+        so ``exec``/verifier return a clean failure (scored reward_fail)."""
+        disk_cap = self.max_session_disk_bytes
+        rss_cap = self.max_session_rss_bytes
         while not self._stop_event.wait(self.disk_check_interval):
-            if not self.shell_process or self.shell_process.poll() is not None:
-                return
-            size = _dir_size_bytes(self.work_dir)
-            if size < 0 or size <= cap:
-                continue
-            logger.warning(
-                "session %s scratch %.1f MiB exceeded cap %.1f MiB; aborting",
-                self._sid, size / 2**20, cap / 2**20,
-            )
-            self._disk_exceeded.set()
             proc = self.shell_process
-            if proc and proc.poll() is None:
+            if not proc or proc.poll() is not None:
+                return
+            reason = None
+            if disk_cap > 0:
+                size = _dir_size_bytes(self.work_dir)
+                if size > disk_cap:
+                    reason = "scratch %.0f MiB > disk cap %.0f MiB" % (size / 2**20, disk_cap / 2**20)
+            if reason is None and rss_cap > 0:
+                rss = _proc_group_rss_bytes(proc.pid)
+                if rss > rss_cap:
+                    reason = "RSS %.0f MiB > cap %.0f MiB" % (rss / 2**20, rss_cap / 2**20)
+            if reason is None:
+                continue
+            logger.warning("session %s aborting: %s", self._sid, reason)
+            self._disk_exceeded.set()
+            if proc.poll() is None:
                 proc.kill()
             # Reclaim the node-local bytes now, not at /close.
             _force_rmtree(self.session_home)
@@ -424,7 +452,7 @@ class ProotTerminalEnvironment:
                 'for f in /.singularity.d/env/*.sh; do [ -f "$f" ] && source "$f" 2>/dev/null; done; true'
             )
 
-        if self.max_session_disk_bytes > 0:
+        if self.max_session_disk_bytes > 0 or self.max_session_rss_bytes > 0:
             self._disk_monitor_thread = threading.Thread(target=self._disk_monitor_loop, daemon=True)
             self._disk_monitor_thread.start()
         return True

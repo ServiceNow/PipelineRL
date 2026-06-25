@@ -37,6 +37,7 @@ class TerminalSession:
         check_initial_state: bool,
         cache_dir: Optional[str | Path] = None,
         max_session_disk_bytes: int = 1536 * 2**20,
+        max_session_rss_bytes: int = 16 * 2**30,
     ):
         self.bases_dir = bases_dir
         self.proot_bin = proot_bin
@@ -47,6 +48,7 @@ class TerminalSession:
         self.check_initial_state = check_initial_state
         self.cache_dir = cache_dir
         self.max_session_disk_bytes = max_session_disk_bytes
+        self.max_session_rss_bytes = max_session_rss_bytes
 
         self._env: Optional[ProotTerminalEnvironment] = None
         self._final_test: str = ""
@@ -78,6 +80,7 @@ class TerminalSession:
             verifier_timeout=self.verifier_timeout,
             cache_dir=self.cache_dir,
             max_session_disk_bytes=self.max_session_disk_bytes,
+            max_session_rss_bytes=self.max_session_rss_bytes,
         )
         build_ok, build_err = self._env.build(task["container_def"])
         if not build_ok:

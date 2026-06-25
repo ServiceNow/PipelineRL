@@ -81,6 +81,12 @@ environments:
     # this bounds local scratch to ~14.4GiB (<16GiB). A session over the cap is aborted
     # and scored as a normal negative outcome. Most tasks use <1MiB, so 0.9GiB is ample.
     max_session_disk_bytes: 966367641   # 0.9 GiB
+    # Hard cap on each session's process-group RSS. A memory-heavy curriculum task
+    # (moderate/complex are heavier than the dropped 'short') or a runaway allocation
+    # OOM-killed the inference replica (gspo_28, exit 137); the disk cap only bounds
+    # /tmp, not RAM. Monitor aborts the session over this (scored reward_fail). 16GiB
+    # is generous (normal tasks use <1GiB); 8 sessions/node x 16 = 128GiB << node RAM.
+    max_session_rss_bytes: 17179869184  # 16 GiB
 
 environment_key: terminal
 
