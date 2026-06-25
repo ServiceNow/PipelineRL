@@ -26,6 +26,7 @@ def load_problems(
     parquet_file: str = DEFAULT_FILE,
     train_ratio: float = 0.95,
     tmax_domains: Optional[List[str]] = None,
+    task_complexity_keep: Optional[List[str]] = None,
     limit: Optional[int] = None,
     seed: int = 0,
     subset: Optional[str] = None,
@@ -37,6 +38,12 @@ def load_problems(
         dataset_names: list (or single name) for the split; a name containing
             "test" loads the held-out split, otherwise the train split.
         tmax_domains: optional subset of the 9 TMax domains (security, ...).
+        task_complexity_keep: curriculum filter. The dataset's ``task_complexity``
+            field is a long string starting with one of ``short`` / ``moderate`` /
+            ``complex`` / ``intricate``; keep only rows whose leading bucket word is
+            in this list. Used to remove trivial ``short`` tasks (all-pass ->
+            zero-advantage filtered) and, in the cut regime, ``intricate`` tasks
+            (all-fail within the turn cap). None = keep all buckets.
         limit: cap the number of returned problems (after the split).
     """
     import pandas as pd
@@ -55,6 +62,13 @@ def load_problems(
 
     if tmax_domains:
         df = df[df["domain"].isin(list(tmax_domains))]
+
+    if task_complexity_keep:
+        keep = {c.strip().lower() for c in task_complexity_keep}
+        before = len(df)
+        bucket = df["task_complexity"].fillna("").str.split().str[0].str.lower()
+        df = df[bucket.isin(keep)]
+        logger.info("curriculum: kept %d/%d tasks with complexity bucket in %s", len(df), before, sorted(keep))
 
     # Deterministic shuffle then split, so train/test are stable across runs.
     df = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)

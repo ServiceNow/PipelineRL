@@ -94,6 +94,13 @@ dataset_loader_params:
     - file_operations
     - data_processing
     - debugging
+  # Phase A curriculum (anti-starvation): keep only the learnable-middle buckets.
+  # Drop 'short' (trivial -> all-pass -> zero-advantage filtered) and 'intricate'
+  # (30-60 cmds -> all-fail within the 40-turn/no-thinking cut regime). Re-add
+  # 'intricate' in Phase B once thinking + 64 turns are restored (then learnable).
+  task_complexity_keep:
+    - moderate
+    - complex
   limit: null
   seed: 0
 # The loader derives the split from the names (a name containing "test" -> held-out).
@@ -104,7 +111,7 @@ test_dataset_names:
 
 finetune:
   learning_rate: 1.0e-6      # TMax constant LR
-  attempts: 8                # BRING-UP/DEBUG: 16 -> 8 (rafa). A group emits only when all `attempts` rollouts finish (actor.py:221), so 8 ~halves group-fill time + softens the straggler tail. Tradeoff: ~75% of groups go all-pass -> zero-advantage filtered, but grad_accum=128 still reaches a step fast. Restore 16 (or TMax's 32) for the real run.
+  attempts: 16               # Phase A (rafa): G=16 + curriculum. keep-rate = 1 - p^G - (1-p)^G; dropping trivial 'short' moves p ~0.95->~0.7 so G16 keeps ~99% (curriculum substitutes for the paper's G=32). attempts=8 starved the trainer (~75% all-pass filtered). TMax paper uses 32; G16+curriculum is the cheaper-to-iterate equivalent.
   max_train_steps: 500       # TMax
   save_checkpoint_steps: 9999999
   also_save_steps: [100, 200, 300, 400, 500]
