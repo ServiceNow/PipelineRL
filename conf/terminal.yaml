@@ -104,7 +104,7 @@ test_dataset_names:
 
 finetune:
   learning_rate: 1.0e-6      # TMax constant LR
-  attempts: 16               # GSPO group size. 8 completed fast but ~75% of groups were all-pass (model aces easy tasks) -> zero-advantage filtered. 16 has more reward variance (fewer all-pass) while still 2x faster than TMax's 32.
+  attempts: 8                # BRING-UP/DEBUG: 16 -> 8 (rafa). A group emits only when all `attempts` rollouts finish (actor.py:221), so 8 ~halves group-fill time + softens the straggler tail. Tradeoff: ~75% of groups go all-pass -> zero-advantage filtered, but grad_accum=128 still reaches a step fast. Restore 16 (or TMax's 32) for the real run.
   max_train_steps: 500       # TMax
   save_checkpoint_steps: 9999999
   also_save_steps: [100, 200, 300, 400, 500]
