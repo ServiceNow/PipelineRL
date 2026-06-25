@@ -111,7 +111,7 @@ finetune:
   save_final_training_state: false
   seq_length: 65536          # TMax
   seq_parallel: 8
-  gradient_accumulation_passes: 1024
+  gradient_accumulation_passes: 128   # BRING-UP ONLY: 1024 -> 128. samples/step is linear in this, so time-to-first-step ~2.5h -> ~20min, landing well inside the node-eviction MTBF (the real blocker; runs were losing a 2.5h race with no resume). 1024 is the intentional staleness regime -> RESTORE for the real run.
   gradient_clipping_threshold: 0.1
   rl:
     policy_loss: gspo
