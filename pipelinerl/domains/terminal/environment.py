@@ -96,24 +96,30 @@ class TerminalSession:
         return {"build_ok": True, "started": True, "init_ok": init_ok}
 
     def exec(self, command: str) -> dict:
-        if self._env is None:
+        # Bind the env once: a concurrent background close() (fast-close pops the
+        # slot, then runs session.close() off the response path) can set
+        # self._env=None between the guard and the disk_exceeded read while a long
+        # /step runs in the thread pool, raising AttributeError on the dict build.
+        env = self._env
+        if env is None:
             raise RuntimeError("session not started")
-        success, output = self._env.exec(command, timeout=self.command_timeout)
+        success, output = env.exec(command, timeout=self.command_timeout)
         return {
             "output": truncate(output, self.max_observation_chars) or "(no output)",
             "success": success,
             "exit_code": 0 if success else 1,
-            "disk_exceeded": self._env.disk_exceeded,
+            "disk_exceeded": env.disk_exceeded,
         }
 
     def finish(self) -> dict:
-        if self._env is None:
+        env = self._env
+        if env is None:
             raise RuntimeError("session not started")
-        passed, output = self._env.run_final_tests(self._final_test)
+        passed, output = env.run_final_tests(self._final_test)
         return {
             "passed": passed,
             "output": truncate(output, self.max_observation_chars),
-            "disk_exceeded": self._env.disk_exceeded,
+            "disk_exceeded": env.disk_exceeded,
         }
 
     def close(self) -> None:
