@@ -11,7 +11,7 @@ from functools import partial
 from multiprocessing import Process, Queue
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Full
 from typing import List
 
 import datasets
@@ -295,6 +295,12 @@ def process_chunk(
         while True:
             try:
                 chunk = input_queue.get()
+                if chunk is None:
+                    # Poison pill from the parent — exit cleanly so the queue's
+                    # feeder thread and SharedMemoryManager can tear down
+                    # without hanging.
+                    logger.info("Preprocessor worker received shutdown sentinel; exiting")
+                    return
                 dataset = preprocess_dataset(
                     llm=llm,
                     data=chunk,
@@ -696,19 +702,30 @@ def run_preprocessing_loop(
                         writing_took = 0
                         num_filtered_out = 0
             finally:
-                # Clean up worker processes. Terminating workers mid-IPC can
-                # leave the SharedMemoryQueue's underlying multiprocessing
-                # Queues in a state where SharedMemoryManager.__exit__ hangs,
-                # so be aggressive: SIGTERM, brief grace period, then SIGKILL,
-                # and wait until they're really gone.
-                for worker in workers:
-                    if worker.is_alive():
+                # Graceful shutdown via poison pill: each worker exits its
+                # `while True` cleanly on receiving None, releasing the queue
+                # so the mp.Queue feeder thread and SharedMemoryManager don't
+                # hang at interpreter exit. Fall back to SIGTERM/SIGKILL only
+                # if a worker ignores the sentinel.
+                alive_workers = [w for w in workers if w.is_alive()]
+                for _ in alive_workers:
+                    try:
+                        input_queue.put(None, timeout=5.0)
+                    except Full:
+                        logger.warning("Input queue full while sending shutdown sentinels; will fall back to terminate")
+                        break
+                for worker in alive_workers:
+                    worker.join(timeout=10.0)
+                stragglers = [w for w in alive_workers if w.is_alive()]
+                if stragglers:
+                    logger.warning(f"{len(stragglers)} preprocessor worker(s) ignored shutdown sentinel; sending SIGTERM")
+                    for worker in stragglers:
                         worker.terminate()
-                for worker in workers:
-                    worker.join(timeout=2.0)
-                    if worker.is_alive():
-                        logger.warning(f"Preprocessor worker {worker.pid} did not stop after SIGTERM; sending SIGKILL")
-                        worker.kill()
-                        worker.join(timeout=5.0)
+                    for worker in stragglers:
+                        worker.join(timeout=2.0)
                         if worker.is_alive():
-                            logger.error(f"Preprocessor worker {worker.pid} still alive after SIGKILL")
+                            logger.warning(f"Preprocessor worker {worker.pid} did not stop after SIGTERM; sending SIGKILL")
+                            worker.kill()
+                            worker.join(timeout=5.0)
+                            if worker.is_alive():
+                                logger.error(f"Preprocessor worker {worker.pid} still alive after SIGKILL")
