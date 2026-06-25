@@ -193,6 +193,15 @@ def rollout_result_from_events(
             if event_type == "evaluation" and training_texts:
                 step_reward = float(payload['info'].get("step_reward") or 0.0)
                 training_texts[-1].step_reward += step_reward
+                # Surface the potential-based shaping debug bundle (when present)
+                # onto the training_text metadata so it lands in xray / rollout
+                # dumps for inspection. Also accumulate a per-rollout sum so the
+                # last step carries `sum_local_reward`.
+                info_payload = payload['info']
+                if "step_reward_info" in info_payload:
+                    training_texts[-1].metadata.setdefault(
+                        "local_reward_info_per_step", []
+                    ).append(info_payload["step_reward_info"])
                 env_eval_buffer.append(event)
 
     flush_env_response()
@@ -204,10 +213,16 @@ def rollout_result_from_events(
     final_reward = float(terminal.get("final_reward") or 0.0)
     rollout_status = str(terminal.get("rollout_status") or "event_error")
     finished = rollout_status == "completed"
+    sum_local_reward = float(sum(t.step_reward for t in training_texts))
+    # Shaped return = terminal env reward + sum of local shaping rewards.
+    # We surface this for inspection; the actual training-time combination is
+    # owned by the advantage estimator (`grpo_loo.step_reward_lambda`).
     for text in training_texts:
         text.reward = final_reward
         text.finished = finished
         text.metadata["final_reward"] = final_reward
+        text.metadata["sum_local_reward"] = sum_local_reward
+        text.metadata["shaped_return"] = final_reward + sum_local_reward
         text.metadata["rollout_status"] = rollout_status
         text.metadata["domain"] = domain
         text.metadata["dataset_name"] = dataset

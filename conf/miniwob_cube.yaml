@@ -54,6 +54,23 @@ finetune:
   rl:
     policy_loss: gspo
     overlong_filtering: true
+    # grpo_loo combines:
+    #     A = z_group(R_final) + step_reward_lambda * z_group_step(G_local[t])
+    # where
+    #     G_local[t] = sum_{u>=t} step_reward_gamma^(u-t) * step_reward[u]
+    #
+    # step_reward_lambda → relative weight of shaping vs terminal reward.
+    #   Lower it (e.g. 0.1) if you want the terminal reward to dominate; set
+    #   to 0.0 to disable the local-reward term without touching the env.
+    # step_reward_gamma  → how far local credit propagates backward.
+    #   1.0 = full credit to every earlier step; <1.0 localizes credit.
+    # step_advantage_centering="step" matches the spec's z_group_step:
+    #   subtract the mean across sibling rollouts at the SAME step index.
+    advantage:
+      type: grpo_loo
+      step_reward_lambda: 0.1
+      step_reward_gamma: 1.0
+      step_advantage_centering: step
 
 preprocess:
   input: actor
@@ -71,7 +88,23 @@ dataset_loader_params:
     benchmark: &miniwob_benchmark
       _type: miniwob_cube.benchmark.MiniWobBenchmarkConfig
       port: 8010
+      # Enables the deterministic potential-based local reward shaper
+      # (`miniwob_cube.shaping`). Flip to `false` to disable shaping
+      # entirely — the terminal MiniWob reward is unaffected either way.
+      #
+      # `shaping_gamma` is the γ in the Ng/Harada/Russell potential-based
+      # shaping rule: local_reward = shaping_gamma * Φ(s') - Φ(s). Keep at
+      # 1.0 — GRPO uses undiscounted episode returns here, so the
+      # policy-invariance theorem requires this γ to also be 1.0.
+      # To downweight shaping vs the terminal reward, lower
+      # `finetune.rl.advantage.step_reward_lambda` (not this γ).
       enable_step_verifier_rewards: true
+      shaping_weight_constraints: 0.3
+      shaping_weight_terminal: 0.7
+      shaping_weight_forbidden: 0.3
+      shaping_weight_error: 0.1
+      shaping_weight_noop: 0.05
+      shaping_gamma: 1.0
       tool_config: &miniwob_tool_config
           _type: miniwob_cube.tools.MiniWobBgymToolConfig
           use_html: true

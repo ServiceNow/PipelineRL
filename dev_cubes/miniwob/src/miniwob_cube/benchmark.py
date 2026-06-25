@@ -108,6 +108,17 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
     episode_max_time: int = 1000000
     server_start_timeout: float = 10.0
     server_start_poll_interval: float = 0.1
+    # Opt-in auxiliary step shaping reward computed from visible text-only obs.
+    # Does not replace the terminal reward; surfaces info["step_reward"].
+    enable_step_verifier_rewards: bool = False
+    # Potential-based reward shaping weights (see `miniwob_cube.shaping`).
+    # Setting `enable_step_verifier_rewards=False` disables shaping entirely.
+    shaping_weight_constraints: float = 0.3
+    shaping_weight_terminal: float = 0.7
+    shaping_weight_forbidden: float = 0.3
+    shaping_weight_error: float = 0.1
+    shaping_weight_noop: float = 0.05
+    shaping_gamma: float = 1.0
 
     task_ids: list[str] = [
         'choose-list',
@@ -168,4 +179,11 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
                 base_url=self.base_url,
                 remove_human_display=self.remove_human_display,
                 episode_max_time=self.episode_max_time,
+                enable_step_verifier_rewards=self.enable_step_verifier_rewards,
+                shaping_weight_constraints=self.shaping_weight_constraints,
+                shaping_weight_terminal=self.shaping_weight_terminal,
+                shaping_weight_forbidden=self.shaping_weight_forbidden,
+                shaping_weight_error=self.shaping_weight_error,
+                shaping_weight_noop=self.shaping_weight_noop,
+                shaping_gamma=self.shaping_gamma,
             )
