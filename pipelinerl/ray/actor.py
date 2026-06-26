@@ -744,12 +744,10 @@ class RayActorLoop:
 
 def _worker_config(cfg: DictConfig, mode: str) -> dict[str, Any]:
     actor_cfg = OmegaConf.to_container(cfg.actor, resolve=True)
-    reward_shaping_cfg = OmegaConf.to_container(getattr(cfg, "reward_shaping", {}), resolve=True)
     return {
         "mode": mode,
         "actor": actor_cfg,
         "output_dir": str(cfg.output_dir),
-        "reward_shaping": reward_shaping_cfg,
     }
 
 

@@ -20,7 +20,6 @@ from cube_harness.rl.event_publisher import EventPublisher
 from cube_harness.rl.events import EventContext, TerminalEvent
 from cube_harness.rl.task_runner import RolloutTaskRunner
 
-from pipelinerl.domains.cube.reward_shaping import RewardShapingConfig, compute_call_shaping
 from pipelinerl.rollouts import BaseMetrics, RolloutResult, TrainingText
 MASKED_TOKEN_ID = -100
 
@@ -125,7 +124,6 @@ def rollout_result_from_events(
     task_id: str,
     dataset: str | None,
     domain: str | None,
-    reward_shaping_config: RewardShapingConfig | None = None,
     debug_env_response: bool = False,
 ) -> RolloutResult:
     """Map a cube-harness RL event stream to a PipelineRL `RolloutResult`."""
@@ -182,7 +180,7 @@ def rollout_result_from_events(
             if call is None:
                 continue
             training_texts.append(
-                _training_text_from_event(event, call, reward_shaping_config=reward_shaping_config)
+                _training_text_from_event(event, call)
             )
         elif event_type in {"agent_error", "tool_call", "evaluation"}:
             payload = event.get("event") or {}
@@ -261,7 +259,6 @@ def apply_reward_shaping(
     agent_config: Any,
     buffer_tokens: int = 0,
     discount_factor: float = 1.0,
-    reward_shaping_config: RewardShapingConfig | None = None,
 ) -> None:
     """Apply discount + length-buffer + per-call format/correctness shaping in-place."""
 
@@ -279,17 +276,9 @@ def apply_reward_shaping(
         for text in training_texts:
             text.reward += penalty
 
-    if reward_shaping_config and reward_shaping_config.is_active:
-        for text in training_texts:
-            shaping = text.metadata.get("reward_shaping")
-            if isinstance(shaping, dict):
-                text.step_reward += float(shaping.get("total", 0.0))
-
 def _training_text_from_event(
     event: dict[str, Any],
     call: dict[str, Any],
-    *,
-    reward_shaping_config: RewardShapingConfig | None = None,
 ) -> TrainingText:
     prompt_token_ids = call.get("prompt_token_ids") or []
     completion_token_ids = call.get("completion_token_ids") or []
@@ -322,8 +311,6 @@ def _training_text_from_event(
             "llm_output_tokens": call.get("output_tokens"),
         }
     )
-    if reward_shaping_config and reward_shaping_config.is_active:
-        metadata["reward_shaping"] = compute_call_shaping(call, reward_shaping_config)
     
     return TrainingText(
         text=text,
