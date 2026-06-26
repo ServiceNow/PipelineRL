@@ -88,12 +88,24 @@ async def _post(session: aiohttp.ClientSession, url: str, payload: dict, timeout
         return await resp.json()
 
 
+# Per-URL rate limit for health-check failure warnings. A dead env-fleet endpoint
+# (e.g. a fleet pod that was platform-killed) is otherwise re-checked by every
+# concurrent rollout every loop iteration, flooding the actor log with thousands of
+# identical "Name or service not known" lines. Warn at most once per URL per window;
+# the health check itself still runs every time, so a recovered fleet is rediscovered.
+_HEALTH_WARN_WINDOW = 60.0
+_last_health_warn: dict[str, float] = {}
+
+
 async def _check_env_health(url: str, session: aiohttp.ClientSession) -> bool:
     try:
         async with session.get(f"{url}/health", timeout=5) as resp:
             return resp.status == 200
     except Exception as e:
-        logger.warning("env health check failed for %s: %s", url, e)
+        now = time.monotonic()
+        if now - _last_health_warn.get(url, 0.0) >= _HEALTH_WARN_WINDOW:
+            logger.warning("env health check failed for %s: %s (further warns rate-limited 60s)", url, e)
+            _last_health_warn[url] = now
         return False
 
 
