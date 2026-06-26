@@ -23,7 +23,17 @@ from wandb.sdk import wandb_run
 
 logger = logging.getLogger(__name__)
 
-_ENV_METADATA_KEYS = {"key", "mode", "replicas_per_actor"}
+_ENV_METADATA_KEYS = {
+    "key",
+    "name",
+    "mode",
+    "replicas_per_actor",
+    "placement",
+    "external_hosts",
+    "external_start_port",
+    "external_count",
+    "external_ports",
+}
 
 
 def _strip_environment_metadata(env_cfg: DictConfig | dict | None):
@@ -206,6 +216,11 @@ def external_environment_jobs(cfg: DictConfig, start_idx: int) -> list[dict]:
         hosts = OmegaConf.to_container(hosts_node, resolve=True) if hosts_node is not None else []
         start_port = int(_env_cfg_type(env_cfg, "external_start_port") or 7777)
         count = int(_env_cfg_type(env_cfg, "external_count") or 1)
+        if not hosts or count <= 0:
+            raise ValueError(
+                f"environment '{key}' has placement=external but external_hosts is empty or "
+                f"external_count<=0 (hosts={hosts}, count={count}); external placement needs both"
+            )
         for host in hosts:
             for port in range(start_port, start_port + count):
                 jobs.append(
