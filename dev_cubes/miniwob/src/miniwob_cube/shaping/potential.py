@@ -31,11 +31,13 @@ from miniwob_cube.shaping.goal_spec import Constraint, GoalSpec
 class RewardWeights:
     """Weights for the components of Phi. Defaults match the spec."""
 
+    enable_step_verifier_rewards: bool = False
     constraints: float = 0.3
     terminal: float = 0.7
     forbidden: float = 0.3
     error: float = 0.1
     noop: float = 0.05
+    gamma: float = 1.0
 
 
 @dataclass
@@ -129,7 +131,6 @@ def compute_local_reward(
     next_state: State,
     tool_result: ToolResult | None = None,
     weights: RewardWeights | None = None,
-    gamma: float = 1.0,
 ) -> LocalRewardInfo:
     """Compute potential-difference local reward and a debug bundle.
 
@@ -141,6 +142,7 @@ def compute_local_reward(
     safe to forget.
     """
     w = weights or RewardWeights()
+    gamma = w.gamma
 
     if tool_result is not None:
         if tool_result.failed and next_state.failed_tool_count == prev_state.failed_tool_count:

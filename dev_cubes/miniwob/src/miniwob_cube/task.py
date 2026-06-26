@@ -7,6 +7,7 @@ from cube.task import Task, TaskConfig, TaskMetadata  # noqa: F401 — TaskMetad
 from cube.tools.browser import BrowserTool
 from PIL import Image
 from pydantic import PrivateAttr
+from miniwob_cube.shaping import RewardWeights
 
 
 class MiniWobTaskMetadata(TaskMetadata):
@@ -49,14 +50,13 @@ class MiniWobTask(Task):
 
     # Auxiliary step shaping reward. The terminal MiniWob success reward
     # remains the source of truth — these signals must be combined with it.
-    enable_step_verifier_rewards: bool = False
-    # Potential-based reward-shaping weights — see `miniwob_cube.shaping`.
-    shaping_weight_constraints: float = 0.3
-    shaping_weight_terminal: float = 0.7
-    shaping_weight_forbidden: float = 0.3
-    shaping_weight_error: float = 0.1
-    shaping_weight_noop: float = 0.05
-    shaping_gamma: float = 1.0
+    step_reward_weights: RewardWeights = RewardWeights(enable_step_verifier_rewards=False,
+                                               constraints=0.3,
+                                               terminal=0.7,
+                                               forbidden=0.3,
+                                               error=0.1,
+                                               noop=0.05,
+                                               gamma=1.0)
 
     _goal: str = PrivateAttr(default="")
     _last_html: str | None = PrivateAttr(default=None)
@@ -110,14 +110,13 @@ return [WOB_REWARD_GLOBAL, WOB_RAW_REWARD_GLOBAL, WOB_REWARD_REASON, WOB_DONE_GL
         # ``MonitoredTool._post_execute_wrapping`` (see cube-harness'
         # ``tool.py``) when ``validate_per_step=True``. ``Task.step`` itself is
         # bypassed by the harness, so this is the canonical per-step hook.
-        if self.enable_step_verifier_rewards:
+        if self.step_reward_weights.enable_step_verifier_rewards:
             self._maybe_add_step_reward(obs, info)
         return reward, info
 
     def _maybe_add_step_reward(self, obs: Observation | None, info: dict[str, Any]) -> None:
         # Local import keeps the shaping code off the standard inference path.
         from miniwob_cube.shaping import (
-            RewardWeights,
             ToolResult,
             build_goal_spec,
             build_state,
@@ -164,13 +163,6 @@ return [WOB_REWARD_GLOBAL, WOB_RAW_REWARD_GLOBAL, WOB_REWARD_REASON, WOB_DONE_GL
             prev_state = build_state(self._last_html, env_meta_prev)
             next_state = build_state(curr_html, env_meta_next)
 
-            weights = RewardWeights(
-                constraints=self.shaping_weight_constraints,
-                terminal=self.shaping_weight_terminal,
-                forbidden=self.shaping_weight_forbidden,
-                error=self.shaping_weight_error,
-                noop=self.shaping_weight_noop,
-            )
             local = compute_local_reward(
                 goal=self._goal_spec,
                 prev_state=prev_state,
@@ -180,8 +172,7 @@ return [WOB_REWARD_GLOBAL, WOB_RAW_REWARD_GLOBAL, WOB_REWARD_REASON, WOB_DONE_GL
                     error_message=(step_error.exception_str if step_error else None),
                     is_noop=is_noop,
                 ),
-                weights=weights,
-                gamma=self.shaping_gamma,
+                weights=self.step_reward_weights
             )
             info["step_reward"] = local.reward
             info["step_reward_info"] = local.to_dict()
@@ -210,14 +201,16 @@ class MiniWobTaskConfig(TaskConfig[MiniWobTaskMetadata]):
     base_url: str = "http://localhost:8000/miniwob"
     remove_human_display: bool = True
     episode_max_time: int = 1000000
-    enable_step_verifier_rewards: bool = False
-    # Potential-based reward shaping weights — forwarded to MiniWobTask.
-    shaping_weight_constraints: float = 0.3
-    shaping_weight_terminal: float = 0.7
-    shaping_weight_forbidden: float = 0.3
-    shaping_weight_error: float = 0.1
-    shaping_weight_noop: float = 0.05
-    shaping_gamma: float = 1.0
+
+    # Auxiliary step shaping reward. The terminal MiniWob success reward
+    # remains the source of truth — these signals must be combined with it.
+    step_reward_weights: RewardWeights = RewardWeights(enable_step_verifier_rewards=False,
+                                               constraints=0.3,
+                                               terminal=0.7,
+                                               forbidden=0.3,
+                                               error=0.1,
+                                               noop=0.05,
+                                               gamma=1.0)
 
     def make(
         self,
@@ -231,13 +224,7 @@ class MiniWobTaskConfig(TaskConfig[MiniWobTaskMetadata]):
             base_url=self.base_url,
             remove_human_display=self.remove_human_display,
             episode_max_time=self.episode_max_time,
-            enable_step_verifier_rewards=self.enable_step_verifier_rewards,
-            shaping_weight_constraints=self.shaping_weight_constraints,
-            shaping_weight_terminal=self.shaping_weight_terminal,
-            shaping_weight_forbidden=self.shaping_weight_forbidden,
-            shaping_weight_error=self.shaping_weight_error,
-            shaping_weight_noop=self.shaping_weight_noop,
-            shaping_gamma=self.shaping_gamma,
+            step_reward_weights=self.step_reward_weights,
         )
 
 

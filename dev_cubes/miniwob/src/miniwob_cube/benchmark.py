@@ -13,7 +13,7 @@ from cube.benchmark import Benchmark, BenchmarkConfig, BenchmarkMetadata
 from cube.resource import InfraConfig
 from cube.task import TaskConfig
 
-from miniwob_cube.task import MiniWobTaskConfig, MiniWobTaskMetadata
+from miniwob_cube.task import MiniWobTaskConfig, MiniWobTaskMetadata, RewardWeights
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,7 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
     episode_max_time: int = 1000000
     server_start_timeout: float = 10.0
     server_start_poll_interval: float = 0.1
+    
     # Opt-in auxiliary step shaping reward computed from visible text-only obs.
     # Does not replace the terminal reward; surfaces info["step_reward"].
     enable_step_verifier_rewards: bool = False
@@ -172,6 +173,15 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
         return f"http://localhost:{self.port}/miniwob"
 
     def get_task_configs(self) -> Generator[MiniWobTaskConfig, None, None]:
+
+        step_reward_weights = RewardWeights(enable_step_verifier_rewards=self.enable_step_verifier_rewards,
+                                            constraints=self.shaping_weight_constraints,
+                                            terminal=self.shaping_weight_terminal,
+                                            forbidden=self.shaping_weight_forbidden,
+                                            error=self.shaping_weight_error,
+                                            noop=self.shaping_weight_noop,
+                                            gamma=self.shaping_gamma)
+
         for tm in self.tasks().values():
             yield MiniWobTaskConfig(
                 metadata=tm,
@@ -179,11 +189,5 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
                 base_url=self.base_url,
                 remove_human_display=self.remove_human_display,
                 episode_max_time=self.episode_max_time,
-                enable_step_verifier_rewards=self.enable_step_verifier_rewards,
-                shaping_weight_constraints=self.shaping_weight_constraints,
-                shaping_weight_terminal=self.shaping_weight_terminal,
-                shaping_weight_forbidden=self.shaping_weight_forbidden,
-                shaping_weight_error=self.shaping_weight_error,
-                shaping_weight_noop=self.shaping_weight_noop,
-                shaping_gamma=self.shaping_gamma,
+                step_reward_weights=step_reward_weights
             )
