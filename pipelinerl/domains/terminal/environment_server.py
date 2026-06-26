@@ -102,10 +102,39 @@ def _start_local_disk_logger() -> None:
                 ordered.append(p)
         return ordered
 
+    def _log_node_memory() -> None:
+        # Node + cgroup memory and the top RSS consumers, to prove where host RAM
+        # goes (the actor-node OOM that motivated the external env-fleet was exit137
+        # SIGKILL = host/cgroup OOM, invisible to per-session caps).
+        try:
+            meminfo = {}
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                k, _, v = line.partition(":")
+                meminfo[k.strip()] = v.strip()
+            total_gib = int(meminfo.get("MemTotal", "0 kB").split()[0]) / 2**20
+            avail_gib = int(meminfo.get("MemAvailable", "0 kB").split()[0]) / 2**20
+            used_gib = total_gib - avail_gib
+            cg = ""
+            for p in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+                try:
+                    cg = f", cgroup={int(Path(p).read_text().strip()) / 2**30:.1f} GiB"
+                    break
+                except Exception:
+                    continue
+            logger.info("[mem] used=%.1f / %.1f GiB (avail %.1f)%s", used_gib, total_gib, avail_gib, cg)
+            out = subprocess.run(
+                "ps -eo rss,comm --sort=-rss | head -6", shell=True, capture_output=True, text=True, timeout=15
+            )
+            if out.stdout.strip():
+                logger.info("[mem] top RSS (KiB):\n%s", out.stdout)
+        except Exception as e:
+            logger.warning("[mem] logging failed: %s", e)
+
     def _loop() -> None:
         first = True
         while True:
             try:
+                _log_node_memory()
                 du = shutil.disk_usage("/")
                 logger.info(
                     "[disk] backing fs '/' used=%.2f GiB / %.2f GiB (%.0f%%)",

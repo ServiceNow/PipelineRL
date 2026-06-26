@@ -62,6 +62,19 @@ environments:
   - key: terminal
     mode: remote
     replicas_per_actor: ${world.env_replicas_per_actor}
+    # External CPU env-fleet: env servers run in SEPARATE --gpu 0 eai jobs
+    # (terminal-envs-a/-b, launched via run_environment_fleet) so their proot/bash
+    # RAM leaves the GPU nodes -> fixes the actor-node OOM (gspo_30-35 exit137/247).
+    # placement=external -> WorldMap skips local placement; actors discover these
+    # via account-scoped internal-dns (dns-<EAI_ACCOUNT_ID>-<name>). 2 hosts x 12
+    # ports = 24 env servers. The env config below (n_envs, caps, bases_dir) is
+    # shared: the fleet launcher instantiates TerminalEnvironmentServer from it.
+    placement: external
+    external_hosts:
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-a
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-b
+    external_start_port: 7777
+    external_count: 12
     _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
     bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
     # Shared read-only task rootfs trees live on the mounted results dir (off the
