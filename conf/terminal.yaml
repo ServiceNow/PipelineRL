@@ -55,7 +55,7 @@ terminal:
   # groups filtered (gspo_32 stalled at step 11 as filtering climbed: time_waiting
   # ~13000s, 80min/batch). Counts come from proot_env._parse_pytest_counts (env-side,
   # untruncated); collection-error/0-tests -> reward_fail.
-  graded_reward: true
+  graded_reward: true    # Paper-aligned continuous reward (TMax: "continuously-valued rewards for certain tasks"). gspo_36 showed graded didn't learn ONLY because divide_advantage_by_std=True amplified its small within-group spread into partial-credit noise; the fix is the paper's "centered" advantage (finetune.rl.divide_advantage_by_std: false), not reverting to binary.
 
 # Remote terminal sandbox servers (one kind="environment" job per actor LLM).
 environments:
@@ -152,6 +152,13 @@ finetune:
     epsilon_high: 4e-3
     overlong_filtering: true
     filter_zero_advantage_groups: true
+    # Paper-aligned "centered" advantage (TMax Table 13: advantage normalization =
+    # centered): subtract the LOO group mean but do NOT divide by std. The default
+    # True divides by (std+1e-4), which with graded reward's small within-group
+    # spread amplifies partial-credit noise into ~unit advantages -> policy chases
+    # noise, reward stuck ~0 (gspo_36). Centered keeps advantages proportional to
+    # real partial-credit gains -> learning signal aligned with solving.
+    divide_advantage_by_std: false
 
 preprocess:
   n_workers: 8
