@@ -227,8 +227,14 @@ async def _execute_rollout(
     # fewer groups are zero-advantage filtered. Falls back to binary when disabled
     # or when no tests resolved (collection error / disk abort -> total_tests 0).
     pass_fraction = passed_tests / total_tests if total_tests > 0 else 0.0
-    if getattr(tcfg, "graded_reward", False) and total_tests > 0:
-        reward = tcfg.reward_fail + (tcfg.reward_pass - tcfg.reward_fail) * pass_fraction
+    if getattr(tcfg, "graded_reward", False):
+        # No resolved tests (collection error / skipped-only / parse-empty) -> fail,
+        # never the binary fallback, so a skipped-only pytest exit 0 can't score pass.
+        reward = (
+            tcfg.reward_fail + (tcfg.reward_pass - tcfg.reward_fail) * pass_fraction
+            if total_tests > 0
+            else tcfg.reward_fail
+        )
     else:
         reward = tcfg.reward_pass if verifier_pass else tcfg.reward_fail
     training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
