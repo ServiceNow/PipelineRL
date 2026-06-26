@@ -507,9 +507,29 @@ class ProotTerminalEnvironment:
             logger.info("initial-state tests failed:\n%s", out[-800:])
         return ok
 
-    def run_final_tests(self, test_text: str) -> Tuple[bool, str]:
+    @staticmethod
+    def _parse_pytest_counts(output: str) -> Tuple[int, int]:
+        """Parse ``pytest -q`` output into ``(passed, total)``.
+
+        ``total`` counts only resolved tests: passed + failed + errors. Skipped,
+        xfail, xpass and deselected are excluded from the denominator and never
+        counted as passes. Returns ``(0, 0)`` when nothing parseable is found, so
+        the caller can treat ``total <= 0`` as a failed verification instead of a
+        0/0 division (collection error / no tests collected).
+        """
+        def _last(pattern: str) -> int:
+            matches = re.findall(pattern, output)
+            return int(matches[-1]) if matches else 0
+
+        passed = _last(r"(\d+) passed")
+        failed = _last(r"(\d+) failed")
+        errors = _last(r"(\d+) error")
+        return passed, passed + failed + errors
+
+    def run_final_tests(self, test_text: str) -> Tuple[bool, str, int, int]:
         ok, out = self._run_pytest(test_text, "test_final_state.py")
-        return ok, out
+        passed, total = self._parse_pytest_counts(out)
+        return ok, out, passed, total
 
     # ------------------------------------------------------------------
     def cleanup(self) -> None:

@@ -115,11 +115,13 @@ class TerminalSession:
         env = self._env
         if env is None:
             raise RuntimeError("session not started")
-        passed, output = env.run_final_tests(self._final_test)
+        passed, output, passed_tests, total_tests = env.run_final_tests(self._final_test)
         return {
             "passed": passed,
             "output": truncate(output, self.max_observation_chars),
             "disk_exceeded": env.disk_exceeded,
+            "passed_tests": passed_tests,
+            "total_tests": total_tests,
         }
 
     def close(self) -> None:

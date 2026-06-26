@@ -43,6 +43,9 @@ SYSTEM_PROMPT = (
 
 class TerminalMetrics(BaseMetrics):
     verifier_pass: bool = False
+    passed_tests: int = 0
+    total_tests: int = 0
+    pass_fraction: float = 0.0
     build_ok: bool = True
     init_ok: bool = True
     overflow: bool = False
@@ -210,6 +213,8 @@ async def _execute_rollout(
 
         verifier = await _post(session, f"{env_url}/finish", {"session_id": session_id}, call_timeout)
         verifier_pass = bool(verifier["passed"])
+        passed_tests = int(verifier.get("passed_tests", 0))
+        total_tests = int(verifier.get("total_tests", 0))
         disk_aborted = disk_aborted or bool(verifier.get("disk_exceeded"))
     finally:
         try:
@@ -217,7 +222,15 @@ async def _execute_rollout(
         except Exception:
             logger.warning("failed to close session %s on %s", session_id, env_url)
 
-    reward = tcfg.reward_pass if verifier_pass else tcfg.reward_fail
+    # Graded reward (opt-in): map the pytest pass fraction onto [reward_fail,
+    # reward_pass] so partially-correct rollouts give within-group variance and
+    # fewer groups are zero-advantage filtered. Falls back to binary when disabled
+    # or when no tests resolved (collection error / disk abort -> total_tests 0).
+    pass_fraction = passed_tests / total_tests if total_tests > 0 else 0.0
+    if getattr(tcfg, "graded_reward", False) and total_tests > 0:
+        reward = tcfg.reward_fail + (tcfg.reward_pass - tcfg.reward_fail) * pass_fraction
+    else:
+        reward = tcfg.reward_pass if verifier_pass else tcfg.reward_fail
     training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     summary = summarize_training_texts(training_texts)
 
@@ -227,6 +240,9 @@ async def _execute_rollout(
         no_error=True,
         no_answer=len(llm_calls) == 0,
         verifier_pass=verifier_pass,
+        passed_tests=passed_tests,
+        total_tests=total_tests,
+        pass_fraction=pass_fraction,
         overflow=summary.overflow,
         disk_aborted=disk_aborted,
         n_turns=len(messages) // 2,

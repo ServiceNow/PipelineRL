@@ -49,6 +49,13 @@ terminal:
   capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
   reward_pass: 1.0
   reward_fail: -1.0
+  # Graded reward: map the pytest pass fraction onto [reward_fail, reward_pass]
+  # instead of binary all-pass/all-fail. 91.8% of curriculum tasks have >1 test, so
+  # partially-correct rollouts give within-group variance -> far fewer zero-advantage
+  # groups filtered (gspo_32 stalled at step 11 as filtering climbed: time_waiting
+  # ~13000s, 80min/batch). Counts come from proot_env._parse_pytest_counts (env-side,
+  # untruncated); collection-error/0-tests -> reward_fail.
+  graded_reward: true
 
 # Remote terminal sandbox servers (one kind="environment" job per actor LLM).
 environments:
