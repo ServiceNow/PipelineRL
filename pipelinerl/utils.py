@@ -133,12 +133,14 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
             key = _env_cfg_type(env_cfg, "key") or _env_cfg_type(env_cfg, "name")
             mode = _env_cfg_type(env_cfg, "mode")
             replicas = _env_cfg_type(env_cfg, "replicas_per_actor")
+            placement = _env_cfg_type(env_cfg, "placement")
             specs.append(
                 {
                     "key": str(key) if key is not None else f"environment_{idx}",
                     "mode": str(mode) if mode is not None else default_mode,
                     "replicas_per_actor": replicas,
                     "index": idx,
+                    "placement": str(placement) if placement is not None else "",
                 }
             )
     elif isinstance(env_cfgs, (DictConfig, dict)):
@@ -175,6 +177,55 @@ def collect_environment_specs(cfg: DictConfig) -> list[dict[str, Any]]:
 
     _apply_domain_mix_replicas(cfg, specs, default_replicas)
     return specs
+
+
+def external_environment_jobs(cfg: DictConfig, start_idx: int) -> list[dict]:
+    """Synthetic ``kind="environment"`` Job dicts for externally-placed env fleets.
+
+    For each ``environments[]`` spec with ``placement: external``, expand
+    ``external_hosts`` x ports ``[external_start_port, +external_count)`` into Job
+    dicts pointing at env servers running in a SEPARATE eai job (reached over
+    account-scoped internal-dns). These are appended to ``cfg.jobs`` for discovery
+    via ``get_environment_jobs`` / ``wait_for_environments`` but are NOT added to
+    the WorldMap job_map, so the training job never tries to launch them.
+    """
+    jobs: list[dict] = []
+    env_cfgs = getattr(cfg, "environments", None)
+    if not isinstance(env_cfgs, (ListConfig, list)):
+        return jobs
+    idx = start_idx
+    replica_idx = 0
+    for spec_idx, env_cfg in enumerate(env_cfgs):
+        if env_cfg is None:
+            continue
+        placement = _env_cfg_type(env_cfg, "placement")
+        if (str(placement) if placement is not None else "") != "external":
+            continue
+        key = _env_cfg_type(env_cfg, "key") or _env_cfg_type(env_cfg, "name") or f"environment_{spec_idx}"
+        hosts_node = _env_cfg_type(env_cfg, "external_hosts")
+        hosts = OmegaConf.to_container(hosts_node, resolve=True) if hosts_node is not None else []
+        start_port = int(_env_cfg_type(env_cfg, "external_start_port") or 7777)
+        count = int(_env_cfg_type(env_cfg, "external_count") or 1)
+        for host in hosts:
+            for port in range(start_port, start_port + count):
+                jobs.append(
+                    {
+                        "kind": "environment",
+                        "idx": idx,
+                        "replica_idx": replica_idx,
+                        "local_idx": 0,
+                        "node_rank": -1,
+                        "hostname": str(host),
+                        "port": int(port),
+                        "gpus": [],
+                        "url": "",
+                        "environment_key": str(key),
+                        "environment_index": spec_idx,
+                    }
+                )
+                idx += 1
+                replica_idx += 1
+    return jobs
 
 
 def resolve_environment_key(cfg: DictConfig, default: str | None = None) -> str | None:
@@ -474,11 +525,15 @@ def wait_for_environments(cfg: DictConfig):
     env_jobs = get_environment_jobs(cfg)
     if not env_jobs:
         return
+    # Overall budget so an unreachable env fleet fails loudly instead of blocking
+    # the actor forever (external env servers run in a separate eai job).
+    timeout = float(getattr(cfg.world, "environment_wait_timeout", 3600.0))
+    deadline = time.monotonic() + timeout
     for job in env_jobs:
+        url = f"http://{job.hostname}:{job.port}/health"
         while True:
-            url = f"http://{job.hostname}:{job.port}/health"
             try:
-                response = requests.get(url)
+                response = requests.get(url, timeout=10)
                 if response.status_code == 200:
                     logger.info(
                         "Environment %s ready at %s",
@@ -487,8 +542,11 @@ def wait_for_environments(cfg: DictConfig):
                     )
                     break
             except requests.exceptions.RequestException:
-                logger.info(f"Waiting for environment at {url} to be ready...")
-                time.sleep(5.0)
+                pass
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"environment server not healthy after {timeout:.0f}s: {url}")
+            logger.info(f"Waiting for environment at {url} to be ready...")
+            time.sleep(5.0)
 
 
 @contextlib.contextmanager

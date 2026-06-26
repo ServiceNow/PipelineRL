@@ -14,7 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import SingleStreamSpec, connect_to_redis, read_stream, set_streams_backend, write_to_streams
-from pipelinerl.utils import terminate_with_children
+from pipelinerl.utils import external_environment_jobs, terminate_with_children
 from pipelinerl.world import Job, WorldMap
 
 logger = logging.getLogger(__name__)
@@ -651,6 +651,9 @@ def main(cfg: DictConfig):
     setup_logging(log_file)
     world_map = WorldMap(cfg, verbose=True)
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
+    # Append external env-fleet servers (separate CPU-only eai job) for discovery
+    # only; they are not in world_map.job_map so launch_jobs won't try to start them.
+    cfg.jobs = cfg.jobs + external_environment_jobs(cfg, start_idx=len(cfg.jobs))
 
     group = str(exp_dir)
     root = cfg.wandb.wandb_workspace_root

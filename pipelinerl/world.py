@@ -215,6 +215,11 @@ class WorldMap:
         for spec_idx, spec in enumerate(environment_specs):
             if spec["mode"] != "remote":
                 continue
+            # External env fleets run in a separate eai job; they are discovered via
+            # synthetic cfg.jobs entries (utils.external_environment_jobs), not placed
+            # on this job's nodes.
+            if spec.get("placement") == "external":
+                continue
             replicas_per_actor = spec.get("replicas_per_actor")
             if replicas_per_actor is None:
                 replicas_per_actor = getattr(cfg.world, "env_replicas_per_actor", None)
