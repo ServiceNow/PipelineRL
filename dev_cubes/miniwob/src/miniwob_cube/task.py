@@ -169,7 +169,7 @@ return [WOB_REWARD_GLOBAL, WOB_RAW_REWARD_GLOBAL, WOB_REWARD_REASON, WOB_DONE_GL
                 next_state=next_state,
                 tool_result=ToolResult(
                     failed=failed,
-                    error_message=(step_error.exception_str if step_error else None),
+                    error_message=step_error,
                     is_noop=is_noop,
                 ),
                 weights=self.step_reward_weights

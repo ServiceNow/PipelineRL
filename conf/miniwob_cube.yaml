@@ -83,28 +83,38 @@ train_dataset_names:
 test_dataset_names:
   # - miniwob_test
 
+# Shared shaping config
+# Enables the deterministic potential-based local reward shaper
+# (`miniwob_cube.shaping`). Flip to `false` to disable shaping
+# entirely — the terminal MiniWob reward is unaffected either way.
+#
+# `shaping_gamma` is the γ in the Ng/Harada/Russell potential-based
+# shaping rule: local_reward = shaping_gamma * Φ(s') - Φ(s). Keep at
+# 1.0 — GRPO uses undiscounted episode returns here, so the
+# policy-invariance theorem requires this γ to also be 1.0.
+# To downweight shaping vs the terminal reward, lower
+# `finetune.rl.advantage.step_reward_lambda` (not this γ).
+miniwob_shaping: &miniwob_shaping
+  enable_step_verifier_rewards: true
+  shaping_weight_constraints: 0.3
+  shaping_weight_forbidden: 0.3
+  shaping_weight_terminal: 0.7
+  shaping_weight_error: 0.1
+  shaping_weight_noop: 0.05
+  shaping_gamma: 1.0
+
 dataset_loader_params:
   miniwob_html:
     benchmark: &miniwob_benchmark
       _type: miniwob_cube.benchmark.MiniWobBenchmarkConfig
       port: 8010
-      # Enables the deterministic potential-based local reward shaper
-      # (`miniwob_cube.shaping`). Flip to `false` to disable shaping
-      # entirely — the terminal MiniWob reward is unaffected either way.
-      #
-      # `shaping_gamma` is the γ in the Ng/Harada/Russell potential-based
-      # shaping rule: local_reward = shaping_gamma * Φ(s') - Φ(s). Keep at
-      # 1.0 — GRPO uses undiscounted episode returns here, so the
-      # policy-invariance theorem requires this γ to also be 1.0.
-      # To downweight shaping vs the terminal reward, lower
-      # `finetune.rl.advantage.step_reward_lambda` (not this γ).
-      enable_step_verifier_rewards: true
-      shaping_weight_constraints: 0.3
-      shaping_weight_terminal: 0.7
-      shaping_weight_forbidden: 0.3
-      shaping_weight_error: 0.1
-      shaping_weight_noop: 0.05
-      shaping_gamma: 1.0
+      enable_step_verifier_rewards: ${miniwob_shaping.enable_step_verifier_rewards}
+      shaping_weight_constraints: ${miniwob_shaping.shaping_weight_constraints}
+      shaping_weight_forbidden: ${miniwob_shaping.shaping_weight_forbidden}
+      shaping_weight_terminal: ${miniwob_shaping.shaping_weight_terminal}
+      shaping_weight_error: ${miniwob_shaping.shaping_weight_error}
+      shaping_weight_noop: ${miniwob_shaping.shaping_weight_noop}
+      shaping_gamma: ${miniwob_shaping.shaping_gamma}
       tool_config: &miniwob_tool_config
           _type: miniwob_cube.tools.MiniWobBgymToolConfig
           use_html: true

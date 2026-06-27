@@ -38,19 +38,27 @@ class MiniWobBgymTool(BgymTool):
         # Records whether the most recent action returned a `StepError`
         # (e.g. Playwright `Locator.clear` on a checkbox). The local-reward
         # shaper reads this to debit Phi for failed tool calls.
-        self.agent_last_step_error: StepError | None = None
+        self.agent_last_step_error: str | None = None
+
+    def _check_error(self, obs: Observation | StepError | None) -> None:
+        if isinstance(obs, StepError):
+            self.agent_last_step_error = obs.exception_str
+        elif isinstance(obs, Observation):
+            data = obs.contents[0].data if obs.contents else None
+            if data and data.startswith("Failed:"):
+                self.agent_last_step_error = data
 
     def execute_action(self, action: Action) -> Observation | StepError:
         self.agent_last_action = action
-        result = super().execute_action(action)
-        self.agent_last_step_error = result if isinstance(result, StepError) else None
-        return result
+        obs = super().execute_action(action)
+        self._check_error(obs)
+        return obs
 
     async def async_execute_action(self, action: Action) -> Observation | StepError:
         self.agent_last_action = action
-        result = await super().async_execute_action(action)
-        self.agent_last_step_error = result if isinstance(result, StepError) else None
-        return result
+        obs = await super().async_execute_action(action)
+        self._check_error(obs)
+        return obs
 
     def reset(self) -> None:
         self.agent_last_action = None
