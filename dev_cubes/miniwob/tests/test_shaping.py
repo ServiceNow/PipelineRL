@@ -1,7 +1,11 @@
-"""Unit tests for the potential-based local reward shaper.
+"""Unit tests for the generic potential-based local reward shaper.
+
+The shaper is *instruction-blind* — every progress signal is computed from
+DOM state and last-action quality. There is no GoalSpec, no parser, no
+constraints/forbidden — those have been deleted.
 
 Run with:
-    uv run --extra cube pytest dev_cubes/miniwob/tests/test_shaping.py -v
+    uv run --extra cube python -m pytest dev_cubes/miniwob/tests/test_shaping.py -v
 """
 
 from __future__ import annotations
@@ -9,17 +13,16 @@ from __future__ import annotations
 import pytest
 
 from miniwob_cube.shaping import (
-    AnyCheckboxChecked,
-    AllCheckboxesUnchecked,
-    CheckboxChecked,
-    ClickButton,
-    GoalSpec,
+    ActionView,
+    EpisodeShaper,
     RewardWeights,
     ToolResult,
-    WrongCheckboxChecked,
-    build_goal_spec,
+    affordance_engagement_breadth,
     build_state,
-    compute_local_reward,
+    count_interactive,
+    detect_bad_target,
+    detect_stuck,
+    form_completion_fraction,
 )
 
 
@@ -47,186 +50,278 @@ INITIAL_HTML = """\
 </div>
 """
 
+FORM_HTML = """\
+<form bid="1">
+ <input bid="2" id="user" type="text" value=""/>
+ <input bid="3" id="pass" type="password" value=""/>
+ <button bid="4">Login</button>
+</form>
+"""
 
-def _html_with_checked(checked_bids: set[str]) -> str:
-    """Build a clone of INITIAL_HTML where listed checkbox bids are checked."""
-    html = INITIAL_HTML
+
+def _html_with_checked(checked_bids: set[str], html: str = INITIAL_HTML) -> str:
     for bid in checked_bids:
-        html = html.replace(
-            f'<input bid="{bid}" id="',
-            f'<input checked bid="{bid}" id="',
-            1,
-        )
+        html = html.replace(f'<input bid="{bid}" id="', f'<input checked bid="{bid}" id="', 1)
     return html
 
 
-# ---- Goal spec parsing ----
+def _html_with_value(bid: str, value: str, html: str = FORM_HTML) -> str:
+    # Replace the existing `value=""` for the targeted bid (single occurrence).
+    needle_prefix = f'<input bid="{bid}" '
+    start = html.index(needle_prefix)
+    end = html.index("/>", start)
+    chunk = html[start:end]
+    new_chunk = chunk.replace('value=""', f'value="{value}"', 1)
+    return html[:start] + new_chunk + html[end:]
 
 
-def test_parse_select_nothing():
-    g = build_goal_spec("Select nothing and click Submit.", INITIAL_HTML)
-    assert g.confidence == 1.0
-    assert len(g.constraints) == 1
-    assert isinstance(g.constraints[0], AllCheckboxesUnchecked)
-    assert isinstance(g.terminal, ClickButton)
-    assert g.terminal.text.lower() == "submit"
-    assert any(isinstance(c, AnyCheckboxChecked) for c in g.forbidden)
+def _default_weights() -> RewardWeights:
+    return RewardWeights()
 
 
-def test_parse_select_apple_and_banana():
-    html = INITIAL_HTML.replace("GjVJ8fQ", "apple").replace("8MoLcKO", "banana")
-    g = build_goal_spec("Select apple and banana and click Submit.", html)
-    labels = sorted(c.label for c in g.constraints if isinstance(c, CheckboxChecked))
-    assert labels == ["apple", "banana"]
-    assert any(isinstance(c, WrongCheckboxChecked) for c in g.forbidden)
+# ---- Tier 1 signals ----
 
 
-def test_parse_click_target():
-    g = build_goal_spec("Click apple.", INITIAL_HTML)
-    assert g.confidence > 0
-    assert g.terminal is not None
+def test_form_completion_fraction_no_inputs():
+    state = build_state(INITIAL_HTML)
+    assert form_completion_fraction(state) == 0.0
 
 
-def test_parse_unknown_fallback():
-    # Instruction with no matching rule -> safe fallback.
-    g = build_goal_spec("Do the thing that pleases the spirit.", INITIAL_HTML)
-    assert g.confidence == 0.0
-    assert g.constraints == []
+def test_form_completion_fraction_partial():
+    state = build_state(_html_with_value("2", "alice"))
+    # 1 of 2 inputs filled.
+    assert form_completion_fraction(state) == pytest.approx(0.5)
 
 
-# ---- Worked examples from the spec ----
+def test_form_completion_fraction_full():
+    html = _html_with_value("2", "alice")
+    html = _html_with_value("3", "secret", html=html)
+    state = build_state(html)
+    assert form_completion_fraction(state) == 1.0
 
 
-def test_failed_clear_on_checkbox_negative_reward():
-    """`Select nothing and click Submit` with failed clear on a checkbox.
+def test_affordance_engagement_breadth_caps_at_one():
+    assert affordance_engagement_breadth({"a", "b", "c"}, interactive_universe=2) == 1.0
 
-    DOM unchanged, but failed_tool_count goes 0 -> 1. Expected reward = -0.1.
+
+def test_affordance_engagement_breadth_zero_universe():
+    assert affordance_engagement_breadth({"a"}, interactive_universe=0) == 0.0
+
+
+def test_count_interactive_on_initial_html():
+    elements = build_state(INITIAL_HTML).elements
+    # 2 checkboxes + 1 button = 3 interactive elements.
+    assert count_interactive(elements) == 3
+
+
+# ---- Tier 2 signals ----
+
+
+def test_detect_bad_target_missing_bid():
+    state = build_state(INITIAL_HTML)
+    act = ActionView(name="click", bid="999")  # no such bid in DOM
+    assert detect_bad_target(state, act) is True
+
+
+def test_detect_bad_target_disabled_element():
+    html = INITIAL_HTML.replace('<button bid="18"', '<button disabled bid="18"', 1)
+    state = build_state(html)
+    act = ActionView(name="click", bid="18")
+    assert detect_bad_target(state, act) is True
+
+
+def test_detect_bad_target_clicking_non_interactive():
+    state = build_state(INITIAL_HTML)
+    act = ActionView(name="click", bid="14")  # the empty <div id="query">
+    assert detect_bad_target(state, act) is True
+
+
+def test_detect_bad_target_valid_click_is_fine():
+    state = build_state(INITIAL_HTML)
+    act = ActionView(name="click", bid="18")  # the Submit button
+    assert detect_bad_target(state, act) is False
+
+
+def test_detect_stuck_for_dom_changing_action_with_no_change():
+    prev = build_state(INITIAL_HTML)
+    next_ = build_state(INITIAL_HTML)
+    act = ActionView(name="click", bid="18")
+    assert detect_stuck(prev, next_, act, failed=False) is True
+
+
+def test_detect_stuck_excludes_non_dom_changing_actions():
+    prev = build_state(INITIAL_HTML)
+    next_ = build_state(INITIAL_HTML)
+    for name in ["focus", "hover", "scroll", "press"]:
+        act = ActionView(name=name, bid="18")
+        assert detect_stuck(prev, next_, act, failed=False) is False, name
+
+
+def test_detect_stuck_excludes_failed_actions():
+    prev = build_state(INITIAL_HTML)
+    next_ = build_state(INITIAL_HTML)
+    act = ActionView(name="click", bid="18")
+    # A failed call is debited via failed_tool_count, not via stuck_count.
+    assert detect_stuck(prev, next_, act, failed=True) is False
+
+
+def test_detect_stuck_does_not_trigger_when_dom_changed():
+    prev = build_state(INITIAL_HTML)
+    next_ = build_state(_html_with_checked({"35"}))
+    act = ActionView(name="click", bid="35")
+    assert detect_stuck(prev, next_, act, failed=False) is False
+
+
+# ---- EpisodeShaper end-to-end ----
+
+
+def test_failed_tool_call_produces_negative_reward():
+    """`clear` on a checkbox: Playwright rejects, DOM unchanged.
+
+    Φ_prev = 0 (nothing has happened yet)
+    Φ_next = -w_error · 1 = -0.1
+    reward = -0.1
     """
-    goal = build_goal_spec("Select nothing and click Submit.", INITIAL_HTML)
-    prev = build_state(INITIAL_HTML, env_metadata={"failed_tool_count": 0})
-    nxt = build_state(INITIAL_HTML, env_metadata={"failed_tool_count": 0})
-
-    info = compute_local_reward(
-        goal=goal,
-        prev_state=prev,
-        next_state=nxt,
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="clear", bid="35"),
         tool_result=ToolResult(failed=True, error_message="cannot be filled"),
-        weights=RewardWeights(),
-        gamma=1.0,
+        terminal_success=False,
     )
-
-    assert info.prev_phi == pytest.approx(0.3, abs=1e-6)
-    assert info.next_phi == pytest.approx(0.2, abs=1e-6)
-    assert info.reward == pytest.approx(-0.1, abs=1e-6)
-    # Predicate was already satisfied before the action — no positive credit.
-    assert info.constraint_score_before == 1.0
-    assert info.constraint_score_after == 1.0
-
-
-def test_successful_submit_terminal_positive_reward():
-    """`Select nothing and click Submit` -> click Submit; env reports success.
-
-    constraint_score stays at 1.0, terminal_score 0 -> 1, no failure.
-    Expected reward = +0.7.
-    """
-    goal = build_goal_spec("Select nothing and click Submit.", INITIAL_HTML)
-    prev = build_state(INITIAL_HTML, env_metadata={"failed_tool_count": 0})
-    nxt = build_state(INITIAL_HTML, env_metadata={"failed_tool_count": 0, "terminal_success": True})
-
-    info = compute_local_reward(
-        goal=goal,
-        prev_state=prev,
-        next_state=nxt,
-        tool_result=ToolResult(),
-        weights=RewardWeights(),
-        gamma=1.0,
-    )
-
-    assert info.prev_phi == pytest.approx(0.3, abs=1e-6)
-    assert info.next_phi == pytest.approx(1.0, abs=1e-6)
-    assert info.reward == pytest.approx(0.7, abs=1e-6)
-
-
-def test_select_nothing_but_checked_a_box_is_negative():
-    """A forbidden constraint becomes true (a checkbox got checked)."""
-    goal = build_goal_spec("Select nothing and click Submit.", INITIAL_HTML)
-    prev = build_state(INITIAL_HTML)
-    nxt = build_state(_html_with_checked({"35"}))
-
-    info = compute_local_reward(
-        goal=goal,
-        prev_state=prev,
-        next_state=nxt,
-        tool_result=ToolResult(),
-        weights=RewardWeights(),
-    )
-
-    # Constraint regressed AND forbidden violated.
-    assert info.constraint_score_before == 1.0
-    assert info.constraint_score_after == 0.0
-    assert info.violation_score_before == 0.0
-    assert info.violation_score_after == 1.0
-    assert info.reward < 0
-
-
-def test_select_x_checking_x_is_positive():
-    html = INITIAL_HTML.replace("GjVJ8fQ", "apple").replace("8MoLcKO", "banana")
-    goal = build_goal_spec("Select apple and click Submit.", html)
-    prev = build_state(html)
-    nxt = build_state(_html_with_checked({"35"}).replace("GjVJ8fQ", "apple").replace("8MoLcKO", "banana"))
-
-    info = compute_local_reward(
-        goal=goal, prev_state=prev, next_state=nxt, tool_result=ToolResult()
-    )
-    assert info.reward > 0
-    assert info.constraint_score_after > info.constraint_score_before
-
-
-def test_select_x_checking_wrong_box_is_worse_than_checking_x():
-    html = INITIAL_HTML.replace("GjVJ8fQ", "apple").replace("8MoLcKO", "banana")
-    goal = build_goal_spec("Select apple and click Submit.", html)
-    prev = build_state(html)
-    # Wrong: checking banana when apple was requested.
-    wrong = build_state(
-        _html_with_checked({"38"}).replace("GjVJ8fQ", "apple").replace("8MoLcKO", "banana")
-    )
-    # Right: checking apple.
-    right = build_state(
-        _html_with_checked({"35"}).replace("GjVJ8fQ", "apple").replace("8MoLcKO", "banana")
-    )
-    r_wrong = compute_local_reward(goal=goal, prev_state=prev, next_state=wrong).reward
-    r_right = compute_local_reward(goal=goal, prev_state=prev, next_state=right).reward
-    assert r_wrong < r_right
-    # Wrong action triggers a forbidden constraint.
-    assert r_wrong <= 0 or r_wrong < r_right
-
-
-def test_noop_action_is_zero_or_small_negative():
-    goal = build_goal_spec("Select nothing and click Submit.", INITIAL_HTML)
-    prev = build_state(INITIAL_HTML)
-    nxt = build_state(INITIAL_HTML)
-    # No failure, no noop counted by the env.
-    info = compute_local_reward(
-        goal=goal, prev_state=prev, next_state=nxt, tool_result=ToolResult()
-    )
-    assert info.reward == pytest.approx(0.0, abs=1e-9)
-    # With the env reporting a noop:
-    info2 = compute_local_reward(
-        goal=goal,
-        prev_state=prev,
-        next_state=build_state(INITIAL_HTML),
-        tool_result=ToolResult(is_noop=True),
-    )
-    assert info2.reward <= 0.0
-
-
-def test_unparsed_task_falls_back_to_terminal_only():
-    goal = build_goal_spec("Do an unknown task.", INITIAL_HTML)
-    assert goal.confidence == 0.0
-    prev = build_state(INITIAL_HTML)
-    nxt = build_state(INITIAL_HTML, env_metadata={"terminal_success": True})
-    info = compute_local_reward(goal=goal, prev_state=prev, next_state=nxt)
-    # Only the terminal-success potential contributes (w_terminal = 0.7).
     assert info.prev_phi == pytest.approx(0.0, abs=1e-9)
-    assert info.next_phi == pytest.approx(0.7, abs=1e-9)
-    assert info.reward == pytest.approx(0.7, abs=1e-9)
+    assert info.next_phi == pytest.approx(-0.1, abs=1e-9)
+    assert info.reward == pytest.approx(-0.1, abs=1e-9)
+    assert info.failed_tool_after == 1
+    # No bad-target debit: bid 35 is a valid checkbox; the failure is on
+    # the choice of tool, not the choice of target.
+    assert info.bad_target_after == 0
+
+
+def test_clicking_disabled_or_missing_bid_is_negative():
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="click", bid="999"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=False,
+    )
+    # Bad-target debit (w_bad_target=0.1) + stuck debit (DOM unchanged,
+    # w_stuck=0.05). Total -0.15.
+    assert info.bad_target_after == 1
+    assert info.stuck_after == 1
+    assert info.reward == pytest.approx(-0.15, abs=1e-9)
+
+
+def test_successful_submit_yields_terminal_reward():
+    """Click Submit, env reports success.
+
+    Φ_prev = 0; Φ_next = w_terminal · 1 + (no penalties) = 0.7.
+    Bid 18 is also "touched" because the env transitions to terminal,
+    but in this simple case the DOM signature for bid 18 doesn't change —
+    the affordance-breadth signal won't fire unless the DOM mutates.
+    """
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="click", bid="18"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=True,
+    )
+    # DOM didn't actually change here (this is a synthetic test), so the
+    # stuck signal does fire — but the terminal reward dwarfs it.
+    # Expected: terminal +0.7, stuck -0.05 -> 0.65.
+    assert info.terminal_score_after == 1.0
+    assert info.reward == pytest.approx(0.65, abs=1e-9)
+
+
+def test_successful_action_with_dom_change_is_positive():
+    """Click a checkbox; DOM updates. No stuck, no bad target.
+
+    Φ_next gains: w_affordance_breadth · 1/3 ≈ 0.05
+    """
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=_html_with_checked({"35"}),
+        action=ActionView(name="click", bid="35"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=False,
+    )
+    assert info.affordance_breadth_after > info.affordance_breadth_before
+    assert info.reward > 0
+    # No mistake debits.
+    assert info.stuck_after == 0
+    assert info.bad_target_after == 0
+
+
+def test_form_completion_signal_grows_when_input_filled():
+    weights = _default_weights()
+    shaper = EpisodeShaper(initial_html=FORM_HTML, weights=weights)
+    info = shaper.step(
+        next_html=_html_with_value("2", "alice"),
+        action=ActionView(name="fill", bid="2"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=False,
+    )
+    # form_completion went 0 -> 0.5; affordance breadth went 0 -> 1/3.
+    assert info.form_completion_after == pytest.approx(0.5)
+    assert info.reward > 0
+
+
+def test_pure_noop_focus_action_is_zero_or_small():
+    """`focus` doesn't change DOM. We exempt it from the stuck signal."""
+    shaper = EpisodeShaper(initial_html=FORM_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=FORM_HTML,
+        action=ActionView(name="focus", bid="2"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=False,
+    )
+    assert info.stuck_after == 0
+    assert info.bad_target_after == 0
+    assert info.reward == pytest.approx(0.0, abs=1e-9)
+
+
+def test_disabled_shaper_via_phi_components_zeroed():
+    """All weights = 0 -> all rewards = 0 regardless of state.
+
+    This is the smoke test for "disable shaping entirely from config."
+    """
+    zero = RewardWeights(
+        enable_step_verifier_rewards=False,
+        terminal=0.0,
+        form_completion=0.0,
+        affordance_breadth=0.0,
+        error=0.0,
+        stuck=0.0,
+        bad_target=0.0,
+        gamma=1.0,
+    )
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=zero)
+    info = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="clear", bid="35"),
+        tool_result=ToolResult(failed=True),
+        terminal_success=False,
+    )
+    assert info.reward == 0.0
+
+
+def test_counters_monotone_across_multiple_steps():
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info1 = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="clear", bid="35"),
+        tool_result=ToolResult(failed=True),
+        terminal_success=False,
+    )
+    info2 = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="click", bid="999"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=False,
+    )
+    # Counters must only increase.
+    assert info2.failed_tool_after >= info1.failed_tool_after
+    assert info2.bad_target_after >= info1.bad_target_after
+    assert info2.stuck_after >= info1.stuck_after

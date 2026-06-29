@@ -50,23 +50,24 @@ class MiniWobTask(Task):
 
     # Auxiliary step shaping reward. The terminal MiniWob success reward
     # remains the source of truth — these signals must be combined with it.
-    step_reward_weights: RewardWeights = RewardWeights(enable_step_verifier_rewards=False,
-                                               constraints=0.3,
-                                               terminal=0.7,
-                                               forbidden=0.3,
-                                               error=0.1,
-                                               noop=0.05,
-                                               gamma=1.0)
+    step_reward_weights: RewardWeights = RewardWeights(
+        enable_step_verifier_rewards=False,
+        terminal=0.7,
+        form_completion=0.15,
+        affordance_breadth=0.15,
+        error=0.1,
+        stuck=0.05,
+        bad_target=0.1,
+        gamma=1.0,
+    )
 
     _goal: str = PrivateAttr(default="")
     _last_html: str | None = PrivateAttr(default=None)
     _last_axtree: str | None = PrivateAttr(default=None)
     _step_step_index: int = PrivateAttr(default=0)
-    # Potential-based local reward shaper state.
-    _initial_html: str | None = PrivateAttr(default=None)
-    _goal_spec: Any | None = PrivateAttr(default=None)
-    _failed_tool_count: int = PrivateAttr(default=0)
-    _noop_count: int = PrivateAttr(default=0)
+    # Episode-scoped potential-based reward shaper — built fresh on every
+    # reset() and consumed once per evaluate() call.
+    _shaper: Any | None = PrivateAttr(default=None)
 
     @property
     def tool(self) -> BrowserTool:  # type: ignore[override]
@@ -88,12 +89,16 @@ class MiniWobTask(Task):
         self._last_html = _obs_text(page_obs, "pruned_html")
         self._last_axtree = _obs_text(page_obs, "axtree_txt")
         self._step_step_index = 0
-        # Capture initial HTML — the goal spec is parsed once per episode from
-        # the instruction + initial DOM, then frozen for the rest of the rollout.
-        self._initial_html = self._last_html
-        self._goal_spec = None
-        self._failed_tool_count = 0
-        self._noop_count = 0
+        # Build a fresh per-episode shaper from the initial DOM. We capture
+        # the initial DOM here (not on the first evaluate() call) so the
+        # affordance-breadth denominator is set BEFORE any agent action.
+        from miniwob_cube.shaping import EpisodeShaper
+
+        self._shaper = EpisodeShaper(
+            initial_html=self._last_html,
+            weights=self.step_reward_weights,
+            gamma=self.step_reward_weights.gamma,
+        )
         return obs, {**info, "task_id": self.id, "task_url": self.url, "goal": goal}
 
     def evaluate(self, obs: Observation | None = None) -> tuple[float, dict[str, Any]]:
@@ -116,70 +121,35 @@ return [WOB_REWARD_GLOBAL, WOB_RAW_REWARD_GLOBAL, WOB_REWARD_REASON, WOB_DONE_GL
 
     def _maybe_add_step_reward(self, obs: Observation | None, info: dict[str, Any]) -> None:
         # Local import keeps the shaping code off the standard inference path.
-        from miniwob_cube.shaping import (
-            ToolResult,
-            build_goal_spec,
-            build_state,
-            compute_local_reward,
-        )
+        from miniwob_cube.shaping import ActionView, ToolResult
 
         try:
+            if self._shaper is None:
+                return
             curr_html = _obs_text(obs, "pruned_html")
             curr_axtree = _obs_text(obs, "axtree_txt")
-
-            # Build the goal spec once per episode from instruction + initial DOM.
-            if self._goal_spec is None:
-                self._goal_spec = build_goal_spec(self._goal, self._initial_html or self._last_html)
 
             # Detect a failed tool call via the bgym tool's recorded step error.
             step_error = getattr(self.tool, "agent_last_step_error", None)
             failed = step_error is not None
-            # Treat an action whose DOM-change is undetectable as a noop only
-            # if it also didn't fail (failures are accounted separately).
-            is_noop = (
-                not failed
-                and curr_html is not None
-                and self._last_html is not None
-                and curr_html == self._last_html
-                and _last_bgym_action(self.tool) is not None
-            )
-            if failed:
-                self._failed_tool_count += 1
-            if is_noop:
-                self._noop_count += 1
 
             terminal_success = bool(float(info.get("raw_reward", 0.0) or 0.0) > 0.0)
 
-            env_meta_prev = {
-                "failed_tool_count": max(0, self._failed_tool_count - (1 if failed else 0)),
-                "noop_count": max(0, self._noop_count - (1 if is_noop else 0)),
-                "terminal_success": False,
-            }
-            env_meta_next = {
-                "failed_tool_count": self._failed_tool_count,
-                "noop_count": self._noop_count,
-                "terminal_success": terminal_success,
-            }
-            prev_state = build_state(self._last_html, env_meta_prev)
-            next_state = build_state(curr_html, env_meta_next)
-
-            local = compute_local_reward(
-                goal=self._goal_spec,
-                prev_state=prev_state,
-                next_state=next_state,
+            local = self._shaper.step(
+                next_html=curr_html,
+                action=ActionView.from_cube_action(_last_bgym_action(self.tool)),
                 tool_result=ToolResult(
                     failed=failed,
                     error_message=step_error,
-                    is_noop=is_noop,
                 ),
-                weights=self.step_reward_weights
+                terminal_success=terminal_success,
             )
             info["step_reward"] = local.reward
             info["step_reward_info"] = local.to_dict()
             self._last_html = curr_html
             self._last_axtree = curr_axtree
             self._step_step_index += 1
-        except Exception:  # pragma: no cover — verifier must never break rollout
+        except Exception:  # pragma: no cover — shaper must never break rollout
             logger.exception("step shaper failed; skipping step reward this step")
 
     def finished(self, obs: Observation | None = None) -> bool:
@@ -204,13 +174,16 @@ class MiniWobTaskConfig(TaskConfig[MiniWobTaskMetadata]):
 
     # Auxiliary step shaping reward. The terminal MiniWob success reward
     # remains the source of truth — these signals must be combined with it.
-    step_reward_weights: RewardWeights = RewardWeights(enable_step_verifier_rewards=False,
-                                               constraints=0.3,
-                                               terminal=0.7,
-                                               forbidden=0.3,
-                                               error=0.1,
-                                               noop=0.05,
-                                               gamma=1.0)
+    step_reward_weights: RewardWeights = RewardWeights(
+        enable_step_verifier_rewards=False,
+        terminal=0.7,
+        form_completion=0.15,
+        affordance_breadth=0.15,
+        error=0.1,
+        stuck=0.05,
+        bad_target=0.1,
+        gamma=1.0,
+    )
 
     def make(
         self,

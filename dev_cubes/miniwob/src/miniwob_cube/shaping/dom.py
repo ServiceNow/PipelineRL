@@ -1,13 +1,13 @@
 """DOM abstraction for MiniWob++ pruned HTML.
 
 Parses pruned HTML into a flat list of `Element`s tagged with browsergym
-`bid`s. We deliberately keep this small: the only consumer is the deterministic
-predicate evaluator in `potential.py`, which only needs visible affordances
-(checkboxes, radios, text inputs, dropdowns, buttons, clickables) and their
-labels.
+`bid`s. The shaper only needs visible affordances (checkboxes, radios, text
+inputs, dropdowns, buttons) and their basic state — `checked`, `selected`,
+`value`, `disabled` — to compute generic progress signals.
 
-Label inference for checkboxes/radios walks the surrounding `<label>` element
-because MiniWob's pruned HTML rarely emits `<label for="...">` linking.
+Label inference for checkboxes/radios walks the surrounding `<label>`
+element because MiniWob's pruned HTML rarely emits `<label for="...">`
+linking.
 """
 
 from __future__ import annotations
@@ -16,12 +16,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-_CHECKBOX_TYPES = frozenset({"checkbox", "radio"})
 _TEXT_INPUT_TYPES = frozenset(
     {"", "text", "search", "email", "url", "password", "tel", "number", "date", "time"}
 )
@@ -40,15 +38,12 @@ class Element:
     selected: bool = False
     disabled: bool = False
     visible: bool = True
-    # Helpful for grouping radios.
     name: str | None = None
     aria_label: str | None = None
     title: str | None = None
     placeholder: str | None = None
-    # Children options for select elements.
     options: list["Element"] = field(default_factory=list)
 
-    # ---- type predicates ----
     def is_checkbox(self) -> bool:
         return self.tag == "input" and (self.type or "").lower() == "checkbox"
 
@@ -72,43 +67,31 @@ class Element:
             return True
         return False
 
-    def best_label(self) -> str:
-        for candidate in (self.label, self.text, self.aria_label, self.title, self.value, self.placeholder):
-            if candidate:
-                s = _norm(candidate)
-                if s:
-                    return s
-        return ""
+    def is_interactive(self) -> bool:
+        return (
+            self.is_checkbox()
+            or self.is_radio()
+            or self.is_text_input()
+            or self.is_select()
+            or self.is_button()
+            or self.tag in {"a", "option"}
+        )
 
-
-@dataclass
-class ToolResult:
-    """Lightweight summary of what happened at one step.
-
-    The shaping logic never sees the LLM's tool call directly — it only needs
-    to know whether the call failed, so it can debit failed_tool_count.
-    """
-
-    failed: bool = False
-    error_message: str | None = None
-    is_noop: bool = False  # DOM unchanged with no error.
+    def state_signature(self) -> tuple:
+        """Stable tuple summarizing the element's interactive state."""
+        return (self.checked, self.selected, (self.value or ""))
 
 
 @dataclass
 class State:
-    """Snapshot of one observation moment.
+    """Snapshot of one observation. Holds DOM elements only.
 
-    `terminal_success` comes from the environment (the MiniWob JS reward),
-    not from any DOM heuristic. `failed_tool_count` and `noop_count` are
-    cumulative counts since episode start (they monotonically grow), so a
-    failed step debits Phi at next_state but not at prev_state, producing a
-    small negative local reward.
+    Episode-level counters live on `HistoryCounters` in `shaper.py`; Φ takes
+    both so it remains a pure function of (state, counters, weights).
     """
 
     elements: list[Element] = field(default_factory=list)
     terminal_success: bool = False
-    failed_tool_count: int = 0
-    noop_count: int = 0
 
     def checkboxes(self) -> list[Element]:
         return [e for e in self.elements if e.is_checkbox() and e.visible]
@@ -125,6 +108,42 @@ class State:
     def buttons(self) -> list[Element]:
         return [e for e in self.elements if e.is_button() and e.visible]
 
+    def interactive(self) -> list[Element]:
+        return [e for e in self.elements if e.is_interactive() and e.visible]
+
+    def by_bid(self) -> dict[str, Element]:
+        return {e.bid: e for e in self.elements if e.bid}
+
+
+@dataclass
+class ToolResult:
+    """Tool-call outcome for one step.
+
+    `failed=True` means the tool reported an error (e.g. Playwright rejected
+    the action). The shaper uses it as the ground-truth signal for
+    `failed_tool_count`.
+    """
+
+    failed: bool = False
+    error_message: str | None = None
+
+
+@dataclass
+class ActionView:
+    """Lightweight view of the agent's last action — keeps the shaper
+    testable without depending on cube.core.Action."""
+
+    name: str = ""
+    bid: str | None = None
+
+    @classmethod
+    def from_cube_action(cls, action) -> "ActionView":
+        if action is None:
+            return cls()
+        name = getattr(action, "name", "") or ""
+        args = getattr(action, "arguments", None) or {}
+        return cls(name=str(name), bid=args.get("bid") if isinstance(args, dict) else None)
+
 
 # ---------------------------------------------------------------------------
 # HTML parsing
@@ -136,17 +155,11 @@ def _norm(s: str | None) -> str:
 
 
 class _DomParser(HTMLParser):
-    """Two-pass-friendly DOM scraper that retains parent stack so checkbox
-    labels can be inferred from the enclosing `<label>` element."""
-
     def __init__(self) -> None:
         super().__init__()
         self.elements: list[Element] = []
-        # Stack entries: (Element, attrs_dict, accumulated text parts).
         self._stack: list[tuple[Element, dict[str, str], list[str]]] = []
-        # Map id -> element for <label for="..."> resolution.
         self._by_id: dict[str, Element] = {}
-        # Element -> "for" target id, resolved at end.
         self._label_for: list[tuple[Element, str]] = []
 
     def _make(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> tuple[Element, dict[str, str]]:
@@ -192,10 +205,8 @@ class _DomParser(HTMLParser):
             elem, _raw, parts = self._stack[i]
             if elem.tag == tag:
                 elem.text = _norm(" ".join(parts))
-                # Pop closed entry; preserve any deeper open tags as tolerable.
                 self._stack = self._stack[:i] + self._stack[i + 1 :]
                 return
-        # Unmatched close — drop top entry.
         elem, _raw, parts = self._stack.pop()
         elem.text = _norm(" ".join(parts))
 
@@ -207,25 +218,18 @@ class _DomParser(HTMLParser):
 
 
 def parse_dom(html: str | None) -> list[Element]:
-    """Parse pruned HTML into a flat list of `Element`s.
-
-    Labels for checkboxes/radios are inferred from any enclosing `<label>`
-    element (the common MiniWob shape) and, as a fallback, from explicit
-    `<label for="id">` references.
-    """
     if not html:
         return []
     p = _DomParser()
     try:
         p.feed(html)
-    except Exception as e:  # pragma: no cover — pruned_html is generally well-formed
+    except Exception as e:  # pragma: no cover — pruned HTML is generally well-formed
         logger.debug("html parse failed: %s", e)
-    # Finalize any stray open elements.
     for elem, _raw, parts in p._stack:
         if not elem.text:
             elem.text = _norm(" ".join(parts))
 
-    # ---- Build select.options ----
+    # Build select.options.
     current_select: Element | None = None
     for elem in p.elements:
         if elem.tag == "select":
@@ -233,7 +237,6 @@ def parse_dom(html: str | None) -> list[Element]:
         elif elem.tag == "option" and current_select is not None:
             current_select.options.append(elem)
 
-    # ---- Wire checkbox/radio labels ----
     _resolve_labels(p.elements, p._by_id, p._label_for)
     return p.elements
 
@@ -243,8 +246,6 @@ def _resolve_labels(
     by_id: dict[str, Element],
     label_for: list[tuple[Element, str]],
 ) -> None:
-    """Infer labels for checkboxes/radios using surrounding <label> text."""
-    # Pass 1: explicit `<label for="...">` linkage.
     for label_elem, target_id in label_for:
         target = by_id.get(target_id)
         if target is not None and (target.is_checkbox() or target.is_radio()):
@@ -252,18 +253,10 @@ def _resolve_labels(
             if text and not target.label:
                 target.label = text
 
-    # Pass 2: implicit — a checkbox/radio nested inside <label>...text...</label>.
-    # We use document order: for every <label>, find the checkbox/radio that
-    # appears between its start and (effectively) its end.
-    # MiniWob nests like: `<label> <input type="checkbox"/> apple </label>`.
-    # The implementation here is index-based on `elements`.
     n = len(elements)
     for i, lbl in enumerate(elements):
         if lbl.tag != "label" or not lbl.text:
             continue
-        # Heuristic: associate the nearest following checkbox/radio
-        # whose label is still empty. This is a flat-list scan, but since
-        # pruned HTML rarely interleaves siblings before the input, it works.
         for j in range(i + 1, min(i + 6, n)):
             cand = elements[j]
             if (cand.is_checkbox() or cand.is_radio()) and not cand.label:
@@ -271,26 +264,12 @@ def _resolve_labels(
                 break
 
 
-# ---------------------------------------------------------------------------
-# State builder
-# ---------------------------------------------------------------------------
+def build_state(html: str | None, terminal_success: bool = False) -> State:
+    """Build a `State` from pruned HTML and an env-supplied success flag.
 
-
-def build_state(
-    html: str | None,
-    env_metadata: dict[str, Any] | None = None,
-) -> State:
-    """Build a `State` from pruned HTML and optional environment metadata.
-
-    `env_metadata` may include:
-        - `terminal_success`: bool
-        - `failed_tool_count`: int
-        - `noop_count`: int
+    Terminal success comes from `evaluate()` (i.e. the MiniWob JS reward
+    signal), not from any DOM heuristic. Episode-level counters
+    (failed_tool_count, stuck_count, …) live on `HistoryCounters` outside
+    the state.
     """
-    md = env_metadata or {}
-    return State(
-        elements=parse_dom(html),
-        terminal_success=bool(md.get("terminal_success", False)),
-        failed_tool_count=int(md.get("failed_tool_count", 0) or 0),
-        noop_count=int(md.get("noop_count", 0) or 0),
-    )
+    return State(elements=parse_dom(html), terminal_success=bool(terminal_success))

@@ -114,11 +114,12 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
     enable_step_verifier_rewards: bool = False
     # Potential-based reward shaping weights (see `miniwob_cube.shaping`).
     # Setting `enable_step_verifier_rewards=False` disables shaping entirely.
-    shaping_weight_constraints: float = 0.3
     shaping_weight_terminal: float = 0.7
-    shaping_weight_forbidden: float = 0.3
+    shaping_weight_form_completion: float = 0.15
+    shaping_weight_affordance_breadth: float = 0.15
     shaping_weight_error: float = 0.1
-    shaping_weight_noop: float = 0.05
+    shaping_weight_stuck: float = 0.05
+    shaping_weight_bad_target: float = 0.1
     shaping_gamma: float = 1.0
 
     task_ids: list[str] = [
@@ -174,13 +175,16 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
 
     def get_task_configs(self) -> Generator[MiniWobTaskConfig, None, None]:
 
-        step_reward_weights = RewardWeights(enable_step_verifier_rewards=self.enable_step_verifier_rewards,
-                                            constraints=self.shaping_weight_constraints,
-                                            terminal=self.shaping_weight_terminal,
-                                            forbidden=self.shaping_weight_forbidden,
-                                            error=self.shaping_weight_error,
-                                            noop=self.shaping_weight_noop,
-                                            gamma=self.shaping_gamma)
+        step_reward_weights = RewardWeights(
+            enable_step_verifier_rewards=self.enable_step_verifier_rewards,
+            terminal=self.shaping_weight_terminal,
+            form_completion=self.shaping_weight_form_completion,
+            affordance_breadth=self.shaping_weight_affordance_breadth,
+            error=self.shaping_weight_error,
+            stuck=self.shaping_weight_stuck,
+            bad_target=self.shaping_weight_bad_target,
+            gamma=self.shaping_gamma,
+        )
 
         for tm in self.tasks().values():
             yield MiniWobTaskConfig(

@@ -1,42 +1,61 @@
 """Potential function and local-reward computation.
 
-This implements potential-based reward shaping (Ng, Harada, Russell 1999):
+This is potential-based reward shaping (Ng, Harada, Russell 1999) using
+purely generic state and action-quality signals — no task instruction is
+parsed.
 
-    Phi(s) =
-        w_constraints * constraint_score(s)
-      + w_terminal   * terminal_score(s)
-      - w_forbidden  * violation_score(s)
-      - w_error      * failed_tool_count(s)
-      - w_noop       * noop_count(s)
+    Phi(s, h) =
+        w_terminal              * 1[terminal_success(s)]
+      + w_form_completion       * form_completion_fraction(s)
+      + w_affordance_breadth    * affordance_engagement_breadth(h)
+      - w_error                 * failed_tool_count(h)
+      - w_stuck                 * stuck_count(h)
+      - w_bad_target            * bad_target_count(h)
 
-    local_reward = gamma * Phi(next_state) - Phi(prev_state)
+    local_reward = gamma * Phi(next_state, next_h) - Phi(prev_state, prev_h)
 
-Because the reward is a pure difference of a state-only potential, the
-optimal policy under the shaped reward equals the optimal policy under the
-unshaped (terminal-only) reward — no biased solutions. The action itself
-never enters Phi; it only influences the reward through its effect on the
-next state (and on the failed-tool/noop counters).
+`h` is an episode-level counter bundle (`HistoryCounters` in `shaper.py`)
+that monotonically grows over the episode. `Phi` reads it; the shaper
+mutates it between steps.
+
+The action itself never enters `Phi`. Actions only influence the reward
+through their effect on the next state (DOM diffs) and on the cumulative
+counters (failed/stuck/bad-target).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from miniwob_cube.shaping.dom import State, ToolResult
-from miniwob_cube.shaping.goal_spec import Constraint, GoalSpec
+from miniwob_cube.shaping.dom import State
+from miniwob_cube.shaping.signals import (
+    affordance_engagement_breadth,
+    form_completion_fraction,
+)
+
+if TYPE_CHECKING:
+    from miniwob_cube.shaping.shaper import HistoryCounters
 
 
 @dataclass
 class RewardWeights:
-    """Weights for the components of Phi. Defaults match the spec."""
+    """Weights for the components of Phi. Defaults are conservative — every
+    component contributes a small bounded amount, so no single signal can
+    dominate.
+
+    Set `enable_step_verifier_rewards=False` to disable shaping entirely
+    without touching any other config (the task class consults this flag
+    before invoking the shaper).
+    """
 
     enable_step_verifier_rewards: bool = False
-    constraints: float = 0.3
     terminal: float = 0.7
-    forbidden: float = 0.3
+    form_completion: float = 0.15
+    affordance_breadth: float = 0.15
     error: float = 0.1
-    noop: float = 0.05
+    stuck: float = 0.05
+    bad_target: float = 0.1
     gamma: float = 1.0
 
 
@@ -47,15 +66,18 @@ class LocalRewardInfo:
     reward: float
     prev_phi: float
     next_phi: float
-    constraint_score_before: float
-    constraint_score_after: float
     terminal_score_before: float
     terminal_score_after: float
-    violation_score_before: float
-    violation_score_after: float
+    form_completion_before: float
+    form_completion_after: float
+    affordance_breadth_before: float
+    affordance_breadth_after: float
     failed_tool_before: int
     failed_tool_after: int
-    goal_spec: GoalSpec
+    stuck_before: int
+    stuck_after: int
+    bad_target_before: int
+    bad_target_after: int
     reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,136 +85,40 @@ class LocalRewardInfo:
             "reward": self.reward,
             "prev_phi": self.prev_phi,
             "next_phi": self.next_phi,
-            "constraint_score_before": self.constraint_score_before,
-            "constraint_score_after": self.constraint_score_after,
             "terminal_score_before": self.terminal_score_before,
             "terminal_score_after": self.terminal_score_after,
-            "violation_score_before": self.violation_score_before,
-            "violation_score_after": self.violation_score_after,
+            "form_completion_before": self.form_completion_before,
+            "form_completion_after": self.form_completion_after,
+            "affordance_breadth_before": self.affordance_breadth_before,
+            "affordance_breadth_after": self.affordance_breadth_after,
             "failed_tool_before": self.failed_tool_before,
             "failed_tool_after": self.failed_tool_after,
-            "goal_spec": self.goal_spec.describe(),
+            "stuck_before": self.stuck_before,
+            "stuck_after": self.stuck_after,
+            "bad_target_before": self.bad_target_before,
+            "bad_target_after": self.bad_target_after,
             "reasons": list(self.reasons),
         }
 
 
-# ---------------------------------------------------------------------------
-# Component scores
-# ---------------------------------------------------------------------------
+def _terminal_score(state: State) -> float:
+    return 1.0 if state.terminal_success else 0.0
 
 
-def _fraction_satisfied(constraints: list[Constraint], state: State) -> float:
-    if not constraints:
-        return 0.0
-    sat = sum(1 for c in constraints if c.is_satisfied(state))
-    return sat / float(len(constraints))
+def phi(state: State, counters: "HistoryCounters", weights: RewardWeights) -> float:
+    """Potential Phi(state, counters).
 
-
-def _fraction_violated(forbidden: list[Constraint], state: State) -> float:
-    if not forbidden:
-        return 0.0
-    viol = sum(1 for c in forbidden if c.is_satisfied(state))
-    return viol / float(len(forbidden))
-
-
-def _terminal_score(goal: GoalSpec, state: State) -> float:
-    if not goal.terminal:
-        return 1.0 if state.terminal_success else 0.0
-    return 1.0 if goal.terminal.is_reached(state) else 0.0
-
-
-def phi(state: State, goal: GoalSpec, weights: RewardWeights) -> float:
-    """Potential function Phi(state).
-
-    NOTE: This is potential-based shaping — Phi must depend only on the
-    state (and the static goal/weights), never on the tool name.
+    Pure function of state + cumulative counters + static weights — never
+    the tool name or action arguments.
     """
-    cs = _fraction_satisfied(goal.constraints, state)
-    ts = _terminal_score(goal, state)
-    vs = _fraction_violated(goal.forbidden, state)
+    ts = _terminal_score(state)
+    fc = form_completion_fraction(state)
+    ab = affordance_engagement_breadth(counters.touched_bids, counters.interactive_universe)
     return (
-        weights.constraints * cs
-        + weights.terminal * ts
-        - weights.forbidden * vs
-        - weights.error * float(state.failed_tool_count)
-        - weights.noop * float(state.noop_count)
-    )
-
-
-# ---------------------------------------------------------------------------
-# Local reward
-# ---------------------------------------------------------------------------
-
-
-def compute_local_reward(
-    *,
-    goal: GoalSpec,
-    prev_state: State,
-    next_state: State,
-    tool_result: ToolResult | None = None,
-    weights: RewardWeights | None = None,
-) -> LocalRewardInfo:
-    """Compute potential-difference local reward and a debug bundle.
-
-    If `tool_result.failed` is set and `next_state.failed_tool_count` was
-    not pre-incremented by the caller, we add one here so the failure
-    actually shows up in the next-state potential. Same for `is_noop`.
-
-    Mirroring this in the caller is fine too; this helper just makes it
-    safe to forget.
-    """
-    w = weights or RewardWeights()
-    gamma = w.gamma
-
-    if tool_result is not None:
-        if tool_result.failed and next_state.failed_tool_count == prev_state.failed_tool_count:
-            next_state.failed_tool_count = prev_state.failed_tool_count + 1
-        if tool_result.is_noop and next_state.noop_count == prev_state.noop_count:
-            next_state.noop_count = prev_state.noop_count + 1
-
-    cs_b = _fraction_satisfied(goal.constraints, prev_state)
-    cs_a = _fraction_satisfied(goal.constraints, next_state)
-    ts_b = _terminal_score(goal, prev_state)
-    ts_a = _terminal_score(goal, next_state)
-    vs_b = _fraction_violated(goal.forbidden, prev_state)
-    vs_a = _fraction_violated(goal.forbidden, next_state)
-
-    prev_phi = phi(prev_state, goal, w)
-    next_phi = phi(next_state, goal, w)
-    reward = gamma * next_phi - prev_phi
-
-    reasons: list[str] = []
-    if cs_a > cs_b:
-        reasons.append(f"constraint progress: {cs_b:.3f} -> {cs_a:.3f}")
-    elif cs_a < cs_b:
-        reasons.append(f"constraint regression: {cs_b:.3f} -> {cs_a:.3f}")
-    if ts_a > ts_b:
-        reasons.append("terminal success achieved")
-    if vs_a > vs_b:
-        reasons.append(f"forbidden violation: {vs_b:.3f} -> {vs_a:.3f}")
-    elif vs_a < vs_b:
-        reasons.append(f"forbidden recovered: {vs_b:.3f} -> {vs_a:.3f}")
-    if next_state.failed_tool_count > prev_state.failed_tool_count:
-        reasons.append(
-            f"failed tool calls: {prev_state.failed_tool_count} -> {next_state.failed_tool_count}"
-        )
-    if next_state.noop_count > prev_state.noop_count:
-        reasons.append(f"noop: {prev_state.noop_count} -> {next_state.noop_count}")
-    if goal.confidence < 1.0:
-        reasons.append(f"low-confidence goal (confidence={goal.confidence:.2f})")
-
-    return LocalRewardInfo(
-        reward=float(reward),
-        prev_phi=float(prev_phi),
-        next_phi=float(next_phi),
-        constraint_score_before=float(cs_b),
-        constraint_score_after=float(cs_a),
-        terminal_score_before=float(ts_b),
-        terminal_score_after=float(ts_a),
-        violation_score_before=float(vs_b),
-        violation_score_after=float(vs_a),
-        failed_tool_before=int(prev_state.failed_tool_count),
-        failed_tool_after=int(next_state.failed_tool_count),
-        goal_spec=goal,
-        reasons=reasons,
+        weights.terminal * ts
+        + weights.form_completion * fc
+        + weights.affordance_breadth * ab
+        - weights.error * float(counters.failed_tool_count)
+        - weights.stuck * float(counters.stuck_count)
+        - weights.bad_target * float(counters.bad_target_count)
     )
