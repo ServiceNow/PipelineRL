@@ -319,30 +319,74 @@ def process_chunk(
         return
 
 
-def filter_zero_advantage_groups(dataset: list[dict], epsilon: float = 1e-6) -> tuple[list[dict], int]:
-    """
-    Filter out groups whose siblings all share the same terminal reward.
+def filter_zero_advantage_groups(
+    dataset: list[dict],
+    mode: str = "asymmetric",
+    epsilon: float = 1e-6,
+) -> tuple[list[dict], int]:
+    """Filter zero-information groups from the preprocessed dataset.
 
-    Decision is made on `episode_advantage` only — a group where every row has
-    `|episode_advantage| < epsilon` is one with no outcome variance among its
-    sibling rollouts (all-success or all-fail), so the outcome reward provides
-    no learnable signal. Step-level shaping (`step_advantage`) is intentionally
-    ignored here: a flat-outcome group has no information about *task success*,
-    regardless of what step_reward says, and including it would dilute the
-    outcome gradient with rows that only have process signal.
+    A group is "zero-information" when there is nothing to learn from any of
+    its rollouts. The exact definition depends on `mode`:
+
+      - "off"          : keep every group. No filtering.
+      - "episode_only" : drop a group iff every sibling has
+                         |episode_advantage| < epsilon. Step-level signal is
+                         deliberately ignored — useful when you want
+                         gradients to depend strictly on terminal-outcome
+                         variance.
+      - "advantage"    : drop a group iff BOTH `episode_advantage` and
+                         `step_advantage` are below epsilon for every
+                         sibling. Reduces to "episode_only" when no
+                         step_reward signal exists (step_advantage is then
+                         identically 0); with step_reward present, keeps
+                         "all-fail with step variance" groups where step
+                         credit is the only learnable signal.
+      - "asymmetric"   : like "advantage", but ALSO drops "all-succeed"
+                         groups even when step_advantage varies. The
+                         intuition: when the policy already wins,
+                         step-level differences are likely spurious
+                         variance the model shouldn't overfit to.
+                         All-fail-with-step-variance groups are still kept.
+
+    Filtering is a pure variance/sample-efficiency trick: it never biases
+    the policy gradient — it just chooses which samples carry useful signal
+    given the current advantage estimator's outputs.
     """
-    filtered_entries = []
+    if mode == "off":
+        return list(dataset), 0
+    if mode not in ("episode_only", "advantage", "asymmetric"):
+        raise ValueError(
+            f"unknown filter mode {mode!r}; "
+            "expected off|episode_only|advantage|asymmetric"
+        )
+
     groups: dict = {}
-
     for entry in dataset:
         groups.setdefault(entry["group_id"], []).append(entry)
 
+    filtered_entries: list[dict] = []
     num_filtered_out = 0
     for entries in groups.values():
-        has_outcome_signal = any(
-            abs(float(entry.get("episode_advantage", 0.0))) > epsilon for entry in entries
-        )
-        if has_outcome_signal:
+        ep_advs = [abs(float(e.get("episode_advantage", 0.0))) for e in entries]
+        step_advs = [float(e.get("step_advantage", 0.0)) for e in entries]
+        has_outcome = any(a > epsilon for a in ep_advs)
+        has_step = (max(step_advs) - min(step_advs)) > epsilon if step_advs else False
+
+        if has_outcome:
+            keep_group = True
+        elif mode == "episode_only":
+            keep_group = False  # outcome-only filter ignores step variance
+        elif mode == "advantage":
+            keep_group = has_step
+        else:  # asymmetric
+            # No outcome signal — distinguish all-succeed from all-fail by
+            # the terminal reward (uniform within the group since all
+            # episode_advantage = 0). Keep only all-fail-with-step-variance.
+            terminal_r = float((entries[0].get("rewards") or [0.0])[0])
+            keep_group = (terminal_r <= 0.0) and has_step
+
+        if keep_group:
             filtered_entries.extend(entries)
         else:
             num_filtered_out += len(entries)
@@ -548,11 +592,17 @@ def run_preprocessing_loop(
                         dataset = output_queue.get(timeout=0.001)
                         if isinstance(dataset, Exception):
                             raise dataset
-                        if rl_config.filter_zero_advantage_groups:
-                            dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
+                        if rl_config.filter_zero_advantage_mode != "off":
+                            dataset, num_filtered_out = filter_zero_advantage_groups(
+                                dataset, mode=rl_config.filter_zero_advantage_mode
+                            )
                             total_filtered_out += num_filtered_out
                             if num_filtered_out > 0:
-                                logger.info(f"Filtered out {num_filtered_out} samples from groups with zero advantage.")
+                                logger.info(
+                                    "Filtered out %d samples (mode=%s).",
+                                    num_filtered_out,
+                                    rl_config.filter_zero_advantage_mode,
+                                )
                         fetching_took += time.time() - start_fetching
                     except Empty:
                         pass

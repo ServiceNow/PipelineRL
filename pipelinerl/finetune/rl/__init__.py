@@ -1,7 +1,7 @@
 import logging
 import os
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 import numpy as np
@@ -142,9 +142,32 @@ class RLConfig(BaseModel):
     # applied to whatever advantages the estimator produced. Estimators that
     # don't yield per-group scalar advantages (e.g. a future GAE variant) may
     # render this a no-op — that's fine.
-    filter_zero_advantage_groups: bool = Field(
-        default=False,
-        description="Filter out groups where all advantages are zero during preprocessing",
+    #
+    # Modes:
+    #   "off"          — keep every group. No filtering.
+    #   "episode_only" — drop a group iff every sibling has
+    #                    |episode_advantage| < epsilon. Step-level signal is
+    #                    intentionally ignored; useful when you want
+    #                    gradients to depend strictly on terminal outcome
+    #                    variance even though step_advantage is being added
+    #                    to the loss.
+    #   "advantage"    — drop a group iff BOTH episode_advantage AND
+    #                    step_advantage are below epsilon for every sibling.
+    #                    Reduces to episode_only when step_reward is absent
+    #                    (step_advantage is then identically 0); with
+    #                    step_reward present, automatically keeps groups
+    #                    whose only learnable signal is step-level
+    #                    (typically "all-fail with variance" early in
+    #                    training).
+    #   "asymmetric"   — like "advantage", but ALSO drops "all-succeed"
+    #                    groups even when step_advantage varies. A hedge
+    #                    against spurious step-level credit assignment when
+    #                    the policy already solves the task; useful when
+    #                    you don't fully trust the step signal in success
+    #                    cases.
+    filter_zero_advantage_mode: Literal["off", "episode_only", "advantage", "asymmetric"] = Field(
+        default="asymmetric",
+        description="How to filter zero-information groups in preprocessing — see code comment.",
     )
     value_loss_coef: float = Field(
         default=0.0,
