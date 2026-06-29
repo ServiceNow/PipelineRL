@@ -511,7 +511,8 @@ class RayActorLoop:
 
     def _finish(self, reason: str) -> str:
         self._stop_reason = reason
-        if self.is_training and self._trainer_version_to_publish is not None and self.latency_list:
+        if self.is_training and self.latency_list:
+            version = self._trainer_version_to_publish if self._trainer_version_to_publish is not None else self._last_trainer_version
             self.publish_stats(
                 {
                     "published_samples": self.total_published_samples,
@@ -520,7 +521,7 @@ class RayActorLoop:
                     "pending_rollouts": self.manager.active_count,
                     "active_rollouts": self.manager.active_count,
                     "time_since_start": time.time() - self._loop_start_time,
-                    "trainer_model_version": self._trainer_version_to_publish,
+                    "trainer_model_version": version,
                 }
             )
             self._trainer_version_to_publish = None
