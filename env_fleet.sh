@@ -15,6 +15,10 @@ COUNT=${COUNT:-12}
 START_PORT=${START_PORT:-7777}
 END_PORT=$((START_PORT + COUNT - 1))
 S=$(dirname "$(readlink -f "$0")")
+# Unique per-launch EAI job-name suffix: a bare `terminal_envs_a` collides with a
+# prior FAILED/CANCELLED job of that exact name ("resource with this name already
+# exists"). internal-dns names stay terminal-envs-{a,b} so the trainer still finds them.
+FLEET_RUN_ID=${FLEET_RUN_ID:-$(date +%s)}
 
 # internal-dns ports fragment (one entry per server port)
 ports_yaml() {
@@ -40,7 +44,7 @@ options:
       name: ${dns}
       ports:
 $(ports_yaml)
-name: terminal_envs_${suffix}
+name: terminal_envs_${suffix}_${FLEET_RUN_ID}
 bid: 9999
 preemptable: true
 restartable: true
