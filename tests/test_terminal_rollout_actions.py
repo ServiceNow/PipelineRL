@@ -34,12 +34,15 @@ def test_extracts_single_bash_tool_call_from_json_arguments():
     assert action.error is None
     assert action.command == "pwd"
     assert action.tool_call_id == "call_0"
+    assert not action.has_prose
 
 
-def test_rejects_prose_around_tool_call():
+def test_accepts_prose_around_single_bash_tool_call():
     action = _extract_bash_action(_llm_call(content="I will inspect files.", tool_calls=[_tool_call()]))
 
-    assert action.error == "prose_with_tool"
+    assert action.error is None
+    assert action.command == "ls -la"
+    assert action.has_prose
 
 
 def test_rejects_missing_multiple_wrong_and_empty_tools():

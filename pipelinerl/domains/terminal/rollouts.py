@@ -37,13 +37,14 @@ _SUBMIT_COMMAND = f"echo {_SUBMIT_MARKER}"
 _FORMAT_ERROR_MESSAGE = (
     "FORMAT_ERROR: Call exactly one bash tool with a non-empty `command` string. "
     f"When the task is complete, call bash with command `{_SUBMIT_COMMAND}`. "
-    "Do not write prose or use markdown."
+    "Brief reasoning is allowed, but do not use markdown."
 )
 
 SYSTEM_PROMPT = (
     "You are a terminal agent. You solve a task by running shell commands in a "
     "persistent bash session. Each turn, call exactly one bash tool with the "
-    "command to execute. Do not write prose, markdown, or more than one tool call. "
+    "command to execute. You may include brief reasoning, but do not use markdown "
+    "or more than one tool call. "
     "You will then see the command output. When the task is fully done, call the "
     f"bash tool with command `{_SUBMIT_COMMAND}`."
 )
@@ -91,6 +92,8 @@ class TerminalMetrics(BaseMetrics):
     format_errors_bad_arguments: int = 0
     format_errors_empty_command: int = 0
     format_errors_prose_with_tool: int = 0
+    tool_calls_with_prose: int = 0
+    tool_call_prose_rate: float = 0.0
     max_format_retries_exceeded: bool = False
 
 
@@ -99,6 +102,7 @@ class TerminalAction:
     command: str | None = None
     tool_call_id: str | None = None
     error: str | None = None
+    has_prose: bool = False
 
 
 def _failed_result(problem: dict, start_time: float, metrics: TerminalMetrics) -> RolloutResult:
@@ -172,9 +176,6 @@ def _extract_bash_action(llm_call: LLMCall) -> TerminalAction:
         return TerminalAction(error="missing_tool")
     if len(tool_calls) != 1:
         return TerminalAction(error="multiple_tools")
-    if content:
-        return TerminalAction(error="prose_with_tool")
-
     tool_call = tool_calls[0]
     if _tool_name(tool_call) != _BASH_TOOL_NAME:
         return TerminalAction(error="wrong_tool")
@@ -188,7 +189,7 @@ def _extract_bash_action(llm_call: LLMCall) -> TerminalAction:
     command = command.strip()
     if not command:
         return TerminalAction(error="empty_command")
-    return TerminalAction(command=command, tool_call_id=_tool_call_id(tool_call))
+    return TerminalAction(command=command, tool_call_id=_tool_call_id(tool_call), has_prose=bool(content))
 
 
 def _is_submit_command(command: str) -> bool:
@@ -344,6 +345,7 @@ async def _execute_rollout(
     n_actions = 0
     n_total_llm_calls = 0
     format_counts = _new_format_counts()
+    tool_calls_with_prose = 0
     max_format_retries = int(getattr(tcfg, "max_format_retries", 3))
     max_format_retries_exceeded = False
     try:
@@ -367,6 +369,9 @@ async def _execute_rollout(
                     max_format_retries_exceeded = True
                     break
                 continue
+
+            if action.has_prose:
+                tool_calls_with_prose += 1
 
             messages.append(_assistant_tool_message(action))
             llm_calls.append(llm_call)
@@ -441,6 +446,8 @@ async def _execute_rollout(
         format_errors_bad_arguments=format_counts["bad_arguments"],
         format_errors_empty_command=format_counts["empty_command"],
         format_errors_prose_with_tool=format_counts["prose_with_tool"],
+        tool_calls_with_prose=tool_calls_with_prose,
+        tool_call_prose_rate=tool_calls_with_prose / max(len(llm_calls), 1),
         max_format_retries_exceeded=max_format_retries_exceeded,
     )
     return RolloutResult(
