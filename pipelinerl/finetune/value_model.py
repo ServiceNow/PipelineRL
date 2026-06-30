@@ -15,8 +15,6 @@ class CausalLMOutputWithValue(ModelOutput):
     Output type for causal language models with an additional value head.
 
     Args:
-        loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
-            Language modeling loss.
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, vocab_size)`):
             Prediction scores of the language modeling head.
         value (`torch.FloatTensor` of shape `(batch_size, sequence_length)`):
@@ -29,7 +27,6 @@ class CausalLMOutputWithValue(ModelOutput):
             Attention weights after the attention softmax.
     """
 
-    loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     value: torch.FloatTensor = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
@@ -76,7 +73,6 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -93,7 +89,6 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=True,
@@ -107,7 +102,6 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         values = self.value_head(hidden_states)
 
         return CausalLMOutputWithValue(
-            loss=outputs.loss,
             logits=outputs.logits,
             value=values,
             past_key_values=outputs.past_key_values,
@@ -120,7 +114,7 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         self.pretrained_model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs
         )
-    
+
     def save_pretrained(
         self,
         save_directory: Union[str, os.PathLike],
@@ -132,14 +126,14 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
     ):
         """Save model and value head separately."""
         import os
-        
+
         if state_dict is None:
             state_dict = self.state_dict()
-        
+
         # Extract pretrained model and value head state dicts
         pretrained_model_state_dict = {}
         value_head_state_dict = {}
-        
+
         for key, value in state_dict.items():
             if key.startswith("value_head."):
                 # Remove the "value_head." prefix
@@ -154,7 +148,7 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
                     f"Unexpected key in state dict: {key}. "
                     "Expected keys should start with 'value_head.' or 'pretrained_model.'."
                 )
-        
+
         # Save the pretrained model which can be easily loaded by vllm, etc.
         self.pretrained_model.save_pretrained(
             save_directory,
@@ -164,7 +158,7 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
             safe_serialization=safe_serialization,
             **kwargs,
         )
-        
+
         # Save value head separately
         if is_main_process:
             value_head_path = os.path.join(save_directory, "value_head.pt")
