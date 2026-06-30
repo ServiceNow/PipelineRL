@@ -54,14 +54,14 @@ def test_submit_command_is_exact_and_never_stepped():
     assert not _is_submit_command(f"{_SUBMIT_COMMAND} && echo extra")
 
 
-def test_assistant_tool_message_uses_dict_arguments_for_qwen_template():
+def test_assistant_tool_message_uses_string_arguments_for_vllm_wire():
     action = _extract_bash_action(_llm_call(tool_calls=[_tool_call(arguments='{"command": "ls"}', call_id="call_7")]))
     message = _assistant_tool_message(action)
 
     tool_call = message["tool_calls"][0]
     assert tool_call["id"] == "call_7"
     assert tool_call["function"]["name"] == "bash"
-    assert tool_call["function"]["arguments"] == {"command": "ls"}
+    assert tool_call["function"]["arguments"] == '{"command": "ls"}'
 
 
 class DummySession:

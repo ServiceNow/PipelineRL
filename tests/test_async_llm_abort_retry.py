@@ -125,7 +125,7 @@ class CapturingSession(DummySession):
         return super().post(**kwargs)
 
 
-def test_llm_async_generate_normalizes_tool_call_history_for_generation() -> None:
+def test_llm_async_generate_keeps_tool_call_history_arguments_as_wire_strings() -> None:
     prompt = Prompt(messages=_tool_history_messages('{"command": "ls"}'), tools=_bash_tool_definition())
     llm = DummyLLM()
     session = CapturingSession([_good_payload()])
@@ -134,8 +134,19 @@ def test_llm_async_generate_normalizes_tool_call_history_for_generation() -> Non
 
     sent_args = session.last_payload["messages"][2]["tool_calls"][0]["function"]["arguments"]
     stored_args = llm_call.prompt.messages[2]["tool_calls"][0]["function"]["arguments"]
-    assert sent_args == {"command": "ls"}
-    assert stored_args == {"command": "ls"}
+    assert sent_args == '{"command": "ls"}'
+    assert stored_args == '{"command": "ls"}'
+
+
+def test_llm_async_generate_stringifies_dict_tool_call_history_for_wire() -> None:
+    prompt = Prompt(messages=_tool_history_messages({"command": "ls"}), tools=_bash_tool_definition())
+    llm = DummyLLM()
+    session = CapturingSession([_good_payload()])
+
+    asyncio.run(llm_async_generate(llm, prompt, session))
+
+    sent_args = session.last_payload["messages"][2]["tool_calls"][0]["function"]["arguments"]
+    assert sent_args == '{"command": "ls"}'
 
 
 def test_make_training_text_rejects_abort_responses_even_with_logprobs() -> None:

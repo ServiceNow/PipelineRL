@@ -70,17 +70,17 @@ def _normalize_tool_arguments(arguments):
     return parsed if isinstance(parsed, dict) else arguments
 
 
-def _normalize_tool_call_messages(messages: list[dict]) -> list[dict]:
-    normalized = []
+def _map_tool_call_arguments(messages: list[dict], map_arguments) -> list[dict]:
+    mapped = []
     for message in messages:
         msg = _to_plain_obj(message)
         if not isinstance(msg, dict):
-            normalized.append(msg)
+            mapped.append(msg)
             continue
         msg = dict(msg)
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
-            normalized_tool_calls = []
+            mapped_tool_calls = []
             for tool_call in tool_calls:
                 call = _to_plain_obj(tool_call)
                 if isinstance(call, dict):
@@ -89,12 +89,29 @@ def _normalize_tool_call_messages(messages: list[dict]) -> list[dict]:
                     if isinstance(function, dict):
                         function = dict(function)
                         if "arguments" in function:
-                            function["arguments"] = _normalize_tool_arguments(function["arguments"])
+                            function["arguments"] = map_arguments(function["arguments"])
                         call["function"] = function
-                normalized_tool_calls.append(call)
-            msg["tool_calls"] = normalized_tool_calls
-        normalized.append(msg)
-    return normalized
+                mapped_tool_calls.append(call)
+            msg["tool_calls"] = mapped_tool_calls
+        mapped.append(msg)
+    return mapped
+
+
+def _normalize_tool_call_messages(messages: list[dict]) -> list[dict]:
+    return _map_tool_call_arguments(messages, _normalize_tool_arguments)
+
+
+def _stringify_tool_arguments(arguments):
+    arguments = _to_plain_obj(arguments)
+    if isinstance(arguments, str):
+        return arguments
+    if isinstance(arguments, dict):
+        return json.dumps(arguments)
+    return arguments
+
+
+def _stringify_tool_call_messages(messages: list[dict]) -> list[dict]:
+    return _map_tool_call_arguments(messages, _stringify_tool_arguments)
 
 
 def _is_retryable_abort_response(data: dict, collect_logprobs: bool) -> tuple[bool, str | None]:
@@ -132,7 +149,10 @@ async def llm_async_generate(
     headers = {"Content-Type": "application/json"}
     if llm.api_token:
         headers |= {"Authorization": f"Bearer {llm.api_token}"}
-    request_prompt = prompt.model_copy(update={"messages": _normalize_tool_call_messages(prompt.messages)})
+    # OpenAI/vLLM request validation requires tool_call function.arguments to be
+    # a JSON string on the wire. Local Qwen chat-template reconstruction below
+    # normalizes those strings back to dicts before apply_chat_template.
+    request_prompt = prompt.model_copy(update={"messages": _stringify_tool_call_messages(prompt.messages)})
     data = {
         "model": llm.model_name,
         "messages": request_prompt.messages,

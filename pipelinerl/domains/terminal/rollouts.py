@@ -206,7 +206,7 @@ def _assistant_tool_message(action: TerminalAction) -> dict:
                 "type": "function",
                 "function": {
                     "name": _BASH_TOOL_NAME,
-                    "arguments": {"command": action.command},
+                    "arguments": json.dumps({"command": action.command}),
                 },
             }
         ],
