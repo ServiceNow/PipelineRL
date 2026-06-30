@@ -46,15 +46,16 @@ options:
 $(ports_yaml)
 name: terminal_envs_${suffix}_${FLEET_RUN_ID}
 bid: 9999
-preemptable: true
-restartable: true
 workdir: /home/toolkit/PipelineRL
 environmentVars:
   - HOME=/home/toolkit
   - PYTHONPATH=/home/toolkit/PipelineRL
 EOF
   echo "=== launching ${dns} (ports ${START_PORT}-${END_PORT}) ==="
-  eai job new -f "$yaml" --account "$ACCOUNT" -- \
+  # --non-preemptable on the CLI: eai silently ignores a YAML `preemptable: false`
+  # (the job stays preemptable). Our account's reserved non-preemptable CPU pool is
+  # idle, so this keeps the fleet from being evicted off contended GPU nodes.
+  eai job new -f "$yaml" --account "$ACCOUNT" --non-preemptable -- \
     /opt/conda/bin/conda run -n "$CONDA_ENV" --no-capture-output bash -c \
     "python -m pipelinerl.entrypoints.run_environment_fleet --config-name terminal --config-dir /home/toolkit/PipelineRL/conf output_dir=${out} +fleet.environment_key=terminal +fleet.start_port=${START_PORT} +fleet.count=${COUNT}"
 }
