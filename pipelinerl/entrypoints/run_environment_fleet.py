@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import signal
 import time
 
 import hydra
@@ -64,16 +65,40 @@ def hydra_entrypoint(cfg: DictConfig):
         for i in range(count):
             port = start_port + i
             procs[port] = _spawn(env_container, port)
+        start_time = time.monotonic()
         logger.info("env fleet launched: %d servers on ports %d-%d", count, start_port, start_port + count - 1)
+
+        # Log platform shutdown signals so a fleet death is diagnosable: a graceful
+        # preemption/drain sends SIGTERM (caught here), whereas a hard SIGKILL (e.g.
+        # OOM-kill / node-level evict) cannot be caught and only the heartbeat below
+        # pins the death time. Raise RuntimeError (an Exception, not BaseException) so
+        # the enclosing better_crashing runs terminate_with_children to reap the
+        # non-daemon env child processes instead of leaving them orphaned on exit.
+        def _on_signal(signum, _frame):
+            alive = sum(1 for p in procs.values() if p.is_alive())
+            logger.warning(
+                "env fleet parent received signal %d (%s) after %.0fs uptime; %d/%d servers alive; exiting",
+                signum, signal.Signals(signum).name, time.monotonic() - start_time, alive, count,
+            )
+            raise RuntimeError(f"signal {signum} ({signal.Signals(signum).name})")
+
+        for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(_sig, _on_signal)
 
         # Supervisor: restart any server that dies so one bad port does not shrink
         # the fleet. The actor side already health-checks and load-balances, so a
         # brief gap on one port is tolerated.
+        last_heartbeat = time.monotonic()
         while True:
             for port, proc in list(procs.items()):
                 if not proc.is_alive():
                     logger.warning("env server on port %d exited (code %s); restarting", port, proc.exitcode)
                     procs[port] = _spawn(env_container, port)
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                alive = sum(1 for p in procs.values() if p.is_alive())
+                logger.info("env fleet heartbeat: %d/%d servers alive, uptime %.0fs", alive, count, now - start_time)
+                last_heartbeat = now
             time.sleep(5.0)
 
 

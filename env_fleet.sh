@@ -59,5 +59,12 @@ EOF
     "python -m pipelinerl.entrypoints.run_environment_fleet --config-name terminal --config-dir /home/toolkit/PipelineRL/conf output_dir=${out} +fleet.environment_key=terminal +fleet.start_port=${START_PORT} +fleet.count=${COUNT}"
 }
 
-launch_one a
-launch_one b
+# Optional arg selects which fleet(s) to launch: a | b | both (default both).
+# Used to restore a single dead fleet without disturbing the live one.
+TARGET=${1:-both}
+case "$TARGET" in
+  a) launch_one a ;;
+  b) launch_one b ;;
+  both) launch_one a; launch_one b ;;
+  *) echo "usage: $0 [a|b|both]" >&2; exit 1 ;;
+esac
