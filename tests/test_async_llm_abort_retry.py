@@ -119,6 +119,25 @@ def test_llm_async_generate_raises_after_repeated_abort_responses() -> None:
     assert session.calls == 2
 
 
+class CapturingSession(DummySession):
+    def post(self, **kwargs):
+        self.last_payload = kwargs["json"]
+        return super().post(**kwargs)
+
+
+def test_llm_async_generate_normalizes_tool_call_history_for_generation() -> None:
+    prompt = Prompt(messages=_tool_history_messages('{"command": "ls"}'), tools=_bash_tool_definition())
+    llm = DummyLLM()
+    session = CapturingSession([_good_payload()])
+
+    llm_call = asyncio.run(llm_async_generate(llm, prompt, session))
+
+    sent_args = session.last_payload["messages"][2]["tool_calls"][0]["function"]["arguments"]
+    stored_args = llm_call.prompt.messages[2]["tool_calls"][0]["function"]["arguments"]
+    assert sent_args == {"command": "ls"}
+    assert stored_args == {"command": "ls"}
+
+
 def test_make_training_text_rejects_abort_responses_even_with_logprobs() -> None:
     llm_call = LLMCall(
         prompt=Prompt.from_user_message("hello"),
@@ -251,3 +270,112 @@ def test_weight_update_manager_resumes_generation_on_rpc_failure() -> None:
         asyncio.run(manager.receive_weight_update(DummyWeightUpdateRequest()))
 
     assert manager.engine.resume_calls == 1
+
+
+class ToolTemplateTokenizer:
+    bos_token = None
+    eos_token = "<eos>"
+
+    def _render(self, conversation, add_generation_prompt=False, **kwargs):
+        parts = []
+        for message in conversation:
+            role = message["role"]
+            parts.append(f"<{role}>")
+            content = message.get("content") or ""
+            if content:
+                parts.append(content)
+            for tool_call in message.get("tool_calls") or []:
+                function = tool_call["function"]
+                arguments = function["arguments"]
+                if not isinstance(arguments, dict):
+                    raise TypeError("tool arguments must be a mapping")
+                parts.append(f"<tool_call:{function['name']}:{arguments['command']}>")
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        return "".join(parts)
+
+    def apply_chat_template(self, conversation, tokenize=True, return_dict=False, add_generation_prompt=False, **kwargs):
+        rendered = self._render(conversation, add_generation_prompt=add_generation_prompt, **kwargs)
+        token_ids = [ord(ch) % 251 for ch in rendered]
+        if tokenize:
+            if return_dict:
+                return BatchEncoding({"input_ids": token_ids})
+            return token_ids
+        return rendered
+
+
+def _tool_history_messages(arguments):
+    return [
+        {"role": "system", "content": "use tools"},
+        {"role": "user", "content": "first"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": arguments},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "file.txt"},
+        {"role": "user", "content": "second"},
+    ]
+
+
+def _bash_tool_definition():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+
+
+def test_make_training_text_normalizes_multiturn_tool_call_history():
+    tokenizer = ToolTemplateTokenizer()
+    prompt = Prompt(messages=_tool_history_messages('{"command": "ls"}'), tools=_bash_tool_definition())
+    output = LLMOutput(content="")
+    output.tool_calls = [
+        SimpleNamespace(
+            id="call_1",
+            function=SimpleNamespace(name="bash", arguments='{"command": "pwd"}'),
+        )
+    ]
+    llm_call = LLMCall(
+        prompt=prompt,
+        output=output,
+        cached=False,
+        llm_info={"finish_reason": "stop"},
+        logprobs=[TokenLogprob(token_id=77, logprob=-0.1, generated=1)],
+        prompt_length_tokens=0,
+        output_length_tokens=1,
+    )
+    llm = SimpleNamespace(
+        model_name="dummy-model",
+        tokenizer=tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    training_text = make_training_text(llm, llm_call)
+
+    canonical_prompt = _tool_history_messages({"command": "ls"})
+    expected_prompt_ids = tokenizer.apply_chat_template(
+        canonical_prompt,
+        tokenize=True,
+        return_dict=False,
+        add_generation_prompt=True,
+        tools=_bash_tool_definition(),
+        enable_thinking=False,
+    )
+    assert training_text.input_ids[:-1] == expected_prompt_ids
+    assert training_text.labels[:-1] == [MASKED_TOKEN_ID] * len(expected_prompt_ids)
+    assert training_text.input_ids[-1] == 77

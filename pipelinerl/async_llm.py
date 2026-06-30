@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import logging
 
 import aiohttp
@@ -58,6 +59,44 @@ def _to_plain_obj(value):
     return value
 
 
+def _normalize_tool_arguments(arguments):
+    arguments = _to_plain_obj(arguments)
+    if not isinstance(arguments, str):
+        return arguments
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return arguments
+    return parsed if isinstance(parsed, dict) else arguments
+
+
+def _normalize_tool_call_messages(messages: list[dict]) -> list[dict]:
+    normalized = []
+    for message in messages:
+        msg = _to_plain_obj(message)
+        if not isinstance(msg, dict):
+            normalized.append(msg)
+            continue
+        msg = dict(msg)
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            normalized_tool_calls = []
+            for tool_call in tool_calls:
+                call = _to_plain_obj(tool_call)
+                if isinstance(call, dict):
+                    call = dict(call)
+                    function = call.get("function")
+                    if isinstance(function, dict):
+                        function = dict(function)
+                        if "arguments" in function:
+                            function["arguments"] = _normalize_tool_arguments(function["arguments"])
+                        call["function"] = function
+                normalized_tool_calls.append(call)
+            msg["tool_calls"] = normalized_tool_calls
+        normalized.append(msg)
+    return normalized
+
+
 def _is_retryable_abort_response(data: dict, collect_logprobs: bool) -> tuple[bool, str | None]:
     try:
         choice = data["choices"][0]
@@ -93,9 +132,10 @@ async def llm_async_generate(
     headers = {"Content-Type": "application/json"}
     if llm.api_token:
         headers |= {"Authorization": f"Bearer {llm.api_token}"}
+    request_prompt = prompt.model_copy(update={"messages": _normalize_tool_call_messages(prompt.messages)})
     data = {
         "model": llm.model_name,
-        "messages": prompt.messages,
+        "messages": request_prompt.messages,
     }
     if llm.collect_logprobs:
         data.update(
@@ -121,8 +161,8 @@ async def llm_async_generate(
 
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
-    if prompt.tools:
-        data["tools"] = _to_plain_obj(prompt.tools)
+    if request_prompt.tools:
+        data["tools"] = _to_plain_obj(request_prompt.tools)
 
     if max_tokens_override is not None:
         data["max_tokens"] = max_tokens_override
@@ -202,7 +242,7 @@ async def llm_async_generate(
     output = LLMOutput(content=content or "")
     if raw_tool_calls:
         output.tool_calls = [litellm.ChatCompletionMessageToolCall(**tc) for tc in raw_tool_calls]
-    llm_call = llm.log_output(prompt, output, count_tokens=False)
+    llm_call = llm.log_output(request_prompt, output, count_tokens=False)
     llm_call.prompt_length_tokens = response_data["usage"]["prompt_tokens"]
     llm_call.output_length_tokens = response_data["usage"]["completion_tokens"]
     if finish_reason:
@@ -223,6 +263,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     images = []
     use_processor = False
     visual_features = None
+    prompt_messages = _normalize_tool_call_messages(llm_call.prompt.messages)
     assistant_msg: dict = {"role": "assistant", "content": llm_call.output.content or ""}
     if llm_call.output.tool_calls:
         assistant_msg["tool_calls"] = [
@@ -236,10 +277,10 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             }
             for tc in llm_call.output.tool_calls
         ]
-    full_messages = llm_call.prompt.messages + [assistant_msg]
+    full_messages = _normalize_tool_call_messages(prompt_messages + [assistant_msg])
 
     if hasattr(llm_call.prompt, "messages"):
-        images = extract_images_from_messages(llm_call.prompt.messages)
+        images = extract_images_from_messages(prompt_messages)
         if images:
             use_processor = True
 
@@ -250,7 +291,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         try:
             # Apply chat template using processor for proper image token handling
             prompt_text = processor.apply_chat_template(
-                llm_call.prompt.messages,
+                prompt_messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -264,7 +305,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             # Process prompt with images to get token IDs with image placeholders
             prompt_inputs = processor(
                 text=processor.apply_chat_template(
-                    llm_call.prompt.messages, tokenize=False, add_generation_prompt=True
+                    prompt_messages, tokenize=False, add_generation_prompt=True
                 ),
                 images=images,
                 return_tensors=None,
@@ -292,7 +333,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         if llm_call.prompt.tools:
             chat_kwargs = {**chat_kwargs, "tools": _to_plain_obj(llm_call.prompt.tools)}
         prompt_text = llm.tokenizer.apply_chat_template(
-            conversation=llm_call.prompt.messages,
+            conversation=prompt_messages,
             tokenize=False,
             add_generation_prompt=True,
             **chat_kwargs,
@@ -303,7 +344,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             **chat_kwargs,
         )
         prompt_token_ids = llm.tokenizer.apply_chat_template(
-            llm_call.prompt.messages,
+            prompt_messages,
             tokenize=True,
             return_dict=False,
             add_generation_prompt=True,

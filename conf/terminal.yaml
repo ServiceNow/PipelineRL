@@ -47,6 +47,7 @@ terminal:
   env_call_timeout: 300      # per HTTP call to the env server (/step, /finish)
   env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
   capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
+  max_format_retries: 3      # malformed tool-call retries; separate from max_turns action budget
   reward_pass: 1.0
   reward_fail: -1.0
   # Graded reward: map the pytest pass fraction onto [reward_fail, reward_pass]
@@ -107,6 +108,11 @@ environments:
     # /tmp, not RAM. Monitor aborts the session over this (scored reward_fail). 16GiB
     # is generous (normal tasks use <1GiB); 8 sessions/node x 16 = 128GiB << node RAM.
     max_session_rss_bytes: 17179869184  # 16 GiB
+    # Reap orphaned sessions that missed /close (client cancellation, actor death,
+    # or start_task timeout). Keep above rollout_timeout so live rollouts are not
+    # touched; close uses the same fast slot-free/background cleanup path as /close.
+    session_ttl_seconds: 3600.0
+    session_reap_interval_seconds: 60.0
 
 environment_key: terminal
 
@@ -175,6 +181,9 @@ vllm_config:
     # 1024 prefilled them in tiny chunks, so 64-turn rollouts blew the rollout
     # timeout; 8192 prefills ~8x faster. (GPU-compute bound, not disk.)
     max-num-batched-tokens: 8192
+    # Use Qwen3's native XML tool-call format for terminal bash actions.
+    enable-auto-tool-choice: ""
+    tool-call-parser: qwen3_xml
     # Route Qwen3.5 GDN prefill to the bundled Triton/FLA kernel. The default
     # ("auto") picks FlashInfer on H100, which lazily JIT-compiles gdn_prefill_sm90
     # on the first prefill and hit an in-thread FileLock reentrancy deadlock that

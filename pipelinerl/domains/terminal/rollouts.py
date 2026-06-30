@@ -3,8 +3,8 @@
 A multi-turn bash agent (mini-SWE-agent shape: one ``bash`` tool, persistent
 shell, submit marker, output truncation) drives a proot sandbox hosted on a
 remote env-server job, then a pytest verifier scores the final state. Reward is
-outcome-only and broadcast to every turn, matching the TMax recipe; PipelineRL's
-LOO group advantage plus zero-advantage filtering supply the rest.
+outcome-only and broadcast to every valid action turn, matching the TMax recipe;
+PipelineRL's LOO group advantage plus zero-advantage filtering supply the rest.
 
 The sandbox runs on ``kind="environment"`` jobs (placed across the actor nodes by
 ``WorldMap._place_environments``) and is reached over plain HTTP with the
@@ -13,12 +13,13 @@ actor's shared ``aiohttp`` session. No TapeAgents dependency.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
-import re
 import time
 import traceback
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List
 
 import aiohttp
 from omegaconf import DictConfig
@@ -30,15 +31,44 @@ from pipelinerl.utils import get_environment_jobs
 
 logger = logging.getLogger(__name__)
 
-_BASH_RE = re.compile(r"```(?:bash|sh)?\s*\n(.*?)```", re.DOTALL)
-_SUBMIT_MARKER = "TASK_COMPLETE"
+_BASH_TOOL_NAME = "bash"
+_SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+_SUBMIT_COMMAND = f"echo {_SUBMIT_MARKER}"
+_FORMAT_ERROR_MESSAGE = (
+    "FORMAT_ERROR: Call exactly one bash tool with a non-empty `command` string. "
+    f"When the task is complete, call bash with command `{_SUBMIT_COMMAND}`. "
+    "Do not write prose or use markdown."
+)
 
 SYSTEM_PROMPT = (
     "You are a terminal agent. You solve a task by running shell commands in a "
-    "persistent bash session. Respond each turn with exactly one command inside a "
-    "```bash``` code block. You will then see its output. When the task is fully "
-    f"done, reply with a final line containing only {_SUBMIT_MARKER} and no code block."
+    "persistent bash session. Each turn, call exactly one bash tool with the "
+    "command to execute. Do not write prose, markdown, or more than one tool call. "
+    "You will then see the command output. When the task is fully done, call the "
+    f"bash tool with command `{_SUBMIT_COMMAND}`."
 )
+
+
+def build_terminal_tools() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": _BASH_TOOL_NAME,
+                "description": "Execute one bash command in the persistent terminal session.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to execute.",
+                        }
+                    },
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
 
 
 class TerminalMetrics(BaseMetrics):
@@ -52,16 +82,23 @@ class TerminalMetrics(BaseMetrics):
     disk_aborted: bool = False
     n_turns: int = 0
     n_llm_calls: int = 0
+    n_total_llm_calls: int = 0
+    n_format_errors: int = 0
+    format_error_rate: float = 0.0
+    format_errors_missing_tool: int = 0
+    format_errors_multiple_tools: int = 0
+    format_errors_wrong_tool: int = 0
+    format_errors_bad_arguments: int = 0
+    format_errors_empty_command: int = 0
+    format_errors_prose_with_tool: int = 0
+    max_format_retries_exceeded: bool = False
 
 
-def _parse_command(content: str) -> Optional[str]:
-    """Return the bash command for this turn, or None if the agent is done."""
-    if _SUBMIT_MARKER in content:
-        return None
-    matches = _BASH_RE.findall(content)
-    if not matches:
-        return None
-    return matches[-1].strip()
+@dataclass(frozen=True)
+class TerminalAction:
+    command: str | None = None
+    tool_call_id: str | None = None
+    error: str | None = None
 
 
 def _failed_result(problem: dict, start_time: float, metrics: TerminalMetrics) -> RolloutResult:
@@ -86,6 +123,109 @@ async def _post(session: aiohttp.ClientSession, url: str, payload: dict, timeout
                 raise EnvironmentCapacityError(f"{url} -> HTTP {resp.status}: {text}")
             raise RuntimeError(f"{url} -> HTTP {resp.status}: {text}")
         return await resp.json()
+
+
+def _tool_function(tool_call) -> object | None:
+    if isinstance(tool_call, dict):
+        return tool_call.get("function")
+    return getattr(tool_call, "function", None)
+
+
+def _tool_call_id(tool_call) -> str:
+    if isinstance(tool_call, dict):
+        return str(tool_call.get("id") or "call_0")
+    return str(getattr(tool_call, "id", None) or "call_0")
+
+
+def _tool_name(tool_call) -> str | None:
+    function = _tool_function(tool_call)
+    if isinstance(function, dict):
+        name = function.get("name")
+    else:
+        name = getattr(function, "name", None)
+    return str(name) if name is not None else None
+
+
+def _tool_arguments(tool_call):
+    function = _tool_function(tool_call)
+    if isinstance(function, dict):
+        return function.get("arguments")
+    return getattr(function, "arguments", None)
+
+
+def _parse_tool_arguments(arguments) -> dict | None:
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str):
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_bash_action(llm_call: LLMCall) -> TerminalAction:
+    content = (llm_call.output.content or "").strip()
+    tool_calls = list(getattr(llm_call.output, "tool_calls", None) or [])
+    if not tool_calls:
+        return TerminalAction(error="missing_tool")
+    if len(tool_calls) != 1:
+        return TerminalAction(error="multiple_tools")
+    if content:
+        return TerminalAction(error="prose_with_tool")
+
+    tool_call = tool_calls[0]
+    if _tool_name(tool_call) != _BASH_TOOL_NAME:
+        return TerminalAction(error="wrong_tool")
+
+    arguments = _parse_tool_arguments(_tool_arguments(tool_call))
+    if arguments is None:
+        return TerminalAction(error="bad_arguments")
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return TerminalAction(error="bad_arguments")
+    command = command.strip()
+    if not command:
+        return TerminalAction(error="empty_command")
+    return TerminalAction(command=command, tool_call_id=_tool_call_id(tool_call))
+
+
+def _is_submit_command(command: str) -> bool:
+    return command.strip() == _SUBMIT_COMMAND
+
+
+def _assistant_tool_message(action: TerminalAction) -> dict:
+    assert action.command is not None
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": action.tool_call_id or "call_0",
+                "type": "function",
+                "function": {
+                    "name": _BASH_TOOL_NAME,
+                    "arguments": {"command": action.command},
+                },
+            }
+        ],
+    }
+
+
+def _format_feedback(category: str) -> str:
+    return f"{_FORMAT_ERROR_MESSAGE} Error: {category}."
+
+
+def _new_format_counts() -> dict[str, int]:
+    return {
+        "missing_tool": 0,
+        "multiple_tools": 0,
+        "wrong_tool": 0,
+        "bad_arguments": 0,
+        "empty_command": 0,
+        "prose_with_tool": 0,
+    }
 
 
 # Per-URL rate limit for health-check failure warnings. A dead env-fleet endpoint
@@ -201,33 +341,57 @@ async def _execute_rollout(
             reward=tcfg.reward_fail, success=False, no_error=False, no_answer=True,
             build_ok=start.get("build_ok", False), init_ok=start.get("init_ok", False)))
 
+    n_actions = 0
+    n_total_llm_calls = 0
+    format_counts = _new_format_counts()
+    max_format_retries = int(getattr(tcfg, "max_format_retries", 3))
+    max_format_retries_exceeded = False
     try:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": problem["task"]},
         ]
+        tools = build_terminal_tools()
         llm_calls: List[LLMCall] = []
         disk_aborted = False
-        for _ in range(tcfg.max_turns):
-            llm_call = await llm_async_generate(llm, Prompt(messages=messages), session)
-            llm_calls.append(llm_call)
-            content = llm_call.output.content or ""
-            messages.append({"role": "assistant", "content": content})
+        submitted = False
+        while n_actions < tcfg.max_turns:
+            llm_call = await llm_async_generate(llm, Prompt(messages=messages, tools=tools), session)
+            n_total_llm_calls += 1
+            action = _extract_bash_action(llm_call)
+            if action.error is not None:
+                format_counts[action.error] += 1
+                messages.append({"role": "assistant", "content": llm_call.output.content or ""})
+                messages.append({"role": "user", "content": _format_feedback(action.error)})
+                if sum(format_counts.values()) >= max_format_retries:
+                    max_format_retries_exceeded = True
+                    break
+                continue
 
-            command = _parse_command(content)
-            if command is None:
+            messages.append(_assistant_tool_message(action))
+            llm_calls.append(llm_call)
+            n_actions += 1
+            assert action.command is not None
+            if _is_submit_command(action.command):
+                submitted = True
                 break
-            obs = await _post(session, f"{env_url}/step", {"session_id": session_id, "command": command}, call_timeout)
-            messages.append({"role": "user", "content": obs["output"]})
+
+            obs = await _post(session, f"{env_url}/step", {"session_id": session_id, "command": action.command}, call_timeout)
+            messages.append({"role": "tool", "tool_call_id": action.tool_call_id or "call_0", "content": obs["output"]})
             if obs.get("disk_exceeded"):
                 disk_aborted = True
                 break
 
-        verifier = await _post(session, f"{env_url}/finish", {"session_id": session_id}, call_timeout)
-        verifier_pass = bool(verifier["passed"])
-        passed_tests = int(verifier.get("passed_tests", 0))
-        total_tests = int(verifier.get("total_tests", 0))
-        disk_aborted = disk_aborted or bool(verifier.get("disk_exceeded"))
+        if max_format_retries_exceeded:
+            verifier_pass = False
+            passed_tests = 0
+            total_tests = 0
+        else:
+            verifier = await _post(session, f"{env_url}/finish", {"session_id": session_id}, call_timeout)
+            verifier_pass = bool(verifier["passed"])
+            passed_tests = int(verifier.get("passed_tests", 0))
+            total_tests = int(verifier.get("total_tests", 0))
+            disk_aborted = disk_aborted or bool(verifier.get("disk_exceeded"))
     finally:
         try:
             await _post(session, f"{env_url}/close", {"session_id": session_id}, 30)
@@ -239,7 +403,9 @@ async def _execute_rollout(
     # fewer groups are zero-advantage filtered. Falls back to binary when disabled
     # or when no tests resolved (collection error / disk abort -> total_tests 0).
     pass_fraction = passed_tests / total_tests if total_tests > 0 else 0.0
-    if getattr(tcfg, "graded_reward", False):
+    if max_format_retries_exceeded:
+        reward = tcfg.reward_fail
+    elif getattr(tcfg, "graded_reward", False):
         # No resolved tests (collection error / skipped-only / parse-empty) -> fail,
         # never the binary fallback, so a skipped-only pytest exit 0 can't score pass.
         reward = (
@@ -252,10 +418,11 @@ async def _execute_rollout(
     training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     summary = summarize_training_texts(training_texts)
 
+    n_format_errors = sum(format_counts.values())
     metrics = TerminalMetrics(
         reward=reward,
         success=verifier_pass,
-        no_error=True,
+        no_error=not max_format_retries_exceeded,
         no_answer=len(llm_calls) == 0,
         verifier_pass=verifier_pass,
         passed_tests=passed_tests,
@@ -263,8 +430,18 @@ async def _execute_rollout(
         pass_fraction=pass_fraction,
         overflow=summary.overflow,
         disk_aborted=disk_aborted,
-        n_turns=len(messages) // 2,
+        n_turns=n_actions,
         n_llm_calls=len(llm_calls),
+        n_total_llm_calls=n_total_llm_calls,
+        n_format_errors=n_format_errors,
+        format_error_rate=n_format_errors / max(n_total_llm_calls, 1),
+        format_errors_missing_tool=format_counts["missing_tool"],
+        format_errors_multiple_tools=format_counts["multiple_tools"],
+        format_errors_wrong_tool=format_counts["wrong_tool"],
+        format_errors_bad_arguments=format_counts["bad_arguments"],
+        format_errors_empty_command=format_counts["empty_command"],
+        format_errors_prose_with_tool=format_counts["prose_with_tool"],
+        max_format_retries_exceeded=max_format_retries_exceeded,
     )
     return RolloutResult(
         training_texts=training_texts,

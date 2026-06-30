@@ -191,6 +191,8 @@ class TerminalEnvironmentServer:
         cache_dir: str | None = None,
         max_session_disk_bytes: int = 1536 * 2**20,
         max_session_rss_bytes: int = 16 * 2**30,
+        session_ttl_seconds: float = 3600.0,
+        session_reap_interval_seconds: float = 60.0,
     ):
         self.bases_dir = Path(bases_dir)
         self.n_envs = n_envs
@@ -204,8 +206,11 @@ class TerminalEnvironmentServer:
         self.cache_dir = cache_dir
         self.max_session_disk_bytes = max_session_disk_bytes
         self.max_session_rss_bytes = max_session_rss_bytes
+        self.session_ttl_seconds = session_ttl_seconds
+        self.session_reap_interval_seconds = session_reap_interval_seconds
 
-        self._sessions: Dict[str, TerminalSession] = {}
+        self._sessions: Dict[str, TerminalSession | None] = {}
+        self._session_last_activity: Dict[str, float] = {}
         self._lock = asyncio.Lock()
         # Each concurrent session may have one blocking proot call in flight.
         self._executor = ThreadPoolExecutor(max_workers=n_envs + 4)
@@ -220,6 +225,51 @@ class TerminalEnvironmentServer:
             {"status": "ok", "active": len(self._sessions), "capacity": self.n_envs}
         )
 
+    def _close_session_background(self, session: TerminalSession | None) -> None:
+        if session is None:
+            return
+        task = asyncio.create_task(self._run(session.close))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _reap_expired_sessions(self) -> None:
+        if self.session_ttl_seconds <= 0:
+            return
+        now = time.monotonic()
+        expired: list[tuple[str, TerminalSession | None]] = []
+        async with self._lock:
+            for session_id, session in list(self._sessions.items()):
+                last_activity = self._session_last_activity.get(session_id, now)
+                if now - last_activity < self.session_ttl_seconds:
+                    continue
+                expired.append((session_id, session))
+                self._sessions.pop(session_id, None)
+                self._session_last_activity.pop(session_id, None)
+
+        for session_id, session in expired:
+            logger.warning("reaping terminal session %s after %.0fs ttl", session_id, self.session_ttl_seconds)
+            self._close_session_background(session)
+
+    async def _reaper_loop(self, app: web.Application) -> None:
+        while True:
+            await asyncio.sleep(self.session_reap_interval_seconds)
+            await self._reap_expired_sessions()
+
+    async def _start_reaper(self, app: web.Application) -> None:
+        if self.session_ttl_seconds <= 0:
+            return
+        app["terminal_session_reaper"] = asyncio.create_task(self._reaper_loop(app))
+
+    async def _stop_reaper(self, app: web.Application) -> None:
+        task = app.get("terminal_session_reaper")
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     async def start_task(self, request: web.Request) -> web.Response:
         body = await request.json()
         task = body["task_data"]
@@ -229,6 +279,7 @@ class TerminalEnvironmentServer:
                 return web.json_response({"error": "capacity reached"}, status=503)
             session_id = str(uuid.uuid4())
             self._sessions[session_id] = None  # reserve the slot
+            self._session_last_activity[session_id] = time.monotonic()
 
         session = TerminalSession(
             bases_dir=self.bases_dir,
@@ -249,6 +300,7 @@ class TerminalEnvironmentServer:
             await self._run(session.close)
             async with self._lock:
                 self._sessions.pop(session_id, None)
+                self._session_last_activity.pop(session_id, None)
             return web.json_response({"error": str(e)}, status=500)
 
         if not flags.get("started"):
@@ -256,15 +308,26 @@ class TerminalEnvironmentServer:
             await self._run(session.close)
             async with self._lock:
                 self._sessions.pop(session_id, None)
+                self._session_last_activity.pop(session_id, None)
             return web.json_response({"session_id": None, **flags})
 
-        self._sessions[session_id] = session
+        expired_during_start = False
+        async with self._lock:
+            if session_id not in self._sessions:
+                expired_during_start = True
+            else:
+                self._sessions[session_id] = session
+                self._session_last_activity[session_id] = time.monotonic()
+        if expired_during_start:
+            await self._run(session.close)
+            return web.json_response({"error": "session expired during start"}, status=503)
         return web.json_response({"session_id": session_id, **flags})
 
     def _get(self, session_id: str) -> TerminalSession:
         session = self._sessions.get(session_id)
         if session is None:
             raise web.HTTPNotFound(text=f"unknown session {session_id}")
+        self._session_last_activity[session_id] = time.monotonic()
         return session
 
     async def step(self, request: web.Request) -> web.Response:
@@ -288,14 +351,14 @@ class TerminalEnvironmentServer:
         # cleanup keep eviction race-safe even with the slot already reused.
         async with self._lock:
             session = self._sessions.pop(session_id, None)
-        if session is not None:
-            task = asyncio.create_task(self._run(session.close))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            self._session_last_activity.pop(session_id, None)
+        self._close_session_background(session)
         return web.json_response({"status": "ok"})
 
     def launch(self, port: int):
         app = web.Application(client_max_size=64 * 1024 * 1024)
+        app.on_startup.append(self._start_reaper)
+        app.on_cleanup.append(self._stop_reaper)
         app.add_routes(
             [
                 web.get("/health", self.health),
@@ -306,8 +369,8 @@ class TerminalEnvironmentServer:
             ]
         )
         logger.info(
-            "TerminalEnvironmentServer on %s:%d (n_envs=%d, bases=%s)",
-            self.host, port, self.n_envs, self.bases_dir,
+            "TerminalEnvironmentServer on %s:%d (n_envs=%d, bases=%s, session_ttl=%.0fs)",
+            self.host, port, self.n_envs, self.bases_dir, self.session_ttl_seconds,
         )
         _start_local_disk_logger()
         web.run_app(app, host=self.host, port=port, access_log=None)
