@@ -81,6 +81,7 @@ class TerminalMetrics(BaseMetrics):
     init_ok: bool = True
     overflow: bool = False
     disk_aborted: bool = False
+    timeout_aborted: bool = False
     n_turns: int = 0
     n_llm_calls: int = 0
     n_total_llm_calls: int = 0
@@ -356,6 +357,7 @@ async def _execute_rollout(
         tools = build_terminal_tools()
         llm_calls: List[LLMCall] = []
         disk_aborted = False
+        timeout_aborted = False
         submitted = False
         while n_actions < tcfg.max_turns:
             llm_call = await llm_async_generate(llm, Prompt(messages=messages, tools=tools), session)
@@ -385,6 +387,7 @@ async def _execute_rollout(
             messages.append({"role": "tool", "tool_call_id": action.tool_call_id or "call_0", "content": obs["output"]})
             if obs.get("disk_exceeded"):
                 disk_aborted = True
+                timeout_aborted = timeout_aborted or bool(obs.get("timeout_aborted"))
                 break
 
         if max_format_retries_exceeded:
@@ -397,6 +400,7 @@ async def _execute_rollout(
             passed_tests = int(verifier.get("passed_tests", 0))
             total_tests = int(verifier.get("total_tests", 0))
             disk_aborted = disk_aborted or bool(verifier.get("disk_exceeded"))
+            timeout_aborted = timeout_aborted or bool(verifier.get("timeout_aborted"))
     finally:
         try:
             await _post(session, f"{env_url}/close", {"session_id": session_id}, 30)
@@ -435,6 +439,7 @@ async def _execute_rollout(
         pass_fraction=pass_fraction,
         overflow=summary.overflow,
         disk_aborted=disk_aborted,
+        timeout_aborted=timeout_aborted,
         n_turns=n_actions,
         n_llm_calls=len(llm_calls),
         n_total_llm_calls=n_total_llm_calls,

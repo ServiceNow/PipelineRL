@@ -32,6 +32,7 @@ import os
 import pty
 import queue
 import re
+import signal
 import shlex
 import shutil
 import socket
@@ -148,6 +149,65 @@ def _proc_group_rss_bytes(pgid: int) -> int:
         return -1
 
 
+def _proc_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _proc_group_snapshot(pgid: int) -> str:
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=,ppid=,pgid=,rss=,comm=,args=", "-g", str(pgid), "--sort=-rss"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        text = out.stdout.strip()
+        return text if text else "(no processes)"
+    except Exception as e:
+        return f"(snapshot failed: {e})"
+
+
+def _terminate_process_group(proc: subprocess.Popen, grace_seconds: float = 2.0) -> None:
+    """Best-effort bounded termination of the proot session process group."""
+    pgid = proc.pid
+
+    def _send(sig: signal.Signals) -> None:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.warning("failed to send %s to process group %s: %s", sig.name, pgid, e)
+
+    _send(signal.SIGTERM)
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        proc.poll()
+        if not _proc_group_exists(pgid):
+            break
+        time.sleep(0.05)
+
+    if _proc_group_exists(pgid):
+        _send(signal.SIGKILL)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            proc.poll()
+            if not _proc_group_exists(pgid):
+                break
+            time.sleep(0.05)
+
+    try:
+        proc.wait(timeout=0.1)
+    except Exception:
+        pass
+
+
 class ProotTerminalEnvironment:
     """Persistent proot bash session for a single terminal task."""
 
@@ -216,6 +276,8 @@ class ProotTerminalEnvironment:
         self.reader_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._disk_exceeded = threading.Event()
+        self._abort_reason: Optional[str] = None
+        self._abort_lock = threading.Lock()
         self._disk_monitor_thread: Optional[threading.Thread] = None
         self._marker = f"__CMD_DONE__{uuid.uuid4().hex}__"
 
@@ -369,8 +431,35 @@ class ProotTerminalEnvironment:
 
     @property
     def disk_exceeded(self) -> bool:
-        """True if this session was aborted for exceeding its scratch cap."""
+        """True if this session was aborted for exceeding a local resource cap."""
         return self._disk_exceeded.is_set()
+
+    @property
+    def abort_reason(self) -> Optional[str]:
+        return self._abort_reason
+
+    @property
+    def timeout_aborted(self) -> bool:
+        return self._abort_reason == "timeout"
+
+    def _abort_session(self, kind: str, reason: str) -> None:
+        with self._abort_lock:
+            if self._abort_reason is None:
+                self._abort_reason = kind
+            self._disk_exceeded.set()
+            self._stop_event.set()
+
+            proc = self.shell_process
+            if proc is not None:
+                logger.warning(
+                    "session %s %s_abort: %s; process group before abort:\n%s",
+                    self._sid, kind, reason, _proc_group_snapshot(proc.pid),
+                )
+                _terminate_process_group(proc)
+
+            # Reclaim the node-local bytes now, not at /close.
+            _force_rmtree(self.session_home)
+            _force_rmtree(self.session_tmp)
 
     def _disk_monitor_loop(self) -> None:
         """Abort the session if its node-local scratch OR its process-group RSS
@@ -386,24 +475,21 @@ class ProotTerminalEnvironment:
             proc = self.shell_process
             if not proc or proc.poll() is not None:
                 return
+            kind = None
             reason = None
             if disk_cap > 0:
                 size = _dir_size_bytes(self.work_dir)
                 if size > disk_cap:
+                    kind = "disk"
                     reason = "scratch %.0f MiB > disk cap %.0f MiB" % (size / 2**20, disk_cap / 2**20)
             if reason is None and rss_cap > 0:
                 rss = _proc_group_rss_bytes(proc.pid)
                 if rss > rss_cap:
+                    kind = "rss"
                     reason = "RSS %.0f MiB > cap %.0f MiB" % (rss / 2**20, rss_cap / 2**20)
             if reason is None:
                 continue
-            logger.warning("session %s aborting: %s", self._sid, reason)
-            self._disk_exceeded.set()
-            if proc.poll() is None:
-                proc.kill()
-            # Reclaim the node-local bytes now, not at /close.
-            _force_rmtree(self.session_home)
-            _force_rmtree(self.session_tmp)
+            self._abort_session(kind or "resource", reason)
             return
 
     def start(self, source_startup_hooks: bool = True) -> bool:
@@ -460,7 +546,8 @@ class ProotTerminalEnvironment:
     def exec(self, command: str, timeout: Optional[float] = None) -> Tuple[bool, str]:
         """Run a command in the persistent shell, returning (success, output)."""
         if self._disk_exceeded.is_set():
-            return False, "session aborted: local scratch disk limit exceeded"
+            reason = self._abort_reason or "local resource limit exceeded"
+            return False, f"session aborted: {reason}"
         if not self.shell_process or self.shell_process.poll() is not None:
             return False, "shell is not running"
         if not self.reader_thread or not self.reader_thread.is_alive():
@@ -482,7 +569,9 @@ class ProotTerminalEnvironment:
 
         raw, code = self._read_until_marker(timeout)
         if code is None:
-            return False, f"command timed out. Partial output:\n{raw[:1000]}"
+            timeout_s = timeout if timeout is not None else self.read_timeout
+            self._abort_session("timeout", "command timed out after %.0fs" % timeout_s)
+            return False, f"command timed out after {timeout_s:.0f}s; session aborted. Partial output:\n{raw[:1000]}"
         cleaned = ANSI_RE.sub("", raw).replace("\r", "")
         return code == 0, cleaned
 
@@ -491,7 +580,8 @@ class ProotTerminalEnvironment:
     # ------------------------------------------------------------------
     def _run_pytest(self, test_text: str, name: str) -> Tuple[bool, str]:
         if self._disk_exceeded.is_set():
-            return False, "session aborted: local scratch disk limit exceeded"
+            reason = self._abort_reason or "local resource limit exceeded"
+            return False, f"session aborted: {reason}"
         # /home/user is bound to the writable session home, so write the test
         # file straight into it instead of touching the read-only base.
         (self.session_home / name).write_text(test_text, encoding="utf-8")
@@ -540,12 +630,14 @@ class ProotTerminalEnvironment:
         if self._disk_monitor_thread:
             self._disk_monitor_thread.join(timeout=1.0)
             self._disk_monitor_thread = None
-        if self.shell_process and self.shell_process.poll() is None:
-            try:
-                os.write(self.master_fd, b"exit\n")
-                self.shell_process.wait(timeout=2)
-            except Exception:
-                self.shell_process.kill()
+        if self.shell_process:
+            if self.shell_process.poll() is None:
+                try:
+                    os.write(self.master_fd, b"exit\n")
+                    self.shell_process.wait(timeout=2)
+                except Exception:
+                    pass
+            _terminate_process_group(self.shell_process)
         self.shell_process = None
         for fd in (self.master_fd, self.slave_fd):
             if fd is not None:

@@ -109,6 +109,8 @@ class TerminalSession:
             "success": success,
             "exit_code": 0 if success else 1,
             "disk_exceeded": env.disk_exceeded,
+            "abort_reason": env.abort_reason,
+            "timeout_aborted": env.timeout_aborted,
         }
 
     def finish(self) -> dict:
@@ -120,6 +122,8 @@ class TerminalSession:
             "passed": passed,
             "output": truncate(output, self.max_observation_chars),
             "disk_exceeded": env.disk_exceeded,
+            "abort_reason": env.abort_reason,
+            "timeout_aborted": env.timeout_aborted,
             "passed_tests": passed_tests,
             "total_tests": total_tests,
         }
