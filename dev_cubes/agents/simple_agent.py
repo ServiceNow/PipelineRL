@@ -62,9 +62,6 @@ class SimpleAgent(Agent):
         self.llm.attach_recorder(recorder)
 
     def capacity_guard(self, prompt_tokens):
-        if not self.config.capacity_guard_enabled:
-            return
-
         remaining = self.max_model_len - prompt_tokens - self.config.safety_buffer 
         if remaining < self.config.min_useful_tokens:
             logger.warning(
@@ -78,6 +75,7 @@ class SimpleAgent(Agent):
                 self.max_completion_tokens, remaining, prompt_tokens, self.max_model_len,
             )
             self.llm.config.max_completion_tokens = remaining
+            return None
 
     def step(self, obs: Observation) -> AgentOutput:
         if self.max_actions_reached():
@@ -92,7 +90,10 @@ class SimpleAgent(Agent):
         prompt = Prompt(messages=messages, tools=self.tools)
         prompt_tokens = self.token_counter(messages=messages, tools=self.tools)
         
-        self.capacity_guard(prompt_tokens)
+        if self.config.capacity_guard_enabled:
+            result = self.capacity_guard(prompt_tokens)
+            if result is not None:
+                return result
 
         logger.info(f"Prompt tokens (estimated): {prompt_tokens}")
         try:
