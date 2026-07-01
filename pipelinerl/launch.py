@@ -566,7 +566,9 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                 #     same as before — stop the services.
                 training_done = trainer_state is not None and trainer_state.training_done
                 only_services_left = all(is_service_process(proc) for proc in alive)
-                shutdown_now = training_done or (trainer_state is None and only_services_left)
+                # Wait for non-service procs (actor) to exit on their own even after
+                # training_done — the actor may still be draining an in-flight final eval.
+                shutdown_now = only_services_left and (training_done or trainer_state is None)
 
                 if not shutdown_now and only_services_left and trainer_state is not None:
                     # Non-service procs all exited cleanly but training_done

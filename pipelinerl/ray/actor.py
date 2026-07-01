@@ -890,10 +890,11 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             eval_loop: RayActorLoop | None = None
             eval_every_n_versions = int(getattr(cfg, "eval_every_n_versions", 0) or 0)
             resource_policy = str(getattr(eval_cfg, "resource_policy", "elastic_train") if eval_cfg else "elastic_train")
+            draining_final_eval = False
             while True:
                 next_regular_eval = int(trainer_state.propagated_weight_version or 0) if last_regular_eval == -1 else last_regular_eval + eval_every_n_versions
                 should_eval = eval_every_n_versions > 0 and not cfg.debug.mode and eval_dataset is not None and len(eval_dataset) > 0
-                if should_eval and eval_loop is None and int(trainer_state.propagated_weight_version or 0) >= next_regular_eval:
+                if should_eval and eval_loop is None and not draining_final_eval and int(trainer_state.propagated_weight_version or 0) >= next_regular_eval:
                     current_eval = next_regular_eval
                     if eval_workers > 0 and resource_policy == "elastic_train":
                         reduced_train_workers = max(1, train_workers - eval_workers)
@@ -935,14 +936,23 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                                 eval_manager.close()
                                 eval_manager = None
                             train_manager.set_target_workers(train_workers)
-                    train_status = train_loop.step()
+                    if not draining_final_eval:
+                        train_status = train_loop.step()
                 except Exception as exc:
                     if is_expected_ray_shutdown(exc):
                         logger.info("Stopping Ray actor loop because a Ray worker node is shutting down")
                         break
                     raise
                 if train_status in ("trainer_finished", "completed"):
-                    break
+                    if eval_loop is None:
+                        break
+                    if not draining_final_eval:
+                        logger.info(
+                            "Training finished (%s); draining in-flight eval v%s before exit",
+                            train_status,
+                            current_eval,
+                        )
+                        draining_final_eval = True
     finally:
         if run is not None:
             try:
