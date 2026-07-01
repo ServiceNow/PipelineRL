@@ -6,7 +6,7 @@ state-and-history bundle `Phi` reads.
 
 Typical use:
 
-    shaper = EpisodeShaper(initial_html, weights=RewardWeights(), gamma=1.0)
+    shaper = EpisodeShaper(initial_html, config=RewardConfig())
     # ... per step:
     info = shaper.step(
         next_html=curr_html,
@@ -30,7 +30,7 @@ from miniwob_cube.shaping.dom import (
 )
 from miniwob_cube.shaping.potential import (
     LocalRewardInfo,
-    RewardWeights,
+    RewardConfig,
     phi,
 )
 from miniwob_cube.shaping.signals import (
@@ -70,11 +70,10 @@ class EpisodeShaper:
     def __init__(
         self,
         initial_html: str | None,
-        weights: RewardWeights | None = None,
-        gamma: float = 1.0,
+        config: RewardConfig | None = None,
     ) -> None:
-        self.weights = weights or RewardWeights()
-        self.gamma = gamma
+        self.config = config or RewardConfig()
+        self.gamma = self.config.gamma
         self.prev_state: State = build_state(initial_html, terminal_success=False)
         self.counters: HistoryCounters = HistoryCounters(
             interactive_universe=count_interactive(self.prev_state.elements),
@@ -104,8 +103,8 @@ class EpisodeShaper:
             self.counters.stuck_count += 1
         update_touched(self.prev_state, next_state, self.counters.touched_bids)
 
-        prev_phi = phi(self.prev_state, prev_counters, self.weights)
-        next_phi = phi(next_state, self.counters, self.weights)
+        prev_phi = phi(self.prev_state, prev_counters, self.config)
+        next_phi = phi(next_state, self.counters, self.config)
         reward = self.gamma * next_phi - prev_phi
 
         info = LocalRewardInfo(

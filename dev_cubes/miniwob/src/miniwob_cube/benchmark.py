@@ -13,7 +13,7 @@ from cube.benchmark import Benchmark, BenchmarkConfig, BenchmarkMetadata
 from cube.resource import InfraConfig
 from cube.task import TaskConfig
 
-from miniwob_cube.task import MiniWobTaskConfig, MiniWobTaskMetadata, RewardWeights
+from miniwob_cube.task import MiniWobTaskConfig, MiniWobTaskMetadata, RewardConfig
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,11 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
     # Opt-in auxiliary step shaping reward computed from visible text-only obs.
     # Does not replace the terminal reward; surfaces info["step_reward"].
     enable_step_verifier_rewards: bool = False
+    # When True, the same shaper signals are also formatted into qualitative
+    # feedback text and appended to the observation handed back to the LLM.
+    # Trains and serves identically — must be the same value at train and
+    # eval time to avoid prompt-distribution mismatch.
+    inject_step_feedback: bool = False
     # Potential-based reward shaping weights (see `miniwob_cube.shaping`).
     # Setting `enable_step_verifier_rewards=False` disables shaping entirely.
     shaping_weight_terminal: float = 0.7
@@ -175,8 +180,9 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
 
     def get_task_configs(self) -> Generator[MiniWobTaskConfig, None, None]:
 
-        step_reward_weights = RewardWeights(
+        step_reward_config = RewardConfig(
             enable_step_verifier_rewards=self.enable_step_verifier_rewards,
+            inject_step_feedback=self.inject_step_feedback,
             terminal=self.shaping_weight_terminal,
             form_completion=self.shaping_weight_form_completion,
             affordance_breadth=self.shaping_weight_affordance_breadth,
@@ -193,5 +199,5 @@ class MiniWobBenchmarkConfig(BenchmarkConfig[MiniWobTaskMetadata]):
                 base_url=self.base_url,
                 remove_human_display=self.remove_human_display,
                 episode_max_time=self.episode_max_time,
-                step_reward_weights=step_reward_weights
+                step_reward_config=step_reward_config
             )

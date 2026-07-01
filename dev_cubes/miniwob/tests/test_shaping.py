@@ -23,6 +23,7 @@ from miniwob_cube.shaping import (
     detect_bad_target,
     detect_stuck,
     form_completion_fraction,
+    format_step_feedback,
 )
 
 
@@ -305,6 +306,49 @@ def test_disabled_shaper_via_phi_components_zeroed():
         terminal_success=False,
     )
     assert info.reward == 0.0
+
+
+def test_format_step_feedback_describes_failure():
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="clear", bid="35"),
+        tool_result=ToolResult(failed=True),
+        terminal_success=False,
+    )
+    text = format_step_feedback(info)
+    assert text is not None
+    assert "[Step feedback]" in text
+    assert "failed" in text.lower()
+    # No numeric reward debits should leak into the text.
+    assert "-0.1" not in text
+    assert "weight" not in text.lower()
+
+
+def test_format_step_feedback_describes_progress():
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=_html_with_checked({"35"}),
+        action=ActionView(name="click", bid="35"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=False,
+    )
+    text = format_step_feedback(info)
+    assert text is not None
+    assert "Interactive elements touched" in text or "interactive elements" in text.lower()
+
+
+def test_format_step_feedback_none_when_nothing_changed():
+    shaper = EpisodeShaper(initial_html=INITIAL_HTML, weights=_default_weights())
+    info = shaper.step(
+        next_html=INITIAL_HTML,
+        action=ActionView(name="focus", bid="35"),
+        tool_result=ToolResult(failed=False),
+        terminal_success=False,
+    )
+    # focus on a non-changing element triggers no debit and no progress —
+    # feedback should be None (nothing to say).
+    assert format_step_feedback(info) is None
 
 
 def test_counters_monotone_across_multiple_steps():
