@@ -35,7 +35,8 @@ from miniwob_cube.shaping.dom import (
 )
 from miniwob_cube.shaping.potential import (
     LocalRewardInfo,
-    RewardWeights,
+    RewardConfig,
+    format_step_feedback,
     phi,
 )
 from miniwob_cube.shaping.shaper import EpisodeShaper, HistoryCounters
@@ -54,7 +55,7 @@ __all__ = [
     "EpisodeShaper",
     "HistoryCounters",
     "LocalRewardInfo",
-    "RewardWeights",
+    "RewardConfig",
     "State",
     "ToolResult",
     "affordance_engagement_breadth",
@@ -63,6 +64,7 @@ __all__ = [
     "detect_bad_target",
     "detect_stuck",
     "form_completion_fraction",
+    "format_step_feedback",
     "parse_dom",
     "phi",
     "update_touched",

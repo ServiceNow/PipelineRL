@@ -81,6 +81,7 @@ preprocess:
 train_dataset_names:
   - miniwob_html
 test_dataset_names:
+  - miniwob_html
   # - miniwob_test
 
 # Shared shaping config — instruction-blind generic progress signals.
@@ -95,6 +96,12 @@ test_dataset_names:
 # `finetune.rl.advantage.step_reward_lambda` (not this γ).
 miniwob_shaping: &miniwob_shaping
   enable_step_verifier_rewards: true
+  # When true, appends a qualitative "[Step feedback]" block to the next
+  # observation describing what the last action did (e.g. "your last tool
+  # call failed", "form completion: 0% -> 50%"). Numeric weights are NOT
+  # surfaced — only events — to avoid reward hacking. Train and eval must
+  # use the same value, or the prompt distribution diverges.
+  inject_step_feedback: false
   shaping_weight_terminal: 0.7            # 1[env reported success]
   shaping_weight_form_completion: 0.15    # fraction of text inputs filled
   shaping_weight_affordance_breadth: 0.15 # fraction of interactive elements touched
@@ -109,6 +116,7 @@ dataset_loader_params:
       _type: miniwob_cube.benchmark.MiniWobBenchmarkConfig
       port: 8010
       enable_step_verifier_rewards: ${miniwob_shaping.enable_step_verifier_rewards}
+      inject_step_feedback: ${miniwob_shaping.inject_step_feedback}
       shaping_weight_terminal: ${miniwob_shaping.shaping_weight_terminal}
       shaping_weight_form_completion: ${miniwob_shaping.shaping_weight_form_completion}
       shaping_weight_affordance_breadth: ${miniwob_shaping.shaping_weight_affordance_breadth}
