@@ -86,6 +86,10 @@ class RLConfig(BaseModel):
         default=True,
         description="Normalize the advantage by the standard deviation",
     )
+    rollout_level_loo: bool = Field(
+        default=False,
+        description="Use rollout-level leave-one-out baseline instead of per-step-index baseline",
+    )
     overlong_filtering: bool = Field(default=False, description="Filter out sequence that do not have eos_token_id")
     group_normalization: bool = Field(
         default=False,
@@ -102,6 +106,10 @@ class RLConfig(BaseModel):
     value_loss_coef: float = Field(
         default=0.0,
         description="Coefficient for the value loss in the final loss",
+    )
+    multi_turn_credit: bool = Field(
+        default=False,
+        description="Use turn-end value predictions to decompose rollout-level advantages",
     )
 
 
@@ -131,6 +139,67 @@ def linear_decay_coef(current_step: int, max_step: int, initial_coef: float, fin
 
     """
     return initial_coef + (final_coef - initial_coef) * current_step / max_step
+
+
+def _segment_bound(value: Any) -> int:
+    return int(value.item()) if isinstance(value, torch.Tensor) else int(value)
+
+
+def turn_end_indices(segments: list[tuple[Any, Any]], masks_shifted: torch.Tensor) -> torch.LongTensor:
+    if masks_shifted.dim() != 2 or masks_shifted.shape[0] != 1:
+        raise ValueError(f"Expected masks_shifted shaped [1, L], got {tuple(masks_shifted.shape)}")
+
+    indices: list[int] = []
+    max_length = masks_shifted.shape[1]
+    for start, end in segments:
+        start_i = _segment_bound(start)
+        end_i = min(_segment_bound(end), max_length)
+        if start_i >= end_i:
+            continue
+        segment_mask = masks_shifted[0, start_i:end_i].bool()
+        valid_offsets = torch.nonzero(segment_mask, as_tuple=False).flatten()
+        if valid_offsets.numel() == 0:
+            continue
+        indices.append(start_i + int(valid_offsets[-1].item()))
+    return torch.tensor(indices, dtype=torch.long, device=masks_shifted.device)
+
+
+def multi_turn_credit_advantages(
+    segments: list[tuple[Any, Any]],
+    masks_shifted: torch.Tensor,
+    value_predictions: torch.Tensor,
+    centered_targets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if value_predictions.shape != centered_targets.shape or value_predictions.shape != masks_shifted.shape:
+        raise ValueError(
+            "value_predictions, centered_targets, and masks_shifted must have matching shapes; "
+            f"got {tuple(value_predictions.shape)}, {tuple(centered_targets.shape)}, {tuple(masks_shifted.shape)}"
+        )
+
+    turn_indices = turn_end_indices(segments, masks_shifted)
+    expanded_advantages = torch.zeros_like(centered_targets)
+    turn_values = value_predictions[0, turn_indices]
+    turn_targets = centered_targets[0, turn_indices]
+    turn_advantages = turn_targets - turn_values.detach()
+
+    turn_idx = 0
+    max_length = masks_shifted.shape[1]
+    for start, end in segments:
+        start_i = _segment_bound(start)
+        end_i = min(_segment_bound(end), max_length)
+        if start_i >= end_i:
+            continue
+        segment_mask = masks_shifted[0, start_i:end_i].bool()
+        if not segment_mask.any():
+            continue
+        expanded_advantages[0, start_i:end_i] = torch.where(
+            segment_mask,
+            turn_advantages[turn_idx],
+            expanded_advantages[0, start_i:end_i],
+        )
+        turn_idx += 1
+
+    return expanded_advantages, turn_indices, turn_values, turn_targets, turn_advantages
 
 
 def rl_step(
@@ -186,6 +255,14 @@ def rl_step(
     else:
         num_sequences = masks.shape[0]
         segments = None
+
+    if config.multi_turn_credit:
+        if not has_value_head:
+            raise ValueError("multi_turn_credit requires a value head")
+        if config.policy_loss != "gspo":
+            raise ValueError("multi_turn_credit requires policy_loss='gspo'")
+        if segments is None:
+            raise ValueError("multi_turn_credit requires packed sequences with segments")
 
     model_inputs = {
         "input_ids": batch.input_ids,
@@ -262,15 +339,28 @@ def rl_step(
     log_ratio_ref_new = ref_logprobs - new_logprobs
     assert torch.isfinite(log_ratio_ref_new).all(), f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
 
+    turn_end_idx = None
+    turn_values = None
+    turn_value_targets = None
+    turn_advantages = None
     if has_value_head:
-        # Get value predictions if available
-        value_predictions = outputs.value[:, :-1] # no target for the last token 
-        # Compute value-based advantages: A(s,a) = MC_return - V(s)
-        # where MC_return is the Monte Carlo return (rewards) and V(s) is the value prediction
-        #FIXME: if this works better it should be a config
-        #advantages = rewards - torch.clamp(value_predictions, 0, 1)
-        advantages = rewards - value_predictions
+        value_predictions = outputs.value[:, :-1]  # no target for the last token
+        if config.policy_loss == "gspo":
+            assert segments is not None
+            centered_targets = batch.advantages[:, 1:]
+            (
+                residual_advantages,
+                turn_end_idx,
+                turn_values,
+                turn_value_targets,
+                turn_advantages,
+            ) = multi_turn_credit_advantages(segments, masks_shifted, value_predictions, centered_targets)
+            advantages = residual_advantages if config.multi_turn_credit else centered_targets
+        else:
+            # Legacy value-head mode: replace precomputed advantages with raw reward residuals.
+            advantages = rewards - value_predictions
     else:
+        value_predictions = None
         advantages = batch.advantages[:, 1:]
 
     log_p_weights = advantages.detach() if config.use_advantages else rewards
@@ -365,18 +455,25 @@ def rl_step(
         policy_loss_total = -sum_sum(loss, masks_shifted, segments)
 
     if has_value_head:
-        # Get the value predictions
-        values = outputs.value
-        # Use the already extracted and shifted rewards as value labels
-        value_labels = rewards  # This is already shifted (from line 216)
-        values = values[:, :-1]
-        values_labels = value_labels
+        assert value_predictions is not None
+        values = value_predictions
         assert values.shape == tokens_weights.shape, (
             f"Values shape {values.shape} does not match example weights shape {tokens_weights.shape}"
         )
-        value_loss = 0.5 * torch.square(values - values_labels) * tokens_weights
-        value_loss = sum_sum(value_loss, masks_shifted, segments) 
-        
+        if config.policy_loss == "gspo":
+            assert turn_end_idx is not None
+            assert turn_values is not None
+            assert turn_value_targets is not None
+            if turn_end_idx.numel() == 0:
+                value_loss = (values * 0).sum()
+            else:
+                turn_weights = tokens_weights[0, turn_end_idx]
+                value_loss = 0.5 * torch.square(turn_values - turn_value_targets) * turn_weights
+                value_loss = value_loss.sum()
+        else:
+            value_loss = 0.5 * torch.square(values - rewards) * tokens_weights
+            value_loss = sum_sum(value_loss, masks_shifted, segments)
+
         # Combine policy loss and value loss
         final_loss = policy_loss_total + config.value_loss_coef * value_loss
     else:
@@ -439,13 +536,32 @@ def rl_step(
     }
 
     if has_value_head:
+        assert value_predictions is not None
         stats["value_mean"] = sum_sum(value_predictions / num_labels_in_seq, masks_shifted, segments).item()
         stats["value_max"] = value_predictions[masks_shifted].max().item() if masks_shifted.any() else 0.0
         stats["value_min"] = value_predictions[masks_shifted].min().item() if masks_shifted.any() else 0.0
         stats["value_loss"] = value_loss.item()
-        stats["value_mse"] = sum_sum(
-            torch.square(value_predictions - value_labels) / num_labels_in_seq, masks_shifted, segments
-        ).item()
+        if config.policy_loss == "gspo":
+            assert turn_values is not None
+            assert turn_value_targets is not None
+            assert turn_advantages is not None
+            if turn_values.numel() == 0:
+                stats["value_mse"] = 0.0
+                if config.multi_turn_credit:
+                    stats["multi_turn_advantage_mean"] = 0.0
+                    stats["multi_turn_advantage_min"] = 0.0
+                    stats["multi_turn_advantage_max"] = 0.0
+            else:
+                residuals = torch.square(turn_values - turn_value_targets)
+                stats["value_mse"] = residuals.mean().item()
+                if config.multi_turn_credit:
+                    stats["multi_turn_advantage_mean"] = turn_advantages.mean().item()
+                    stats["multi_turn_advantage_min"] = turn_advantages.min().item()
+                    stats["multi_turn_advantage_max"] = turn_advantages.max().item()
+        else:
+            stats["value_mse"] = sum_sum(
+                torch.square(value_predictions - rewards) / num_labels_in_seq, masks_shifted, segments
+            ).item()
 
     return final_loss, stats
 
@@ -474,55 +590,118 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         )
         .reset_index()
     )
-    df_grouped = (
-        df_stats.groupby(["group_id", "step_index"])
-        .agg(
-            step_reward_sum=("step_reward", "sum"),
-            step_reward_count=("step_reward", "count"),
-            step_reward_std=("step_reward", "std"),
-        )
-        .reset_index()
-    )
     assert df_group_tokens.columns.tolist() == [
         "group_id",
         "group_tokens",
     ]
-    assert df_grouped.columns.tolist() == [
-        "group_id",
-        "step_index",
-        "step_reward_sum",
-        "step_reward_count",
-        "step_reward_std",
-    ]
 
     # Step 2: calculate advantages for each sample
-    df_advantages = pd.merge(
-        df_stats[["group_id", "rollout_index", "step_index", "rewards", "step_reward"]],
-        df_grouped,
-        on=["group_id", "step_index"],
-        how="left"
-    )
-    df_advantages = pd.merge(df_advantages, df_group_tokens, on="group_id", how="left")
-    assert len(df_advantages) == len(df_init)
+    if config.rollout_level_loo:
+        df_rollout_rewards = (
+            df_stats.groupby(["group_id", "rollout_index"])
+            .agg(
+                rollout_reward=("step_reward", "mean"),
+            )
+            .reset_index()
+        )
+        df_rollout_grouped = (
+            df_rollout_rewards.groupby("group_id")
+            .agg(
+                rollout_reward_sum=("rollout_reward", "sum"),
+                rollout_reward_count=("rollout_reward", "count"),
+                rollout_reward_std=("rollout_reward", "std"),
+            )
+            .reset_index()
+        )
+        assert df_rollout_rewards.columns.tolist() == [
+            "group_id",
+            "rollout_index",
+            "rollout_reward",
+        ]
+        assert df_rollout_grouped.columns.tolist() == [
+            "group_id",
+            "rollout_reward_sum",
+            "rollout_reward_count",
+            "rollout_reward_std",
+        ]
+        df_advantages = pd.merge(
+            df_stats[["group_id", "rollout_index", "step_index", "rewards", "step_reward"]],
+            df_rollout_rewards,
+            on=["group_id", "rollout_index"],
+            how="left",
+        )
+        df_advantages = pd.merge(df_advantages, df_rollout_grouped, on="group_id", how="left")
+        df_advantages = pd.merge(df_advantages, df_group_tokens, on="group_id", how="left")
+        assert len(df_advantages) == len(df_init)
 
-    def calculate_advantages(row):
-        rewards = row["rewards"]
-        group_sum = row["step_reward_sum"]
-        group_count = row["step_reward_count"]
-        current_reward = row["step_reward"]
-        if group_count > 1:
+        def calculate_advantages(row):
+            rewards = row["rewards"]
+            group_sum = row["rollout_reward_sum"]
+            group_count = row["rollout_reward_count"]
+            current_reward = row["rollout_reward"]
+            if group_count <= 1:
+                return [0.0 for _ in rewards]
             loo_mean = (group_sum - current_reward) / (group_count - 1)
-        else:
-            loo_mean = current_reward
-        std = row["step_reward_std"]
-        if config.divide_advantage_by_std:
-            return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
-        return [(r - loo_mean) for r in rewards]
+            std = row["rollout_reward_std"]
+            if config.divide_advantage_by_std:
+                return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
+            return [(r - loo_mean) for r in rewards]
 
-    df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
-    df_advantages = df_advantages.drop(
-        columns=["rewards", "step_reward", "step_reward_sum", "step_reward_count", "step_reward_std"]
-    )
+        df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
+        df_advantages = df_advantages.drop(
+            columns=[
+                "rewards",
+                "step_reward",
+                "rollout_reward",
+                "rollout_reward_sum",
+                "rollout_reward_count",
+                "rollout_reward_std",
+            ]
+        )
+    else:
+        df_grouped = (
+            df_stats.groupby(["group_id", "step_index"])
+            .agg(
+                step_reward_sum=("step_reward", "sum"),
+                step_reward_count=("step_reward", "count"),
+                step_reward_std=("step_reward", "std"),
+            )
+            .reset_index()
+        )
+        assert df_grouped.columns.tolist() == [
+            "group_id",
+            "step_index",
+            "step_reward_sum",
+            "step_reward_count",
+            "step_reward_std",
+        ]
+        df_advantages = pd.merge(
+            df_stats[["group_id", "rollout_index", "step_index", "rewards", "step_reward"]],
+            df_grouped,
+            on=["group_id", "step_index"],
+            how="left"
+        )
+        df_advantages = pd.merge(df_advantages, df_group_tokens, on="group_id", how="left")
+        assert len(df_advantages) == len(df_init)
+
+        def calculate_advantages(row):
+            rewards = row["rewards"]
+            group_sum = row["step_reward_sum"]
+            group_count = row["step_reward_count"]
+            current_reward = row["step_reward"]
+            if group_count > 1:
+                loo_mean = (group_sum - current_reward) / (group_count - 1)
+            else:
+                loo_mean = current_reward
+            std = row["step_reward_std"]
+            if config.divide_advantage_by_std:
+                return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
+            return [(r - loo_mean) for r in rewards]
+
+        df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
+        df_advantages = df_advantages.drop(
+            columns=["rewards", "step_reward", "step_reward_sum", "step_reward_count", "step_reward_std"]
+        )
     assert df_advantages.columns.tolist() == [
         "group_id",
         "rollout_index",

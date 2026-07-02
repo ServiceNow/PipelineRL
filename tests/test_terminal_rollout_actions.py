@@ -6,10 +6,12 @@ from pipelinerl.domains.terminal.environment_server import TerminalEnvironmentSe
 from pipelinerl.domains.terminal.rollouts import (
     _SUBMIT_COMMAND,
     _assistant_tool_message,
+    _execute_rollout,
     _extract_bash_action,
     _is_submit_command,
 )
 from pipelinerl.llm import LLMCall, LLMOutput, Prompt
+from pipelinerl.rollouts import TrainingText
 
 
 def _tool_call(name="bash", arguments=None, call_id="call_0"):
@@ -65,6 +67,177 @@ def test_assistant_tool_message_uses_string_arguments_for_vllm_wire():
     assert tool_call["id"] == "call_7"
     assert tool_call["function"]["name"] == "bash"
     assert tool_call["function"]["arguments"] == '{"command": "ls"}'
+
+
+def _terminal_cfg(**overrides):
+    values = {
+        "max_turns": 1,
+        "env_call_timeout": 1,
+        "env_start_timeout": 1,
+        "max_format_retries": 3,
+        "reward_pass": 1.0,
+        "reward_fail": -1.0,
+        "graded_reward": False,
+        "format_error_reward": None,
+        "no_submit_penalty": 0.0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(terminal=SimpleNamespace(**values))
+
+
+def _patch_rollout_fakes(monkeypatch, llm_calls, *, verifier_pass=True, step_response=None):
+    pending_calls = list(llm_calls)
+
+    async def fake_generate(llm, prompt, session):
+        assert pending_calls
+        return pending_calls.pop(0)
+
+    async def fake_post(session, url, payload, timeout):
+        if url.endswith("/start_task"):
+            return {"session_id": "session-1", "started": True, "init_ok": True, "build_ok": True}
+        if url.endswith("/step"):
+            return step_response or {"output": "ok", "disk_exceeded": False, "timeout_aborted": False}
+        if url.endswith("/finish"):
+            return {
+                "passed": verifier_pass,
+                "passed_tests": int(verifier_pass),
+                "total_tests": 1,
+                "disk_exceeded": False,
+                "timeout_aborted": False,
+            }
+        if url.endswith("/close"):
+            return {"status": "ok"}
+        raise AssertionError(url)
+
+    def fake_make_training_text(llm, llm_call):
+        return TrainingText(text=llm_call.output.content or "tool", n_predicted=1)
+
+    def fake_make_training_texts(llm, llm_calls, reward=None):
+        return [
+            TrainingText(text=llm_call.output.content or "tool", n_predicted=1, reward=reward)
+            for llm_call in llm_calls
+        ]
+
+    monkeypatch.setattr("pipelinerl.domains.terminal.rollouts.llm_async_generate", fake_generate)
+    monkeypatch.setattr("pipelinerl.domains.terminal.rollouts._post", fake_post)
+    monkeypatch.setattr("pipelinerl.domains.terminal.rollouts.make_training_text", fake_make_training_text)
+    monkeypatch.setattr(
+        "pipelinerl.domains.terminal.rollouts.make_training_texts_from_llm_calls",
+        fake_make_training_texts,
+    )
+
+
+def test_format_error_reward_retains_error_turn_in_chronological_order(monkeypatch):
+    llm_calls = [
+        _llm_call(content="bad format"),
+        _llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})]),
+    ]
+    _patch_rollout_fakes(monkeypatch, llm_calls)
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(format_error_reward=-0.2),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert [text.text for text in result.training_texts] == ["bad format", "submit"]
+    assert [text.reward for text in result.training_texts] == [-0.2, 1.0]
+    assert result.metrics.n_format_errors == 1
+    assert result.metrics.submitted
+
+
+def test_format_error_reward_respects_max_retry_failure(monkeypatch):
+    llm_calls = [
+        _llm_call(content="bad format 1"),
+        _llm_call(content="bad format 2"),
+    ]
+    _patch_rollout_fakes(monkeypatch, llm_calls)
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(format_error_reward=-0.2, max_format_retries=2),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert [text.text for text in result.training_texts] == ["bad format 1", "bad format 2"]
+    assert [text.reward for text in result.training_texts] == [-1.0, -1.0]
+    assert result.metrics.max_format_retries_exceeded
+
+
+def test_null_format_error_reward_drops_error_turn(monkeypatch):
+    llm_calls = [
+        _llm_call(content="bad format"),
+        _llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})]),
+    ]
+    _patch_rollout_fakes(monkeypatch, llm_calls)
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert [text.text for text in result.training_texts] == ["submit"]
+    assert [text.reward for text in result.training_texts] == [1.0]
+    assert result.metrics.n_format_errors == 1
+    assert result.metrics.submitted
+
+
+def test_no_submit_penalty_applies_only_to_clean_max_turn_exit(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="inspect", tool_calls=[_tool_call(arguments={"command": "ls"})])],
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(no_submit_penalty=0.4),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.metrics.reward == 0.6
+    assert [text.reward for text in result.training_texts] == [0.6]
+    assert not result.metrics.submitted
+
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})])],
+    )
+
+    submitted_result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(no_submit_penalty=0.4),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert submitted_result.metrics.reward == 1.0
+    assert [text.reward for text in submitted_result.training_texts] == [1.0]
+    assert submitted_result.metrics.submitted
 
 
 class DummySession:

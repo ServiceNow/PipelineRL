@@ -42,9 +42,11 @@ class ValueHead(nn.Module):
 
     def __init__(self, hidden_size: int):
         super().__init__()
-        self.output = nn.Linear(hidden_size, 1)
-        torch.manual_seed(42)  # For reproducibility
-        nn.init.normal_(self.output.weight, std=1e-3)
+        with torch.random.fork_rng(devices=[]):
+            self.output = nn.Linear(hidden_size, 1)
+        generator = torch.Generator(device=self.output.weight.device)
+        generator.manual_seed(42)
+        nn.init.normal_(self.output.weight, std=1e-3, generator=generator)
         nn.init.zeros_(self.output.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -61,13 +63,39 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         super().__init__()
         self.pretrained_model = pretrained_model
         self.config = pretrained_model.config
-        hidden_size = self.config.hidden_size
+        hidden_size = getattr(self.config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = self.config.text_config.hidden_size
 
         # Initialize value head
         self.value_head = ValueHead(hidden_size)
+        self._final_hidden_state_module = self._find_final_hidden_state_module(pretrained_model)
 
         # Copy relevant attributes from the pretrained model
         self.main_input_name = pretrained_model.main_input_name
+
+    @staticmethod
+    def _find_final_hidden_state_module(pretrained_model: nn.Module) -> nn.Module:
+        for path in (
+            "model.norm",
+            "model.language_model.norm",
+            "transformer.ln_f",
+            "gpt_neox.final_layer_norm",
+            "model.decoder.final_layer_norm",
+            "decoder.final_layer_norm",
+        ):
+            module = pretrained_model
+            for name in path.split("."):
+                module = getattr(module, name, None)
+                if module is None:
+                    break
+            if isinstance(module, nn.Module):
+                return module
+        raise ValueError(
+            "Could not find a final hidden-state module for the value head. "
+            "Expected one of: model.norm, model.language_model.norm, transformer.ln_f, "
+            "gpt_neox.final_layer_norm, model.decoder.final_layer_norm, decoder.final_layer_norm."
+        )
 
     def forward(
         self,
@@ -86,25 +114,34 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         Forward pass that computes both language modeling outputs and value predictions.
         """
 
-        # Get outputs from the base model
-        outputs = self.pretrained_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        final_hidden_states = None
 
-        # Get the last hidden states
-        hidden_states = outputs.hidden_states[-1]
+        def capture_final_hidden_states(_module, _inputs, output):
+            nonlocal final_hidden_states
+            final_hidden_states = output[0] if isinstance(output, (tuple, list)) else output
 
-        # Compute values
-        values = self.value_head(hidden_states)
+        hook = self._final_hidden_state_module.register_forward_hook(capture_final_hidden_states)
+        try:
+            outputs = self.pretrained_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        finally:
+            hook.remove()
+
+        if final_hidden_states is None:
+            raise RuntimeError("Value-head final-hidden-state hook did not fire")
+
+        # Train the critic as a linear probe; value loss must not perturb the policy trunk.
+        values = self.value_head(final_hidden_states.detach())
 
         return CausalLMOutputWithValue(
             loss=outputs.loss,

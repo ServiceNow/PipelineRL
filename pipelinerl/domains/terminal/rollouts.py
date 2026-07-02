@@ -2,9 +2,11 @@
 
 A multi-turn bash agent (mini-SWE-agent shape: one ``bash`` tool, persistent
 shell, submit marker, output truncation) drives a proot sandbox hosted on a
-remote env-server job, then a pytest verifier scores the final state. Reward is
-outcome-only and broadcast to every valid action turn, matching the TMax recipe;
-PipelineRL's LOO group advantage plus zero-advantage filtering supply the rest.
+remote env-server job, then a pytest verifier scores the final state. By
+default reward is outcome-only and broadcast to every valid action turn, matching
+the TMax recipe; opt-in event rewards can retain malformed turns with
+per-turn rewards. PipelineRL's LOO group advantage plus zero-advantage filtering
+supply the rest.
 
 The sandbox runs on ``kind="environment"`` jobs (placed across the actor nodes by
 ``WorldMap._place_environments``) and is reached over plain HTTP with the
@@ -24,7 +26,11 @@ from typing import List
 import aiohttp
 from omegaconf import DictConfig
 
-from pipelinerl.async_llm import llm_async_generate, make_training_texts_from_llm_calls
+from pipelinerl.async_llm import (
+    llm_async_generate,
+    make_training_text,
+    make_training_texts_from_llm_calls,
+)
 from pipelinerl.llm import LLMCall, Prompt, TrainableLLM
 from pipelinerl.rollouts import BaseMetrics, RolloutResult, summarize_training_texts
 from pipelinerl.utils import get_environment_jobs
@@ -82,6 +88,7 @@ class TerminalMetrics(BaseMetrics):
     overflow: bool = False
     disk_aborted: bool = False
     timeout_aborted: bool = False
+    submitted: bool = False
     n_turns: int = 0
     n_llm_calls: int = 0
     n_total_llm_calls: int = 0
@@ -348,6 +355,7 @@ async def _execute_rollout(
     format_counts = _new_format_counts()
     tool_calls_with_prose = 0
     max_format_retries = int(getattr(tcfg, "max_format_retries", 3))
+    format_error_reward = getattr(tcfg, "format_error_reward", None)
     max_format_retries_exceeded = False
     try:
         messages = [
@@ -356,6 +364,7 @@ async def _execute_rollout(
         ]
         tools = build_terminal_tools()
         llm_calls: List[LLMCall] = []
+        llm_call_events: list[tuple[LLMCall, bool]] = []
         disk_aborted = False
         timeout_aborted = False
         submitted = False
@@ -365,6 +374,8 @@ async def _execute_rollout(
             action = _extract_bash_action(llm_call)
             if action.error is not None:
                 format_counts[action.error] += 1
+                if format_error_reward is not None:
+                    llm_call_events.append((llm_call, True))
                 messages.append({"role": "assistant", "content": llm_call.output.content or ""})
                 messages.append({"role": "user", "content": _format_feedback(action.error)})
                 if sum(format_counts.values()) >= max_format_retries:
@@ -376,6 +387,8 @@ async def _execute_rollout(
                 tool_calls_with_prose += 1
 
             messages.append(_assistant_tool_message(action))
+            if format_error_reward is not None:
+                llm_call_events.append((llm_call, False))
             llm_calls.append(llm_call)
             n_actions += 1
             assert action.command is not None
@@ -424,7 +437,26 @@ async def _execute_rollout(
         )
     else:
         reward = tcfg.reward_pass if verifier_pass else tcfg.reward_fail
-    training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
+
+    no_submit_penalty = float(getattr(tcfg, "no_submit_penalty", 0.0))
+    if (
+        no_submit_penalty > 0
+        and n_actions >= tcfg.max_turns
+        and not submitted
+        and not disk_aborted
+        and not timeout_aborted
+        and not max_format_retries_exceeded
+    ):
+        reward = max(tcfg.reward_fail, reward - no_submit_penalty)
+
+    if format_error_reward is None:
+        training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
+    else:
+        training_texts = []
+        for llm_call, is_format_error in llm_call_events:
+            training_text = make_training_text(llm, llm_call)
+            training_text.reward = reward if max_format_retries_exceeded or not is_format_error else format_error_reward
+            training_texts.append(training_text)
     summary = summarize_training_texts(training_texts)
 
     n_format_errors = sum(format_counts.values())
@@ -440,6 +472,7 @@ async def _execute_rollout(
         overflow=summary.overflow,
         disk_aborted=disk_aborted,
         timeout_aborted=timeout_aborted,
+        submitted=submitted,
         n_turns=n_actions,
         n_llm_calls=len(llm_calls),
         n_total_llm_calls=n_total_llm_calls,

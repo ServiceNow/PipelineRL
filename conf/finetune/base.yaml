@@ -112,3 +112,4 @@ rl:
   temperature: ${...llm.parameters.temperature}
   aggregate_loss: sum
   overlong_filtering: false
+  multi_turn_credit: false
