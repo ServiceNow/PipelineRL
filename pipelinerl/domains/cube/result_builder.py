@@ -11,8 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 from pathlib import Path
+import re
 from typing import Any
 
 from cube_harness.episode import MAX_STEPS
@@ -333,12 +333,23 @@ def _compute_anchor_obs(call: dict[str, Any]) -> str:
     message (HTML, AXTree, tool output). Hash so we don't carry full DOMs
     through the dataframe.
     """
+    OBS_NAME_REGEX = r"^## [^\n]+\n"
+
     messages = ((call.get("prompt") or {}).get("messages")) or []
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content")
             if content is None:
                 return ""
+            
+            match = re.match(OBS_NAME_REGEX, content)
+            if match:
+                content_name = match.group(0).lstrip("#").rstrip("\n").strip()
+                if content_name != 'pruned_html':
+                    continue
+            else:
+                return ""
+
             blob = json.dumps(content, sort_keys=True, default=str, separators=(",", ":"))
             return hashlib.sha1(blob.encode("utf-8")).hexdigest()
     return ""
