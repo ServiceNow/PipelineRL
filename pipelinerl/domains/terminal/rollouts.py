@@ -126,6 +126,10 @@ class EnvironmentCapacityError(RuntimeError):
     pass
 
 
+class EnvironmentConnectionError(RuntimeError):
+    pass
+
+
 async def _post(session: aiohttp.ClientSession, url: str, payload: dict, timeout: float) -> dict:
     async with session.post(url, json=payload, timeout=timeout) as resp:
         if resp.status != 200:
@@ -235,25 +239,10 @@ def _new_format_counts() -> dict[str, int]:
     }
 
 
-# Per-URL rate limit for health-check failure warnings. A dead env-fleet endpoint
-# (e.g. a fleet pod that was platform-killed) is otherwise re-checked by every
-# concurrent rollout every loop iteration, flooding the actor log with thousands of
-# identical "Name or service not known" lines. Warn at most once per URL per window;
-# the health check itself still runs every time, so a recovered fleet is rediscovered.
-_HEALTH_WARN_WINDOW = 60.0
-_last_health_warn: dict[str, float] = {}
-
-
-async def _check_env_health(url: str, session: aiohttp.ClientSession) -> bool:
-    try:
-        async with session.get(f"{url}/health", timeout=5) as resp:
-            return resp.status == 200
-    except Exception as e:
-        now = time.monotonic()
-        if now - _last_health_warn.get(url, 0.0) >= _HEALTH_WARN_WINDOW:
-            logger.warning("env health check failed for %s: %s (further warns rate-limited 60s)", url, e)
-            _last_health_warn[url] = now
-        return False
+# Per-URL rate limit for /start_task connection warnings. A dead env-fleet
+# endpoint can be hit by every concurrent rollout every loop iteration.
+_START_WARN_WINDOW = 60.0
+_last_start_warn: dict[str, float] = {}
 
 
 async def generate_terminal_rollout(
@@ -282,21 +271,23 @@ async def generate_terminal_rollout(
         saw_capacity = False
         saw_healthy = False
         for url in urls:
-            if not await _check_env_health(url, session):
-                continue
-            saw_healthy = True
             try:
                 return await asyncio.wait_for(
                     _execute_rollout(cfg, llm, problem, session, start_time, url),
                     timeout=max(1.0, deadline - time.time()),
                 )
+            except EnvironmentConnectionError:
+                continue
             except EnvironmentCapacityError:
                 saw_capacity = True
+                saw_healthy = True
                 continue
             except asyncio.TimeoutError:
+                saw_healthy = True
                 logger.warning("rollout timed out for %s on %s, trying next server", problem.get("task_id"), url)
                 continue
             except Exception:
+                saw_healthy = True
                 logger.warning("rollout failed for %s on %s: %s", problem.get("task_id"), url, traceback.format_exc())
                 continue
 
@@ -341,7 +332,15 @@ async def _execute_rollout(
 
     session_id = None
     try:
-        start = await _post(session, f"{env_url}/start_task", {"task_data": problem}, start_timeout)
+        try:
+            start_timeout_cfg = aiohttp.ClientTimeout(total=start_timeout, connect=10)
+            start = await _post(session, f"{env_url}/start_task", {"task_data": problem}, start_timeout_cfg)
+        except aiohttp.ClientConnectionError as e:
+            now = time.monotonic()
+            if now - _last_start_warn.get(env_url, 0.0) >= _START_WARN_WINDOW:
+                logger.warning("env start_task failed for %s: %s (further warns rate-limited 60s)", env_url, e)
+                _last_start_warn[env_url] = now
+            raise EnvironmentConnectionError(str(e)) from e
         session_id = start.get("session_id")
         if not session_id or not start.get("started") or not start.get("init_ok"):
             logger.warning("task %s not runnable (start=%s), dropping", problem.get("task_id"), start)
