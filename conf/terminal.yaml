@@ -90,6 +90,9 @@ environments:
     # 16GiB local ephemeral quota); proot_env scopes them by hostname. Per-session
     # writable /home/user and the lock/refcounts stay node-local.
     cache_dir: ${output_dir}/env_cache
+    # Keep idle task rootfs trees briefly after the last session; group rollouts can
+    # bounce refcounts to zero between siblings and otherwise repay the build.
+    rootfs_retention_seconds: 600.0
     # Concurrent proot sessions per server. n_envs:2 (16 sessions/node) OOM-killed the
     # inference replica (exit 137, host memory: 16 concurrent bash agents on top of 8
     # vLLM engines) even though disk was fine. n_envs:1 (8 sessions/node) ran stably
