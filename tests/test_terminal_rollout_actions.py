@@ -1,4 +1,7 @@
 import asyncio
+import os
+
+import pytest
 import time
 from types import SimpleNamespace
 
@@ -14,7 +17,7 @@ from pipelinerl.domains.terminal.rollouts import (
     TerminalMetrics,
     generate_terminal_rollout,
 )
-from pipelinerl.llm import LLMCall, LLMOutput, Prompt
+from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TrainableLLM
 from pipelinerl.rollouts import RolloutResult, TrainingText
 
 
@@ -512,30 +515,47 @@ def test_unreconstructable_format_error_turn_is_dropped_not_fatal(monkeypatch):
     assert result.metrics.n_format_errors == 1
 
 
-def test_context_budget_ends_rollout_cleanly_before_oversized_request(monkeypatch):
-    _patch_rollout_fakes(monkeypatch, [])
+MODEL_PATH = "/mnt/llmd/base_models/Qwen3.5-9B"
 
-    cfg = _terminal_cfg(no_submit_penalty=0.4)
-    cfg.vllm_config = SimpleNamespace(vllm_kwargs={"max_model_len": 65536})
-    fake_llm = SimpleNamespace(
+
+@pytest.mark.skipif(not os.path.isdir(MODEL_PATH), reason="base model tokenizer not available")
+def test_context_budget_with_real_tokenizer_ends_rollout_cleanly(monkeypatch):
+    """Real TrainableLLM + real Qwen tokenizer through the precheck: catches the
+    lazy-tokenizer lifecycle and template compatibility with wire-format messages."""
+    llm = TrainableLLM(
+        base_url="http://unused",
+        model_name=MODEL_PATH,
+        tokenizer_name=MODEL_PATH,
         parameters={"max_tokens": 16000},
-        chat_template_kwargs={"enable_thinking": True},
-        tokenizer=SimpleNamespace(apply_chat_template=lambda *a, **k: list(range(50000))),
     )
+    llm.chat_template_kwargs = {"enable_thinking": True}
 
+    # Budget the real system+task prompt cannot fit -> immediate clean exhaustion.
+    _patch_rollout_fakes(monkeypatch, [])
+    cfg = _terminal_cfg(no_submit_penalty=0.4, max_turns=8)
+    cfg.vllm_config = SimpleNamespace(vllm_kwargs={"max_model_len": 512})
     result = asyncio.run(
-        _execute_rollout(
-            cfg,
-            fake_llm,
-            {"task": "fix it", "task_id": "task-1"},
-            object(),
-            time.time(),
-            "http://env",
-        )
+        _execute_rollout(cfg, llm, {"task": "fix it", "task_id": "t"}, object(), time.time(), "http://env")
     )
-
     assert result.metrics.context_exhausted
     assert result.metrics.n_turns == 0
-    assert not result.metrics.submitted
-    # clean exit: verifier still ran (fake passes), no-submit penalty applied
     assert result.metrics.reward == 0.6
+
+    # Ample budget -> precheck passes, and the REAL template must render a history
+    # containing a wire-format (string-arguments) tool call without crashing.
+    _patch_rollout_fakes(
+        monkeypatch,
+        [
+            _llm_call(content="run it", tool_calls=[_tool_call(arguments={"command": "ls"})]),
+            _llm_call(content="done", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})]),
+        ],
+    )
+    cfg.vllm_config = SimpleNamespace(vllm_kwargs={"max_model_len": 65536})
+    result = asyncio.run(
+        _execute_rollout(cfg, llm, {"task": "fix it", "task_id": "t"}, object(), time.time(), "http://env")
+    )
+    assert not result.metrics.context_exhausted
+    assert result.metrics.submitted
+    assert result.metrics.n_turns == 2
+
+

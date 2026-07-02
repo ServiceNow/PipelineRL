@@ -380,6 +380,10 @@ async def _execute_rollout(
         max_model_len = int(vllm_kwargs.get("max_model_len") or 0) if vllm_kwargs is not None else 0
         max_new_tokens = int((getattr(llm, "parameters", None) or {}).get("max_tokens") or 0)
         context_margin = 64
+        if max_model_len and max_new_tokens:
+            # The tokenizer is lazily loaded by llm_async_generate; the precheck
+            # runs before the first generation and must load it itself.
+            llm.load_tokenizer()
         while n_actions < tcfg.max_turns:
             if max_model_len and max_new_tokens:
                 chat_kwargs = dict(getattr(llm, "chat_template_kwargs", None) or {})
