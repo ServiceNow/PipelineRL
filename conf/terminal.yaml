@@ -42,8 +42,8 @@ actor:
 
 # Rollout-side knobs (read by generate_terminal_rollout).
 terminal:
-  max_turns: 40              # TMax uses 64; avg rollout is ~13 turns, so 40 trims the slow tail while keeping headroom
-  rollout_timeout: 1800      # hard cap per rollout, seconds (raised: long 64-turn rollouts were timing out at 1200 -> incomplete groups dropped)
+  max_turns: 64              # TMax paper setting; avg rollout is ~13 turns, so this restores headroom without making short tasks dominant
+  rollout_timeout: 2700      # hard cap per rollout, seconds (64 turns with a longer compile-friendly command_timeout tail)
   env_call_timeout: 300      # per HTTP call to the env server (/step, /finish)
   env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
   capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
@@ -72,16 +72,18 @@ environments:
     mode: remote
     replicas_per_actor: ${world.env_replicas_per_actor}
     # External CPU env-fleet: env servers run in SEPARATE --gpu 0 eai jobs
-    # (terminal-envs-a/-b, launched via run_environment_fleet) so their proot/bash
+    # (terminal-envs-a through -d, launched via run_environment_fleet) so their proot/bash
     # RAM leaves the GPU nodes -> fixes the actor-node OOM (gspo_30-35 exit137/247).
     # placement=external -> WorldMap skips local placement; actors discover these
-    # via account-scoped internal-dns (dns-<EAI_ACCOUNT_ID>-<name>). 2 hosts x 12
-    # ports = 24 env servers. The env config below (n_envs, caps, bases_dir) is
+    # via account-scoped internal-dns (dns-<EAI_ACCOUNT_ID>-<name>). 4 hosts x 12
+    # ports = 48 env servers. The env config below (n_envs, caps, bases_dir) is
     # shared: the fleet launcher instantiates TerminalEnvironmentServer from it.
     placement: external
     external_hosts:
       - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-a
       - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-b
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-c
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-d
     external_start_port: 7777
     external_count: 12
     _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
@@ -93,37 +95,35 @@ environments:
     # Keep idle task rootfs trees briefly after the last session; group rollouts can
     # bounce refcounts to zero between siblings and otherwise repay the build.
     rootfs_retention_seconds: 600.0
-    # Concurrent proot sessions per server. n_envs:2 (16 sessions/node) OOM-killed the
-    # inference replica (exit 137, host memory: 16 concurrent bash agents on top of 8
-    # vLLM engines) even though disk was fine. n_envs:1 (8 sessions/node) ran stably
-    # for 75min in gspo_19. Keep 1 for memory stability; the keep-partial fix is what
-    # actually unblocks the trainer. Throughput (n_envs:2 + a memory guard) is post-step
-    # tuning.
+    # Concurrent proot sessions per server. Keep n_envs:1 on CPU fleets: each
+    # fleet job runs 12 servers, so this gives 12 sessions/node. Denser settings
+    # halve CPU per session and, at the 0.9GiB scratch cap, can exceed the 16GiB
+    # local ephemeral envelope before accounting for caches/logs.
     n_envs: 1
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
-    command_timeout: 60.0
+    command_timeout: 180.0
     verifier_timeout: 180.0
     max_observation_chars: 4000
     check_initial_state: true
     # Hard cap on each session's node-local writable scratch. One runaway agent
     # command can otherwise fill the node's 16GiB ephemeral quota and evict the
-    # replica (observed: a single session wrote 18GiB). At n_envs:2 = 16 sessions/node
-    # this bounds local scratch to ~14.4GiB (<16GiB). A session over the cap is aborted
+    # replica (observed: a single session wrote 18GiB). At n_envs:1 and 12 servers/node
+    # this bounds local scratch to ~10.8GiB (<16GiB). A session over the cap is aborted
     # and scored as a normal negative outcome. Most tasks use <1MiB, so 0.9GiB is ample.
     max_session_disk_bytes: 966367641   # 0.9 GiB
     # Hard cap on each session's process-group RSS. A memory-heavy curriculum task
     # (moderate/complex are heavier than the dropped 'short') or a runaway allocation
     # OOM-killed the inference replica (gspo_28, exit 137); the disk cap only bounds
     # /tmp, not RAM. Monitor aborts the session over this (scored reward_fail). 16GiB
-    # is generous (normal tasks use <1GiB); 8 sessions/node x 16 = 128GiB << node RAM.
+    # is generous (normal tasks use <1GiB); 12 sessions/node x 16 = 192GiB << node RAM.
     max_session_rss_bytes: 17179869184  # 16 GiB
     # Reap orphaned sessions that missed /close (client cancellation, actor death,
     # or cancellation before /start_task returned a session_id). Keep just above
-    # rollout_timeout=1800 so live rollouts are not touched, while residual leaks
+    # rollout_timeout=2700 so live rollouts are not touched, while residual leaks
     # clear far sooner than the old one-hour TTL.
-    session_ttl_seconds: 1900.0
+    session_ttl_seconds: 2800.0
     session_reap_interval_seconds: 60.0
 
 environment_key: terminal
@@ -231,10 +231,10 @@ vllm_config:
 
 llm:
   parameters:
-    max_tokens: 4096          # bring-up: thinking is off so a command fits in 4096; restore ~16000 when enabling thinking
+    max_tokens: 16000         # restored for thinking-enabled terminal rollouts
     temperature: 1.0
   chat_template_kwargs:
-    enable_thinking: false    # bring-up simplification (NOT a TMax rec; TMax uses interleaved thinking). Turn on + raise max_tokens for the real run.
+    enable_thinking: true     # TMax uses interleaved thinking; history stores tool calls without assistant prose bloat.
 
 test_llm:
   parameters:
@@ -243,7 +243,7 @@ test_llm:
     top_p: 0.95
     top_k: 50
   chat_template_kwargs:
-    enable_thinking: false
+    enable_thinking: true
 
 world:
   replicas: 1
