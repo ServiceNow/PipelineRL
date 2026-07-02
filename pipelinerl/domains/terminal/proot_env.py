@@ -27,6 +27,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import json
 import logging
 import os
 import pty
@@ -36,6 +37,7 @@ import signal
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import termios
@@ -43,7 +45,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,7 @@ _DEFAULT_ROOTFS_ROOT = Path(os.environ.get("PL_TERMINAL_CACHE_DIR", Path(tempfil
 #: coordinate the env-server processes on one node, and keeping it off the shared
 #: mount avoids relying on NFS file locking.
 _META_ROOT = Path(tempfile.gettempdir()) / "pl_terminal_meta"
+_SESSION_DIRS_MANIFEST = ".session_dirs.json"
 
 
 def _proot_argv(proot_bin: str, rootfs: Path, cwd: str, binds: Sequence[str] = ()) -> List[str]:
@@ -134,6 +137,101 @@ def _dir_size_bytes(path: Path) -> int:
     except Exception:
         pass
     return -1
+
+
+def _is_session_private_path(rel: Path) -> bool:
+    parts = rel.parts
+    return parts[:2] == ("home", "user") or parts[:1] == ("tmp",)
+
+
+def _symlink_target_inside(path: Path, root: Path) -> bool:
+    target = Path(os.readlink(path))
+    candidate = target if target.is_absolute() else path.parent / target
+    root_resolved = root.resolve(strict=False)
+    target_resolved = candidate.resolve(strict=False)
+    return target_resolved == root_resolved or root_resolved in target_resolved.parents
+
+
+def _tree_metadata(root: Path) -> dict[str, tuple[Any, ...]]:
+    metadata: dict[str, tuple[Any, ...]] = {}
+    for path in root.rglob("*"):
+        rel = path.relative_to(root)
+        if _is_session_private_path(rel):
+            continue
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            continue
+        mode = st.st_mode
+        if stat.S_ISLNK(mode):
+            if not _symlink_target_inside(path, root):
+                continue
+            metadata[str(rel)] = ("symlink", os.readlink(path), st.st_size, st.st_mtime_ns)
+        elif stat.S_ISDIR(mode):
+            metadata[str(rel)] = ("dir", st.st_mtime_ns)
+        elif stat.S_ISREG(mode):
+            metadata[str(rel)] = ("file", st.st_size, st.st_mtime_ns)
+    return metadata
+
+
+def _entry_bytes(path: Path) -> int:
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return 0
+    mode = st.st_mode
+    if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+        return st.st_size
+    if not stat.S_ISDIR(mode):
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            child_st = child.lstat()
+        except FileNotFoundError:
+            continue
+        child_mode = child_st.st_mode
+        if stat.S_ISREG(child_mode) or stat.S_ISLNK(child_mode):
+            total += child_st.st_size
+    return total
+
+
+def _write_session_dirs_manifest(root: Path, before: dict[str, tuple[Any, ...]]) -> dict[str, Any]:
+    after = _tree_metadata(root)
+    top_names: set[str] = set()
+    for rel_s in set(before) | set(after):
+        if before.get(rel_s) == after.get(rel_s):
+            continue
+        rel = Path(rel_s)
+        if _is_session_private_path(rel) or not rel.parts:
+            continue
+        top = rel.parts[0]
+        src = root / top
+        if src.exists() or src.is_symlink():
+            top_names.add(top)
+
+    dirs = [
+        {"name": name, "bytes": _entry_bytes(root / name)}
+        for name in sorted(top_names)
+    ]
+    payload = {
+        "version": 1,
+        "build_completed_at": time.time(),
+        "dirs": dirs,
+        "total_bytes": sum(item["bytes"] for item in dirs),
+    }
+    (root / _SESSION_DIRS_MANIFEST).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return payload
+
+
+def _read_session_dirs_manifest(root: Path) -> dict[str, Any]:
+    path = root / _SESSION_DIRS_MANIFEST
+    if not path.exists():
+        raise RuntimeError(f"missing session delta manifest: {path}")
+    payload = json.loads(path.read_text())
+    if int(payload.get("version", 0)) != 1:
+        raise RuntimeError(f"unsupported session delta manifest version in {path}")
+    return payload
 
 
 def _proc_group_rss_bytes(pgid: int) -> int:
@@ -226,6 +324,8 @@ class ProotTerminalEnvironment:
         max_session_disk_bytes: int = 1536 * 2**20,
         max_session_rss_bytes: int = 16 * 2**30,
         disk_check_interval: float = 3.0,
+        session_delta_max_bytes: int = 512 * 2**20,
+        contamination_check: bool = True,
     ):
         self.base_rootfs = Path(base_rootfs).resolve()
         self.proot_bin = proot_bin
@@ -247,6 +347,8 @@ class ProotTerminalEnvironment:
         # if its process-group RSS exceeds this. 0 disables.
         self.max_session_rss_bytes = max_session_rss_bytes
         self.disk_check_interval = disk_check_interval
+        self.session_delta_max_bytes = session_delta_max_bytes
+        self.contamination_check = contamination_check
 
         self._owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="terminal_env_"))
@@ -270,6 +372,8 @@ class ProotTerminalEnvironment:
         self._ref: Optional[Path] = None
         self.session_home = self.work_dir / "home"
         self.session_tmp = self.work_dir / "tmp"
+        self.session_deltas = self.work_dir / "deltas"
+        self._session_delta_binds: List[str] = []
 
         self.shell_process: Optional[subprocess.Popen] = None
         self.master_fd: Optional[int] = None
@@ -312,6 +416,9 @@ class ProotTerminalEnvironment:
             self._ref.write_text("")
 
         self.rootfs = task_rootfs
+        ok, err = self._materialize_session_delta_dirs(task_rootfs)
+        if not ok:
+            return False, err
         # Materialize a small writable /home/user for this session from the
         # read-only base, plus a writable /tmp. cp -a preserves the stripped
         # write bits, so restore them on the copy.
@@ -369,6 +476,7 @@ class ProotTerminalEnvironment:
             etc = tmp_rootfs / "etc"
             etc.mkdir(parents=True, exist_ok=True)
             (etc / "resolv.conf").write_text(f"nameserver {self.nameserver}\noptions ndots:0\n")
+            before_post = _tree_metadata(tmp_rootfs)
 
             post = _post_body(container_def)
             argv = _proot_argv(self.proot_bin, tmp_rootfs, cwd="/root") + ["/bin/bash", "-c", post]
@@ -377,6 +485,7 @@ class ProotTerminalEnvironment:
             if proc.returncode != 0:
                 _force_rmtree(tmp_rootfs)
                 return False, ((proc.stderr or proc.stdout) or "")[-1000:]
+            _write_session_dirs_manifest(tmp_rootfs, before_post)
             # Strip write bits so concurrent sessions sharing this base cannot
             # corrupt it; each session writes only to its bound /home/user and /tmp.
             subprocess.run(["chmod", "-R", "a-w", str(tmp_rootfs)], check=False)
@@ -396,11 +505,75 @@ class ProotTerminalEnvironment:
             _force_rmtree(tmp_rootfs)
             raise
 
+    def _materialize_session_delta_dirs(self, task_rootfs: Path) -> Tuple[bool, str]:
+        self._session_delta_binds = []
+        try:
+            manifest = _read_session_dirs_manifest(task_rootfs)
+        except Exception as e:
+            return False, str(e)
+
+        total_bytes = int(manifest.get("total_bytes", 0))
+        if self.session_delta_max_bytes > 0 and total_bytes > self.session_delta_max_bytes:
+            msg = (
+                f"session delta manifest is {total_bytes} bytes, over cap "
+                f"{self.session_delta_max_bytes} bytes"
+            )
+            logger.warning(msg)
+            return False, msg
+
+        _force_rmtree(self.session_deltas)
+        for item in manifest.get("dirs", []):
+            name = str(item["name"])
+            src = task_rootfs / name
+            if not src.exists() and not src.is_symlink():
+                continue
+            dest = self.session_deltas / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["cp", "-a", "--reflink=auto", str(src), str(dest)], check=True)
+            subprocess.run(["chmod", "-R", "u+w", str(dest)], check=False)
+            self._session_delta_binds.append(f"{dest}:/{name}")
+        return True, ""
+
     def _session_binds(self) -> List[str]:
         return [
+            *self._session_delta_binds,
             f"{self.session_home}:/home/user",
             f"{self.session_tmp}:/tmp",
         ]
+
+    def _detect_shared_rootfs_contamination(self) -> int:
+        if not self.contamination_check or self.rootfs is None:
+            return 0
+        try:
+            manifest = _read_session_dirs_manifest(self.rootfs)
+            cutoff = float(manifest["build_completed_at"]) + 2.0
+            delta_names = {str(item["name"]) for item in manifest.get("dirs", [])}
+        except Exception:
+            logger.warning("shared rootfs contamination check failed for %s", self.rootfs, exc_info=True)
+            return 0
+
+        count = 0
+        examples: list[str] = []
+        for path in self.rootfs.rglob("*"):
+            try:
+                rel = path.relative_to(self.rootfs)
+                if rel.parts and rel.parts[0] in delta_names:
+                    continue
+                st = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime <= cutoff:
+                continue
+            count += 1
+            if len(examples) < 5:
+                examples.append(f"/{rel.as_posix()}")
+
+        if count > 0:
+            logger.warning(
+                "shared rootfs contamination detected in %s: %d files modified after build; examples=%s",
+                self.rootfs, count, examples,
+            )
+        return count
 
     # ------------------------------------------------------------------
     # persistent shell (PTY) lifecycle — ported from tmax env.py
@@ -474,6 +647,7 @@ class ProotTerminalEnvironment:
             # Reclaim the node-local bytes now, not at /close.
             _force_rmtree(self.session_home)
             _force_rmtree(self.session_tmp)
+            _force_rmtree(self.session_deltas)
 
     def _disk_monitor_loop(self) -> None:
         """Abort the session if its node-local scratch OR its process-group RSS
@@ -638,7 +812,7 @@ class ProotTerminalEnvironment:
         return ok, out, passed, total, abort_kind
 
     # ------------------------------------------------------------------
-    def cleanup(self) -> None:
+    def cleanup(self) -> int:
         self._stop_event.set()
         if self.reader_thread:
             self.reader_thread.join(timeout=1.0)
@@ -663,6 +837,8 @@ class ProotTerminalEnvironment:
                     pass
         self.master_fd = self.slave_fd = None
 
+        contamination_count = self._detect_shared_rootfs_contamination()
+
         # Release this session's hold on the shared rootfs. With retention
         # disabled this evicts at zero refs; otherwise cleanup is age-based.
         self._release_shared_rootfs()
@@ -675,6 +851,7 @@ class ProotTerminalEnvironment:
             if size >= 0:
                 logger.info("session %s local scratch at close: %.1f MiB", self._sid, size / (1024 * 1024))
             shutil.rmtree(self.work_dir, ignore_errors=True)
+        return contamination_count
 
     def _release_shared_rootfs(self) -> None:
         if self._task_meta_dir is None:
