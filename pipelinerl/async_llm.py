@@ -169,6 +169,13 @@ async def llm_async_generate(
 
     assert response_data is not None, "response_data is None"
 
+    # A malformed or error response (e.g. an HTTP 200 carrying an error body, or an empty payload)
+    # can lack "choices"; treat it as retryable instead of crashing the actor loop with a KeyError.
+    if not response_data.get("choices"):
+        raise RetryableAbortedCompletionError(
+            f"Completion response for prompt {prompt.id} is missing 'choices': {response_data}"
+        )
+
     try:
         content = response_data["choices"][0]["message"]["content"]
         raw_tool_calls = response_data["choices"][0]["message"].get("tool_calls", [])
