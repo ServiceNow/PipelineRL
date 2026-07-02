@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from typing import List, TextIO
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+from pipelinerl import fleet
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import SingleStreamSpec, connect_to_redis, read_stream, set_streams_backend, write_to_streams
 from pipelinerl.utils import external_environment_jobs, terminate_with_children
@@ -516,12 +518,23 @@ def is_inference_process(proc: LaunchedProcess) -> bool:
     return proc.kind in {"actor_llm", "preprocessor_llm"}
 
 
-def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False):
+def watch_processes_running(
+    exp_path: Path,
+    processes: List[LaunchedProcess],
+    debug_mode: bool = False,
+    fleet_handle: fleet.FleetHandle | None = None,
+):
     if not debug_mode:
         trainer_state = TrainerState(exp_path)
         trainer_state.start_listening()
     else:
         trainer_state = None
+
+    def _sigterm_to_keyboard_interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    if fleet_handle is not None:
+        signal.signal(signal.SIGTERM, _sigterm_to_keyboard_interrupt)
 
     # Wait for all processes to complete
     def gently_stop_all_processes():
@@ -530,6 +543,7 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         for proc in processes:
             logger.info(f"Terminating {proc.handle.args}")
             terminate_with_children(proc.handle.pid)
+        fleet.teardown_fleets(fleet_handle)
 
     logger.info("I have launched everyone, waiting for them to finish...")
 
@@ -541,6 +555,7 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         # if just one dies non-zero, stop all
         alive = list(processes)
         logger.info(f"Starting process monitoring with {len(alive)} processes: {[proc.kind for proc in alive]}")
+        next_fleet_poll = time.monotonic() + 60.0
         while alive:
             for proc in list(alive):
                 return_code = proc.handle.poll()
@@ -567,6 +582,12 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                     proc.handle.wait()
                     logger.info(f"Inference server {proc.handle.args} stopped")
                     alive.remove(proc)
+            if fleet_handle is not None and time.monotonic() >= next_fleet_poll:
+                try:
+                    fleet.poll_and_restore(fleet_handle)
+                except Exception:
+                    logger.warning("fleet restore poll failed; skipping this cycle", exc_info=True)
+                next_fleet_poll = time.monotonic() + 60.0
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
             #     and (version := trainer_state.propagated_weight_version is not None)
@@ -577,6 +598,7 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
             #     logger.error("No new weight update in 30 minutes, exiting")
             #     sys.exit(1)
             time.sleep(1.0)
+        fleet.teardown_fleets(fleet_handle)
     except KeyboardInterrupt:
         gently_stop_all_processes()
 
@@ -676,6 +698,7 @@ def main(cfg: DictConfig):
     set_streams_backend(**cfg.streams)
 
     processes = []
+    fleet_handle = None
 
     lead_launcher_stream = SingleStreamSpec(exp_path=exp_dir, topic="launcher_0")
     init_msg = {"exp_init": "true"}
@@ -684,6 +707,12 @@ def main(cfg: DictConfig):
         os.makedirs(config_dir, exist_ok=True)
         OmegaConf.save(cfg, config_dir / "exp_config.yaml")
         logger.info("Orchestrator 0 created the exp folder")
+        if not cfg.debug.mode:
+            fleet_handle = fleet.start_fleets(
+                cfg,
+                exp_dir,
+                dry_run=os.environ.get("DRY_RUN", "0") == "1",
+            )
         if cfg.streams.backend == "redis":
             processes.extend(run_redis(cfg))
             redis = connect_to_redis(cfg.streams)
@@ -732,7 +761,7 @@ def main(cfg: DictConfig):
     if os.environ.get("DRY_RUN", "0") == "1":
         assert not processes
         return
-    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode))
+    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode), fleet_handle=fleet_handle)
 
 
 if __name__ == "__main__":
