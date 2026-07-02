@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 
 import pytest
@@ -352,6 +353,36 @@ class DummyRequest:
 
     async def json(self):
         return self.body
+
+
+def test_close_background_records_contamination_in_health():
+    class ContaminatedSession(DummySession):
+        def close(self):
+            super().close()
+            return 3
+
+    async def run_case():
+        server = TerminalEnvironmentServer(
+            bases_dir="/tmp",
+            n_envs=1,
+            session_ttl_seconds=60.0,
+            session_reap_interval_seconds=60.0,
+        )
+        session = ContaminatedSession()
+        server._sessions["session-1"] = session
+        server._session_last_activity["session-1"] = time.monotonic()
+
+        close_response = await server.close(DummyRequest({"session_id": "session-1"}))
+        if server._bg_tasks:
+            await asyncio.gather(*list(server._bg_tasks))
+        health_response = await server.health(DummyRequest({}))
+        server._executor.shutdown(wait=True)
+
+        assert close_response.status == 200
+        assert session.closed
+        assert json.loads(health_response.text)["contamination_events"] == 1
+
+    asyncio.run(run_case())
 
 
 def test_finish_removes_session_and_close_stays_idempotent():
