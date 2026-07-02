@@ -118,6 +118,9 @@ environments:
     # with a huge mutable /app-style payload is dropped instead of sharing state
     # across sibling rollouts.
     session_delta_max_bytes: 536870912   # 512 MiB
+    # Backstop: warn and surface a health counter if anything still mutates the
+    # shared task rootfs after build. Nonzero means the isolation model has a hole.
+    contamination_check: true
     # Hard cap on each session's process-group RSS. A memory-heavy curriculum task
     # (moderate/complex are heavier than the dropped 'short') or a runaway allocation
     # OOM-killed the inference replica (gspo_28, exit 137); the disk cap only bounds
@@ -179,7 +182,7 @@ finetune:
   attempts: 16               # Phase A (rafa): G=16 + curriculum. keep-rate = 1 - p^G - (1-p)^G; dropping trivial 'short' moves p ~0.95->~0.7 so G16 keeps ~99% (curriculum substitutes for the paper's G=32). attempts=8 starved the trainer (~75% all-pass filtered). TMax paper uses 32; G16+curriculum is the cheaper-to-iterate equivalent.
   max_train_steps: 500       # TMax
   save_checkpoint_steps: 9999999
-  also_save_steps: [100, 150, 200, 250, 300, 400, 500]  # denser early saves for probe/checkpoint analysis (rafa 2026-07-02)
+  also_save_steps: [20, 100]  # denser early saves for probe/checkpoint analysis (rafa 2026-07-02)
   save_final_training_state: false
   seq_length: 65536          # TMax
   seq_parallel: 8
