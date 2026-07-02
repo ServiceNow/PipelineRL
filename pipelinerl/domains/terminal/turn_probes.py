@@ -43,8 +43,12 @@ TURN_BUCKETS = [(0, 2), (3, 7), (8, 15), (16, 10_000)]
 # ---------------------------------------------------------------------------
 
 def prompt_length(record: dict) -> int:
-    """Prompt length of a turn record: everything except the n_predicted completion tokens."""
-    return len(record["input_ids"]) - record["n_predicted"]
+    """Prompt token count of a turn record.
+
+    Uses the explicit ``prompt_tokens`` field; ``n_predicted`` is a CHARACTER
+    count (``len(output_text)``) and must not be used for token positions.
+    """
+    return int(record["prompt_tokens"])
 
 
 def pre_gen_position(record: dict) -> int:

@@ -13,7 +13,8 @@ from pipelinerl.domains.terminal.turn_probes import (
 
 
 def test_prompt_length_and_pre_gen_position():
-    record = {"input_ids": [1, 2, 3, 4, 5], "n_predicted": 2}
+    # prompt_tokens is the token count; n_predicted is a CHAR count and must be ignored
+    record = {"input_ids": [1, 2, 3, 4, 5], "prompt_tokens": 3, "n_predicted": 999}
     assert prompt_length(record) == 3
     assert pre_gen_position(record) == 2
 
