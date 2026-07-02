@@ -135,7 +135,8 @@ dataset_loader_params:
         _type: cube_harness.rl.llm.RolloutLLMConfig
         model_name: ${vllm_config.vllm_kwargs.served_model_name}
         tokenizer_name: ${model_path}
-        timeout: 3600.0
+        # timeout: 3600.0
+        timeout: 500
         num_retries: 1
       max_actions: 10
   miniwob_axtree:
