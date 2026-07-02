@@ -222,6 +222,7 @@ class ProotTerminalEnvironment:
         verifier_timeout: float = 180.0,
         work_dir: Optional[str | Path] = None,
         cache_dir: Optional[str | Path] = None,
+        rootfs_retention_seconds: float = 0.0,
         max_session_disk_bytes: int = 1536 * 2**20,
         max_session_rss_bytes: int = 16 * 2**30,
         disk_check_interval: float = 3.0,
@@ -257,6 +258,7 @@ class ProotTerminalEnvironment:
             self._rootfs_root = Path(cache_dir) / socket.gethostname()
         else:
             self._rootfs_root = _DEFAULT_ROOTFS_ROOT
+        self.rootfs_retention_seconds = rootfs_retention_seconds
 
         self._sid = uuid.uuid4().hex
         # Set by build(): the shared read-only task rootfs (under _rootfs_root),
@@ -326,7 +328,7 @@ class ProotTerminalEnvironment:
         return True, ""
 
     def _build_shared_rootfs(self, task_rootfs: Path, container_def: str, t0: float) -> Tuple[bool, str]:
-        """Clone the base rootfs and apply ``%post`` once, then make it read-only.
+        """Clone the staged base rootfs and apply ``%post`` once, then make it read-only.
 
         Build into a unique per-session temp dir and atomically rename into place.
         Building directly into ``task_rootfs`` was fragile: ``_force_rmtree`` uses
@@ -336,11 +338,34 @@ class ProotTerminalEnvironment:
         yielding a rootfs with no ``/etc`` (the observed HTTP 500 on
         ``etc/resolv.conf``). A fresh sid-scoped temp never nests. Caller holds the
         per-task build lock."""
+        base_stage_root = _META_ROOT / "_base_stages"
+        base_stage = base_stage_root / self.base_rootfs.name
+        base_ready = base_stage_root / f"{self.base_rootfs.name}.ready"
+        base_lock = _META_ROOT / "_locks" / f"base_{self.base_rootfs.name}.lock"
+        with _locked(base_lock):
+            if not base_ready.exists() or not base_stage.exists():
+                base_stage_root.mkdir(parents=True, exist_ok=True)
+                tmp_base_stage = base_stage_root / f".building.{self.base_rootfs.name}.{self._sid}"
+                _force_rmtree(tmp_base_stage)
+                try:
+                    subprocess.run(["cp", "-a", str(self.base_rootfs), str(tmp_base_stage)], check=True)
+                    base_ready.unlink(missing_ok=True)
+                    _force_rmtree(base_stage)
+                    if base_stage.exists():
+                        trash = base_stage_root / f".trash.{self.base_rootfs.name}.{self._sid}"
+                        os.rename(base_stage, trash)
+                        _force_rmtree(trash)
+                    os.replace(tmp_base_stage, base_stage)
+                    base_ready.write_text("")
+                except Exception:
+                    _force_rmtree(tmp_base_stage)
+                    raise
+
         self._task_cache_dir.mkdir(parents=True, exist_ok=True)
         tmp_rootfs = self._task_cache_dir / f".building.{self._sid}"
         _force_rmtree(tmp_rootfs)
         try:
-            subprocess.run(["cp", "-a", str(self.base_rootfs), str(tmp_rootfs)], check=True)
+            subprocess.run(["cp", "-a", "--reflink=auto", str(base_stage), str(tmp_rootfs)], check=True)
             etc = tmp_rootfs / "etc"
             etc.mkdir(parents=True, exist_ok=True)
             (etc / "resolv.conf").write_text(f"nameserver {self.nameserver}\noptions ndots:0\n")
@@ -651,8 +676,8 @@ class ProotTerminalEnvironment:
                     pass
         self.master_fd = self.slave_fd = None
 
-        # Release this session's hold on the shared rootfs and evict it once no
-        # session is using it, so the node-local cache stays bounded.
+        # Release this session's hold on the shared rootfs. With retention
+        # disabled this evicts at zero refs; otherwise cleanup is age-based.
         self._release_shared_rootfs()
 
         if self._owns_work_dir and self.work_dir.exists():
@@ -669,6 +694,7 @@ class ProotTerminalEnvironment:
             return
         key = self._task_meta_dir.name
         lock = _META_ROOT / "_locks" / f"{key}.lock"
+        now = time.time()
         try:
             with _locked(lock):
                 if self._ref is not None:
@@ -679,11 +705,33 @@ class ProotTerminalEnvironment:
                 refs_dir = self._task_meta_dir / "refs"
                 remaining = list(refs_dir.glob("*")) if refs_dir.exists() else []
                 if not remaining:
-                    # No session is using this task: drop both the read-only
-                    # rootfs (on the mount) and the node-local meta dir.
-                    if self._task_cache_dir is not None:
-                        _force_rmtree(self._task_cache_dir)
-                    _force_rmtree(self._task_meta_dir)
+                    if self.rootfs_retention_seconds <= 0:
+                        if self._task_cache_dir is not None:
+                            _force_rmtree(self._task_cache_dir)
+                        _force_rmtree(self._task_meta_dir)
+                    else:
+                        (self._task_meta_dir / "last_used").write_text(str(now))
+
+            if self.rootfs_retention_seconds > 0 and _META_ROOT.exists():
+                for meta_dir in _META_ROOT.iterdir():
+                    if not meta_dir.is_dir() or meta_dir.name in {"_locks", "_base_stages"}:
+                        continue
+                    last_used = meta_dir / "last_used"
+                    if not last_used.exists():
+                        continue
+                    evict_lock = _META_ROOT / "_locks" / f"{meta_dir.name}.lock"
+                    with _locked(evict_lock):
+                        if not last_used.exists():
+                            continue
+                        refs_dir = meta_dir / "refs"
+                        remaining = list(refs_dir.glob("*")) if refs_dir.exists() else []
+                        if remaining:
+                            continue
+                        last = float(last_used.read_text().strip())
+                        if now - last < self.rootfs_retention_seconds:
+                            continue
+                        _force_rmtree(self._rootfs_root / meta_dir.name)
+                        _force_rmtree(meta_dir)
         except Exception:
             logger.warning("shared rootfs cleanup failed for %s", self._task_cache_dir, exc_info=True)
         finally:
