@@ -189,6 +189,7 @@ class TerminalEnvironmentServer:
         max_observation_chars: int = 4000,
         check_initial_state: bool = True,
         cache_dir: str | None = None,
+        rootfs_retention_seconds: float = 0.0,
         max_session_disk_bytes: int = 1536 * 2**20,
         max_session_rss_bytes: int = 16 * 2**30,
         session_ttl_seconds: float = 3600.0,
@@ -204,6 +205,7 @@ class TerminalEnvironmentServer:
         self.max_observation_chars = max_observation_chars
         self.check_initial_state = check_initial_state
         self.cache_dir = cache_dir
+        self.rootfs_retention_seconds = rootfs_retention_seconds
         self.max_session_disk_bytes = max_session_disk_bytes
         self.max_session_rss_bytes = max_session_rss_bytes
         self.session_ttl_seconds = session_ttl_seconds
@@ -290,6 +292,7 @@ class TerminalEnvironmentServer:
             max_observation_chars=self.max_observation_chars,
             check_initial_state=self.check_initial_state,
             cache_dir=self.cache_dir,
+            rootfs_retention_seconds=self.rootfs_retention_seconds,
             max_session_disk_bytes=self.max_session_disk_bytes,
             max_session_rss_bytes=self.max_session_rss_bytes,
         )
