@@ -39,6 +39,8 @@ class TerminalSession:
         rootfs_retention_seconds: float = 0.0,
         max_session_disk_bytes: int = 1536 * 2**20,
         max_session_rss_bytes: int = 16 * 2**30,
+        session_delta_max_bytes: int = 512 * 2**20,
+        contamination_check: bool = True,
     ):
         self.bases_dir = bases_dir
         self.proot_bin = proot_bin
@@ -51,6 +53,8 @@ class TerminalSession:
         self.rootfs_retention_seconds = rootfs_retention_seconds
         self.max_session_disk_bytes = max_session_disk_bytes
         self.max_session_rss_bytes = max_session_rss_bytes
+        self.session_delta_max_bytes = session_delta_max_bytes
+        self.contamination_check = contamination_check
 
         self._env: Optional[ProotTerminalEnvironment] = None
         self._final_test: str = ""
@@ -84,6 +88,8 @@ class TerminalSession:
             rootfs_retention_seconds=self.rootfs_retention_seconds,
             max_session_disk_bytes=self.max_session_disk_bytes,
             max_session_rss_bytes=self.max_session_rss_bytes,
+            session_delta_max_bytes=self.session_delta_max_bytes,
+            contamination_check=self.contamination_check,
         )
         build_ok, build_err = self._env.build(task["container_def"])
         if not build_ok:
@@ -127,7 +133,9 @@ class TerminalSession:
             "total_tests": total_tests,
         }
 
-    def close(self) -> None:
-        if self._env is not None:
-            self._env.cleanup()
-            self._env = None
+    def close(self) -> int:
+        if self._env is None:
+            return 0
+        contamination_count = self._env.cleanup()
+        self._env = None
+        return contamination_count
