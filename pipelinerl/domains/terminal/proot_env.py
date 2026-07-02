@@ -536,9 +536,11 @@ class ProotTerminalEnvironment:
             # Apptainer auto-sources these on exec; proot does not. Sourcing them
             # here starts the task's background services inside this long-lived
             # session so verifier port checks pass.
-            self.exec(
+            ok, _ = self.exec(
                 'for f in /.singularity.d/env/*.sh; do [ -f "$f" ] && source "$f" 2>/dev/null; done; true'
             )
+            if not ok and self._abort_reason is not None:
+                return False
 
         if self.max_session_disk_bytes > 0 or self.max_session_rss_bytes > 0:
             self._disk_monitor_thread = threading.Thread(target=self._disk_monitor_loop, daemon=True)
