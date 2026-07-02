@@ -36,6 +36,7 @@ class TerminalSession:
         max_observation_chars: int,
         check_initial_state: bool,
         cache_dir: Optional[str | Path] = None,
+        rootfs_retention_seconds: float = 0.0,
         max_session_disk_bytes: int = 1536 * 2**20,
         max_session_rss_bytes: int = 16 * 2**30,
     ):
@@ -47,6 +48,7 @@ class TerminalSession:
         self.max_observation_chars = max_observation_chars
         self.check_initial_state = check_initial_state
         self.cache_dir = cache_dir
+        self.rootfs_retention_seconds = rootfs_retention_seconds
         self.max_session_disk_bytes = max_session_disk_bytes
         self.max_session_rss_bytes = max_session_rss_bytes
 
@@ -79,6 +81,7 @@ class TerminalSession:
             nameserver=self.nameserver,
             verifier_timeout=self.verifier_timeout,
             cache_dir=self.cache_dir,
+            rootfs_retention_seconds=self.rootfs_retention_seconds,
             max_session_disk_bytes=self.max_session_disk_bytes,
             max_session_rss_bytes=self.max_session_rss_bytes,
         )
