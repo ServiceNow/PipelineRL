@@ -333,8 +333,26 @@ def fit(args: argparse.Namespace) -> None:
         "z_centered_return": (loo_centered_returns(group_ids, rollout_ids, rollout_rewards), False),
     }
 
+    l2_values = [float(v) for v in args.l2_sweep.split(",")]
     rows = []
     bucket_names = ["all"] + sorted(set(buckets.tolist()))
+
+    # Control probe: turn position only. If the activation probes do not beat this,
+    # the "signal" is positional (late turns of long rollouts fail more), not
+    # representational.
+    x_control = np.stack([step_indices, step_indices ** 2], axis=1).astype(float)
+    for bucket in bucket_names:
+        mask = np.ones(len(meta), dtype=bool) if bucket == "all" else buckets == bucket
+        if mask.sum() < args.min_bucket_size:
+            continue
+        for name, (y, binary) in targets.items():
+            value = cross_validated_metric(x_control[mask], y[mask], folds[mask], 1.0, binary)
+            rows.append({
+                "target": name, "layer": -1, "bucket": bucket, "l2": 1.0,
+                "n": int(mask.sum()), "n_pos": int(y[mask].sum()) if binary else -1,
+                "metric": "auroc" if binary else "r2", "value": round(value, 4),
+            })
+
     for li, layer in enumerate(layer_indices):
         x_layer = features[:, li, :].float().numpy()
         for bucket in bucket_names:
@@ -342,20 +360,20 @@ def fit(args: argparse.Namespace) -> None:
             if mask.sum() < args.min_bucket_size:
                 continue
             for name, (y, binary) in targets.items():
-                value = cross_validated_metric(x_layer[mask], y[mask], folds[mask], args.l2, binary)
-                rows.append({
-                    "target": name, "layer": layer, "bucket": bucket,
-                    "n": int(mask.sum()), "n_pos": int(y[mask].sum()) if binary else -1,
-                    "metric": "auroc" if binary else "r2", "value": round(value, 4),
-                })
-                logger.info("layer %d bucket %-5s %-18s %s=%.4f (n=%d)",
-                            layer, bucket, name, "auroc" if binary else "r2", value, int(mask.sum()))
+                for l2 in l2_values:
+                    value = cross_validated_metric(x_layer[mask], y[mask], folds[mask], l2, binary)
+                    rows.append({
+                        "target": name, "layer": layer, "bucket": bucket, "l2": l2,
+                        "n": int(mask.sum()), "n_pos": int(y[mask].sum()) if binary else -1,
+                        "metric": "auroc" if binary else "r2", "value": round(value, 4),
+                    })
+                logger.info("layer %d bucket %-5s %-18s done (n=%d)", layer, bucket, name, int(mask.sum()))
 
     csv_path = out_dir / "probe_results.csv"
     with open(csv_path, "w") as f:
-        f.write("target,layer,bucket,n,n_pos,metric,value\n")
+        f.write("target,layer,bucket,l2,n,n_pos,metric,value\n")
         for r in rows:
-            f.write(f"{r['target']},{r['layer']},{r['bucket']},{r['n']},{r['n_pos']},{r['metric']},{r['value']}\n")
+            f.write(f"{r['target']},{r['layer']},{r['bucket']},{r['l2']},{r['n']},{r['n_pos']},{r['metric']},{r['value']}\n")
 
     lines = ["# P0 turn-probe results", "", f"activations: {args.activations}", ""]
     for name in targets:
@@ -363,14 +381,16 @@ def fit(args: argparse.Namespace) -> None:
         for r in rows:
             if r["target"] == name and (r["bucket"] not in best or r["value"] > best[r["bucket"]]["value"]):
                 best[r["bucket"]] = r
-        lines.append(f"## {name} (best layer per bucket)")
+        lines.append(f"## {name} (best layer+l2 per bucket vs turn-index control; best is max over the sweep, mildly optimistic)")
         lines.append("")
-        lines.append("| bucket | layer | metric | value | n |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| bucket | layer | l2 | metric | value | control (turn-index only) | n |")
+        lines.append("|---|---|---|---|---|---|---|")
+        controls = {r["bucket"]: r for r in rows if r["target"] == name and r["layer"] == -1}
         for bucket in bucket_names:
-            if bucket in best:
+            if bucket in best and best[bucket]["layer"] != -1:
                 r = best[bucket]
-                lines.append(f"| {bucket} | {r['layer']} | {r['metric']} | {r['value']} | {r['n']} |")
+                c = controls.get(bucket, {}).get("value", "n/a")
+                lines.append(f"| {bucket} | {r['layer']} | {r['l2']} | {r['metric']} | {r['value']} | {c} | {r['n']} |")
         lines.append("")
     (out_dir / "probe_summary.md").write_text("\n".join(lines))
     logger.info("wrote %s and probe_summary.md (%d rows)", csv_path, len(rows))
@@ -397,7 +417,7 @@ def main() -> None:
     p_fit.add_argument("--activations", required=True)
     p_fit.add_argument("--out-dir", default=None)
     p_fit.add_argument("--folds", type=int, default=5)
-    p_fit.add_argument("--l2", type=float, default=1.0)
+    p_fit.add_argument("--l2-sweep", default="1,10,100,1000")
     p_fit.add_argument("--min-bucket-size", type=int, default=50)
     p_fit.set_defaults(func=fit)
 
