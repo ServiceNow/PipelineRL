@@ -1,0 +1,405 @@
+"""P0 probe study: how early do turn-boundary activations encode terminal-rollout outcomes?
+
+Replicates the pre-generation linear-probe methodology of arXiv:2604.01202 on our
+terminal domain, as groundwork for critic-free credit assignment. Two stages:
+
+  extract (GPU): read per-turn TrainingTexts from an experiment's raw actor stream,
+      run ONE forward pass per rollout over the last turn's sequence (every earlier
+      turn's prompt is a prefix of it, which we verify token-exactly), and save the
+      residual-stream hidden state at each turn's pre-generation position (the last
+      prompt token) for a strided subset of layers.
+
+  fit (CPU): train linear probes on the saved activations with GroupKFold by
+      group_id (so the same task never spans train and test) and report AUROC /
+      R^2 per (layer, turn-position bucket) for three targets: the turn's action
+      is submit, final rollout success, and the LOO-centered rollout return z.
+
+Usage:
+    python -m pipelinerl.domains.terminal.turn_probes extract \
+        --exp-dir <exp> --model-path <ckpt> [--max-rollouts 400]
+    python -m pipelinerl.domains.terminal.turn_probes fit \
+        --activations <exp>/probe_analysis/activations.pt
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+
+logger = logging.getLogger(__name__)
+
+SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+TURN_BUCKETS = [(0, 2), (3, 7), (8, 15), (16, 10_000)]
+
+
+# ---------------------------------------------------------------------------
+# pure helpers (unit-tested)
+# ---------------------------------------------------------------------------
+
+def prompt_length(record: dict) -> int:
+    """Prompt length of a turn record: everything except the n_predicted completion tokens."""
+    return len(record["input_ids"]) - record["n_predicted"]
+
+
+def pre_gen_position(record: dict) -> int:
+    """Index of the last prompt token: the state from which the first completion token is generated."""
+    return prompt_length(record) - 1
+
+
+def is_prefix(turn_ids, full_ids, length: int) -> bool:
+    if length > len(full_ids):
+        return False
+    return np.array_equal(np.asarray(turn_ids[:length]), np.asarray(full_ids[:length]))
+
+
+def loo_centered_returns(group_ids: list[str], rollout_ids: list[int], rewards: list[float]) -> np.ndarray:
+    """z = R - mean(R of the OTHER rollouts in the group), per (group, rollout).
+
+    Rollouts are deduplicated on (group_id, rollout_id); singleton groups get z=0.
+    Returns one z per input row (rows of the same rollout share the z).
+    """
+    rollout_reward: dict[tuple[str, int], float] = {}
+    for g, r, rew in zip(group_ids, rollout_ids, rewards):
+        rollout_reward[(g, r)] = rew
+    by_group: dict[str, list[float]] = defaultdict(list)
+    for (g, _), rew in rollout_reward.items():
+        by_group[g].append(rew)
+    z = np.zeros(len(group_ids))
+    for i, (g, r) in enumerate(zip(group_ids, rollout_ids)):
+        rewards_g = by_group[g]
+        if len(rewards_g) < 2:
+            continue
+        own = rollout_reward[(g, r)]
+        z[i] = own - (sum(rewards_g) - own) / (len(rewards_g) - 1)
+    return z
+
+
+def group_fold(group_id: str, n_folds: int) -> int:
+    """Deterministic fold assignment by group so a task never spans train and test."""
+    digest = hashlib.sha1(group_id.encode()).hexdigest()
+    return int(digest[:8], 16) % n_folds
+
+
+def turn_bucket(step_index: int) -> str:
+    for lo, hi in TURN_BUCKETS:
+        if lo <= step_index <= hi:
+            return f"{lo}-{hi}" if hi < 10_000 else f"{lo}+"
+    return "unknown"
+
+
+def auroc(labels: np.ndarray, scores: np.ndarray) -> float:
+    """Rank-based AUROC (ties get midranks)."""
+    labels = np.asarray(labels, dtype=bool)
+    n_pos = int(labels.sum())
+    n_neg = len(labels) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(len(scores))
+    sorted_scores = scores[order]
+    i = 0
+    while i < len(scores):
+        j = i
+        while j + 1 < len(scores) and sorted_scores[j + 1] == sorted_scores[i]:
+            j += 1
+        ranks[order[i : j + 1]] = (i + j) / 2 + 1
+        i = j + 1
+    return float((ranks[labels].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
+# ---------------------------------------------------------------------------
+# stage 1: extract
+# ---------------------------------------------------------------------------
+
+def load_rollouts(exp_dir: Path, max_rollouts: int) -> list[list[dict]]:
+    """Read the raw actor stream and return per-rollout turn lists sorted by step_index."""
+    rollouts: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    files = sorted((exp_dir / "streams" / "actor").rglob("*.jsonl"))
+    if not files:
+        raise FileNotFoundError(f"no actor stream files under {exp_dir}")
+    done = False
+    for path in files:
+        with open(path) as f:
+            for line in f:
+                for rec in json.loads(line):
+                    # Compact the token arrays immediately: full-context turns are
+                    # ~2MB each as Python int lists but ~260KB as int32 arrays, and
+                    # a single stream line carries a whole group of them.
+                    rec["input_ids"] = np.asarray(rec["input_ids"], dtype=np.int32)
+                    rec.pop("labels", None)
+                    rec.pop("logprobs", None)
+                    rec.pop("ref_logprobs", None)
+                    rec.pop("text", None)
+                    key = (rec["group_id"], rec["metadata"]["rollout_index"])
+                    rollouts[key].append(rec)
+                if len(rollouts) >= max_rollouts:
+                    done = True
+                    break
+        if done:
+            break
+    ordered = []
+    for key in sorted(rollouts.keys(), key=str):
+        turns = sorted(rollouts[key], key=lambda r: r["metadata"]["step_index"])
+        ordered.append(turns)
+        if len(ordered) >= max_rollouts:
+            break
+    logger.info("loaded %d rollouts from %d stream files", len(ordered), len(files))
+    return ordered
+
+
+def find_decoder_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
+    for path in ("model.language_model.layers", "model.layers", "transformer.h"):
+        node: torch.nn.Module | None = model
+        for name in path.split("."):
+            node = getattr(node, name, None)
+            if node is None:
+                break
+        if node is not None:
+            return list(node)
+    raise ValueError("could not locate decoder layer list on the model")
+
+
+def extract(args: argparse.Namespace) -> None:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    exp_dir = Path(args.exp_dir)
+    out_path = Path(args.out) if args.out else exp_dir / "probe_analysis" / "activations.pt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rollouts = load_rollouts(exp_dir, args.max_rollouts)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
+    model.to(args.device).eval()
+    layers = find_decoder_layers(model)
+    layer_indices = sorted(set(range(0, len(layers), args.layer_stride)) | {len(layers) - 1})
+    logger.info("probing layers %s of %d", layer_indices, len(layers))
+
+    captured: dict[int, torch.Tensor] = {}
+    positions_holder: list[int] = []
+
+    def make_hook(layer_idx: int):
+        def hook(_module, _inputs, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            captured[layer_idx] = hidden[0, positions_holder, :].detach().to("cpu", torch.float16)
+        return hook
+
+    handles = [layers[i].register_forward_hook(make_hook(i)) for i in layer_indices]
+
+    features: list[torch.Tensor] = []
+    meta: list[dict] = []
+    skipped_prefix = 0
+    try:
+        for n_done, turns in enumerate(rollouts):
+            full_ids = turns[-1]["input_ids"]
+            if len(full_ids) > args.max_seq_len:
+                full_ids = full_ids[: args.max_seq_len]
+            valid_turns, positions = [], []
+            for rec in turns:
+                p = prompt_length(rec)
+                if p - 1 < 0 or p > len(full_ids) or not is_prefix(rec["input_ids"], full_ids, p):
+                    skipped_prefix += 1
+                    continue
+                valid_turns.append(rec)
+                positions.append(p - 1)
+            if not valid_turns:
+                continue
+            positions_holder[:] = positions
+            input_ids = torch.tensor([full_ids], device=args.device)
+            with torch.no_grad():
+                model(input_ids=input_ids, use_cache=False)
+            stacked = torch.stack([captured[i] for i in layer_indices], dim=1)  # [turns, layers, hidden]
+            features.append(stacked)
+            rollout_reward = turns[-1]["reward"]
+            for rec, pos in zip(valid_turns, positions):
+                completion = tokenizer.decode(rec["input_ids"][prompt_length(rec):].tolist())
+                meta.append({
+                    "group_id": rec["group_id"],
+                    "rollout_index": rec["metadata"]["rollout_index"],
+                    "step_index": rec["metadata"]["step_index"],
+                    "n_turns": len(turns),
+                    "turn_reward": rec["reward"],
+                    "rollout_reward": rollout_reward,
+                    "is_submit": SUBMIT_MARKER in completion,
+                    "position": pos,
+                })
+            if (n_done + 1) % 20 == 0:
+                logger.info("extracted %d/%d rollouts (%d turns)", n_done + 1, len(rollouts), len(meta))
+    finally:
+        for h in handles:
+            h.remove()
+
+    torch.save(
+        {
+            "features": torch.cat(features, dim=0),
+            "layer_indices": layer_indices,
+            "meta": meta,
+            "model_path": str(args.model_path),
+            "exp_dir": str(exp_dir),
+        },
+        out_path,
+    )
+    logger.info(
+        "saved %d turn activations x %d layers to %s (skipped %d prefix mismatches)",
+        len(meta), len(layer_indices), out_path, skipped_prefix,
+    )
+
+
+# ---------------------------------------------------------------------------
+# stage 2: fit
+# ---------------------------------------------------------------------------
+
+def _standardize(train: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mean, std = train.mean(axis=0), train.std(axis=0) + 1e-6
+    return (train - mean) / std, (test - mean) / std
+
+
+def _fit_logistic(x: np.ndarray, y: np.ndarray, l2: float) -> np.ndarray:
+    xt = torch.tensor(x, dtype=torch.float32)
+    yt = torch.tensor(y, dtype=torch.float32)
+    w = torch.zeros(x.shape[1], requires_grad=True)
+    b = torch.zeros(1, requires_grad=True)
+    opt = torch.optim.LBFGS([w, b], max_iter=100, line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        logits = xt @ w + b
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, yt) + l2 * (w * w).mean()
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return np.concatenate([w.detach().numpy(), b.detach().numpy()])
+
+
+def _fit_ridge(x: np.ndarray, y: np.ndarray, l2: float) -> np.ndarray:
+    xb = np.concatenate([x, np.ones((len(x), 1))], axis=1)
+    gram = xb.T @ xb + l2 * np.eye(xb.shape[1])
+    return np.linalg.solve(gram, xb.T @ y)
+
+
+def cross_validated_metric(
+    x: np.ndarray, y: np.ndarray, folds: np.ndarray, l2: float, binary: bool
+) -> float:
+    """GroupKFold AUROC (binary) or R^2 (regression), pooled over held-out folds."""
+    scores = np.zeros(len(y))
+    for fold in np.unique(folds):
+        test_mask = folds == fold
+        if test_mask.all() or not test_mask.any():
+            return float("nan")
+        x_train, x_test = _standardize(x[~test_mask], x[test_mask])
+        y_train = y[~test_mask]
+        if binary:
+            if len(np.unique(y_train)) < 2:
+                return float("nan")
+            wb = _fit_logistic(x_train, y_train, l2)
+        else:
+            wb = _fit_ridge(x_train, y_train, l2)
+        scores[test_mask] = x_test @ wb[:-1] + wb[-1]
+    if binary:
+        return auroc(y.astype(bool), scores)
+    ss_res = float(((y - scores) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum()) + 1e-12
+    return 1.0 - ss_res / ss_tot
+
+
+def fit(args: argparse.Namespace) -> None:
+    blob = torch.load(args.activations, map_location="cpu", weights_only=False)
+    features: torch.Tensor = blob["features"]  # [N, L, H]
+    layer_indices: list[int] = blob["layer_indices"]
+    meta: list[dict] = blob["meta"]
+    out_dir = Path(args.out_dir) if args.out_dir else Path(args.activations).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    group_ids = [m["group_id"] for m in meta]
+    rollout_ids = [m["rollout_index"] for m in meta]
+    step_indices = np.array([m["step_index"] for m in meta])
+    rollout_rewards = [m["rollout_reward"] for m in meta]
+    folds = np.array([group_fold(g, args.folds) for g in group_ids])
+    buckets = np.array([turn_bucket(int(s)) for s in step_indices])
+
+    targets: dict[str, tuple[np.ndarray, bool]] = {
+        "submit_action": (np.array([m["is_submit"] for m in meta], dtype=float), True),
+        "rollout_success": (np.array([r >= 0.999 for r in rollout_rewards], dtype=float), True),
+        "z_centered_return": (loo_centered_returns(group_ids, rollout_ids, rollout_rewards), False),
+    }
+
+    rows = []
+    bucket_names = ["all"] + sorted(set(buckets.tolist()))
+    for li, layer in enumerate(layer_indices):
+        x_layer = features[:, li, :].float().numpy()
+        for bucket in bucket_names:
+            mask = np.ones(len(meta), dtype=bool) if bucket == "all" else buckets == bucket
+            if mask.sum() < args.min_bucket_size:
+                continue
+            for name, (y, binary) in targets.items():
+                value = cross_validated_metric(x_layer[mask], y[mask], folds[mask], args.l2, binary)
+                rows.append({
+                    "target": name, "layer": layer, "bucket": bucket,
+                    "n": int(mask.sum()), "n_pos": int(y[mask].sum()) if binary else -1,
+                    "metric": "auroc" if binary else "r2", "value": round(value, 4),
+                })
+                logger.info("layer %d bucket %-5s %-18s %s=%.4f (n=%d)",
+                            layer, bucket, name, "auroc" if binary else "r2", value, int(mask.sum()))
+
+    csv_path = out_dir / "probe_results.csv"
+    with open(csv_path, "w") as f:
+        f.write("target,layer,bucket,n,n_pos,metric,value\n")
+        for r in rows:
+            f.write(f"{r['target']},{r['layer']},{r['bucket']},{r['n']},{r['n_pos']},{r['metric']},{r['value']}\n")
+
+    lines = ["# P0 turn-probe results", "", f"activations: {args.activations}", ""]
+    for name in targets:
+        best = {}
+        for r in rows:
+            if r["target"] == name and (r["bucket"] not in best or r["value"] > best[r["bucket"]]["value"]):
+                best[r["bucket"]] = r
+        lines.append(f"## {name} (best layer per bucket)")
+        lines.append("")
+        lines.append("| bucket | layer | metric | value | n |")
+        lines.append("|---|---|---|---|---|")
+        for bucket in bucket_names:
+            if bucket in best:
+                r = best[bucket]
+                lines.append(f"| {bucket} | {r['layer']} | {r['metric']} | {r['value']} | {r['n']} |")
+        lines.append("")
+    (out_dir / "probe_summary.md").write_text("\n".join(lines))
+    logger.info("wrote %s and probe_summary.md (%d rows)", csv_path, len(rows))
+
+
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_ext = sub.add_parser("extract", help="dump turn-start activations (needs a GPU)")
+    p_ext.add_argument("--exp-dir", required=True)
+    p_ext.add_argument("--model-path", required=True)
+    p_ext.add_argument("--out", default=None)
+    p_ext.add_argument("--max-rollouts", type=int, default=400)
+    p_ext.add_argument("--layer-stride", type=int, default=4)
+    p_ext.add_argument("--max-seq-len", type=int, default=65536)
+    p_ext.add_argument("--device", default="cuda")
+    p_ext.set_defaults(func=extract)
+
+    p_fit = sub.add_parser("fit", help="fit probes on saved activations (CPU)")
+    p_fit.add_argument("--activations", required=True)
+    p_fit.add_argument("--out-dir", default=None)
+    p_fit.add_argument("--folds", type=int, default=5)
+    p_fit.add_argument("--l2", type=float, default=1.0)
+    p_fit.add_argument("--min-bucket-size", type=int, default=50)
+    p_fit.set_defaults(func=fit)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
