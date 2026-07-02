@@ -128,6 +128,22 @@ environments:
 
 environment_key: terminal
 
+orchestrator:
+  manage_fleets: true
+  account: snow.research.adea
+  image: registry.toolkit-sp.yul201.service-now.com/snow.research.tapes/interactive-toolkit:throughput
+  mounts:
+    - snow.research.tapes.rafael_pardinas_home:/home/toolkit:rw
+    - snow.research.tapes.data:/mnt/llmd/data:rw
+    - snow.research.tapes.results:/mnt/llmd/results:rw
+  fleet_resources:
+    cpu: 64
+    mem: 512
+  bid: 9999
+  conda_env: pipeline-rl
+  fleet_name_prefix: terminal_envs
+  fleet_restores_per_hour: 3
+
 dataset_loader: pipelinerl.domains.terminal.load_problems
 dataset_loader_params:
   repo_id: allenai/TMax-15K
