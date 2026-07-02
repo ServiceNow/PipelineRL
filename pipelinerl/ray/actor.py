@@ -871,6 +871,9 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             write_to_streams(eval_data_stream, "a") as eval_data_writer,
             write_to_streams(eval_stats_stream, "a") as eval_stats_writer,
         ):
+            # When rollout_once is set this loop is a one-shot re-eval, not
+            # training — use eval LLM params (test_llm) to match periodic eval.
+            train_loop_llms = eval_llms if bool(getattr(cfg.actor, "rollout_once", False)) else train_llms
             train_loop = RayActorLoop(
                 cfg=cfg,
                 dataset=train_dataset,
@@ -881,7 +884,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                 scheduler_name="ray_train_scheduler",
                 is_training=True,
                 llm_load_balancer=llm_load_balancer,
-                llms=train_llms,
+                llms=train_loop_llms,
             )
             train_loop.start()
 
