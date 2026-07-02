@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import signal
@@ -167,6 +168,167 @@ def test_build_shared_rootfs_stages_base_and_uses_reflink(monkeypatch, tmp_path)
     assert cp_commands[1][:3] == ["cp", "-a", "--reflink=auto"]
     assert cp_commands[1][3] == str(base_stage)
     assert (task_rootfs / "home/user/.bashrc").exists()
+
+
+def test_session_delta_manifest_tracks_touched_top_level_dirs(tmp_path):
+    root = tmp_path / "rootfs"
+    (root / "app").mkdir(parents=True)
+    (root / "opt").mkdir(parents=True)
+    (root / "home/user").mkdir(parents=True)
+    (root / "tmp").mkdir(parents=True)
+    before = proot_env._tree_metadata(root)
+
+    (root / "app/new.txt").write_text("abc")
+    (root / "opt/config.txt").write_text("hello")
+    (root / "home/user/ignore.txt").write_text("private")
+    (root / "tmp/ignore.txt").write_text("private")
+    (root / "outside").symlink_to("/etc/passwd")
+
+    manifest = proot_env._write_session_dirs_manifest(root, before)
+
+    assert manifest["version"] == 1
+    assert isinstance(manifest["build_completed_at"], float)
+    assert manifest["dirs"] == [
+        {"name": "app", "bytes": 3},
+        {"name": "opt", "bytes": 5},
+    ]
+    assert manifest["total_bytes"] == 8
+    assert json.loads((root / ".session_dirs.json").read_text()) == manifest
+
+
+def test_shared_rootfs_contamination_detector_reports_modified_files(tmp_path):
+    root = tmp_path / "rootfs"
+    (root / "etc").mkdir(parents=True)
+    (root / "app").mkdir()
+    clean = root / "etc/clean.txt"
+    touched = root / "etc/touched.txt"
+    delta_touched = root / "app/touched.txt"
+    manifest = {
+        "version": 1,
+        "build_completed_at": 1000.0,
+        "dirs": [{"name": "app", "bytes": 7}],
+        "total_bytes": 7,
+    }
+    manifest_path = root / ".session_dirs.json"
+    manifest_path.write_text(json.dumps(manifest))
+    clean.write_text("clean")
+    touched.write_text("dirty")
+    delta_touched.write_text("private")
+    for path, mtime in (
+        (manifest_path, 1000.0),
+        (clean, 1001.0),
+        (touched, 1003.5),
+        (delta_touched, 1003.5),
+    ):
+        os.utime(path, (mtime, mtime))
+
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+    )
+    env.rootfs = root
+
+    assert env._detect_shared_rootfs_contamination() == 1
+
+
+def test_shared_rootfs_contamination_detector_ignores_untouched_files(tmp_path):
+    root = tmp_path / "rootfs"
+    (root / "etc").mkdir(parents=True)
+    clean = root / "etc/clean.txt"
+    manifest = {
+        "version": 1,
+        "build_completed_at": 1000.0,
+        "dirs": [],
+        "total_bytes": 0,
+    }
+    manifest_path = root / ".session_dirs.json"
+    manifest_path.write_text(json.dumps(manifest))
+    clean.write_text("clean")
+    os.utime(manifest_path, (1000.0, 1000.0))
+    os.utime(clean, (1001.0, 1001.0))
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+    )
+    env.rootfs = root
+
+    assert env._detect_shared_rootfs_contamination() == 0
+
+
+def test_session_delta_binds_include_reflinked_copies(monkeypatch, tmp_path):
+    root = tmp_path / "rootfs"
+    (root / "app").mkdir(parents=True)
+    (root / "app/file.txt").write_text("abc")
+    (root / ".session_dirs.json").write_text(json.dumps({
+        "version": 1,
+        "build_completed_at": 1000.0,
+        "dirs": [{"name": "app", "bytes": 3}],
+        "total_bytes": 3,
+    }))
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+    )
+    commands = []
+
+    real_run = proot_env.subprocess.run
+
+    def recording_run(argv, *args, **kwargs):
+        commands.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(proot_env.subprocess, "run", recording_run)
+
+    ok, err = env._materialize_session_delta_dirs(root)
+
+    assert ok
+    assert err == ""
+    copied = env.session_deltas / "app" / "file.txt"
+    assert copied.read_text() == "abc"
+    assert [cmd[:3] for cmd in commands if cmd[:2] == ["cp", "-a"]] == [["cp", "-a", "--reflink=auto"]]
+    binds = env._session_binds()
+    assert binds[0] == f"{env.session_deltas / 'app'}:/app"
+    assert binds[-2:] == [f"{env.session_home}:/home/user", f"{env.session_tmp}:/tmp"]
+
+
+def test_session_delta_over_cap_is_not_runnable(monkeypatch, tmp_path):
+    meta_root = tmp_path / "meta"
+    monkeypatch.setattr(proot_env, "_META_ROOT", meta_root)
+    base = tmp_path / "base"
+    base.mkdir()
+    env = ProotTerminalEnvironment(
+        base_rootfs=base,
+        work_dir=tmp_path / "work",
+        cache_dir=tmp_path / "cache",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+        session_delta_max_bytes=2,
+    )
+    key = proot_env._task_key(base.name, "def")
+    task_cache = env._rootfs_root / key
+    root = task_cache / "rootfs"
+    (root / "app").mkdir(parents=True)
+    (root / "app/file.txt").write_text("abc")
+    (root / ".session_dirs.json").write_text(json.dumps({
+        "version": 1,
+        "build_completed_at": 1000.0,
+        "dirs": [{"name": "app", "bytes": 3}],
+        "total_bytes": 3,
+    }))
+    (task_cache / ".ready").touch()
+
+    ok, err = env.build("def")
+
+    assert not ok
+    assert "over cap" in err
+    assert env._session_delta_binds == []
+    env.cleanup()
 
 
 def test_release_shared_rootfs_retains_current_and_evicts_old(monkeypatch, tmp_path):
