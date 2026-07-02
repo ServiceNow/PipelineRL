@@ -417,15 +417,17 @@ class ProotTerminalEnvironment:
             if chunk:
                 buf.append(chunk)
                 joined = "".join(buf)
-                for line in joined.splitlines():
-                    if self._marker in line and ":" in line:
-                        head, _, tail = line.rpartition(":")
-                        if head.endswith(self._marker):
-                            try:
-                                code = int(tail.strip())
-                            except ValueError:
-                                code = None
-                            return joined[: joined.find(self._marker)], code
+                offset = 0
+                for line in joined.splitlines(keepends=True):
+                    line_complete = line.endswith(("\n", "\r"))
+                    logical_line = line.rstrip("\r\n")
+                    if line_complete and self._marker in logical_line and ":" in logical_line:
+                        head, _, tail = logical_line.rpartition(":")
+                        tail = tail.strip()
+                        if head.endswith(self._marker) and tail.lstrip("-").isdigit():
+                            marker_start = offset + logical_line.rfind(self._marker)
+                            return joined[:marker_start], int(tail)
+                    offset += len(line)
             time.sleep(0.002)
         return "".join(buf), None
 
