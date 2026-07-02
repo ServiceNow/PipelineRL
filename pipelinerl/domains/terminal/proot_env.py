@@ -456,19 +456,6 @@ class ProotTerminalEnvironment:
             time.sleep(0.002)
         return "".join(buf), None
 
-    @property
-    def disk_exceeded(self) -> bool:
-        """True if this session was aborted for exceeding a local resource cap."""
-        return self._disk_exceeded.is_set()
-
-    @property
-    def abort_reason(self) -> Optional[str]:
-        return self._abort_reason
-
-    @property
-    def timeout_aborted(self) -> bool:
-        return self._abort_reason == "timeout"
-
     def _abort_session(self, kind: str, reason: str) -> None:
         with self._abort_lock:
             if self._abort_reason is None:
@@ -561,7 +548,7 @@ class ProotTerminalEnvironment:
             # Apptainer auto-sources these on exec; proot does not. Sourcing them
             # here starts the task's background services inside this long-lived
             # session so verifier port checks pass.
-            ok, _ = self.exec(
+            ok, _, _ = self.exec(
                 'for f in /.singularity.d/env/*.sh; do [ -f "$f" ] && source "$f" 2>/dev/null; done; true'
             )
             if not ok and self._abort_reason is not None:
@@ -572,15 +559,15 @@ class ProotTerminalEnvironment:
             self._disk_monitor_thread.start()
         return True
 
-    def exec(self, command: str, timeout: Optional[float] = None) -> Tuple[bool, str]:
-        """Run a command in the persistent shell, returning (success, output)."""
+    def exec(self, command: str, timeout: Optional[float] = None) -> Tuple[bool, str, Optional[str]]:
+        """Run a command, returning (success, output, abort_kind)."""
         if self._disk_exceeded.is_set():
             reason = self._abort_reason or "local resource limit exceeded"
-            return False, f"session aborted: {reason}"
+            return False, f"session aborted: {reason}", self._abort_reason
         if not self.shell_process or self.shell_process.poll() is not None:
-            return False, "shell is not running"
+            return False, "shell is not running", self._abort_reason
         if not self.reader_thread or not self.reader_thread.is_alive():
-            return False, "reader thread is not alive"
+            return False, "reader thread is not alive", self._abort_reason
 
         self._drain()
         command = command.strip()
@@ -594,23 +581,23 @@ class ProotTerminalEnvironment:
         try:
             os.write(self.master_fd, (wrapped + "\n").encode())
         except OSError as e:
-            return False, f"command write failed: {e}"
+            return False, f"command write failed: {e}", self._abort_reason
 
         raw, code = self._read_until_marker(timeout)
         if code is None:
             timeout_s = timeout if timeout is not None else self.read_timeout
             self._abort_session("timeout", "command timed out after %.0fs" % timeout_s)
-            return False, f"command timed out after {timeout_s:.0f}s; session aborted. Partial output:\n{raw[:1000]}"
+            return False, f"command timed out after {timeout_s:.0f}s; session aborted. Partial output:\n{raw[:1000]}", self._abort_reason
         cleaned = ANSI_RE.sub("", raw).replace("\r", "")
-        return code == 0, cleaned
+        return code == 0, cleaned, self._abort_reason
 
     # ------------------------------------------------------------------
     # verifiers
     # ------------------------------------------------------------------
-    def _run_pytest(self, test_text: str, name: str) -> Tuple[bool, str]:
+    def _run_pytest(self, test_text: str, name: str) -> Tuple[bool, str, Optional[str]]:
         if self._disk_exceeded.is_set():
             reason = self._abort_reason or "local resource limit exceeded"
-            return False, f"session aborted: {reason}"
+            return False, f"session aborted: {reason}", self._abort_reason
         # /home/user is bound to the writable session home, so write the test
         # file straight into it instead of touching the read-only base.
         (self.session_home / name).write_text(test_text, encoding="utf-8")
@@ -621,7 +608,7 @@ class ProotTerminalEnvironment:
         )
 
     def run_initial_tests(self, test_text: str) -> bool:
-        ok, out = self._run_pytest(test_text, "test_initial_state.py")
+        ok, out, _ = self._run_pytest(test_text, "test_initial_state.py")
         if not ok:
             logger.info("initial-state tests failed:\n%s", out[-800:])
         return ok
@@ -645,10 +632,10 @@ class ProotTerminalEnvironment:
         errors = _last(r"(\d+) error")
         return passed, passed + failed + errors
 
-    def run_final_tests(self, test_text: str) -> Tuple[bool, str, int, int]:
-        ok, out = self._run_pytest(test_text, "test_final_state.py")
+    def run_final_tests(self, test_text: str) -> Tuple[bool, str, int, int, Optional[str]]:
+        ok, out, abort_kind = self._run_pytest(test_text, "test_final_state.py")
         passed, total = self._parse_pytest_counts(out)
-        return ok, out, passed, total
+        return ok, out, passed, total, abort_kind
 
     # ------------------------------------------------------------------
     def cleanup(self) -> None:

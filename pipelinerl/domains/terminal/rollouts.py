@@ -88,6 +88,7 @@ class TerminalMetrics(BaseMetrics):
     overflow: bool = False
     disk_aborted: bool = False
     timeout_aborted: bool = False
+    rss_aborted: bool = False
     submitted: bool = False
     n_turns: int = 0
     n_llm_calls: int = 0
@@ -364,6 +365,7 @@ async def _execute_rollout(
         llm_call_events: list[tuple[LLMCall, bool]] = []
         disk_aborted = False
         timeout_aborted = False
+        rss_aborted = False
         submitted = False
         while n_actions < tcfg.max_turns:
             llm_call = await llm_async_generate(llm, Prompt(messages=messages, tools=tools), session)
@@ -395,9 +397,11 @@ async def _execute_rollout(
 
             obs = await _post(session, f"{env_url}/step", {"session_id": session_id, "command": action.command}, call_timeout)
             messages.append({"role": "tool", "tool_call_id": action.tool_call_id or "call_0", "content": obs["output"]})
-            if obs.get("disk_exceeded"):
-                disk_aborted = True
-                timeout_aborted = timeout_aborted or bool(obs.get("timeout_aborted"))
+            abort_kind = obs.get("abort_kind")
+            if abort_kind:
+                disk_aborted = disk_aborted or abort_kind == "disk"
+                timeout_aborted = timeout_aborted or abort_kind == "timeout"
+                rss_aborted = rss_aborted or abort_kind == "rss"
                 break
 
         if max_format_retries_exceeded:
@@ -409,8 +413,10 @@ async def _execute_rollout(
             verifier_pass = bool(verifier["passed"])
             passed_tests = int(verifier.get("passed_tests", 0))
             total_tests = int(verifier.get("total_tests", 0))
-            disk_aborted = disk_aborted or bool(verifier.get("disk_exceeded"))
-            timeout_aborted = timeout_aborted or bool(verifier.get("timeout_aborted"))
+            abort_kind = verifier.get("abort_kind")
+            disk_aborted = disk_aborted or abort_kind == "disk"
+            timeout_aborted = timeout_aborted or abort_kind == "timeout"
+            rss_aborted = rss_aborted or abort_kind == "rss"
     finally:
         if session_id:
             try:
@@ -421,7 +427,7 @@ async def _execute_rollout(
     # Graded reward (opt-in): map the pytest pass fraction onto [reward_fail,
     # reward_pass] so partially-correct rollouts give within-group variance and
     # fewer groups are zero-advantage filtered. Falls back to binary when disabled
-    # or when no tests resolved (collection error / disk abort -> total_tests 0).
+    # or when no tests resolved (collection error / abort -> total_tests 0).
     pass_fraction = passed_tests / total_tests if total_tests > 0 else 0.0
     if max_format_retries_exceeded:
         reward = tcfg.reward_fail
@@ -443,6 +449,7 @@ async def _execute_rollout(
         and not submitted
         and not disk_aborted
         and not timeout_aborted
+        and not rss_aborted
         and not max_format_retries_exceeded
     ):
         reward = max(tcfg.reward_fail, reward - no_submit_penalty)
@@ -470,6 +477,7 @@ async def _execute_rollout(
         overflow=summary.overflow,
         disk_aborted=disk_aborted,
         timeout_aborted=timeout_aborted,
+        rss_aborted=rss_aborted,
         submitted=submitted,
         n_turns=n_actions,
         n_llm_calls=len(llm_calls),

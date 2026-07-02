@@ -113,7 +113,7 @@ def test_start_returns_false_when_startup_hook_aborts(monkeypatch, tmp_path):
 
     def aborting_exec(command):
         env._abort_reason = "timeout"
-        return False, "session aborted"
+        return False, "session aborted", env._abort_reason
 
     env.exec = aborting_exec
     monkeypatch.setattr(proot_env.pty, "openpty", lambda: (10, 11))

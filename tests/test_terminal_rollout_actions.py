@@ -100,14 +100,13 @@ def _patch_rollout_fakes(monkeypatch, llm_calls, *, verifier_pass=True, step_res
         if url.endswith("/start_task"):
             return {"session_id": "session-1", "started": True, "init_ok": True, "build_ok": True}
         if url.endswith("/step"):
-            return step_response or {"output": "ok", "disk_exceeded": False, "timeout_aborted": False}
+            return step_response or {"output": "ok", "abort_kind": None}
         if url.endswith("/finish"):
             return {
                 "passed": verifier_pass,
                 "passed_tests": int(verifier_pass),
                 "total_tests": 1,
-                "disk_exceeded": False,
-                "timeout_aborted": False,
+                "abort_kind": None,
             }
         if url.endswith("/close"):
             return {"status": "ok"}
@@ -275,6 +274,58 @@ def test_no_submit_penalty_applies_only_to_clean_max_turn_exit(monkeypatch):
     assert submitted_result.metrics.reward == 1.0
     assert [text.reward for text in submitted_result.training_texts] == [1.0]
     assert submitted_result.metrics.submitted
+
+
+def test_timeout_abort_breaks_loop_and_sets_metric(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="run", tool_calls=[_tool_call(arguments={"command": "make"})])],
+        verifier_pass=False,
+        step_response={"output": "command timed out", "abort_kind": "timeout"},
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(max_turns=2),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.metrics.timeout_aborted
+    assert not result.metrics.disk_aborted
+    assert not result.metrics.rss_aborted
+    assert result.metrics.n_llm_calls == 1
+    assert result.metrics.n_total_llm_calls == 1
+
+
+def test_rss_abort_sets_metric_and_skips_no_submit_penalty(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="run", tool_calls=[_tool_call(arguments={"command": "python train.py"})])],
+        verifier_pass=True,
+        step_response={"output": "rss cap exceeded", "abort_kind": "rss"},
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(max_turns=1, no_submit_penalty=0.4),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.metrics.rss_aborted
+    assert not result.metrics.disk_aborted
+    assert not result.metrics.timeout_aborted
+    assert result.metrics.reward == 1.0
+    assert [text.reward for text in result.training_texts] == [1.0]
 
 
 class DummySession:

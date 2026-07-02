@@ -101,32 +101,28 @@ class TerminalSession:
     def exec(self, command: str) -> dict:
         # Bind the env once: a concurrent background close() (fast-close pops the
         # slot, then runs session.close() off the response path) can set
-        # self._env=None between the guard and the disk_exceeded read while a long
+        # self._env=None between the guard and result construction while a long
         # /step runs in the thread pool, raising AttributeError on the dict build.
         env = self._env
         if env is None:
             raise RuntimeError("session not started")
-        success, output = env.exec(command, timeout=self.command_timeout)
+        success, output, abort_kind = env.exec(command, timeout=self.command_timeout)
         return {
             "output": truncate(output, self.max_observation_chars) or "(no output)",
             "success": success,
             "exit_code": 0 if success else 1,
-            "disk_exceeded": env.disk_exceeded,
-            "abort_reason": env.abort_reason,
-            "timeout_aborted": env.timeout_aborted,
+            "abort_kind": abort_kind,
         }
 
     def finish(self) -> dict:
         env = self._env
         if env is None:
             raise RuntimeError("session not started")
-        passed, output, passed_tests, total_tests = env.run_final_tests(self._final_test)
+        passed, output, passed_tests, total_tests, abort_kind = env.run_final_tests(self._final_test)
         return {
             "passed": passed,
             "output": truncate(output, self.max_observation_chars),
-            "disk_exceeded": env.disk_exceeded,
-            "abort_reason": env.abort_reason,
-            "timeout_aborted": env.timeout_aborted,
+            "abort_kind": abort_kind,
             "passed_tests": passed_tests,
             "total_tests": total_tests,
         }
