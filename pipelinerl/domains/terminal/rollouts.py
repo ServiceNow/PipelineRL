@@ -27,6 +27,8 @@ import aiohttp
 from omegaconf import DictConfig
 
 from pipelinerl.async_llm import (
+    RetryableAbortedCompletionError,
+    _normalize_tool_call_messages,
     llm_async_generate,
     make_training_text,
     make_training_texts_from_llm_calls,
@@ -103,6 +105,8 @@ class TerminalMetrics(BaseMetrics):
     tool_calls_with_prose: int = 0
     tool_call_prose_rate: float = 0.0
     max_format_retries_exceeded: bool = False
+    format_error_texts_dropped: int = 0
+    context_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -367,7 +371,28 @@ async def _execute_rollout(
         timeout_aborted = False
         rss_aborted = False
         submitted = False
+        context_exhausted = False
+        # Context budget: vLLM rejects the request outright (400) when prompt +
+        # max_tokens exceeds max_model_len, which failed the whole rollout once the
+        # multi-turn history grew past that line. Predict it with the same tokenizer
+        # and template the server uses and end the rollout cleanly instead.
+        vllm_kwargs = getattr(getattr(cfg, "vllm_config", None), "vllm_kwargs", None)
+        max_model_len = int(vllm_kwargs.get("max_model_len") or 0) if vllm_kwargs is not None else 0
+        max_new_tokens = int((getattr(llm, "parameters", None) or {}).get("max_tokens") or 0)
+        context_margin = 64
         while n_actions < tcfg.max_turns:
+            if max_model_len and max_new_tokens:
+                chat_kwargs = dict(getattr(llm, "chat_template_kwargs", None) or {})
+                prompt_ids = llm.tokenizer.apply_chat_template(
+                    _normalize_tool_call_messages(messages),
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **chat_kwargs,
+                )
+                if len(prompt_ids) + max_new_tokens + context_margin > max_model_len:
+                    context_exhausted = True
+                    break
             llm_call = await llm_async_generate(llm, Prompt(messages=messages, tools=tools), session)
             n_total_llm_calls += 1
             action = _extract_bash_action(llm_call)
@@ -445,7 +470,7 @@ async def _execute_rollout(
     no_submit_penalty = float(getattr(tcfg, "no_submit_penalty", 0.0))
     if (
         no_submit_penalty > 0
-        and n_actions >= tcfg.max_turns
+        and (n_actions >= tcfg.max_turns or context_exhausted)
         and not submitted
         and not disk_aborted
         and not timeout_aborted
@@ -454,12 +479,28 @@ async def _execute_rollout(
     ):
         reward = max(tcfg.reward_fail, reward - no_submit_penalty)
 
+    format_error_texts_dropped = 0
     if format_error_reward is None:
         training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     else:
         training_texts = []
         for llm_call, is_format_error in llm_call_events:
-            training_text = make_training_text(llm, llm_call)
+            try:
+                training_text = make_training_text(llm, llm_call)
+            except RetryableAbortedCompletionError:
+                raise
+            except Exception:
+                if not is_format_error:
+                    raise
+                # A malformed tool call (e.g. unparseable `arguments`) can defeat the
+                # chat-template reconstruction (jinja `|items` on a non-mapping). Drop
+                # just this penalty turn instead of failing the whole rollout.
+                format_error_texts_dropped += 1
+                logger.warning(
+                    "dropping unreconstructable format-error turn for %s",
+                    problem.get("task_id"), exc_info=True,
+                )
+                continue
             training_text.reward = reward if max_format_retries_exceeded or not is_format_error else format_error_reward
             training_texts.append(training_text)
     summary = summarize_training_texts(training_texts)
@@ -492,6 +533,8 @@ async def _execute_rollout(
         tool_calls_with_prose=tool_calls_with_prose,
         tool_call_prose_rate=tool_calls_with_prose / max(len(llm_calls), 1),
         max_format_retries_exceeded=max_format_retries_exceeded,
+        format_error_texts_dropped=format_error_texts_dropped,
+        context_exhausted=context_exhausted,
     )
     return RolloutResult(
         training_texts=training_texts,

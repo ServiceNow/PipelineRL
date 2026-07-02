@@ -477,3 +477,65 @@ def test_generate_rollout_tries_start_task_without_health_probe(monkeypatch):
 
     assert result.metrics.success
     assert attempts == ["http://dead-env:7777", "http://live-env:7778"]
+
+
+def test_unreconstructable_format_error_turn_is_dropped_not_fatal(monkeypatch):
+    llm_calls = [
+        _llm_call(content="bad format"),
+        _llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})]),
+    ]
+    _patch_rollout_fakes(monkeypatch, llm_calls)
+
+    def exploding_make_training_text(llm, llm_call):
+        if (llm_call.output.content or "") == "bad format":
+            raise TypeError("Can only get item pairs from a mapping.")
+        return TrainingText(text=llm_call.output.content or "tool", n_predicted=1)
+
+    monkeypatch.setattr(
+        "pipelinerl.domains.terminal.rollouts.make_training_text", exploding_make_training_text
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(format_error_reward=-0.2),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert [text.text for text in result.training_texts] == ["submit"]
+    assert [text.reward for text in result.training_texts] == [1.0]
+    assert result.metrics.format_error_texts_dropped == 1
+    assert result.metrics.n_format_errors == 1
+
+
+def test_context_budget_ends_rollout_cleanly_before_oversized_request(monkeypatch):
+    _patch_rollout_fakes(monkeypatch, [])
+
+    cfg = _terminal_cfg(no_submit_penalty=0.4)
+    cfg.vllm_config = SimpleNamespace(vllm_kwargs={"max_model_len": 65536})
+    fake_llm = SimpleNamespace(
+        parameters={"max_tokens": 16000},
+        chat_template_kwargs={"enable_thinking": True},
+        tokenizer=SimpleNamespace(apply_chat_template=lambda *a, **k: list(range(50000))),
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            cfg,
+            fake_llm,
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.metrics.context_exhausted
+    assert result.metrics.n_turns == 0
+    assert not result.metrics.submitted
+    # clean exit: verifier still ran (fake passes), no-submit penalty applied
+    assert result.metrics.reward == 0.6
