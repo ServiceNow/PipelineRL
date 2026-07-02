@@ -2,6 +2,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+from pipelinerl.domains.terminal import rollouts
 from pipelinerl.domains.terminal.environment_server import TerminalEnvironmentServer
 from pipelinerl.domains.terminal.rollouts import (
     _SUBMIT_COMMAND,
@@ -9,9 +10,12 @@ from pipelinerl.domains.terminal.rollouts import (
     _execute_rollout,
     _extract_bash_action,
     _is_submit_command,
+    EnvironmentConnectionError,
+    TerminalMetrics,
+    generate_terminal_rollout,
 )
 from pipelinerl.llm import LLMCall, LLMOutput, Prompt
-from pipelinerl.rollouts import TrainingText
+from pipelinerl.rollouts import RolloutResult, TrainingText
 
 
 def _tool_call(name="bash", arguments=None, call_id="call_0"):
@@ -352,3 +356,73 @@ def test_reaper_removes_expired_sessions_and_closes_in_background():
         assert not fresh.closed
 
     asyncio.run(run_case())
+
+
+def test_execute_rollout_wraps_start_task_connection_error(monkeypatch):
+    seen_timeouts = []
+
+    async def fake_post(session, url, payload, timeout):
+        seen_timeouts.append(timeout)
+        raise rollouts.aiohttp.ClientConnectionError("dead")
+
+    monkeypatch.setattr(rollouts, "_post", fake_post)
+
+    try:
+        asyncio.run(
+            _execute_rollout(
+                _terminal_cfg(env_start_timeout=30),
+                object(),
+                {"task": "fix it", "task_id": "task-1"},
+                object(),
+                time.time(),
+                "http://dead-env",
+            )
+        )
+    except EnvironmentConnectionError:
+        pass
+    else:
+        raise AssertionError("expected start_task connection error")
+
+    assert seen_timeouts
+    assert seen_timeouts[0].total == 30
+    assert seen_timeouts[0].connect == 10
+
+
+def test_generate_rollout_tries_start_task_without_health_probe(monkeypatch):
+    jobs = [
+        SimpleNamespace(hostname="dead-env", port=7777),
+        SimpleNamespace(hostname="live-env", port=7778),
+    ]
+    attempts = []
+
+    class NoHealthSession:
+        def get(self, *args, **kwargs):
+            raise AssertionError("health probe should not run")
+
+    async def fake_execute(cfg, llm, problem, session, start_time, env_url):
+        attempts.append(env_url)
+        if env_url == "http://dead-env:7777":
+            raise EnvironmentConnectionError("dead")
+        return RolloutResult(
+            training_texts=[],
+            metrics=TerminalMetrics(reward=1.0, success=True, no_error=True, no_answer=False),
+            latency=0.0,
+            dataset_name=None,
+            domain="terminal",
+        )
+
+    monkeypatch.setattr(rollouts, "get_environment_jobs", lambda cfg, key: jobs)
+    monkeypatch.setattr(rollouts.random, "shuffle", lambda urls: None)
+    monkeypatch.setattr(rollouts, "_execute_rollout", fake_execute)
+
+    result = asyncio.run(
+        generate_terminal_rollout(
+            _terminal_cfg(rollout_timeout=5, capacity_retry_sleep=0),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            NoHealthSession(),
+        )
+    )
+
+    assert result.metrics.success
+    assert attempts == ["http://dead-env:7777", "http://live-env:7778"]
