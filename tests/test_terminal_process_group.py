@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 
-from pipelinerl.domains.terminal.proot_env import _terminate_process_group
+from pipelinerl.domains.terminal.proot_env import ProotTerminalEnvironment, _terminate_process_group
 
 
 def _pid_running(pid: int) -> bool:
@@ -49,3 +49,36 @@ def test_terminate_process_group_kills_child_process():
             proc.wait(timeout=1)
         except Exception:
             pass
+
+
+def test_read_until_marker_waits_for_split_exit_code():
+    env = ProotTerminalEnvironment.__new__(ProotTerminalEnvironment)
+    env._marker = "__CMD_DONE__test__"
+    env.read_timeout = 0.05
+    chunks = iter([
+        "visible output\necho __CMD_DONE__test__:not-an-exit\n__CMD_DONE__test__:",
+        "0\n",
+    ])
+    env._drain = lambda: next(chunks, "")
+
+    raw, code = env._read_until_marker(timeout=0.2)
+
+    assert code == 0
+    assert raw == "visible output\necho __CMD_DONE__test__:not-an-exit\n"
+
+
+def test_read_until_marker_waits_for_complete_exit_code_line():
+    env = ProotTerminalEnvironment.__new__(ProotTerminalEnvironment)
+    env._marker = "__CMD_DONE__test__"
+    env.read_timeout = 0.05
+    chunks = iter([
+        "visible output\n__CMD_DONE__test__:1",
+        "2\n",
+    ])
+    env._drain = lambda: next(chunks, "")
+
+    raw, code = env._read_until_marker(timeout=0.2)
+
+    assert code == 12
+    assert raw == "visible output\n"
+    assert env._drain() == ""
