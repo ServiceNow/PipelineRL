@@ -117,9 +117,10 @@ environments:
     # is generous (normal tasks use <1GiB); 8 sessions/node x 16 = 128GiB << node RAM.
     max_session_rss_bytes: 17179869184  # 16 GiB
     # Reap orphaned sessions that missed /close (client cancellation, actor death,
-    # or start_task timeout). Keep above rollout_timeout so live rollouts are not
-    # touched; close uses the same fast slot-free/background cleanup path as /close.
-    session_ttl_seconds: 3600.0
+    # or cancellation before /start_task returned a session_id). Keep just above
+    # rollout_timeout=1800 so live rollouts are not touched, while residual leaks
+    # clear far sooner than the old one-hour TTL.
+    session_ttl_seconds: 1900.0
     session_reap_interval_seconds: 60.0
 
 environment_key: terminal

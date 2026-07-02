@@ -337,27 +337,27 @@ async def _execute_rollout(
     tcfg = cfg.terminal
     call_timeout = getattr(tcfg, "env_call_timeout", 300)
     # /start_task triggers the one-time per-task rootfs build, which reads the
-    # base over NFS and can take several minutes. Give it a longer timeout than
-    # /step so a cold build is not abandoned mid-flight (which would leak the
-    # server-side session and its capacity slot).
+    # base over NFS and can take several minutes. Once the server returns a
+    # session_id, the finally block must close it even on an early failed rollout.
     start_timeout = getattr(tcfg, "env_start_timeout", 900)
 
-    start = await _post(session, f"{env_url}/start_task", {"task_data": problem}, start_timeout)
-    session_id = start.get("session_id")
-    if not session_id or not start.get("started") or not start.get("init_ok"):
-        logger.warning("task %s not runnable (start=%s), dropping", problem.get("task_id"), start)
-        return _failed_result(problem, start_time, TerminalMetrics(
-            reward=tcfg.reward_fail, success=False, no_error=False, no_answer=True,
-            build_ok=start.get("build_ok", False), init_ok=start.get("init_ok", False)))
-
-    n_actions = 0
-    n_total_llm_calls = 0
-    format_counts = _new_format_counts()
-    tool_calls_with_prose = 0
-    max_format_retries = int(getattr(tcfg, "max_format_retries", 3))
-    format_error_reward = getattr(tcfg, "format_error_reward", None)
-    max_format_retries_exceeded = False
+    session_id = None
     try:
+        start = await _post(session, f"{env_url}/start_task", {"task_data": problem}, start_timeout)
+        session_id = start.get("session_id")
+        if not session_id or not start.get("started") or not start.get("init_ok"):
+            logger.warning("task %s not runnable (start=%s), dropping", problem.get("task_id"), start)
+            return _failed_result(problem, start_time, TerminalMetrics(
+                reward=tcfg.reward_fail, success=False, no_error=False, no_answer=True,
+                build_ok=start.get("build_ok", False), init_ok=start.get("init_ok", False)))
+
+        n_actions = 0
+        n_total_llm_calls = 0
+        format_counts = _new_format_counts()
+        tool_calls_with_prose = 0
+        max_format_retries = int(getattr(tcfg, "max_format_retries", 3))
+        format_error_reward = getattr(tcfg, "format_error_reward", None)
+        max_format_retries_exceeded = False
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": problem["task"]},
@@ -415,10 +415,11 @@ async def _execute_rollout(
             disk_aborted = disk_aborted or bool(verifier.get("disk_exceeded"))
             timeout_aborted = timeout_aborted or bool(verifier.get("timeout_aborted"))
     finally:
-        try:
-            await _post(session, f"{env_url}/close", {"session_id": session_id}, 30)
-        except Exception:
-            logger.warning("failed to close session %s on %s", session_id, env_url)
+        if session_id:
+            try:
+                await _post(session, f"{env_url}/close", {"session_id": session_id}, 30)
+            except Exception:
+                logger.warning("failed to close session %s on %s", session_id, env_url)
 
     # Graded reward (opt-in): map the pytest pass fraction onto [reward_fail,
     # reward_pass] so partially-correct rollouts give within-group variance and

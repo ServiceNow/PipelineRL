@@ -338,8 +338,19 @@ class TerminalEnvironmentServer:
 
     async def finish(self, request: web.Request) -> web.Response:
         body = await request.json()
-        session = self._get(body["session_id"])
-        result = await self._run(session.finish)
+        session_id = body["session_id"]
+        session = self._get(session_id)
+        try:
+            result = await self._run(session.finish)
+        finally:
+            async with self._lock:
+                if self._sessions.get(session_id) is session:
+                    self._sessions.pop(session_id, None)
+                    self._session_last_activity.pop(session_id, None)
+                    close_session = session
+                else:
+                    close_session = None
+            self._close_session_background(close_session)
         return web.json_response(result)
 
     async def close(self, request: web.Request) -> web.Response:

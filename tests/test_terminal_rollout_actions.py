@@ -198,6 +198,39 @@ def test_null_format_error_reward_drops_error_turn(monkeypatch):
     assert result.metrics.submitted
 
 
+def test_execute_rollout_closes_started_session_on_init_failure(monkeypatch):
+    calls = []
+
+    async def fake_post(session, url, payload, timeout):
+        calls.append((url, payload))
+        if url.endswith("/start_task"):
+            return {"session_id": "session-1", "started": True, "init_ok": False, "build_ok": True}
+        if url.endswith("/close"):
+            return {"status": "ok"}
+        raise AssertionError(url)
+
+    monkeypatch.setattr("pipelinerl.domains.terminal.rollouts._post", fake_post)
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.metrics.reward == -1.0
+    assert result.metrics.build_ok
+    assert not result.metrics.init_ok
+    assert calls == [
+        ("http://env/start_task", {"task_data": {"task": "fix it", "task_id": "task-1"}}),
+        ("http://env/close", {"session_id": "session-1"}),
+    ]
+
+
 def test_no_submit_penalty_applies_only_to_clean_max_turn_exit(monkeypatch):
     _patch_rollout_fakes(
         monkeypatch,
@@ -243,9 +276,53 @@ def test_no_submit_penalty_applies_only_to_clean_max_turn_exit(monkeypatch):
 class DummySession:
     def __init__(self):
         self.closed = False
+        self.finished = False
+        self.close_count = 0
+
+    def finish(self):
+        self.finished = True
+        return {"passed": True}
 
     def close(self):
         self.closed = True
+        self.close_count += 1
+
+
+class DummyRequest:
+    def __init__(self, body):
+        self.body = body
+
+    async def json(self):
+        return self.body
+
+
+def test_finish_removes_session_and_close_stays_idempotent():
+    async def run_case():
+        server = TerminalEnvironmentServer(
+            bases_dir="/tmp",
+            n_envs=1,
+            session_ttl_seconds=60.0,
+            session_reap_interval_seconds=60.0,
+        )
+        session = DummySession()
+        server._sessions["session-1"] = session
+        server._session_last_activity["session-1"] = time.monotonic()
+
+        response = await server.finish(DummyRequest({"session_id": "session-1"}))
+        close_response = await server.close(DummyRequest({"session_id": "session-1"}))
+        if server._bg_tasks:
+            await asyncio.gather(*list(server._bg_tasks))
+        server._executor.shutdown(wait=True)
+
+        assert response.status == 200
+        assert close_response.status == 200
+        assert "session-1" not in server._sessions
+        assert "session-1" not in server._session_last_activity
+        assert session.finished
+        assert session.closed
+        assert session.close_count == 1
+
+    asyncio.run(run_case())
 
 
 def test_reaper_removes_expired_sessions_and_closes_in_background():
