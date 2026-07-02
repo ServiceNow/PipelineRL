@@ -26,6 +26,7 @@ import time
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+from pipelinerl import fleet as fleet_manager
 from pipelinerl.utils import better_crashing, select_environment_config
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ def _spawn(env_container: dict, port: int) -> mp.Process:
 @hydra.main(config_path="../../conf", config_name="base", version_base="1.3.2")
 def hydra_entrypoint(cfg: DictConfig):
     with better_crashing("environment_fleet"):
+        logger.info("env fleet git sha: %s", fleet_manager.git_sha())
         fleet = getattr(cfg, "fleet", None)
         if fleet is None:
             raise ValueError("run_environment_fleet requires +fleet.{environment_key,start_port,count}")
