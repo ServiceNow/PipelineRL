@@ -99,7 +99,6 @@ class TerminalMetrics(BaseMetrics):
     format_errors_wrong_tool: int = 0
     format_errors_bad_arguments: int = 0
     format_errors_empty_command: int = 0
-    format_errors_prose_with_tool: int = 0
     tool_calls_with_prose: int = 0
     tool_call_prose_rate: float = 0.0
     max_format_retries_exceeded: bool = False
@@ -233,7 +232,6 @@ def _new_format_counts() -> dict[str, int]:
         "wrong_tool": 0,
         "bad_arguments": 0,
         "empty_command": 0,
-        "prose_with_tool": 0,
     }
 
 
@@ -484,7 +482,6 @@ async def _execute_rollout(
         format_errors_wrong_tool=format_counts["wrong_tool"],
         format_errors_bad_arguments=format_counts["bad_arguments"],
         format_errors_empty_command=format_counts["empty_command"],
-        format_errors_prose_with_tool=format_counts["prose_with_tool"],
         tool_calls_with_prose=tool_calls_with_prose,
         tool_call_prose_rate=tool_calls_with_prose / max(len(llm_calls), 1),
         max_format_retries_exceeded=max_format_retries_exceeded,
