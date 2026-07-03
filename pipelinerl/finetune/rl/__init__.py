@@ -244,6 +244,15 @@ def turn_end_indices(segments: list[tuple[Any, Any]], masks_shifted: torch.Tenso
     return _turn_boundary_indices(segments, masks_shifted, -1)
 
 
+def _binary_auroc(labels: torch.Tensor, scores: torch.Tensor) -> float:
+    from pipelinerl.domains.terminal.turn_probes import auroc
+
+    return auroc(
+        labels.detach().cpu().numpy().astype(bool),
+        scores.detach().cpu().numpy(),
+    )
+
+
 def _forward_with_frozen_probe_capture(
     model: PreTrainedModel,
     model_inputs: dict[str, Any],
@@ -725,18 +734,19 @@ def rl_step(
     if frozen_probe_turn_probs is not None:
         assert frozen_probe_turn_targets is not None
         assert frozen_probe_turn_advantages is not None
-        stats["frozen_probe/p_mean"] = frozen_probe_turn_probs.mean().item() if frozen_probe_turn_probs.numel() else 0.0
+        stats["frozen_probe/p_mean"] = frozen_probe_turn_probs.mean().item() if frozen_probe_turn_probs.numel() else float("nan")
         success_mask = frozen_probe_turn_targets == 1
         fail_mask = frozen_probe_turn_targets == 0
         stats["frozen_probe/p_at_success"] = (
-            frozen_probe_turn_probs[success_mask].mean().item() if success_mask.any() else 0.0
+            frozen_probe_turn_probs[success_mask].mean().item() if success_mask.any() else float("nan")
         )
         stats["frozen_probe/p_at_fail"] = (
-            frozen_probe_turn_probs[fail_mask].mean().item() if fail_mask.any() else 0.0
+            frozen_probe_turn_probs[fail_mask].mean().item() if fail_mask.any() else float("nan")
         )
-        stats["frozen_probe/A_mean"] = frozen_probe_turn_advantages.mean().item() if frozen_probe_turn_advantages.numel() else 0.0
-        stats["frozen_probe/A_min"] = frozen_probe_turn_advantages.min().item() if frozen_probe_turn_advantages.numel() else 0.0
-        stats["frozen_probe/A_max"] = frozen_probe_turn_advantages.max().item() if frozen_probe_turn_advantages.numel() else 0.0
+        stats["frozen_probe/auroc_online"] = _binary_auroc(frozen_probe_turn_targets, frozen_probe_turn_probs)
+        stats["frozen_probe/A_mean"] = frozen_probe_turn_advantages.mean().item() if frozen_probe_turn_advantages.numel() else float("nan")
+        stats["frozen_probe/A_min"] = frozen_probe_turn_advantages.min().item() if frozen_probe_turn_advantages.numel() else float("nan")
+        stats["frozen_probe/A_max"] = frozen_probe_turn_advantages.max().item() if frozen_probe_turn_advantages.numel() else float("nan")
 
     if has_value_head:
         assert value_predictions is not None

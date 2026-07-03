@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from torch import nn
 from pipelinerl.finetune.rl import (
     FrozenProbeRuntime,
     RLConfig,
+    _binary_auroc,
     _forward_with_frozen_probe_capture,
     frozen_probe_advantages,
     load_frozen_probe_runtime,
@@ -18,6 +20,7 @@ from pipelinerl.finetune.rl import (
     turn_start_indices,
 )
 from pipelinerl.finetune.types import PipelineBatchEncoding
+from pipelinerl.finetune_loop import _aggregate_step_rl_metrics
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead, ValueHead
 
 
@@ -35,6 +38,15 @@ def test_base_yaml_frozen_probe_credit_loads_as_string() -> None:
     config = RLConfig(**rl_values)
 
     assert config.frozen_probe_credit == "off"
+
+
+def test_binary_auroc_matches_probe_semantics() -> None:
+    labels = torch.tensor([1.0, 1.0, 0.0, 0.0])
+
+    assert _binary_auroc(labels, torch.tensor([0.9, 0.8, 0.2, 0.1])) == 1.0
+    assert _binary_auroc(labels, torch.tensor([0.1, 0.2, 0.8, 0.9])) == 0.0
+    assert _binary_auroc(labels, torch.tensor([0.5, 0.5, 0.5, 0.5])) == 0.5
+    assert math.isnan(_binary_auroc(torch.tensor([1.0, 1.0]), torch.tensor([0.1, 0.2])))
 
 
 def test_turn_indices_select_labeled_boundaries_per_segment() -> None:
@@ -86,6 +98,25 @@ def _packed_batch() -> PipelineBatchEncoding:
         group_tokens=torch.ones(1, 3),
         num_labels=torch.ones(1, 3),
         overflow=torch.zeros(1, 3),
+        model_version=0,
+        is_packed=True,
+    )
+
+
+def _packed_two_segment_batch() -> PipelineBatchEncoding:
+    return PipelineBatchEncoding(
+        input_ids=torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        attention_mask=torch.ones(1, 6, dtype=torch.long),
+        labels=torch.tensor([[-100, 1, 2, -100, 4, 5]]),
+        position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
+        segment_ids=torch.tensor([[0, 0, 0, 1, 1, 1]]),
+        rewards=torch.tensor([[1.0, 1.0, 1.0, -1.0, -1.0, -1.0]]),
+        advantages=torch.zeros(1, 6),
+        ref_logprobs=torch.zeros(1, 6),
+        old_logprobs=torch.zeros(1, 6),
+        group_tokens=torch.ones(1, 6),
+        num_labels=torch.ones(1, 6),
+        overflow=torch.zeros(1, 6),
         model_version=0,
         is_packed=True,
     )
@@ -276,6 +307,52 @@ def test_frozen_probe_shadow_leaves_gspo_advantages_bit_identical() -> None:
         assert off_stats[key] == shadow_stats[key]
     assert shadow_stats["frozen_probe/p_mean"] == 0.5
     assert shadow_stats["frozen_probe/A_mean"] == -0.5
+    assert math.isnan(shadow_stats["frozen_probe/auroc_online"])
+
+
+def test_frozen_probe_shadow_logs_online_auroc() -> None:
+    model = _TinyProbePolicy()
+    runtime = FrozenProbeRuntime(
+        layer=model.model.layers[31],
+        w_prime=torch.zeros(4, dtype=torch.float32),
+        b_prime=0.0,
+    )
+
+    _loss, stats = rl_step(
+        model,
+        _packed_two_segment_batch(),
+        current_step=0,
+        max_step=1,
+        config=RLConfig(policy_loss="gspo", batch_size=1, frozen_probe_credit="shadow"),
+        frozen_probe=runtime,
+    )
+
+    assert stats["frozen_probe/p_mean"] == 0.5
+    assert stats["frozen_probe/p_at_success"] == 0.5
+    assert stats["frozen_probe/p_at_fail"] == 0.5
+    assert stats["frozen_probe/auroc_online"] == 0.5
+    assert stats["frozen_probe/A_mean"] == 0.0
+
+
+def test_frozen_probe_step_metrics_aggregate_per_microbatch_and_skip_nan() -> None:
+    metrics = _aggregate_step_rl_metrics(
+        {
+            "reward": [1.0, 3.0],
+            "frozen_probe/p_mean": [0.2, 0.6],
+            "frozen_probe/p_at_success": [float("nan"), 0.7],
+            "frozen_probe/A_min": [-0.2, -0.8],
+            "frozen_probe/A_max": [0.3, 0.9],
+            "frozen_probe/auroc_online": [float("nan"), 0.75],
+        },
+        num_samples=4,
+    )
+
+    assert metrics["rl/reward"] == 1.0
+    assert metrics["rl/frozen_probe/p_mean"] == 0.4
+    assert metrics["rl/frozen_probe/p_at_success"] == 0.7
+    assert metrics["rl/frozen_probe/A_min"] == -0.8
+    assert metrics["rl/frozen_probe/A_max"] == 0.9
+    assert metrics["rl/frozen_probe/auroc_online"] == 0.75
 
 
 def test_frozen_probe_live_replaces_gspo_advantages() -> None:

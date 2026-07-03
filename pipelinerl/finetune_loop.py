@@ -74,6 +74,28 @@ from pipelinerl.utils import wait_for_inference_servers
 logger = logging.getLogger(__name__)
 
 
+def _aggregate_step_rl_metrics(rl_metrics: Dict[str, List], num_samples: int) -> dict[str, float]:
+    frozen_probe_metrics: dict[str, float] = {}
+    for key in list(rl_metrics):
+        if not key.startswith("frozen_probe/"):
+            continue
+        values = np.asarray(rl_metrics.pop(key), dtype=float)
+        values = values[~np.isnan(values)]
+        if values.size == 0:
+            value = float("nan")
+        elif key == "frozen_probe/A_min":
+            value = float(np.min(values))
+        elif key == "frozen_probe/A_max":
+            value = float(np.max(values))
+        else:
+            value = float(np.mean(values))
+        frozen_probe_metrics[f"rl/{key}"] = value
+
+    metrics = aggregate_rl_stats(rl_metrics, num_samples)
+    metrics.update(frozen_probe_metrics)
+    return metrics
+
+
 def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
     """
     Gather RL metrics from all processes using torch.distributed.all_gather_object.
@@ -927,7 +949,7 @@ def rl_finetuning_worker(
             gathered_rl_metrics = gather_rl_metrics(rl_metrics)
             time_waiting_for_data = 0.0
 
-            average_rl_metrics = aggregate_rl_stats(gathered_rl_metrics, samples_per_step)
+            average_rl_metrics = _aggregate_step_rl_metrics(gathered_rl_metrics, samples_per_step)
             ess = (
                 average_rl_metrics["rl/ratio_new_old_sum"] ** 2
                 / average_rl_metrics["rl/ratio_new_old_squared_sum"]
