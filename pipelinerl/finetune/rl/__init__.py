@@ -1,5 +1,6 @@
 import logging
 import os
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, TYPE_CHECKING
 from pydantic import BaseModel, Field
@@ -111,6 +112,65 @@ class RLConfig(BaseModel):
         default=False,
         description="Use turn-end value predictions to decompose rollout-level advantages",
     )
+    frozen_probe_path: str | None = Field(
+        default=None,
+        description="Path to a frozen rollout-success probe artifact",
+    )
+
+
+@dataclass(frozen=True)
+class FrozenProbeRuntime:
+    layer: torch.nn.Module
+    w_prime: torch.Tensor
+    b_prime: float
+
+
+def _model_hidden_size(model: torch.nn.Module) -> int:
+    config = getattr(model, "config", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is None:
+        text_config = getattr(config, "text_config", None)
+        hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is None:
+        raise ValueError("frozen probe requires model config.hidden_size or config.text_config.hidden_size")
+    return int(hidden_size)
+
+
+def load_frozen_probe_runtime(path: str, model: torch.nn.Module) -> FrozenProbeRuntime:
+    from pipelinerl.domains.terminal.turn_probes import find_decoder_layers
+
+    artifact = torch.load(path, map_location="cpu", weights_only=False)
+    if artifact.get("version") != 1:
+        raise ValueError("frozen probe artifact must have version == 1")
+    if artifact.get("target") != "rollout_success":
+        raise ValueError("frozen probe artifact target must be rollout_success")
+
+    layer_index_value = artifact.get("layer_index")
+    if layer_index_value is None:
+        raise ValueError("frozen probe artifact layer_index must be 31")
+    layer_index = int(layer_index_value)
+    if layer_index != 31:
+        raise ValueError("frozen probe artifact layer_index must be 31")
+
+    w_prime = artifact.get("w_prime")
+    if not isinstance(w_prime, torch.Tensor):
+        raise ValueError("frozen probe artifact w_prime must be a tensor")
+    hidden_size = _model_hidden_size(model)
+    if w_prime.shape != (hidden_size,) or w_prime.dtype != torch.float32 or w_prime.device.type != "cpu":
+        raise ValueError(
+            "frozen probe artifact w_prime must be a fp32 cpu tensor shaped "
+            f"[{hidden_size}], got shape={tuple(w_prime.shape)} dtype={w_prime.dtype} device={w_prime.device}"
+        )
+
+    b_prime = artifact.get("b_prime")
+    if not isinstance(b_prime, (float, int)):
+        raise ValueError("frozen probe artifact b_prime must be a float")
+
+    layers = find_decoder_layers(model)
+    if layer_index >= len(layers):
+        raise ValueError(f"frozen probe layer_index {layer_index} outside model with {len(layers)} layers")
+
+    return FrozenProbeRuntime(layer=layers[layer_index], w_prime=w_prime.contiguous(), b_prime=float(b_prime))
 
 
 def make_rl_data_callback(args, current_dir, rl_config, model):
@@ -174,6 +234,32 @@ def turn_end_indices(segments: list[tuple[Any, Any]], masks_shifted: torch.Tenso
     return _turn_boundary_indices(segments, masks_shifted, -1)
 
 
+def _forward_with_frozen_probe_capture(
+    model: PreTrainedModel,
+    model_inputs: dict[str, Any],
+    frozen_probe: FrozenProbeRuntime | None,
+):
+    if frozen_probe is None:
+        return model(**model_inputs), None
+
+    captured_hidden = None
+
+    def capture_hidden(_module, _inputs, output):
+        nonlocal captured_hidden
+        hidden = output[0] if isinstance(output, (tuple, list)) else output
+        captured_hidden = hidden.detach()
+
+    hook = frozen_probe.layer.register_forward_hook(capture_hidden)
+    try:
+        outputs = model(**model_inputs)
+    finally:
+        hook.remove()
+
+    if captured_hidden is None:
+        raise RuntimeError("Frozen-probe hidden-state hook did not fire")
+    return outputs, captured_hidden.float()
+
+
 def multi_turn_credit_advantages(
     segments: list[tuple[Any, Any]],
     masks_shifted: torch.Tensor,
@@ -219,6 +305,7 @@ def rl_step(
     max_step: int,
     config: RLConfig,
     seq_parallel_group=None,
+    frozen_probe: FrozenProbeRuntime | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Perform a single RL step on the model using the given batch and config.
@@ -288,7 +375,7 @@ def rl_step(
     if hasattr(batch, 'image_grid_thw') and batch.image_grid_thw is not None:
         model_inputs["image_grid_thw"] = batch.image_grid_thw #torch.tensor(.reshape((1, 3))
     
-    outputs = model(**model_inputs)
+    outputs, _frozen_probe_hidden = _forward_with_frozen_probe_capture(model, model_inputs, frozen_probe)
 
     # compute log probs for actual tokens without materializing full logprobs unless needed
     logits = outputs.logits[:, :-1, :]

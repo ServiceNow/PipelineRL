@@ -5,7 +5,10 @@ import torch
 from torch import nn
 
 from pipelinerl.finetune.rl import (
+    FrozenProbeRuntime,
     RLConfig,
+    _forward_with_frozen_probe_capture,
+    load_frozen_probe_runtime,
     multi_turn_credit_advantages,
     rl_step,
     turn_end_indices,
@@ -67,6 +70,113 @@ def _packed_batch() -> PipelineBatchEncoding:
         model_version=0,
         is_packed=True,
     )
+
+
+class _CountingLayer(nn.Module):
+    def __init__(self, hidden_size: int, *, output_bfloat16: bool = False) -> None:
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+        self.output_bfloat16 = output_bfloat16
+        self.register_calls = 0
+
+    def register_forward_hook(self, hook, *args, **kwargs):
+        self.register_calls += 1
+        return super().register_forward_hook(hook, *args, **kwargs)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear(hidden_states)
+        return hidden_states.to(torch.bfloat16) if self.output_bfloat16 else hidden_states
+
+
+class _TinyProbePolicy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(hidden_size=4)
+        self.embed = nn.Embedding(8, 4)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList(
+            [_CountingLayer(4, output_bfloat16=i == 31) for i in range(32)]
+        )
+        self.lm_head = nn.Linear(4, 8)
+
+    def forward(self, input_ids, attention_mask=None, labels=None, position_ids=None):
+        hidden_states = self.embed(input_ids)
+        for layer in self.model.layers:
+            hidden_states = layer(hidden_states)
+        return SimpleNamespace(logits=self.lm_head(hidden_states.float()))
+
+
+def test_load_frozen_probe_runtime_validates_artifact_and_resolves_layer(tmp_path) -> None:
+    model = _TinyProbePolicy()
+    artifact_path = tmp_path / "probe.pt"
+    torch.save(
+        {
+            "version": 1,
+            "target": "rollout_success",
+            "layer_index": 31,
+            "w_prime": torch.ones(4, dtype=torch.float32),
+            "b_prime": 0.25,
+        },
+        artifact_path,
+    )
+
+    runtime = load_frozen_probe_runtime(str(artifact_path), model)
+
+    assert runtime.layer is model.model.layers[31]
+    torch.testing.assert_close(runtime.w_prime, torch.ones(4))
+    assert runtime.b_prime == 0.25
+
+    torch.save(
+        {
+            "version": 1,
+            "target": "rollout_success",
+            "layer_index": 31,
+            "w_prime": torch.ones(3, dtype=torch.float32),
+            "b_prime": 0.25,
+        },
+        artifact_path,
+    )
+    with pytest.raises(ValueError, match="w_prime"):
+        load_frozen_probe_runtime(str(artifact_path), model)
+
+
+def test_frozen_probe_forward_capture_detaches_upcasts_and_removes_hook() -> None:
+    model = _TinyProbePolicy()
+    runtime = FrozenProbeRuntime(
+        layer=model.model.layers[31],
+        w_prime=torch.ones(4, dtype=torch.float32),
+        b_prime=0.0,
+    )
+
+    outputs, hidden = _forward_with_frozen_probe_capture(
+        model,
+        {"input_ids": torch.tensor([[0, 1, 2]]), "attention_mask": torch.ones(1, 3), "labels": None},
+        runtime,
+    )
+
+    assert outputs.logits.shape == (1, 3, 8)
+    assert hidden is not None
+    assert hidden.shape == (1, 3, 4)
+    assert hidden.dtype == torch.float32
+    assert not hidden.requires_grad
+    assert model.model.layers[31].register_calls == 1
+    assert len(model.model.layers[31]._forward_hooks) == 0
+
+
+def test_rl_step_without_frozen_probe_does_not_register_probe_hook() -> None:
+    model = _TinyProbePolicy()
+
+    loss, stats = rl_step(
+        model,
+        _packed_batch(),
+        current_step=0,
+        max_step=1,
+        config=RLConfig(policy_loss="gspo", batch_size=1),
+    )
+
+    assert torch.isfinite(loss)
+    assert "loss" in stats
+    assert sum(layer.register_calls for layer in model.model.layers) == 0
 
 
 def test_multi_turn_credit_requires_value_head() -> None:

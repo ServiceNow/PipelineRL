@@ -57,6 +57,7 @@ from pipelinerl.finetune.memory_debug import MemoryDebugger, create_memory_debug
 from pipelinerl.finetune.optim import get_optimizer
 from pipelinerl.finetune.rl import (
     RLConfig,
+    load_frozen_probe_runtime,
     rl_step,
 )
 from pipelinerl.finetune.rl.utils import aggregate_rl_stats
@@ -656,6 +657,11 @@ def rl_finetuning_worker(
     rl_config = RLConfig(**args.rl)
     # samples_per_step will be used to normalize the loss
     rl_config.batch_size = samples_per_step
+    frozen_probe = None
+    if rl_config.frozen_probe_path is not None:
+        unwrapped_model = get_accelerator().unwrap_model(model)
+        frozen_probe = load_frozen_probe_runtime(rl_config.frozen_probe_path, unwrapped_model)
+        logger.info("Loaded frozen probe from %s", rl_config.frozen_probe_path)
     while training_metrics.completed_steps < final_train_steps:
         logical_step = training_metrics.completed_steps + 1
         # We include time waiting for data in the step time
@@ -784,6 +790,7 @@ def rl_finetuning_worker(
                 final_train_steps,
                 rl_config,
                 seq_parallel_group=seq_parallel_group,
+                frozen_probe=frozen_probe,
             )
             if memory_debug is not None and memory_debug.should_log_micro_batch(logical_step):
                 memory_debug.log_snapshot(
