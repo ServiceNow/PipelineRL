@@ -4,12 +4,18 @@ import pytest
 import torch
 from torch import nn
 
-from pipelinerl.finetune.rl import RLConfig, multi_turn_credit_advantages, rl_step, turn_end_indices
+from pipelinerl.finetune.rl import (
+    RLConfig,
+    multi_turn_credit_advantages,
+    rl_step,
+    turn_end_indices,
+    turn_start_indices,
+)
 from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead, ValueHead
 
 
-def test_turn_end_indices_selects_last_labeled_token_per_segment() -> None:
+def test_turn_indices_select_labeled_boundaries_per_segment() -> None:
     segments = [
         (torch.tensor(0), torch.tensor(3)),
         (torch.tensor(3), torch.tensor(5)),
@@ -17,9 +23,11 @@ def test_turn_end_indices_selects_last_labeled_token_per_segment() -> None:
     ]
     masks_shifted = torch.tensor([[False, True, True, False, True, False]])
 
-    indices = turn_end_indices(segments, masks_shifted)
+    start_indices = turn_start_indices(segments, masks_shifted)
+    end_indices = turn_end_indices(segments, masks_shifted)
 
-    assert indices.tolist() == [2, 4]
+    assert start_indices.tolist() == [1, 4]
+    assert end_indices.tolist() == [2, 4]
 
 
 def test_multi_turn_credit_advantages_expands_turn_residuals_per_segment() -> None:

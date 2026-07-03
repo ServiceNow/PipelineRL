@@ -145,7 +145,9 @@ def _segment_bound(value: Any) -> int:
     return int(value.item()) if isinstance(value, torch.Tensor) else int(value)
 
 
-def turn_end_indices(segments: list[tuple[Any, Any]], masks_shifted: torch.Tensor) -> torch.LongTensor:
+def _turn_boundary_indices(
+    segments: list[tuple[Any, Any]], masks_shifted: torch.Tensor, offset_index: int
+) -> torch.LongTensor:
     if masks_shifted.dim() != 2 or masks_shifted.shape[0] != 1:
         raise ValueError(f"Expected masks_shifted shaped [1, L], got {tuple(masks_shifted.shape)}")
 
@@ -160,8 +162,16 @@ def turn_end_indices(segments: list[tuple[Any, Any]], masks_shifted: torch.Tenso
         valid_offsets = torch.nonzero(segment_mask, as_tuple=False).flatten()
         if valid_offsets.numel() == 0:
             continue
-        indices.append(start_i + int(valid_offsets[-1].item()))
+        indices.append(start_i + int(valid_offsets[offset_index].item()))
     return torch.tensor(indices, dtype=torch.long, device=masks_shifted.device)
+
+
+def turn_start_indices(segments: list[tuple[Any, Any]], masks_shifted: torch.Tensor) -> torch.LongTensor:
+    return _turn_boundary_indices(segments, masks_shifted, 0)
+
+
+def turn_end_indices(segments: list[tuple[Any, Any]], masks_shifted: torch.Tensor) -> torch.LongTensor:
+    return _turn_boundary_indices(segments, masks_shifted, -1)
 
 
 def multi_turn_credit_advantages(
