@@ -113,14 +113,16 @@ environments:
     # this bounds local scratch to ~10.8GiB (<16GiB). A session over the cap is aborted
     # and scored as a normal negative outcome. Most tasks use <1MiB, so 0.9GiB is ample.
     max_session_disk_bytes: 966367641   # 0.9 GiB
-    # Build-time task deltas outside /home/user and /tmp are copied per session
-    # and bound over the shared read-only rootfs. Cap that copy size so a task
-    # with a huge mutable /app-style payload is dropped instead of sharing state
-    # across sibling rollouts.
+    # Delta isolation copies task build deltas per session. It is bypassed for
+    # this run because apt/toolchain-heavy tasks require 450MiB-1.6GiB of real
+    # NFS copies and up to 1766 binds; keep known-good shared-rootfs throughput
+    # and measure actual contamination with the sampled detector below.
+    session_delta_isolation: false
     session_delta_max_bytes: 536870912   # 512 MiB
-    # Backstop: warn and surface a health counter if anything still mutates the
-    # shared task rootfs after build. Nonzero means the isolation model has a hole.
+    # Backstop: sample shared-rootfs mutation checks. Health reports both sampled
+    # closes and contaminated sampled closes so the live rate is interpretable.
     contamination_check: true
+    contamination_sample_every: 20
     # Hard cap on each session's process-group RSS. A memory-heavy curriculum task
     # (moderate/complex are heavier than the dropped 'short') or a runaway allocation
     # OOM-killed the inference replica (gspo_28, exit 137); the disk cap only bounds

@@ -233,6 +233,39 @@ def test_shared_rootfs_contamination_detector_reports_modified_files(tmp_path):
     assert env._detect_shared_rootfs_contamination() == 1
 
 
+def test_shared_rootfs_contamination_detector_counts_delta_dirs_when_isolation_off(tmp_path):
+    root = tmp_path / "rootfs"
+    (root / "etc").mkdir(parents=True)
+    (root / "app").mkdir()
+    touched = root / "etc/touched.txt"
+    delta_touched = root / "app/touched.txt"
+    manifest = {
+        "version": 1,
+        "build_completed_at": 1000.0,
+        "dirs": [{"name": "app", "bytes": 7}],
+        "total_bytes": 7,
+    }
+    manifest_path = root / ".session_dirs.json"
+    manifest_path.write_text(json.dumps(manifest))
+    touched.write_text("dirty")
+    delta_touched.write_text("private")
+    for path in (manifest_path,):
+        os.utime(path, (1000.0, 1000.0))
+    for path in (touched, delta_touched):
+        os.utime(path, (1003.5, 1003.5))
+
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+        session_delta_isolation=False,
+    )
+    env.rootfs = root
+
+    assert env._detect_shared_rootfs_contamination() == 2
+
+
 def test_shared_rootfs_contamination_detector_ignores_untouched_files(tmp_path):
     root = tmp_path / "rootfs"
     (root / "etc").mkdir(parents=True)
@@ -328,6 +361,46 @@ def test_session_delta_over_cap_is_not_runnable(monkeypatch, tmp_path):
     assert not ok
     assert "over cap" in err
     assert env._session_delta_binds == []
+    env.cleanup()
+
+
+def test_session_delta_isolation_disabled_bypasses_stale_over_cap_manifest(monkeypatch, tmp_path):
+    meta_root = tmp_path / "meta"
+    monkeypatch.setattr(proot_env, "_META_ROOT", meta_root)
+    base = tmp_path / "base"
+    base.mkdir()
+    env = ProotTerminalEnvironment(
+        base_rootfs=base,
+        work_dir=tmp_path / "work",
+        cache_dir=tmp_path / "cache",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+        session_delta_max_bytes=2,
+        session_delta_isolation=False,
+        contamination_check=False,
+    )
+    key = proot_env._task_key(base.name, "def")
+    task_cache = env._rootfs_root / key
+    root = task_cache / "rootfs"
+    (root / "app").mkdir(parents=True)
+    (root / "app/file.txt").write_text("abc")
+    (root / ".session_dirs.json").write_text(json.dumps({
+        "version": 999,
+        "build_completed_at": 1000.0,
+        "dirs": [{"name": "app", "bytes": 3}],
+        "total_bytes": 3,
+    }))
+    (task_cache / ".ready").touch()
+
+    ok, err = env.build("def")
+
+    assert ok
+    assert err == ""
+    assert env._session_delta_binds == []
+    assert env._session_binds() == [
+        f"{env.session_home}:/home/user",
+        f"{env.session_tmp}:/tmp",
+    ]
     env.cleanup()
 
 

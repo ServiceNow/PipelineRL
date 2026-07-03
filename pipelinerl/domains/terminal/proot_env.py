@@ -325,6 +325,7 @@ class ProotTerminalEnvironment:
         max_session_rss_bytes: int = 16 * 2**30,
         disk_check_interval: float = 3.0,
         session_delta_max_bytes: int = 512 * 2**20,
+        session_delta_isolation: bool = True,
         contamination_check: bool = True,
     ):
         self.base_rootfs = Path(base_rootfs).resolve()
@@ -348,6 +349,7 @@ class ProotTerminalEnvironment:
         self.max_session_rss_bytes = max_session_rss_bytes
         self.disk_check_interval = disk_check_interval
         self.session_delta_max_bytes = session_delta_max_bytes
+        self.session_delta_isolation = session_delta_isolation
         self.contamination_check = contamination_check
 
         self._owns_work_dir = work_dir is None
@@ -507,6 +509,8 @@ class ProotTerminalEnvironment:
 
     def _materialize_session_delta_dirs(self, task_rootfs: Path) -> Tuple[bool, str]:
         self._session_delta_binds = []
+        if not self.session_delta_isolation:
+            return True, ""
         try:
             manifest = _read_session_dirs_manifest(task_rootfs)
         except Exception as e:
@@ -547,7 +551,10 @@ class ProotTerminalEnvironment:
         try:
             manifest = _read_session_dirs_manifest(self.rootfs)
             cutoff = float(manifest["build_completed_at"]) + 2.0
-            delta_names = {str(item["name"]) for item in manifest.get("dirs", [])}
+            delta_names = (
+                {str(item["name"]) for item in manifest.get("dirs", [])}
+                if self.session_delta_isolation else set()
+            )
         except Exception:
             logger.warning("shared rootfs contamination check failed for %s", self.rootfs, exc_info=True)
             return 0
@@ -812,7 +819,7 @@ class ProotTerminalEnvironment:
         return ok, out, passed, total, abort_kind
 
     # ------------------------------------------------------------------
-    def cleanup(self) -> int:
+    def cleanup(self, contamination_sample: bool = True) -> tuple[int, int]:
         self._stop_event.set()
         if self.reader_thread:
             self.reader_thread.join(timeout=1.0)
@@ -837,7 +844,11 @@ class ProotTerminalEnvironment:
                     pass
         self.master_fd = self.slave_fd = None
 
-        contamination_count = self._detect_shared_rootfs_contamination()
+        contamination_sampled = 0
+        contamination_count = 0
+        if contamination_sample and self.contamination_check:
+            contamination_sampled = 1
+            contamination_count = self._detect_shared_rootfs_contamination()
 
         # Release this session's hold on the shared rootfs. With retention
         # disabled this evicts at zero refs; otherwise cleanup is age-based.
@@ -851,7 +862,7 @@ class ProotTerminalEnvironment:
             if size >= 0:
                 logger.info("session %s local scratch at close: %.1f MiB", self._sid, size / (1024 * 1024))
             shutil.rmtree(self.work_dir, ignore_errors=True)
-        return contamination_count
+        return contamination_sampled, contamination_count
 
     def _release_shared_rootfs(self) -> None:
         if self._task_meta_dir is None:

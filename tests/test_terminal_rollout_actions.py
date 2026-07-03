@@ -342,9 +342,10 @@ class DummySession:
         self.finished = True
         return {"passed": True}
 
-    def close(self):
+    def close(self, contamination_sample=True):
         self.closed = True
         self.close_count += 1
+        return 0, 0
 
 
 class DummyRequest:
@@ -357,9 +358,9 @@ class DummyRequest:
 
 def test_close_background_records_contamination_in_health():
     class ContaminatedSession(DummySession):
-        def close(self):
-            super().close()
-            return 3
+        def close(self, contamination_sample=True):
+            super().close(contamination_sample=contamination_sample)
+            return (1, 3) if contamination_sample else (0, 0)
 
     async def run_case():
         server = TerminalEnvironmentServer(
@@ -380,7 +381,51 @@ def test_close_background_records_contamination_in_health():
 
         assert close_response.status == 200
         assert session.closed
-        assert json.loads(health_response.text)["contamination_events"] == 1
+        health = json.loads(health_response.text)
+        assert health["contamination_events"] == 1
+        assert health["contamination_closes_sampled"] == 1
+        assert health["contamination_contaminated_sampled"] == 1
+
+    asyncio.run(run_case())
+
+
+def test_contamination_sampling_records_one_in_n_closes():
+    class SamplingSession(DummySession):
+        def __init__(self):
+            super().__init__()
+            self.samples = []
+
+        def close(self, contamination_sample=True):
+            super().close(contamination_sample=contamination_sample)
+            self.samples.append(contamination_sample)
+            return (1, 2) if contamination_sample else (0, 0)
+
+    async def run_case():
+        server = TerminalEnvironmentServer(
+            bases_dir="/tmp",
+            n_envs=3,
+            contamination_sample_every=3,
+            session_ttl_seconds=60.0,
+            session_reap_interval_seconds=60.0,
+        )
+        sessions = [SamplingSession() for _ in range(3)]
+        for i, session in enumerate(sessions):
+            server._sessions[f"session-{i}"] = session
+            server._session_last_activity[f"session-{i}"] = time.monotonic()
+
+        for i in range(3):
+            response = await server.close(DummyRequest({"session_id": f"session-{i}"}))
+            assert response.status == 200
+        if server._bg_tasks:
+            await asyncio.gather(*list(server._bg_tasks))
+        health_response = await server.health(DummyRequest({}))
+        server._executor.shutdown(wait=True)
+
+        assert [session.samples for session in sessions] == [[False], [False], [True]]
+        health = json.loads(health_response.text)
+        assert health["contamination_events"] == 1
+        assert health["contamination_closes_sampled"] == 1
+        assert health["contamination_contaminated_sampled"] == 1
 
     asyncio.run(run_case())
 

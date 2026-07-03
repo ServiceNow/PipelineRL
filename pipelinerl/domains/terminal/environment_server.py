@@ -193,7 +193,9 @@ class TerminalEnvironmentServer:
         max_session_disk_bytes: int = 1536 * 2**20,
         max_session_rss_bytes: int = 16 * 2**30,
         session_delta_max_bytes: int = 512 * 2**20,
+        session_delta_isolation: bool = True,
         contamination_check: bool = True,
+        contamination_sample_every: int = 1,
         session_ttl_seconds: float = 3600.0,
         session_reap_interval_seconds: float = 60.0,
     ):
@@ -211,7 +213,9 @@ class TerminalEnvironmentServer:
         self.max_session_disk_bytes = max_session_disk_bytes
         self.max_session_rss_bytes = max_session_rss_bytes
         self.session_delta_max_bytes = session_delta_max_bytes
+        self.session_delta_isolation = session_delta_isolation
         self.contamination_check = contamination_check
+        self.contamination_sample_every = max(1, int(contamination_sample_every))
         self.session_ttl_seconds = session_ttl_seconds
         self.session_reap_interval_seconds = session_reap_interval_seconds
 
@@ -223,6 +227,9 @@ class TerminalEnvironmentServer:
         # Background cleanup tasks (kept referenced so they aren't GC'd mid-flight).
         self._bg_tasks: set = set()
         self.contamination_events = 0
+        self.contamination_closes_seen = 0
+        self.contamination_closes_sampled = 0
+        self.contamination_contaminated_sampled = 0
 
     async def _run(self, fn, *args):
         return await asyncio.get_event_loop().run_in_executor(self._executor, partial(fn, *args))
@@ -234,17 +241,32 @@ class TerminalEnvironmentServer:
                 "active": len(self._sessions),
                 "capacity": self.n_envs,
                 "contamination_events": self.contamination_events,
+                "contamination_closes_sampled": self.contamination_closes_sampled,
+                "contamination_contaminated_sampled": self.contamination_contaminated_sampled,
             }
         )
 
-    def _record_contamination(self, count: int | None) -> None:
-        if count and count > 0:
+    def _sample_contamination_close(self) -> bool:
+        if not self.contamination_check:
+            return False
+        self.contamination_closes_seen += 1
+        return self.contamination_closes_seen % self.contamination_sample_every == 0
+
+    def _record_contamination(self, result: tuple[int, int] | None) -> None:
+        if result is None:
+            return
+        sampled, count = result
+        if sampled:
+            self.contamination_closes_sampled += 1
+        if count > 0:
             self.contamination_events += 1
+            self.contamination_contaminated_sampled += 1
 
     def _close_session_background(self, session: TerminalSession | None) -> None:
         if session is None:
             return
-        task = asyncio.create_task(self._run(session.close))
+        sample = self._sample_contamination_close()
+        task = asyncio.create_task(self._run(session.close, sample))
         self._bg_tasks.add(task)
 
         def _done(done: asyncio.Task) -> None:
@@ -318,13 +340,14 @@ class TerminalEnvironmentServer:
             max_session_disk_bytes=self.max_session_disk_bytes,
             max_session_rss_bytes=self.max_session_rss_bytes,
             session_delta_max_bytes=self.session_delta_max_bytes,
+            session_delta_isolation=self.session_delta_isolation,
             contamination_check=self.contamination_check,
         )
         try:
             flags = await self._run(session.start, task)
         except Exception as e:
             logger.exception("start_task failed: %s", e)
-            self._record_contamination(await self._run(session.close))
+            self._record_contamination(await self._run(session.close, self._sample_contamination_close()))
             async with self._lock:
                 self._sessions.pop(session_id, None)
                 self._session_last_activity.pop(session_id, None)
@@ -332,7 +355,7 @@ class TerminalEnvironmentServer:
 
         if not flags.get("started"):
             # Unbuildable / unrunnable task: free the slot, no session handle.
-            self._record_contamination(await self._run(session.close))
+            self._record_contamination(await self._run(session.close, self._sample_contamination_close()))
             async with self._lock:
                 self._sessions.pop(session_id, None)
                 self._session_last_activity.pop(session_id, None)
@@ -346,7 +369,7 @@ class TerminalEnvironmentServer:
                 self._sessions[session_id] = session
                 self._session_last_activity[session_id] = time.monotonic()
         if expired_during_start:
-            self._record_contamination(await self._run(session.close))
+            self._record_contamination(await self._run(session.close, self._sample_contamination_close()))
             return web.json_response({"error": "session expired during start"}, status=503)
         return web.json_response({"session_id": session_id, **flags})
 
