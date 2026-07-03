@@ -3,6 +3,7 @@ import numpy as np
 from pipelinerl.domains.terminal.turn_probes import (
     auroc,
     cross_validated_metric,
+    fold_standardization,
     group_fold,
     is_prefix,
     loo_centered_returns,
@@ -78,3 +79,20 @@ def test_cross_validated_metric_recovers_linear_signal():
     y_noise = rng.normal(size=n)
     r2_noise = cross_validated_metric(x, y_noise, folds, l2=1.0, binary=False)
     assert r2_noise < 0.1
+
+
+def test_fold_standardization_matches_standardized_logits():
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=(32, 6)).astype(np.float32)
+    x[:, 0] = 0.0
+    w = rng.normal(size=6).astype(np.float32)
+    b = 0.3
+    mean, std = x.mean(axis=0), x.std(axis=0)
+
+    w_prime, b_prime = fold_standardization(w, b, mean, std)
+
+    standardized_logits = ((x - mean) / (std + 1e-6)) @ w + b
+    folded_logits = x @ w_prime + b_prime
+    assert np.isfinite(w_prime).all()
+    assert np.isfinite(b_prime)
+    np.testing.assert_allclose(folded_logits, standardized_logits, rtol=1e-6, atol=1e-6)

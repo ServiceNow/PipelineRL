@@ -19,6 +19,8 @@ Usage:
         --exp-dir <exp> --model-path <ckpt> [--max-rollouts 400]
     python -m pipelinerl.domains.terminal.turn_probes fit \
         --activations <exp>/probe_analysis/activations.pt
+    python -m pipelinerl.domains.terminal.turn_probes export \
+        --activations <exp>/probe_analysis/activations.pt --layer 31
 """
 from __future__ import annotations
 
@@ -263,6 +265,22 @@ def _standardize(train: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.nd
     return (train - mean) / std, (test - mean) / std
 
 
+def fold_standardization(
+    w: np.ndarray, b: float, mean: np.ndarray, std: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """Fold standardization into raw-feature logistic weights.
+
+    ``std`` is the raw feature std; the same +1e-6 epsilon as ``_standardize``
+    is applied here.
+    """
+    w64 = w.astype(np.float64)
+    mean64 = mean.astype(np.float64)
+    scale = std.astype(np.float64) + 1e-6
+    w_prime = w64 / scale
+    b_prime = float(b - (mean64 / scale) @ w64)
+    return w_prime.astype(np.float32), b_prime
+
+
 def _fit_logistic(x: np.ndarray, y: np.ndarray, l2: float) -> np.ndarray:
     xt = torch.tensor(x, dtype=torch.float32)
     yt = torch.tensor(y, dtype=torch.float32)
@@ -396,6 +414,52 @@ def fit(args: argparse.Namespace) -> None:
     logger.info("wrote %s and probe_summary.md (%d rows)", csv_path, len(rows))
 
 
+def export(args: argparse.Namespace) -> None:
+    activations = Path(args.activations)
+    blob = torch.load(activations, map_location="cpu", weights_only=False)
+    features: torch.Tensor = blob["features"]
+    layer_indices: list[int] = blob["layer_indices"]
+    meta: list[dict] = blob["meta"]
+    if args.layer not in layer_indices:
+        raise ValueError(f"layer {args.layer} not found in activations; available layers: {layer_indices}")
+
+    layer_pos = layer_indices.index(args.layer)
+    x = features[:, layer_pos, :].float().numpy()
+    y = np.array([m["rollout_reward"] >= 0.999 for m in meta], dtype=float)
+    if len(np.unique(y)) < 2:
+        raise ValueError("rollout_success target needs both positive and negative rows")
+
+    mean, std = x.mean(axis=0), x.std(axis=0)
+    x_standardized = (x - mean) / (std + 1e-6)
+    wb = _fit_logistic(x_standardized, y, args.l2)
+    w_prime, b_prime = fold_standardization(wb[:-1], float(wb[-1]), mean, std)
+    in_sample_auroc = auroc(y.astype(bool), x @ w_prime + b_prime)
+
+    out_path = Path(args.out) if args.out else activations.parent / f"frozen_probe_layer{args.layer}.pt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    w_prime_tensor = torch.as_tensor(w_prime, dtype=torch.float32, device=torch.device("cpu")).contiguous()
+    torch.save(
+        {
+            "version": 1,
+            "target": "rollout_success",
+            "model_path": blob["model_path"],
+            "layer_index": int(args.layer),
+            "l2": float(args.l2),
+            "activations": str(activations),
+            "w_prime": w_prime_tensor,
+            "b_prime": float(b_prime),
+            "n_rows": int(len(y)),
+            "n_pos": int(y.sum()),
+            "in_sample_auroc": float(in_sample_auroc),
+        },
+        out_path,
+    )
+    logger.info(
+        "exported frozen rollout_success probe layer=%d l2=%s n=%d n_pos=%d auroc=%.4f to %s",
+        args.layer, args.l2, len(y), int(y.sum()), in_sample_auroc, out_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -420,6 +484,13 @@ def main() -> None:
     p_fit.add_argument("--l2-sweep", default="1,10,100,1000")
     p_fit.add_argument("--min-bucket-size", type=int, default=50)
     p_fit.set_defaults(func=fit)
+
+    p_export = sub.add_parser("export", help="export a frozen rollout_success probe artifact")
+    p_export.add_argument("--activations", required=True)
+    p_export.add_argument("--layer", type=int, default=31)
+    p_export.add_argument("--l2", type=float, default=1000.0)
+    p_export.add_argument("--out", default=None)
+    p_export.set_defaults(func=export)
 
     args = parser.parse_args()
     args.func(args)
