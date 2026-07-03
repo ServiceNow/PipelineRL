@@ -93,7 +93,15 @@ def _terminal_cfg(**overrides):
     return SimpleNamespace(terminal=SimpleNamespace(**values))
 
 
-def _patch_rollout_fakes(monkeypatch, llm_calls, *, verifier_pass=True, step_response=None):
+def _patch_rollout_fakes(
+    monkeypatch,
+    llm_calls,
+    *,
+    verifier_pass=True,
+    step_response=None,
+    finish_response=None,
+    start_response=None,
+):
     pending_calls = list(llm_calls)
 
     async def fake_generate(llm, prompt, session):
@@ -102,15 +110,19 @@ def _patch_rollout_fakes(monkeypatch, llm_calls, *, verifier_pass=True, step_res
 
     async def fake_post(session, url, payload, timeout):
         if url.endswith("/start_task"):
-            return {"session_id": "session-1", "started": True, "init_ok": True, "build_ok": True}
+            return start_response or {"session_id": "session-1", "started": True, "init_ok": True, "build_ok": True}
         if url.endswith("/step"):
             return step_response or {"output": "ok", "abort_kind": None}
         if url.endswith("/finish"):
+            if finish_response is not None:
+                return finish_response
             return {
                 "passed": verifier_pass,
                 "passed_tests": int(verifier_pass),
                 "total_tests": 1,
                 "abort_kind": None,
+                "output": "pytest output",
+                "contamination_result": {"sampled": False, "count": 0},
             }
         if url.endswith("/close"):
             return {"status": "ok"}
@@ -179,6 +191,7 @@ def test_format_error_reward_respects_max_retry_failure(monkeypatch):
     assert [text.text for text in result.training_texts] == ["bad format 1", "bad format 2"]
     assert [text.reward for text in result.training_texts] == [-1.0, -1.0]
     assert result.metrics.max_format_retries_exceeded
+    assert not result.audit["dropped"]
 
 
 def test_null_format_error_reward_drops_error_turn(monkeypatch):
@@ -304,6 +317,10 @@ def test_timeout_abort_breaks_loop_and_sets_metric(monkeypatch):
     assert not result.metrics.rss_aborted
     assert result.metrics.n_llm_calls == 1
     assert result.metrics.n_total_llm_calls == 1
+    assert [text.reward for text in result.training_texts] == [-1.0]
+    assert result.audit["abort_kind"] == "timeout"
+    assert result.audit["abort_phase"] == "step"
+    assert not result.audit["dropped"]
 
 
 def test_rss_abort_sets_metric_and_skips_no_submit_penalty(monkeypatch):
@@ -332,6 +349,106 @@ def test_rss_abort_sets_metric_and_skips_no_submit_penalty(monkeypatch):
     assert [text.reward for text in result.training_texts] == [1.0]
 
 
+def test_finish_abort_drops_rollout_and_records_audit(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})])],
+        finish_response={
+            "passed": False,
+            "passed_tests": 0,
+            "total_tests": 1,
+            "abort_kind": "timeout",
+            "output": "verifier timed out after partial stdout",
+            "contamination_result": {"sampled": True, "count": 2},
+        },
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(),
+            object(),
+            {"task": "fix it", "task_id": "task-1", "task_complexity": "hard"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.training_texts == []
+    assert result.metrics.timeout_aborted
+    assert result.audit["task_id"] == "task-1"
+    assert result.audit["complexity"] == "hard"
+    assert result.audit["abort_kind"] == "timeout"
+    assert result.audit["abort_phase"] == "finish"
+    assert result.audit["dropped"]
+    assert result.audit["drop_reason"] == "finish_abort"
+    assert result.audit["contamination_result"] == {"sampled": True, "count": 2}
+    assert "verifier timed out" in result.audit["finish_stdout_tail"]
+
+
+def test_no_tests_resolved_after_step_abort_drops_rollout(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="run", tool_calls=[_tool_call(arguments={"command": "make"})])],
+        step_response={"output": "command timed out", "abort_kind": "timeout"},
+        finish_response={
+            "passed": False,
+            "passed_tests": 0,
+            "total_tests": 0,
+            "abort_kind": None,
+            "output": "no tests resolved",
+        },
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(max_turns=2),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.training_texts == []
+    assert result.metrics.timeout_aborted
+    assert result.audit["abort_kind"] == "timeout"
+    assert result.audit["abort_phase"] == "step"
+    assert result.audit["dropped"]
+    assert result.audit["drop_reason"] == "no_tests_resolved"
+
+
+def test_context_exhausted_with_verdict_stays_scored(monkeypatch):
+    class TinyBudgetLLM:
+        parameters = {"max_tokens": 16}
+        chat_template_kwargs = {}
+
+        def load_tokenizer(self):
+            self.tokenizer = SimpleNamespace(apply_chat_template=lambda *args, **kwargs: list(range(100)))
+
+    _patch_rollout_fakes(monkeypatch, [])
+    cfg = _terminal_cfg(no_submit_penalty=0.4, max_turns=8)
+    cfg.vllm_config = SimpleNamespace(vllm_kwargs={"max_model_len": 128})
+
+    result = asyncio.run(
+        _execute_rollout(
+            cfg,
+            TinyBudgetLLM(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.metrics.context_exhausted
+    assert result.metrics.total_tests == 1
+    assert result.metrics.reward == 0.6
+    assert not result.audit["dropped"]
+    assert result.audit["context_exhausted"]
+
+
 class DummySession:
     def __init__(self):
         self.closed = False
@@ -341,6 +458,9 @@ class DummySession:
     def finish(self):
         self.finished = True
         return {"passed": True}
+
+    def sample_contamination(self):
+        return 0, 0
 
     def close(self, contamination_sample=True):
         self.closed = True
@@ -455,6 +575,49 @@ def test_finish_removes_session_and_close_stays_idempotent():
         assert session.finished
         assert session.closed
         assert session.close_count == 1
+
+    asyncio.run(run_case())
+
+
+def test_finish_returns_sampled_contamination_result_without_resampling_close():
+    class SampledSession(DummySession):
+        def __init__(self):
+            super().__init__()
+            self.close_samples = []
+
+        def sample_contamination(self):
+            return 1, 4
+
+        def close(self, contamination_sample=True):
+            self.close_samples.append(contamination_sample)
+            super().close(contamination_sample=contamination_sample)
+            return (1, 9) if contamination_sample else (0, 0)
+
+    async def run_case():
+        server = TerminalEnvironmentServer(
+            bases_dir="/tmp",
+            n_envs=1,
+            contamination_sample_every=1,
+            session_ttl_seconds=60.0,
+            session_reap_interval_seconds=60.0,
+        )
+        session = SampledSession()
+        server._sessions["session-1"] = session
+        server._session_last_activity["session-1"] = time.monotonic()
+
+        response = await server.finish(DummyRequest({"session_id": "session-1"}))
+        if server._bg_tasks:
+            await asyncio.gather(*list(server._bg_tasks))
+        health_response = await server.health(DummyRequest({}))
+        server._executor.shutdown(wait=True)
+
+        body = json.loads(response.text)
+        health = json.loads(health_response.text)
+        assert body["contamination_result"] == {"sampled": True, "count": 4}
+        assert session.close_samples == [False]
+        assert health["contamination_events"] == 1
+        assert health["contamination_closes_sampled"] == 1
+        assert health["contamination_contaminated_sampled"] == 1
 
     asyncio.run(run_case())
 
