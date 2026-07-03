@@ -55,7 +55,8 @@ def _create_stateless_pg(host, port, rank, world_size):
         port=port,
         world_size=world_size,
         is_master=launch_server,
-        timeout=datetime.timedelta(seconds=300),
+        # Cold vLLM engine build (~320s) can exceed 300s with short worker head-starts; 400s gives headroom (gspo_48/49).
+        timeout=datetime.timedelta(seconds=400),
         use_libuv=False,
         master_listen_fd=listen_fd,
     )
