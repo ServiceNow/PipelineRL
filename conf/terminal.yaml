@@ -48,13 +48,12 @@ terminal:
   env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
   capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
   max_format_retries: 3      # malformed tool-call retries; separate from max_turns action budget
-  # Optional event rewards. format_error_reward retains malformed LLM calls as
-  # trainable turns with this reward instead of dropping them; this is meaningful
-  # with finetune.rl.rollout_level_loo=true because per-step LOO would mix penalty
-  # and action turns at the same step_index across rollouts. null preserves the
-  # current behavior. no_submit_penalty applies only to clean max-turn exits that
-  # never used the submit command.
-  format_error_reward: -0.2   # enabled 2026-07-02: small penalty, ~1/5 of a graded-reward unit
+  # Optional event rewards. Keep format_error_reward null: a constant event
+  # reward enters rollout-level LOO as event_reward - group_baseline; in failing
+  # groups with baseline near -1, the old -0.2 reward trained malformed tool
+  # calls at about +0.8 advantage and collapsed gspo_47. Event credit needs an
+  # advantage-side or potential-based design before re-enabling.
+  format_error_reward: null
   no_submit_penalty: 0.2      # enabled 2026-07-02: distinguishes never-submitted from submitted-same-state
   reward_pass: 1.0
   reward_fail: -1.0
