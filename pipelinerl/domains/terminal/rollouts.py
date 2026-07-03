@@ -47,6 +47,47 @@ _FORMAT_ERROR_MESSAGE = (
     f"When the task is complete, call bash with command `{_SUBMIT_COMMAND}`. "
     "Brief reasoning is allowed, but do not use markdown."
 )
+_FINISH_STDOUT_TAIL_CHARS = 2000
+
+
+def _terminal_audit_base(problem: dict) -> dict:
+    return {
+        "task_id": problem.get("task_id"),
+        "domain": problem.get("tmax_domain") or problem.get("domain") or "terminal",
+        "complexity": problem.get("task_complexity", problem.get("complexity")),
+        "group_id": None,
+        "rollout_index": None,
+        "reward": None,
+        "verifier_pass": False,
+        "passed_tests": 0,
+        "total_tests": 0,
+        "pass_fraction": 0.0,
+        "abort_kind": None,
+        "abort_phase": None,
+        "build_ok": True,
+        "init_ok": True,
+        "submitted": False,
+        "format_retry_exceeded": False,
+        "context_exhausted": False,
+        "contamination_result": None,
+        "finish_stdout_tail": "",
+        "dropped": False,
+        "drop_reason": None,
+    }
+
+
+def _contamination_audit(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "sampled": bool(value.get("sampled", False)),
+        "count": int(value.get("count", 0)),
+    }
+
+
+def _finish_stdout_tail(output: str) -> str:
+    return output[-_FINISH_STDOUT_TAIL_CHARS:]
+
 
 SYSTEM_PROMPT = (
     "You are a terminal agent. You solve a task by running shell commands in a "
@@ -117,13 +158,38 @@ class TerminalAction:
     has_prose: bool = False
 
 
-def _failed_result(problem: dict, start_time: float, metrics: TerminalMetrics) -> RolloutResult:
+def _failed_result(
+    problem: dict,
+    start_time: float,
+    metrics: TerminalMetrics,
+    audit: dict | None = None,
+) -> RolloutResult:
+    audit_data = _terminal_audit_base(problem)
+    audit_data.update(
+        {
+            "reward": metrics.reward,
+            "verifier_pass": metrics.verifier_pass,
+            "passed_tests": metrics.passed_tests,
+            "total_tests": metrics.total_tests,
+            "pass_fraction": metrics.pass_fraction,
+            "build_ok": metrics.build_ok,
+            "init_ok": metrics.init_ok,
+            "submitted": metrics.submitted,
+            "format_retry_exceeded": metrics.max_format_retries_exceeded,
+            "context_exhausted": metrics.context_exhausted,
+            "dropped": True,
+            "drop_reason": "failed_result",
+        }
+    )
+    if audit:
+        audit_data.update(audit)
     return RolloutResult(
         training_texts=[],
         metrics=metrics,
         latency=time.time() - start_time,
         dataset_name=problem.get("dataset"),
         domain="terminal",
+        audit=audit_data,
     )
 
 
@@ -330,6 +396,7 @@ async def _execute_rollout(
 ) -> RolloutResult:
     tcfg = cfg.terminal
     call_timeout = getattr(tcfg, "env_call_timeout", 300)
+    audit = _terminal_audit_base(problem)
     # /start_task triggers the one-time per-task rootfs build, which reads the
     # base over NFS and can take several minutes. Once the server returns a
     # session_id, the finally block must close it even on an early failed rollout.
@@ -349,9 +416,18 @@ async def _execute_rollout(
         session_id = start.get("session_id")
         if not session_id or not start.get("started") or not start.get("init_ok"):
             logger.warning("task %s not runnable (start=%s), dropping", problem.get("task_id"), start)
+            audit.update(
+                {
+                    "reward": tcfg.reward_fail,
+                    "build_ok": start.get("build_ok", False),
+                    "init_ok": start.get("init_ok", False),
+                    "dropped": True,
+                    "drop_reason": "not_runnable",
+                }
+            )
             return _failed_result(problem, start_time, TerminalMetrics(
                 reward=tcfg.reward_fail, success=False, no_error=False, no_answer=True,
-                build_ok=start.get("build_ok", False), init_ok=start.get("init_ok", False)))
+                build_ok=start.get("build_ok", False), init_ok=start.get("init_ok", False)), audit=audit)
 
         n_actions = 0
         n_total_llm_calls = 0
@@ -370,6 +446,11 @@ async def _execute_rollout(
         disk_aborted = False
         timeout_aborted = False
         rss_aborted = False
+        abort_kind = None
+        abort_phase = None
+        finish_output = ""
+        contamination_result = None
+        verifier_ran = False
         submitted = False
         context_exhausted = False
         # Context budget: vLLM rejects the request outright (400) when prompt +
@@ -426,11 +507,13 @@ async def _execute_rollout(
 
             obs = await _post(session, f"{env_url}/step", {"session_id": session_id, "command": action.command}, call_timeout)
             messages.append({"role": "tool", "tool_call_id": action.tool_call_id or "call_0", "content": obs["output"]})
-            abort_kind = obs.get("abort_kind")
-            if abort_kind:
-                disk_aborted = disk_aborted or abort_kind == "disk"
-                timeout_aborted = timeout_aborted or abort_kind == "timeout"
-                rss_aborted = rss_aborted or abort_kind == "rss"
+            step_abort_kind = obs.get("abort_kind")
+            if step_abort_kind:
+                abort_kind = step_abort_kind
+                abort_phase = "step"
+                disk_aborted = disk_aborted or step_abort_kind == "disk"
+                timeout_aborted = timeout_aborted or step_abort_kind == "timeout"
+                rss_aborted = rss_aborted or step_abort_kind == "rss"
                 break
 
         if max_format_retries_exceeded:
@@ -438,14 +521,20 @@ async def _execute_rollout(
             passed_tests = 0
             total_tests = 0
         else:
+            verifier_ran = True
             verifier = await _post(session, f"{env_url}/finish", {"session_id": session_id}, call_timeout)
             verifier_pass = bool(verifier["passed"])
             passed_tests = int(verifier.get("passed_tests", 0))
             total_tests = int(verifier.get("total_tests", 0))
-            abort_kind = verifier.get("abort_kind")
-            disk_aborted = disk_aborted or abort_kind == "disk"
-            timeout_aborted = timeout_aborted or abort_kind == "timeout"
-            rss_aborted = rss_aborted or abort_kind == "rss"
+            finish_output = str(verifier.get("output", ""))
+            contamination_result = _contamination_audit(verifier.get("contamination_result"))
+            finish_abort_kind = verifier.get("abort_kind")
+            if finish_abort_kind:
+                abort_kind = finish_abort_kind
+                abort_phase = "finish"
+            disk_aborted = disk_aborted or finish_abort_kind == "disk"
+            timeout_aborted = timeout_aborted or finish_abort_kind == "timeout"
+            rss_aborted = rss_aborted or finish_abort_kind == "rss"
     finally:
         if session_id:
             try:
@@ -483,8 +572,39 @@ async def _execute_rollout(
     ):
         reward = max(tcfg.reward_fail, reward - no_submit_penalty)
 
+    drop_reason = None
+    if verifier_ran and abort_phase == "finish":
+        drop_reason = "finish_abort"
+    elif verifier_ran and total_tests == 0:
+        drop_reason = "no_tests_resolved"
+
+    audit.update(
+        {
+            "reward": reward,
+            "verifier_pass": verifier_pass,
+            "passed_tests": passed_tests,
+            "total_tests": total_tests,
+            "pass_fraction": pass_fraction,
+            "abort_kind": abort_kind,
+            "abort_phase": abort_phase,
+            "submitted": submitted,
+            "format_retry_exceeded": max_format_retries_exceeded,
+            "context_exhausted": context_exhausted,
+            "contamination_result": contamination_result,
+            "finish_stdout_tail": _finish_stdout_tail(finish_output),
+            "dropped": drop_reason is not None,
+            "drop_reason": drop_reason,
+        }
+    )
+
     format_error_texts_dropped = 0
-    if format_error_reward is None:
+    if drop_reason is not None:
+        logger.info(
+            "dropping terminal rollout %s from training: %s",
+            problem.get("task_id"), drop_reason,
+        )
+        training_texts = []
+    elif format_error_reward is None:
         training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
     else:
         training_texts = []
@@ -546,4 +666,5 @@ async def _execute_rollout(
         latency=time.time() - start_time,
         dataset_name=problem.get("dataset"),
         domain="terminal",
+        audit=audit,
     )
