@@ -1,7 +1,9 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch import nn
 
 from pipelinerl.finetune.rl import (
@@ -17,6 +19,22 @@ from pipelinerl.finetune.rl import (
 )
 from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead, ValueHead
+
+
+def test_base_yaml_frozen_probe_credit_loads_as_string() -> None:
+    cfg = OmegaConf.load(Path(__file__).resolve().parents[1] / "conf/finetune/base.yaml")
+
+    assert cfg.rl.frozen_probe_credit == "off"
+    assert isinstance(cfg.rl.frozen_probe_credit, str)
+
+    rl_values = OmegaConf.to_container(cfg.rl, resolve=False)
+    assert isinstance(rl_values, dict)
+    rl_values["final_kl_coef"] = rl_values["kl_coef"]
+    rl_values["temperature"] = 1.0
+
+    config = RLConfig(**rl_values)
+
+    assert config.frozen_probe_credit == "off"
 
 
 def test_turn_indices_select_labeled_boundaries_per_segment() -> None:
@@ -222,6 +240,84 @@ def test_frozen_probe_advantages_expands_turn_success_residuals_per_segment() ->
     rewards_with_event[0, 1] = 0.5
     with pytest.raises(ValueError, match="constant rewards"):
         frozen_probe_advantages(segments, masks_shifted, hidden_states, rewards_with_event, runtime)
+
+
+def test_frozen_probe_shadow_leaves_gspo_advantages_bit_identical() -> None:
+    model = _TinyProbePolicy()
+    batch = _packed_batch()
+    runtime = FrozenProbeRuntime(
+        layer=model.model.layers[31],
+        w_prime=torch.zeros(4, dtype=torch.float32),
+        b_prime=0.0,
+    )
+
+    off_loss, off_stats = rl_step(
+        model,
+        batch,
+        current_step=0,
+        max_step=1,
+        config=RLConfig(policy_loss="gspo", batch_size=1),
+        frozen_probe=runtime,
+    )
+    assert sum(layer.register_calls for layer in model.model.layers) == 0
+
+    shadow_loss, shadow_stats = rl_step(
+        model,
+        batch,
+        current_step=0,
+        max_step=1,
+        config=RLConfig(policy_loss="gspo", batch_size=1, frozen_probe_credit="shadow"),
+        frozen_probe=runtime,
+    )
+
+    assert model.model.layers[31].register_calls == 1
+    assert torch.equal(off_loss.detach(), shadow_loss.detach())
+    for key in ("loss", "advantage", "max_advantage", "min_advantage"):
+        assert off_stats[key] == shadow_stats[key]
+    assert shadow_stats["frozen_probe/p_mean"] == 0.5
+    assert shadow_stats["frozen_probe/A_mean"] == -0.5
+
+
+def test_frozen_probe_live_replaces_gspo_advantages() -> None:
+    model = _TinyProbePolicy()
+    runtime = FrozenProbeRuntime(
+        layer=model.model.layers[31],
+        w_prime=torch.zeros(4, dtype=torch.float32),
+        b_prime=0.0,
+    )
+
+    off_loss, off_stats = rl_step(
+        model,
+        _packed_batch(),
+        current_step=0,
+        max_step=1,
+        config=RLConfig(policy_loss="gspo", batch_size=1),
+    )
+    live_loss, live_stats = rl_step(
+        model,
+        _packed_batch(),
+        current_step=0,
+        max_step=1,
+        config=RLConfig(policy_loss="gspo", batch_size=1, frozen_probe_credit="live"),
+        frozen_probe=runtime,
+    )
+
+    assert not torch.equal(off_loss.detach(), live_loss.detach())
+    assert off_stats["advantage"] == 0.0
+    assert live_stats["advantage"] == -1.0
+    assert live_stats["max_advantage"] == -0.5
+    assert live_stats["min_advantage"] == -0.5
+
+
+def test_frozen_probe_shadow_requires_loaded_probe() -> None:
+    with pytest.raises(ValueError, match="requires frozen_probe_path"):
+        rl_step(
+            _TinyProbePolicy(),
+            _packed_batch(),
+            current_step=0,
+            max_step=1,
+            config=RLConfig(policy_loss="gspo", batch_size=1, frozen_probe_credit="shadow"),
+        )
 
 
 def test_multi_turn_credit_requires_value_head() -> None:

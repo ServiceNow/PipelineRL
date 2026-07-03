@@ -113,3 +113,5 @@ rl:
   aggregate_loss: sum
   overlong_filtering: false
   multi_turn_credit: false
+  frozen_probe_credit: "off"
+  frozen_probe_path: null

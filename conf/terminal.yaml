@@ -213,6 +213,10 @@ finetune:
     # Policy advantages stay z; watch value_mse vs var(z). Run 2 flips
     # finetune.rl.multi_turn_credit: true only if the critic is calibrated.
     # Keep finetune.rl.rollout_level_loo: true.
+    # Frozen-probe credit stays off in-tree while gspo_49 can restart from the
+    # working tree. Flip this to shadow with frozen_probe_path at relaunch time.
+    frozen_probe_credit: "off"
+    frozen_probe_path: null
 
 preprocess:
   n_workers: 8

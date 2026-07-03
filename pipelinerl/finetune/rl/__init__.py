@@ -2,7 +2,7 @@ import logging
 import os
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 import numpy as np
@@ -111,6 +111,10 @@ class RLConfig(BaseModel):
     multi_turn_credit: bool = Field(
         default=False,
         description="Use turn-end value predictions to decompose rollout-level advantages",
+    )
+    frozen_probe_credit: Literal["off", "shadow", "live"] = Field(
+        default="off",
+        description="Frozen-probe credit mode: off, shadow, or live",
     )
     frozen_probe_path: str | None = Field(
         default=None,
@@ -415,6 +419,16 @@ def rl_step(
         if segments is None:
             raise ValueError("multi_turn_credit requires packed sequences with segments")
 
+    if config.frozen_probe_credit not in {"off", "shadow", "live"}:
+        raise ValueError("frozen_probe_credit must be one of off, shadow, live")
+    if config.frozen_probe_credit != "off":
+        if frozen_probe is None:
+            raise ValueError("frozen_probe_credit requires frozen_probe_path")
+        if config.policy_loss != "gspo":
+            raise ValueError("frozen_probe_credit requires policy_loss='gspo'")
+        if segments is None:
+            raise ValueError("frozen_probe_credit requires packed sequences with segments")
+
     model_inputs = {
         "input_ids": batch.input_ids,
         "attention_mask": batch.attention_mask,
@@ -429,7 +443,8 @@ def rl_step(
     if hasattr(batch, 'image_grid_thw') and batch.image_grid_thw is not None:
         model_inputs["image_grid_thw"] = batch.image_grid_thw #torch.tensor(.reshape((1, 3))
     
-    outputs, _frozen_probe_hidden = _forward_with_frozen_probe_capture(model, model_inputs, frozen_probe)
+    active_frozen_probe = frozen_probe if config.frozen_probe_credit != "off" else None
+    outputs, _frozen_probe_hidden = _forward_with_frozen_probe_capture(model, model_inputs, active_frozen_probe)
 
     # compute log probs for actual tokens without materializing full logprobs unless needed
     logits = outputs.logits[:, :-1, :]
@@ -490,18 +505,17 @@ def rl_step(
     log_ratio_ref_new = ref_logprobs - new_logprobs
     assert torch.isfinite(log_ratio_ref_new).all(), f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
 
+    frozen_probe_expanded_advantages = None
     frozen_probe_turn_probs = None
     frozen_probe_turn_targets = None
     frozen_probe_turn_advantages = None
-    if frozen_probe is not None:
-        if config.policy_loss != "gspo":
-            raise ValueError("frozen_probe_path requires policy_loss='gspo'")
-        if segments is None:
-            raise ValueError("frozen_probe_path requires packed sequences with segments")
+    if config.frozen_probe_credit != "off":
+        assert frozen_probe is not None
+        assert segments is not None
         if _frozen_probe_hidden is None:
             raise RuntimeError("Frozen-probe hidden capture missing despite loaded probe")
         (
-            _frozen_probe_advantages,
+            frozen_probe_expanded_advantages,
             _frozen_probe_turn_idx,
             frozen_probe_turn_probs,
             frozen_probe_turn_targets,
@@ -531,6 +545,10 @@ def rl_step(
     else:
         value_predictions = None
         advantages = batch.advantages[:, 1:]
+
+    if config.frozen_probe_credit == "live":
+        assert frozen_probe_expanded_advantages is not None
+        advantages = frozen_probe_expanded_advantages
 
     log_p_weights = advantages.detach() if config.use_advantages else rewards
     if config.relu_log_p_weights:
