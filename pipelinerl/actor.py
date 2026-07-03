@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import math
 import multiprocessing as mp
@@ -146,6 +147,27 @@ def write_rollout_audit_records(audit_writer: StreamWriter, rollout_results: Lis
         audit_writer.write(make_rollout_audit_record(result))
 
 
+def stamp_rollout_metadata(
+    rollout_result: RolloutResult,
+    scheduler_name: str,
+    group_id: int,
+    rollout_index: int,
+    model_version: int,
+) -> None:
+    rollout_result.model_version = model_version
+    full_group_id = f"{scheduler_name}_{group_id}"
+    rollout_result.group_id = full_group_id
+    rollout_result.audit["model_version"] = model_version
+    rollout_result.audit["group_id"] = full_group_id
+    rollout_result.audit["rollout_index"] = rollout_index
+    for step_index, sample in enumerate(rollout_result.training_texts):
+        if sample.metadata.get("model_version") is None:
+            sample.metadata["model_version"] = model_version
+        sample.metadata["rollout_index"] = rollout_index
+        sample.metadata["step_index"] = step_index
+        sample.group_id = full_group_id
+
+
 async def schedule_rollouts(
     cfg: DictConfig,
     attempts: int,
@@ -175,6 +197,10 @@ async def schedule_rollouts(
     group_rollouts = {}
     rollout_policy = hydra.utils.get_method(cfg.actor.rollout_policy)
     logger.info(f"Use rollout policy: {rollout_policy}")
+    rollout_accepts_model_version_provider = "model_version_provider" in inspect.signature(rollout_policy).parameters
+
+    def current_model_version() -> int | None:
+        return trainer_state.propagated_weight_version
 
     final_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
@@ -223,7 +249,12 @@ async def schedule_rollouts(
             retry_count = 0
             while True:
                 try:
-                    rollout_result = await rollout_policy(cfg, llm, problem, session)
+                    if rollout_accepts_model_version_provider:
+                        rollout_result = await rollout_policy(
+                            cfg, llm, problem, session, model_version_provider=current_model_version
+                        )
+                    else:
+                        rollout_result = await rollout_policy(cfg, llm, problem, session)
                     break
                 except asyncio.CancelledError:
                     raise
@@ -242,19 +273,7 @@ async def schedule_rollouts(
                         continue
                     handle_rollout_exception(exc)
                     return
-            rollout_result.model_version = model_version
-            # Make a group id that will be different from groups made by another rollout maker
-            full_group_id = f"{scheduler_name}_{group_id}"
-            rollout_result.group_id = full_group_id
-            rollout_result.audit["model_version"] = model_version
-            rollout_result.audit["group_id"] = full_group_id
-            rollout_result.audit["rollout_index"] = rollout_index
-            for step_index, sample in enumerate(rollout_result.training_texts):
-                # Downstream in the pipeline we'll need these fields in every sample
-                sample.metadata["model_version"] = model_version
-                sample.metadata["rollout_index"] = rollout_index
-                sample.metadata["step_index"] = step_index
-                sample.group_id = full_group_id
+            stamp_rollout_metadata(rollout_result, scheduler_name, group_id, rollout_index, model_version)
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.

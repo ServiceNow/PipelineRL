@@ -146,6 +146,29 @@ def _patch_rollout_fakes(
     )
 
 
+def test_training_texts_carry_per_call_model_versions(monkeypatch):
+    llm_calls = [
+        _llm_call(content="inspect", tool_calls=[_tool_call(arguments={"command": "ls"})]),
+        _llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})]),
+    ]
+    _patch_rollout_fakes(monkeypatch, llm_calls)
+    versions = iter([10, 11])
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(max_turns=2),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+            model_version_provider=lambda: next(versions),
+        )
+    )
+
+    assert [text.metadata["model_version"] for text in result.training_texts] == [10, 11]
+
+
 def test_format_error_reward_retains_error_turn_in_chronological_order(monkeypatch):
     llm_calls = [
         _llm_call(content="bad format"),
@@ -692,7 +715,7 @@ def test_generate_rollout_tries_start_task_without_health_probe(monkeypatch):
         def get(self, *args, **kwargs):
             raise AssertionError("health probe should not run")
 
-    async def fake_execute(cfg, llm, problem, session, start_time, env_url):
+    async def fake_execute(cfg, llm, problem, session, start_time, env_url, model_version_provider=None):
         attempts.append(env_url)
         if env_url == "http://dead-env:7777":
             raise EnvironmentConnectionError("dead")

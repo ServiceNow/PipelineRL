@@ -1,4 +1,4 @@
-from pipelinerl.actor import make_rollout_audit_record, write_rollout_audit_records
+from pipelinerl.actor import make_rollout_audit_record, stamp_rollout_metadata, write_rollout_audit_records
 from pipelinerl.domains.terminal.rollouts import TerminalMetrics
 from pipelinerl.rollouts import RolloutResult, TrainingText
 
@@ -72,6 +72,31 @@ def test_make_rollout_audit_record_preserves_terminal_fields():
     assert record["dropped"] is True
     assert record["drop_reason"] == "finish_abort"
     assert record["n_training_texts"] == 0
+
+
+def test_stamp_rollout_metadata_preserves_per_turn_versions():
+    result = RolloutResult(
+        training_texts=[
+            TrainingText(text="a", n_predicted=1, reward=1.0, metadata={"model_version": 8}),
+            TrainingText(text="b", n_predicted=1, reward=1.0, metadata={"model_version": 9}),
+            TrainingText(text="c", n_predicted=1, reward=1.0),
+        ],
+        metrics=_metrics(reward=1.0),
+        latency=0.0,
+        audit={},
+    )
+
+    stamp_rollout_metadata(result, "actor", 12, 3, 7)
+
+    assert result.model_version == 7
+    assert result.group_id == "actor_12"
+    assert result.audit["model_version"] == 7
+    assert result.audit["group_id"] == "actor_12"
+    assert result.audit["rollout_index"] == 3
+    assert [sample.metadata["model_version"] for sample in result.training_texts] == [8, 9, 7]
+    assert [sample.metadata["step_index"] for sample in result.training_texts] == [0, 1, 2]
+    assert all(sample.metadata["rollout_index"] == 3 for sample in result.training_texts)
+    assert all(sample.group_id == "actor_12" for sample in result.training_texts)
 
 
 def test_write_rollout_audit_records_writes_zero_sample_rollouts():

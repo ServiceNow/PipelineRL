@@ -21,7 +21,7 @@ import random
 import time
 import traceback
 from dataclasses import dataclass
-from typing import List
+from typing import Callable, List
 
 import aiohttp
 from omegaconf import DictConfig
@@ -34,7 +34,7 @@ from pipelinerl.async_llm import (
     make_training_texts_from_llm_calls,
 )
 from pipelinerl.llm import LLMCall, Prompt, TrainableLLM
-from pipelinerl.rollouts import BaseMetrics, RolloutResult, summarize_training_texts
+from pipelinerl.rollouts import BaseMetrics, RolloutResult, TrainingText, summarize_training_texts
 from pipelinerl.utils import get_environment_jobs
 
 logger = logging.getLogger(__name__)
@@ -310,6 +310,11 @@ def _new_format_counts() -> dict[str, int]:
     }
 
 
+def _stamp_training_text_model_version(training_text: TrainingText, llm_call: LLMCall) -> None:
+    if llm_call.model_version is not None:
+        training_text.metadata["model_version"] = llm_call.model_version
+
+
 # Per-URL rate limit for /start_task connection warnings. A dead env-fleet
 # endpoint can be hit by every concurrent rollout every loop iteration.
 _START_WARN_WINDOW = 60.0
@@ -321,6 +326,7 @@ async def generate_terminal_rollout(
     llm: TrainableLLM,
     problem: dict,
     session: aiohttp.ClientSession,
+    model_version_provider: Callable[[], int | None] | None = None,
 ) -> RolloutResult:
     start_time = time.time()
     tcfg = cfg.terminal
@@ -344,7 +350,7 @@ async def generate_terminal_rollout(
         for url in urls:
             try:
                 return await asyncio.wait_for(
-                    _execute_rollout(cfg, llm, problem, session, start_time, url),
+                    _execute_rollout(cfg, llm, problem, session, start_time, url, model_version_provider),
                     timeout=max(1.0, deadline - time.time()),
                 )
             except EnvironmentConnectionError:
@@ -393,6 +399,7 @@ async def _execute_rollout(
     session: aiohttp.ClientSession,
     start_time: float,
     env_url: str,
+    model_version_provider: Callable[[], int | None] | None = None,
 ) -> RolloutResult:
     tcfg = cfg.terminal
     call_timeout = getattr(tcfg, "env_call_timeout", 300)
@@ -478,7 +485,9 @@ async def _execute_rollout(
                 if len(prompt_ids) + max_new_tokens + context_margin > max_model_len:
                     context_exhausted = True
                     break
+            call_model_version = model_version_provider() if model_version_provider is not None else None
             llm_call = await llm_async_generate(llm, Prompt(messages=messages, tools=tools), session)
+            llm_call.model_version = call_model_version
             n_total_llm_calls += 1
             action = _extract_bash_action(llm_call)
             if action.error is not None:
@@ -606,6 +615,8 @@ async def _execute_rollout(
         training_texts = []
     elif format_error_reward is None:
         training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
+        for training_text, llm_call in zip(training_texts, llm_calls):
+            _stamp_training_text_model_version(training_text, llm_call)
     else:
         training_texts = []
         for llm_call, is_format_error in llm_call_events:
@@ -626,6 +637,7 @@ async def _execute_rollout(
                 )
                 continue
             training_text.reward = reward if max_format_retries_exceeded or not is_format_error else format_error_reward
+            _stamp_training_text_model_version(training_text, llm_call)
             training_texts.append(training_text)
     summary = summarize_training_texts(training_texts)
 

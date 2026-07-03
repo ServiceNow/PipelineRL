@@ -80,6 +80,7 @@ class LLMCall(BaseModel):
         prompt_length_tokens (int): The length of the prompt in tokens. Defaults to -1 if not set.
         output_length_tokens (int): The length of the output in tokens. Defaults to -1 if not set.
         cached (bool): Indicates whether the result was retrieved from cache.
+        model_version (int | None): Trainer weight version used for this call, if known.
     """
 
     timestamp: str = Field(default_factory=lambda: datetime.datetime.now().isoformat())
@@ -88,6 +89,7 @@ class LLMCall(BaseModel):
     prompt_length_tokens: int = -1
     output_length_tokens: int = -1
     cached: bool
+    model_version: int | None = None
     llm_info: dict = {}
     cost: float = 0
     logprobs: list[TokenLogprob] = Field(default_factory=list, exclude=True)
