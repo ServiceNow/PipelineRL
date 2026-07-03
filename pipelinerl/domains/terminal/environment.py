@@ -136,6 +136,11 @@ class TerminalSession:
             "total_tests": total_tests,
         }
 
+    def sample_contamination(self) -> tuple[int, int]:
+        if self._env is None:
+            return 0, 0
+        return self._env.sample_contamination()
+
     def close(self, contamination_sample: bool = True) -> tuple[int, int]:
         if self._env is None:
             return 0, 0
