@@ -8,6 +8,7 @@ from pipelinerl.finetune.rl import (
     FrozenProbeRuntime,
     RLConfig,
     _forward_with_frozen_probe_capture,
+    frozen_probe_advantages,
     load_frozen_probe_runtime,
     multi_turn_credit_advantages,
     rl_step,
@@ -177,6 +178,50 @@ def test_rl_step_without_frozen_probe_does_not_register_probe_hook() -> None:
     assert torch.isfinite(loss)
     assert "loss" in stats
     assert sum(layer.register_calls for layer in model.model.layers) == 0
+
+
+def test_frozen_probe_advantages_expands_turn_success_residuals_per_segment() -> None:
+    segments = [(0, 3), (3, 6)]
+    masks_shifted = torch.tensor([[True, True, False, True, False, True]])
+    hidden_states = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    rewards = torch.tensor([[1.0, 1.0, 1.0, -1.0, -1.0, -1.0]])
+    runtime = FrozenProbeRuntime(
+        layer=nn.Identity(),
+        w_prime=torch.tensor([1.0, -1.0], dtype=torch.float32),
+        b_prime=0.0,
+    )
+
+    expanded, turn_indices, turn_probs, turn_targets, turn_advantages = frozen_probe_advantages(
+        segments,
+        masks_shifted,
+        hidden_states,
+        rewards,
+        runtime,
+    )
+
+    assert turn_indices.tolist() == [0, 3]
+    torch.testing.assert_close(turn_probs, torch.tensor([0.5, 0.5]))
+    torch.testing.assert_close(turn_targets, torch.tensor([1.0, 0.0]))
+    torch.testing.assert_close(turn_advantages, torch.tensor([0.5, -0.5]))
+    torch.testing.assert_close(expanded, torch.tensor([[0.5, 0.5, 0.0, -0.5, 0.0, -0.5]]))
+    assert runtime._device_w_prime is not None
+
+    rewards_with_event = rewards.clone()
+    rewards_with_event[0, 1] = 0.5
+    with pytest.raises(ValueError, match="constant rewards"):
+        frozen_probe_advantages(segments, masks_shifted, hidden_states, rewards_with_event, runtime)
 
 
 def test_multi_turn_credit_requires_value_head() -> None:

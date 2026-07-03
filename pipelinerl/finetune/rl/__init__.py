@@ -118,11 +118,17 @@ class RLConfig(BaseModel):
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class FrozenProbeRuntime:
     layer: torch.nn.Module
     w_prime: torch.Tensor
     b_prime: float
+    _device_w_prime: torch.Tensor | None = None
+
+    def weights_for(self, device: torch.device) -> torch.Tensor:
+        if self._device_w_prime is None or self._device_w_prime.device != device:
+            self._device_w_prime = self.w_prime.to(device=device)
+        return self._device_w_prime
 
 
 def _model_hidden_size(model: torch.nn.Module) -> int:
@@ -298,6 +304,54 @@ def multi_turn_credit_advantages(
     return expanded_advantages, turn_indices, turn_values, turn_targets, turn_advantages
 
 
+def frozen_probe_advantages(
+    segments: list[tuple[Any, Any]],
+    masks_shifted: torch.Tensor,
+    hidden_states: torch.Tensor,
+    rewards: torch.Tensor,
+    frozen_probe: FrozenProbeRuntime,
+) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if hidden_states.dim() != 3 or hidden_states.shape[0] != 1:
+        raise ValueError(f"Expected hidden_states shaped [1, L, H], got {tuple(hidden_states.shape)}")
+    if rewards.shape != masks_shifted.shape:
+        raise ValueError(f"rewards and masks_shifted must have matching shapes, got {tuple(rewards.shape)} and {tuple(masks_shifted.shape)}")
+
+    turn_indices = turn_start_indices(segments, masks_shifted)
+    expanded_advantages = torch.zeros_like(rewards)
+    if turn_indices.numel() == 0:
+        empty = torch.empty(0, dtype=torch.float32, device=hidden_states.device)
+        return expanded_advantages, turn_indices, empty, empty, empty
+
+    h = hidden_states[0, turn_indices, :].float()
+    w_prime = frozen_probe.weights_for(h.device)
+    logits = (h * w_prime).sum(dim=-1) + frozen_probe.b_prime
+    turn_probs = torch.sigmoid(logits)
+    turn_targets = (rewards[0, turn_indices] >= 0.999).to(dtype=turn_probs.dtype)
+    turn_advantages = turn_targets - turn_probs
+
+    turn_idx = 0
+    max_length = masks_shifted.shape[1]
+    for start, end in segments:
+        start_i = _segment_bound(start)
+        end_i = min(_segment_bound(end), max_length)
+        if start_i >= end_i:
+            continue
+        segment_mask = masks_shifted[0, start_i:end_i].bool()
+        if not segment_mask.any():
+            continue
+        segment_rewards = rewards[0, start_i:end_i][segment_mask]
+        if not torch.all(segment_rewards == segment_rewards[0]):
+            raise ValueError("frozen probe credit requires constant rewards within each segment")
+        expanded_advantages[0, start_i:end_i] = torch.where(
+            segment_mask,
+            turn_advantages[turn_idx].to(dtype=expanded_advantages.dtype),
+            expanded_advantages[0, start_i:end_i],
+        )
+        turn_idx += 1
+
+    return expanded_advantages, turn_indices, turn_probs, turn_targets, turn_advantages
+
+
 def rl_step(
     model: PreTrainedModel,
     batch: PipelineBatchEncoding,
@@ -435,6 +489,24 @@ def rl_step(
     ratio_new_old = torch.exp(log_ratio_new_old)
     log_ratio_ref_new = ref_logprobs - new_logprobs
     assert torch.isfinite(log_ratio_ref_new).all(), f"log_ratio_ref_new is not finite: {log_ratio_ref_new}"
+
+    frozen_probe_turn_probs = None
+    frozen_probe_turn_targets = None
+    frozen_probe_turn_advantages = None
+    if frozen_probe is not None:
+        if config.policy_loss != "gspo":
+            raise ValueError("frozen_probe_path requires policy_loss='gspo'")
+        if segments is None:
+            raise ValueError("frozen_probe_path requires packed sequences with segments")
+        if _frozen_probe_hidden is None:
+            raise RuntimeError("Frozen-probe hidden capture missing despite loaded probe")
+        (
+            _frozen_probe_advantages,
+            _frozen_probe_turn_idx,
+            frozen_probe_turn_probs,
+            frozen_probe_turn_targets,
+            frozen_probe_turn_advantages,
+        ) = frozen_probe_advantages(segments, masks_shifted, _frozen_probe_hidden, rewards, frozen_probe)
 
     turn_end_idx = None
     turn_values = None
@@ -631,6 +703,22 @@ def rl_step(
         "num_output_tokens_sum": masks_shifted.sum().item(),
         "input_size": batch.input_ids.numel(), 
     }
+
+    if frozen_probe_turn_probs is not None:
+        assert frozen_probe_turn_targets is not None
+        assert frozen_probe_turn_advantages is not None
+        stats["frozen_probe/p_mean"] = frozen_probe_turn_probs.mean().item() if frozen_probe_turn_probs.numel() else 0.0
+        success_mask = frozen_probe_turn_targets == 1
+        fail_mask = frozen_probe_turn_targets == 0
+        stats["frozen_probe/p_at_success"] = (
+            frozen_probe_turn_probs[success_mask].mean().item() if success_mask.any() else 0.0
+        )
+        stats["frozen_probe/p_at_fail"] = (
+            frozen_probe_turn_probs[fail_mask].mean().item() if fail_mask.any() else 0.0
+        )
+        stats["frozen_probe/A_mean"] = frozen_probe_turn_advantages.mean().item() if frozen_probe_turn_advantages.numel() else 0.0
+        stats["frozen_probe/A_min"] = frozen_probe_turn_advantages.min().item() if frozen_probe_turn_advantages.numel() else 0.0
+        stats["frozen_probe/A_max"] = frozen_probe_turn_advantages.max().item() if frozen_probe_turn_advantages.numel() else 0.0
 
     if has_value_head:
         assert value_predictions is not None
