@@ -66,6 +66,7 @@ class RolloutResult(BaseModel):
     dataset_name: str | None = None
     group_id: str | None = None
     domain: str | None = None
+    audit: dict = Field(default_factory=dict)
 
 
 @dataclass(frozen=True)
