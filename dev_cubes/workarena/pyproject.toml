@@ -1,0 +1,38 @@
+[project]
+name = "workarena-cube"
+version = "1.0.0"
+description = "WorkArena ServiceNow benchmark for cube"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "cube-standard>=0.1.0rc8",
+    "browsergym-workarena",
+    "termcolor",
+    "cube-browser-tool[bgym]>=0.3.0",
+    "cube-browser-playwright>=0.2.0",
+    "cube-chat-tool>=0.1.0",
+    "playwright==1.44",
+]
+
+[project.entry-points."cube.benchmarks"]
+workarena-cube = "workarena_cube.benchmark:WorkArenaBenchmarkConfig"
+
+[build-system]
+requires = ["uv_build>=0.8,<0.9"]
+build-backend = "uv_build"
+
+[tool.uv-build]
+include = ["src/workarena_cube/task_metadata.json"]
+
+[tool.uv.sources]
+# TODO: drop once cube-browser-tool 0.3.0 ships to PyPI.
+# Until then, 0.3.0 lives on cube-standard's dev branch
+# (cube-tools/cube-browser-tool subdirectory); PyPI only has <=0.2.0.
+cube-browser-tool = { git = "https://github.com/The-AI-Alliance/cube-standard", subdirectory = "cube-tools/cube-browser-tool" }
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.ruff]
+fix = true
+line-length = 120
+indent-width = 4
