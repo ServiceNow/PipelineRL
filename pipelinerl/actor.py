@@ -111,6 +111,41 @@ def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
 
 
+def make_rollout_audit_record(result: RolloutResult) -> dict:
+    metrics = result.metrics
+    record = dict(result.audit)
+    record.setdefault("task_id", None)
+    record.setdefault("domain", result.domain)
+    record.setdefault("complexity", None)
+    record["group_id"] = result.group_id
+    record.setdefault("rollout_index", None)
+    record["model_version"] = result.model_version
+    record["dataset_name"] = result.dataset_name
+    record.setdefault("reward", metrics.reward)
+    record.setdefault("verifier_pass", getattr(metrics, "verifier_pass", metrics.success))
+    record.setdefault("passed_tests", getattr(metrics, "passed_tests", None))
+    record.setdefault("total_tests", getattr(metrics, "total_tests", None))
+    record.setdefault("pass_fraction", getattr(metrics, "pass_fraction", None))
+    record.setdefault("abort_kind", None)
+    record.setdefault("abort_phase", None)
+    record.setdefault("build_ok", getattr(metrics, "build_ok", None))
+    record.setdefault("init_ok", getattr(metrics, "init_ok", None))
+    record.setdefault("submitted", getattr(metrics, "submitted", None))
+    record.setdefault("format_retry_exceeded", getattr(metrics, "max_format_retries_exceeded", None))
+    record.setdefault("context_exhausted", getattr(metrics, "context_exhausted", None))
+    record.setdefault("contamination_result", None)
+    record.setdefault("finish_stdout_tail", "")
+    record.setdefault("dropped", len(result.training_texts) == 0)
+    record.setdefault("drop_reason", None)
+    record["n_training_texts"] = len(result.training_texts)
+    return record
+
+
+def write_rollout_audit_records(audit_writer: StreamWriter, rollout_results: List[RolloutResult]) -> None:
+    for result in rollout_results:
+        audit_writer.write(make_rollout_audit_record(result))
+
+
 async def schedule_rollouts(
     cfg: DictConfig,
     attempts: int,
@@ -211,6 +246,9 @@ async def schedule_rollouts(
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
             rollout_result.group_id = full_group_id
+            rollout_result.audit["model_version"] = model_version
+            rollout_result.audit["group_id"] = full_group_id
+            rollout_result.audit["rollout_index"] = rollout_index
             for step_index, sample in enumerate(rollout_result.training_texts):
                 # Downstream in the pipeline we'll need these fields in every sample
                 sample.metadata["model_version"] = model_version
@@ -326,12 +364,14 @@ class ActorLoop:
         llms: list[TrainableLLM],
         data_stream: StreamSpec,
         stats_stream: StreamSpec,
+        audit_stream: StreamSpec,
         trainer_state: TrainerState,
         is_training: bool = True,
     ) -> None:
         self.data_stream = data_stream
         self.trainer_state = trainer_state
         self.stats_stream = stats_stream
+        self.audit_stream = audit_stream
         self.sliding_aggregator = SlidingWindowAggregator(window_size=cfg.actor.throughput_window_size)
         self.llms = llms
         self.loop_start_time = -1
@@ -551,6 +591,7 @@ class ActorLoop:
         with (
             write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
+            write_to_streams(self.audit_stream, "a") as audit_writer,
         ):
             while True:
                 # the user function must do next(...) to run each iteration
@@ -607,6 +648,7 @@ class ActorLoop:
                     f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
+                write_rollout_audit_records(audit_writer, rollout_results)
 
                 # Track completions per domain for adaptive sampling
                 if domain_sampler is not None:
@@ -828,6 +870,8 @@ def run_actor_loop(cfg: DictConfig):
     test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test")
     data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
     test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test")
+    audit_stream = SingleStreamSpec(exp_path=exp_path, topic="rollout_audit")
+    test_audit_stream = SingleStreamSpec(exp_path=exp_path, topic="rollout_audit_test")
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)
     # Get dataset loader parameters if they exist in config, otherwise use empty dict
@@ -879,7 +923,12 @@ def run_actor_loop(cfg: DictConfig):
         trainer_state.wait_for_model_version()
 
     train_loop = ActorLoop(
-        data_stream=data_stream, cfg=cfg, trainer_state=trainer_state, stats_stream=stats_stream, llms=train_llms
+        data_stream=data_stream,
+        cfg=cfg,
+        trainer_state=trainer_state,
+        stats_stream=stats_stream,
+        audit_stream=audit_stream,
+        llms=train_llms,
     )
     train_loop_run = train_loop.run(
         dataset=train_dataset,
@@ -889,6 +938,7 @@ def run_actor_loop(cfg: DictConfig):
         cfg=cfg,
         trainer_state=trainer_state,
         stats_stream=test_stats_stream,
+        audit_stream=test_audit_stream,
         llms=test_llms,
         is_training=False,
     )
