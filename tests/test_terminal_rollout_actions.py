@@ -395,7 +395,7 @@ def test_no_tests_resolved_after_step_abort_drops_rollout(monkeypatch):
             "passed": False,
             "passed_tests": 0,
             "total_tests": 0,
-            "abort_kind": None,
+            "abort_kind": "timeout",
             "output": "no tests resolved",
         },
     )

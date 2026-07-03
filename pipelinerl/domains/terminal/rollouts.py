@@ -529,7 +529,7 @@ async def _execute_rollout(
             finish_output = str(verifier.get("output", ""))
             contamination_result = _contamination_audit(verifier.get("contamination_result"))
             finish_abort_kind = verifier.get("abort_kind")
-            if finish_abort_kind:
+            if finish_abort_kind and abort_phase is None:
                 abort_kind = finish_abort_kind
                 abort_phase = "finish"
             disk_aborted = disk_aborted or finish_abort_kind == "disk"
