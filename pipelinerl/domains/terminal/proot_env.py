@@ -582,6 +582,11 @@ class ProotTerminalEnvironment:
             )
         return count
 
+    def sample_contamination(self) -> tuple[int, int]:
+        if not self.contamination_check:
+            return 0, 0
+        return 1, self._detect_shared_rootfs_contamination()
+
     # ------------------------------------------------------------------
     # persistent shell (PTY) lifecycle — ported from tmax env.py
     # ------------------------------------------------------------------
