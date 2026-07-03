@@ -812,7 +812,11 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
     eval_workers = int(getattr(eval_cfg, "ray_workers", 0) or 0)
     train_worker_num_cpus = float(getattr(cfg.actor, "ray_worker_num_cpus", 0.25))
     eval_worker_num_cpus = train_worker_num_cpus
-    reduced_train_workers = max(1, train_workers - eval_workers) if eval_workers > 0 else train_workers
+    resource_policy = getattr(eval_cfg, "resource_policy", None)
+    if resource_policy == 'elastic_train':
+        reduced_train_workers = max(1, train_workers - eval_workers) if eval_workers > 0 else train_workers
+    else:
+        reduced_train_workers = train_workers
     required_ray_cpus = max(1, int(math.ceil(max(train_workers * train_worker_num_cpus, reduced_train_workers * train_worker_num_cpus + eval_workers * eval_worker_num_cpus))))
     max_concurrent_workers = max(train_workers, reduced_train_workers + eval_workers)
     check_local_ray_worker_resources(cfg, instances=max_concurrent_workers, worker_num_cpus=max(train_worker_num_cpus, eval_worker_num_cpus), required_ray_cpus=required_ray_cpus)
@@ -938,7 +942,8 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                             if eval_manager is not None:
                                 eval_manager.close()
                                 eval_manager = None
-                            train_manager.set_target_workers(train_workers)
+                            if resource_policy == "elastic_train":
+                                train_manager.set_target_workers(train_workers)
                     if not draining_final_eval:
                         train_status = train_loop.step()
                 except Exception as exc:
