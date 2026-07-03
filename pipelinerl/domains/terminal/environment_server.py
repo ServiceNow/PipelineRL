@@ -262,10 +262,14 @@ class TerminalEnvironmentServer:
             self.contamination_events += 1
             self.contamination_contaminated_sampled += 1
 
-    def _close_session_background(self, session: TerminalSession | None) -> None:
+    def _close_session_background(
+        self,
+        session: TerminalSession | None,
+        contamination_sample: bool | None = None,
+    ) -> None:
         if session is None:
             return
-        sample = self._sample_contamination_close()
+        sample = self._sample_contamination_close() if contamination_sample is None else contamination_sample
         task = asyncio.create_task(self._run(session.close, sample))
         self._bg_tasks.add(task)
 
@@ -390,8 +394,18 @@ class TerminalEnvironmentServer:
         body = await request.json()
         session_id = body["session_id"]
         session = self._get(session_id)
+        contamination_sample = self._sample_contamination_close()
+        contamination_sampled = False
         try:
             result = await self._run(session.finish)
+            if contamination_sample:
+                contamination_result = await self._run(session.sample_contamination)
+                contamination_sampled = True
+                self._record_contamination(contamination_result)
+                sampled, count = contamination_result
+                result["contamination_result"] = {"sampled": bool(sampled), "count": count}
+            else:
+                result["contamination_result"] = {"sampled": False, "count": 0}
         finally:
             async with self._lock:
                 if self._sessions.get(session_id) is session:
@@ -400,7 +414,10 @@ class TerminalEnvironmentServer:
                     close_session = session
                 else:
                     close_session = None
-            self._close_session_background(close_session)
+            self._close_session_background(
+                close_session,
+                contamination_sample=False if contamination_sampled else contamination_sample,
+            )
         return web.json_response(result)
 
     async def close(self, request: web.Request) -> web.Response:
