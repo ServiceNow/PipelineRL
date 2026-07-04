@@ -88,6 +88,95 @@ def test_read_until_marker_waits_for_complete_exit_code_line():
     assert env._drain() == ""
 
 
+def _started_env_for_exec():
+    env = ProotTerminalEnvironment.__new__(ProotTerminalEnvironment)
+    env._disk_exceeded = SimpleNamespace(is_set=lambda: False)
+    env._abort_reason = None
+    env.shell_process = SimpleNamespace(poll=lambda: None)
+    env.reader_thread = SimpleNamespace(is_alive=lambda: True)
+    env.master_fd = 11
+    env._marker = "__CMD_DONE__test__"
+    env.read_timeout = 0.05
+    env._drain = lambda: ""
+    env._read_until_marker = lambda timeout: ("ok\n", 0)
+    return env
+
+
+def test_exec_bash_precheck_rejects_unterminated_quote_without_touching_session(monkeypatch):
+    env = _started_env_for_exec()
+    writes = []
+    monkeypatch.setattr(proot_env.os, "write", lambda fd, data: writes.append(data.decode()) or len(data))
+
+    ok, out, abort_kind = env.exec('echo "unterminated', timeout=1.0)
+
+    assert not ok
+    assert abort_kind is None
+    assert "bash syntax error (exit 2):" in out
+    assert "unexpected EOF" in out
+    assert writes == []
+
+    ok, out, abort_kind = env.exec("echo ok", timeout=1.0)
+
+    assert ok
+    assert abort_kind is None
+    assert "echo ok" in writes[-1]
+
+
+def test_exec_bash_precheck_rejects_unterminated_heredoc_without_touching_session(monkeypatch):
+    env = _started_env_for_exec()
+    writes = []
+    monkeypatch.setattr(proot_env.os, "write", lambda fd, data: writes.append(data.decode()) or len(data))
+
+    ok, out, abort_kind = env.exec("cat <<EOF\nhello", timeout=1.0)
+
+    assert not ok
+    assert abort_kind is None
+    assert "bash syntax error (exit 2):" in out
+    assert "here-document" in out
+    assert writes == []
+
+    ok, out, abort_kind = env.exec("cat <<EOF\nhello\nEOF", timeout=1.0)
+
+    assert ok
+    assert abort_kind is None
+    assert "cat <<EOF" in writes[-1]
+
+
+def test_exec_bash_precheck_preserves_background_commands(monkeypatch):
+    env = _started_env_for_exec()
+    writes = []
+    monkeypatch.setattr(proot_env.os, "write", lambda fd, data: writes.append(data.decode()) or len(data))
+
+    ok, out, abort_kind = env.exec("sleep 1 &", timeout=1.0)
+
+    assert ok
+    assert abort_kind is None
+    assert "sleep 1 &" in writes[-1]
+
+
+def test_exec_bash_precheck_timeout_falls_through_to_normal_exec(monkeypatch):
+    env = _started_env_for_exec()
+    writes = []
+    monkeypatch.setattr(proot_env.os, "write", lambda fd, data: writes.append(data.decode()) or len(data))
+
+    captured_env = {}
+
+    def timeout_run(*args, **kwargs):
+        captured_env["value"] = kwargs.get("env")
+        raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 5.0))
+
+    monkeypatch.setattr(proot_env.subprocess, "run", timeout_run)
+
+    ok, out, abort_kind = env.exec('echo "unterminated', timeout=1.0)
+
+    assert ok
+    assert abort_kind is None
+    assert captured_env["value"] is not os.environ
+    assert captured_env["value"]["LC_ALL"] == "C"
+    assert writes
+    assert 'echo "unterminated' in writes[-1]
+
+
 def test_start_returns_false_when_startup_hook_aborts(monkeypatch, tmp_path):
     class DummyProcess:
         returncode = None

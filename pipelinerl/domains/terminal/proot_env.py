@@ -73,6 +73,40 @@ _DEFAULT_ROOTFS_ROOT = Path(os.environ.get("PL_TERMINAL_CACHE_DIR", Path(tempfil
 #: mount avoids relying on NFS file locking.
 _META_ROOT = Path(tempfile.gettempdir()) / "pl_terminal_meta"
 _SESSION_DIRS_MANIFEST = ".session_dirs.json"
+_BASH_PRECHECK_TIMEOUT_SECONDS = 5.0
+
+
+def _bash_precheck_error(command: str) -> Optional[str]:
+    path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", prefix="pl_bash_check_", suffix=".sh", delete=False
+        ) as f:
+            f.write(command)
+            f.write("\n")
+            path = f.name
+        env = {**os.environ, "LC_ALL": "C"}
+        proc = subprocess.run(
+            ["bash", "-n", path],
+            capture_output=True,
+            text=True,
+            timeout=_BASH_PRECHECK_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except Exception as e:
+        logger.warning("bash syntax pre-check failed; falling back to PTY exec: %s", e)
+        return None
+    finally:
+        if path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+
+    stderr = proc.stderr or proc.stdout or ""
+    unterminated_heredoc = "here-document" in stderr and "delimited by end-of-file" in stderr
+    if proc.returncode != 0 or unterminated_heredoc:
+        rc = proc.returncode if proc.returncode != 0 else 2
+        return f"bash syntax error (exit {rc}):\n{stderr}"
+    return None
 
 
 def _proot_argv(proot_bin: str, rootfs: Path, cwd: str, binds: Sequence[str] = ()) -> List[str]:
@@ -755,8 +789,12 @@ class ProotTerminalEnvironment:
         if not self.reader_thread or not self.reader_thread.is_alive():
             return False, "reader thread is not alive", self._abort_reason
 
-        self._drain()
         command = command.strip()
+        syntax_error = _bash_precheck_error(command)
+        if syntax_error is not None:
+            return False, syntax_error, None
+
+        self._drain()
         stripped = command.rstrip()
         is_background = stripped.endswith("&") and not stripped.endswith("&&")
         if "<<" in command or is_background:
