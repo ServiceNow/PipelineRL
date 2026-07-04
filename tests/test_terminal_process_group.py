@@ -219,6 +219,48 @@ def test_start_returns_false_when_startup_hook_aborts(monkeypatch, tmp_path):
     assert env._abort_reason == "timeout"
 
 
+def test_start_exports_noninteractive_environment(monkeypatch, tmp_path):
+    class DummyProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+    )
+    env.rootfs = tmp_path
+    env._session_binds = lambda: []
+    env._read_until_marker = lambda timeout: ("", 0)
+    writes = []
+
+    monkeypatch.setattr(proot_env.pty, "openpty", lambda: (10, 11))
+    monkeypatch.setattr(proot_env.termios, "tcgetattr", lambda fd: [0, 0, 0, 0])
+    monkeypatch.setattr(proot_env.termios, "tcsetattr", lambda *args: None)
+    monkeypatch.setattr(proot_env.subprocess, "Popen", lambda *args, **kwargs: DummyProcess())
+    monkeypatch.setattr(proot_env.threading, "Thread", lambda *args, **kwargs: SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(proot_env.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(proot_env.os, "write", lambda fd, data: writes.append(data.decode()) or len(data))
+    monkeypatch.setattr(proot_env, "_proot_argv", lambda *args, **kwargs: ["proot"])
+
+    assert env.start(source_startup_hooks=False)
+
+    init = writes[0]
+    for expected in [
+        "export PAGER=cat",
+        "GIT_PAGER=cat",
+        "SYSTEMD_PAGER=cat",
+        "LESS=FRX",
+        "EDITOR=true",
+        "GIT_EDITOR=true",
+        "DEBIAN_FRONTEND=noninteractive",
+    ]:
+        assert expected in init
+
+
 def test_build_shared_rootfs_stages_base_and_uses_reflink(monkeypatch, tmp_path):
     meta_root = tmp_path / "meta"
     monkeypatch.setattr(proot_env, "_META_ROOT", meta_root)

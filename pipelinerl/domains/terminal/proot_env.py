@@ -755,6 +755,8 @@ class ProotTerminalEnvironment:
 
         init = (
             "set -o pipefail 2>/dev/null; export PS1=''; export HOME=/home/user; "
+            "export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat LESS=FRX "
+            "EDITOR=true GIT_EDITOR=true DEBIAN_FRONTEND=noninteractive; "
             "cd /home/user 2>/dev/null || true; "
             f"printf '{self._marker}:0\\n'"
         )
