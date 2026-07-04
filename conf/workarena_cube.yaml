@@ -4,7 +4,7 @@ defaults:
   - _self_
 
 output_dir: results/cube_math_tool/${now:%Y-%m-%d}/${now:%H-%M-%S}
-model_path: /mnt/llmd/base_models/Qwen2.5-7B-Instruct
+model_path: /mnt/llmd/base_models/Qwen3-4B-Instruct-2507
 
 actor:
   max_steps: 10
@@ -41,14 +41,14 @@ test_llm:
 
 vllm_config:
   vllm_kwargs:
-    max_model_len: 32000
-    served_model_name: Qwen2.5-7B-Instruct
+    max_model_len: 16000
+    served_model_name: Qwen3-4B-Instruct-2507
     enable-auto-tool-choice: ""
     tool-call-parser: rl_tool
     tool-parser-plugin: ${hydra:runtime.cwd}/pipelinerl/rl_tool_parser_plugin.py
 
 finetune:
-  seq_length: 32000
+  seq_length: 16000
   seq_parallel: 8
   gradient_accumulation_passes: 1024
   rl:
@@ -79,10 +79,9 @@ preprocess:
   shared_memory_entry_size: 1000000000
 
 train_dataset_names:
-  - miniwob_html
+  - workarena_train
 test_dataset_names:
-  - miniwob_html
-  # - miniwob_test
+  - workarena_eval
 
 # Shared shaping config — instruction-blind generic progress signals.
 # All weights are read by `miniwob_cube.shaping.RewardWeights` and are
@@ -94,7 +93,7 @@ test_dataset_names:
 # episode returns here, so the policy-invariance theorem requires this
 # γ to match. To downweight shaping vs the terminal reward, lower
 # `finetune.rl.advantage.step_reward_lambda` (not this γ).
-miniwob_shaping: &miniwob_shaping
+reward_shaping: &reward_shaping
   enable_step_verifier_rewards: true
   # When true, appends a qualitative "[Step feedback]" block to the next
   # observation describing what the last action did (e.g. "your last tool
@@ -111,26 +110,26 @@ miniwob_shaping: &miniwob_shaping
   shaping_gamma: 1.0
 
 dataset_loader_params:
-  miniwob_html:
-    benchmark: &miniwob_benchmark
-      _type: miniwob_cube.benchmark.MiniWobBenchmarkConfig
-      port: 8010
-      enable_step_verifier_rewards: ${miniwob_shaping.enable_step_verifier_rewards}
-      inject_step_feedback: ${miniwob_shaping.inject_step_feedback}
-      shaping_weight_terminal: ${miniwob_shaping.shaping_weight_terminal}
-      shaping_weight_form_completion: ${miniwob_shaping.shaping_weight_form_completion}
-      shaping_weight_affordance_breadth: ${miniwob_shaping.shaping_weight_affordance_breadth}
-      shaping_weight_error: ${miniwob_shaping.shaping_weight_error}
-      shaping_weight_stuck: ${miniwob_shaping.shaping_weight_stuck}
-      shaping_weight_bad_target: ${miniwob_shaping.shaping_weight_bad_target}
-      shaping_gamma: ${miniwob_shaping.shaping_gamma}
+  workarena_train:
+    benchmark: &workarena_benchmark
+      _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigTrain
+      # port: 8010
+      # enable_step_verifier_rewards: ${reward_shaping.enable_step_verifier_rewards}
+      # inject_step_feedback: ${reward_shaping.inject_step_feedback}
+      # shaping_weight_terminal: ${reward_shaping.shaping_weight_terminal}
+      # shaping_weight_form_completion: ${reward_shaping.shaping_weight_form_completion}
+      # shaping_weight_affordance_breadth: ${reward_shaping.shaping_weight_affordance_breadth}
+      # shaping_weight_error: ${reward_shaping.shaping_weight_error}
+      # shaping_weight_stuck: ${reward_shaping.shaping_weight_stuck}
+      # shaping_weight_bad_target: ${reward_shaping.shaping_weight_bad_target}
+      # shaping_gamma: ${reward_shaping.shaping_gamma}
       tool_config: &miniwob_tool_config
           _type: miniwob_cube.tools.MiniWobBgymToolConfig
-          use_html: true
-          use_axtree: false
+          use_html: false
+          use_axtree: true
           use_screenshot: false
-    agent: &simple_agent
-      _type: dev_cubes.agents.SimpleAgentConfig
+    agent: &workarena_agent
+      _type: dev_cubes.agents.WorkArenaAgentConfig
       llm_config:
         _type: cube_harness.rl.llm.RolloutLLMConfig
         model_name: ${vllm_config.vllm_kwargs.served_model_name}
@@ -139,13 +138,8 @@ dataset_loader_params:
         timeout: 500
         num_retries: 1
       max_actions: 10
-  miniwob_axtree:
+  workarena_eval:
     benchmark:
-      <<: *miniwob_benchmark
-      port: 8011
-      tool_config:
-        <<: *miniwob_tool_config
-        use_html: false
-        use_axtree: true
-        use_screenshot: false
-    agent: *simple_agent
+      <<: *workarena_benchmark
+      _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigEval
+    agent: *workarena_agent

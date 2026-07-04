@@ -73,6 +73,7 @@ cube = [
     "cube-harness",
     "cube-standard",
     "miniwob-cube",
+    "workarena-cube"
 ]
 # Install all domain dependencies
 domains = [
@@ -93,4 +94,5 @@ include = ["pipelinerl*"]
 flash-attn = { url = "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
 cube-harness = { path = "../cube-harness", editable = true }
 miniwob-cube = { path = "dev_cubes/miniwob", editable = true }
+workarena-cube = { path = "dev_cubes/workarena", editable = true }
 cube-standard = { git = "https://github.com/The-AI-Alliance/cube-standard.git", branch = "dev" }

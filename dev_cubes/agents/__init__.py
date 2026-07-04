@@ -1,2 +1,2 @@
-from dev_cubes.agents.simple_agent import SimpleAgentConfig
-from dev_cubes.agents.simple_agent import SimpleAgent
+from dev_cubes.agents.simple_agent import SimpleAgentConfig, SimpleAgent
+from dev_cubes.agents.workarena_agent import WorkArenaAgentConfig, WorkArenaAgent

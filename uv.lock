@@ -1017,6 +1017,31 @@ bgym = [
 ]
 
 [[package]]
+name = "cube-chat"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cube-standard" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/02/18/77dd7f1edacead54818e3588b170c2f2bdaaa84ed13720a81b197ac0a049/cube_chat-0.1.1.tar.gz", hash = "sha256:23d4470c22b1bb241adbd9874415e290af129118798292859345393fb28532af", size = 1852, upload-time = "2026-06-16T20:09:16.306Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e2/70/59c6dc3e2ea858a2d7a4c6a6673df8ba8ed28d65c28d422087f55bb9fdbb/cube_chat-0.1.1-py3-none-any.whl", hash = "sha256:d1b931c1ec190afcb54172e11aae05efbe19a52eba765ac3a5dde90ca9db7f85", size = 2673, upload-time = "2026-06-16T20:09:14.95Z" },
+]
+
+[[package]]
+name = "cube-chat-tool"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cube-chat" },
+    { name = "cube-standard" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d9/e4/3a2e231a382cc5243e880712883022fa77d2ee350c459ae88eb60ea6a83e/cube_chat_tool-0.1.1.tar.gz", hash = "sha256:476e608ea03c92fafc82b2b4a1caf556d24499bbc87d8d2aa3f2a55293cc4c05", size = 2260, upload-time = "2026-06-16T20:20:06.179Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/f8/50f765ac053f9c244201ff7b1fc67422b14733b27416306c96ae98e257ed/cube_chat_tool-0.1.1-py3-none-any.whl", hash = "sha256:2a561fdcd364e84bfd99c60416cdb601deb6bf2e670537f26545a19f9effbf8b", size = 3161, upload-time = "2026-06-16T20:20:04.951Z" },
+]
+
+[[package]]
 name = "cube-harness"
 version = "0.1.0"
 source = { editable = "../cube-harness" }
@@ -4180,6 +4205,7 @@ cube = [
     { name = "cube-harness" },
     { name = "cube-standard" },
     { name = "miniwob-cube" },
+    { name = "workarena-cube" },
 ]
 domains = [
     { name = "absl-py" },
@@ -4237,6 +4263,7 @@ requires-dist = [
     { name = "uvloop", specifier = ">=0.19.0" },
     { name = "vllm", specifier = "==0.18.1" },
     { name = "wandb", specifier = ">=0.16.0" },
+    { name = "workarena-cube", marker = "extra == 'cube'", editable = "dev_cubes/workarena" },
 ]
 provides-extras = ["miniwob", "coding", "fn-calling", "logic", "ifeval", "cube", "domains"]
 
@@ -7092,6 +7119,34 @@ name = "word2number"
 version = "1.1"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/4a/29/a31940c848521f0725f0df6b25dca8917f13a2025b0e8fcbe5d0457e45e6/word2number-1.1.zip", hash = "sha256:70e27a5d387f67b04c71fbb7621c05930b19bfd26efd6851e6e0f9969dcde7d0", size = 9723, upload-time = "2017-06-02T15:45:14.488Z" }
+
+[[package]]
+name = "workarena-cube"
+version = "1.0.0"
+source = { editable = "dev_cubes/workarena" }
+dependencies = [
+    { name = "browsergym-workarena" },
+    { name = "cube-browser-playwright" },
+    { name = "cube-browser-tool", extra = ["bgym"] },
+    { name = "cube-chat-tool" },
+    { name = "cube-standard" },
+    { name = "playwright" },
+    { name = "termcolor" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "browsergym-workarena" },
+    { name = "cube-browser-playwright", specifier = ">=0.2.0" },
+    { name = "cube-browser-tool", extras = ["bgym"], git = "https://github.com/The-AI-Alliance/cube-standard?subdirectory=cube-tools%2Fcube-browser-tool" },
+    { name = "cube-chat-tool", specifier = ">=0.1.0" },
+    { name = "cube-standard", specifier = ">=0.1.0rc8" },
+    { name = "playwright", specifier = "==1.44" },
+    { name = "termcolor" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
 name = "wrapt"
