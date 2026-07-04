@@ -75,21 +75,37 @@ logger = logging.getLogger(__name__)
 
 
 def _aggregate_step_rl_metrics(rl_metrics: Dict[str, List], num_samples: int) -> dict[str, float]:
+    probs_lists = rl_metrics.pop("frozen_probe/pair_probs", None)
+    targets_lists = rl_metrics.pop("frozen_probe/pair_targets", None)
+
     frozen_probe_metrics: dict[str, float] = {}
-    for key in list(rl_metrics):
-        if not key.startswith("frozen_probe/"):
-            continue
-        values = np.asarray(rl_metrics.pop(key), dtype=float)
-        values = values[~np.isnan(values)]
-        if values.size == 0:
-            value = float("nan")
-        elif key == "frozen_probe/A_min":
-            value = float(np.min(values))
-        elif key == "frozen_probe/A_max":
-            value = float(np.max(values))
+    if probs_lists is not None or targets_lists is not None:
+        from pipelinerl.domains.terminal.turn_probes import auroc
+
+        probs = np.concatenate([np.asarray(x, dtype=float) for x in probs_lists or []] or [np.empty(0)])
+        targets = np.concatenate([np.asarray(x, dtype=float) for x in targets_lists or []] or [np.empty(0)])
+        assert probs.shape == targets.shape, f"pair shape mismatch: {probs.shape} vs {targets.shape}"
+        # One pooled statistic per optimizer step over the union of turns from all
+        # micro-batches and ranks; per-micro-batch AUROC is quantized noise.
+        if probs.size:
+            success = targets >= 0.5
+            advantages = targets - probs
+            frozen_probe_metrics["rl/frozen_probe/p_mean"] = float(probs.mean())
+            frozen_probe_metrics["rl/frozen_probe/p_at_success"] = (
+                float(probs[success].mean()) if success.any() else float("nan")
+            )
+            frozen_probe_metrics["rl/frozen_probe/p_at_fail"] = (
+                float(probs[~success].mean()) if (~success).any() else float("nan")
+            )
+            frozen_probe_metrics["rl/frozen_probe/auroc_online"] = auroc(success, probs)
+            frozen_probe_metrics["rl/frozen_probe/A_mean"] = float(advantages.mean())
+            frozen_probe_metrics["rl/frozen_probe/A_min"] = float(advantages.min())
+            frozen_probe_metrics["rl/frozen_probe/A_max"] = float(advantages.max())
+            frozen_probe_metrics["rl/frozen_probe/n_turns"] = float(probs.size)
         else:
-            value = float(np.mean(values))
-        frozen_probe_metrics[f"rl/{key}"] = value
+            for name in ("p_mean", "p_at_success", "p_at_fail", "auroc_online", "A_mean", "A_min", "A_max"):
+                frozen_probe_metrics[f"rl/frozen_probe/{name}"] = float("nan")
+            frozen_probe_metrics["rl/frozen_probe/n_turns"] = 0.0
 
     metrics = aggregate_rl_stats(rl_metrics, num_samples)
     metrics.update(frozen_probe_metrics)
@@ -118,9 +134,15 @@ def gather_rl_metrics(rl_metrics: Dict[str, List]) -> Dict[str, List]:
         #if process_metrics is None:
         #    continue
         for key, values in process_metrics.items():
-            if values:
+            if not values:
+                continue
+            if key.startswith("frozen_probe/pair_"):
+                # Each value is a per-micro-batch list of floats; keep them whole
+                # so the step aggregation can pool the union.
+                aggregated_metrics[key].extend(values)
+            else:
                 aggregated_metrics[key].extend([v for v in values if np.isfinite(v)])
-    
+
     return aggregated_metrics
 
 

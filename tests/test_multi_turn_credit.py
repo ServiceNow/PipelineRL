@@ -2,6 +2,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -10,7 +11,6 @@ from torch import nn
 from pipelinerl.finetune.rl import (
     FrozenProbeRuntime,
     RLConfig,
-    _binary_auroc,
     _forward_with_frozen_probe_capture,
     frozen_probe_advantages,
     load_frozen_probe_runtime,
@@ -19,6 +19,7 @@ from pipelinerl.finetune.rl import (
     turn_end_indices,
     turn_start_indices,
 )
+from pipelinerl.domains.terminal.turn_probes import auroc
 from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune_loop import _aggregate_step_rl_metrics
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead, ValueHead
@@ -40,13 +41,13 @@ def test_base_yaml_frozen_probe_credit_loads_as_string() -> None:
     assert config.frozen_probe_credit == "off"
 
 
-def test_binary_auroc_matches_probe_semantics() -> None:
-    labels = torch.tensor([1.0, 1.0, 0.0, 0.0])
+def test_auroc_matches_probe_semantics() -> None:
+    labels = np.array([True, True, False, False])
 
-    assert _binary_auroc(labels, torch.tensor([0.9, 0.8, 0.2, 0.1])) == 1.0
-    assert _binary_auroc(labels, torch.tensor([0.1, 0.2, 0.8, 0.9])) == 0.0
-    assert _binary_auroc(labels, torch.tensor([0.5, 0.5, 0.5, 0.5])) == 0.5
-    assert math.isnan(_binary_auroc(torch.tensor([1.0, 1.0]), torch.tensor([0.1, 0.2])))
+    assert auroc(labels, np.array([0.9, 0.8, 0.2, 0.1])) == 1.0
+    assert auroc(labels, np.array([0.1, 0.2, 0.8, 0.9])) == 0.0
+    assert auroc(labels, np.array([0.5, 0.5, 0.5, 0.5])) == 0.5
+    assert math.isnan(auroc(np.array([True, True]), np.array([0.1, 0.2])))
 
 
 def test_turn_indices_select_labeled_boundaries_per_segment() -> None:
@@ -305,12 +306,11 @@ def test_frozen_probe_shadow_leaves_gspo_advantages_bit_identical() -> None:
     assert torch.equal(off_loss.detach(), shadow_loss.detach())
     for key in ("loss", "advantage", "max_advantage", "min_advantage"):
         assert off_stats[key] == shadow_stats[key]
-    assert shadow_stats["frozen_probe/p_mean"] == 0.5
-    assert shadow_stats["frozen_probe/A_mean"] == -0.5
-    assert math.isnan(shadow_stats["frozen_probe/auroc_online"])
+    assert shadow_stats["frozen_probe/pair_probs"] == [0.5]
+    assert shadow_stats["frozen_probe/pair_targets"] == [0.0]
 
 
-def test_frozen_probe_shadow_logs_online_auroc() -> None:
+def test_frozen_probe_shadow_emits_turn_pairs() -> None:
     model = _TinyProbePolicy()
     runtime = FrozenProbeRuntime(
         layer=model.model.layers[31],
@@ -327,32 +327,59 @@ def test_frozen_probe_shadow_logs_online_auroc() -> None:
         frozen_probe=runtime,
     )
 
-    assert stats["frozen_probe/p_mean"] == 0.5
-    assert stats["frozen_probe/p_at_success"] == 0.5
-    assert stats["frozen_probe/p_at_fail"] == 0.5
-    assert stats["frozen_probe/auroc_online"] == 0.5
-    assert stats["frozen_probe/A_mean"] == 0.0
+    assert stats["frozen_probe/pair_probs"] == [0.5, 0.5]
+    assert stats["frozen_probe/pair_targets"] == [1.0, 0.0]
 
 
-def test_frozen_probe_step_metrics_aggregate_per_microbatch_and_skip_nan() -> None:
+def test_frozen_probe_step_metrics_pool_pairs_across_microbatches() -> None:
+    # Two single-class micro-batches: per-micro-batch AUROC would be NaN for
+    # both (the quantized-noise failure mode this fix removes); the pooled union
+    # is perfectly separable.
     metrics = _aggregate_step_rl_metrics(
         {
             "reward": [1.0, 3.0],
-            "frozen_probe/p_mean": [0.2, 0.6],
-            "frozen_probe/p_at_success": [float("nan"), 0.7],
-            "frozen_probe/A_min": [-0.2, -0.8],
-            "frozen_probe/A_max": [0.3, 0.9],
-            "frozen_probe/auroc_online": [float("nan"), 0.75],
+            "frozen_probe/pair_probs": [[0.9, 0.8], [0.2, 0.1]],
+            "frozen_probe/pair_targets": [[1.0, 1.0], [0.0, 0.0]],
         },
         num_samples=4,
     )
 
     assert metrics["rl/reward"] == 1.0
-    assert metrics["rl/frozen_probe/p_mean"] == 0.4
-    assert metrics["rl/frozen_probe/p_at_success"] == 0.7
-    assert metrics["rl/frozen_probe/A_min"] == -0.8
-    assert metrics["rl/frozen_probe/A_max"] == 0.9
-    assert metrics["rl/frozen_probe/auroc_online"] == 0.75
+    assert metrics["rl/frozen_probe/auroc_online"] == 1.0
+    assert metrics["rl/frozen_probe/p_mean"] == pytest.approx(0.5)
+    assert metrics["rl/frozen_probe/p_at_success"] == pytest.approx(0.85)
+    assert metrics["rl/frozen_probe/p_at_fail"] == pytest.approx(0.15)
+    assert metrics["rl/frozen_probe/A_mean"] == pytest.approx(0.0)
+    assert metrics["rl/frozen_probe/A_min"] == pytest.approx(-0.2)
+    assert metrics["rl/frozen_probe/A_max"] == pytest.approx(0.2)
+    assert metrics["rl/frozen_probe/n_turns"] == 4.0
+    assert not any("pair_" in key for key in metrics)
+
+
+def test_frozen_probe_step_metrics_empty_and_absent_pairs() -> None:
+    empty = _aggregate_step_rl_metrics(
+        {"reward": [1.0], "frozen_probe/pair_probs": [[]], "frozen_probe/pair_targets": [[]]},
+        num_samples=1,
+    )
+    assert math.isnan(empty["rl/frozen_probe/auroc_online"])
+    assert empty["rl/frozen_probe/n_turns"] == 0.0
+
+    absent = _aggregate_step_rl_metrics({"reward": [1.0]}, num_samples=1)
+    assert not any(key.startswith("rl/frozen_probe/") for key in absent)
+
+
+def test_gather_rl_metrics_preserves_pair_lists(monkeypatch) -> None:
+    import pipelinerl.finetune_loop as finetune_loop
+
+    monkeypatch.setattr(finetune_loop.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(finetune_loop.dist, "all_gather_object", lambda out, obj: out.__setitem__(0, obj))
+
+    gathered = finetune_loop.gather_rl_metrics(
+        {"frozen_probe/pair_probs": [[0.9], [0.1]], "reward": [1.0, float("nan")]}
+    )
+
+    assert gathered["frozen_probe/pair_probs"] == [[0.9], [0.1]]
+    assert gathered["reward"] == [1.0]
 
 
 def test_frozen_probe_live_replaces_gspo_advantages() -> None:
