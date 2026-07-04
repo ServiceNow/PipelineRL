@@ -269,10 +269,14 @@ def _read_session_dirs_manifest(root: Path) -> dict[str, Any]:
 
 
 def _proc_group_rss_bytes(pgid: int) -> int:
-    """Sum resident memory (bytes) of the session's process group, or -1 if it
-    can't be measured. The proot shell is started with ``start_new_session=True``,
-    so its pid == pgid and the agent's child processes inherit it; ``ps -g`` sums
-    them. -1 is treated as 'unknown' by the caller (never triggers an abort)."""
+    """Sum resident memory (bytes) for the session selected by ``pgid``.
+
+    procps ``ps -g`` selects by session id here, not strict process group. The
+    proot shell is started with ``start_new_session=True``, so ``proc.pid`` is the
+    session id, and subprocess-mode commands launched with bash job control stay
+    in that same session even when they get their own process group. A guest
+    command that runs its own ``setsid`` escapes this accounting, matching the
+    existing PTY behavior. -1 is treated as unknown by the caller."""
     try:
         out = subprocess.run(["ps", "-o", "rss=", "-g", str(pgid)], capture_output=True, text=True, timeout=10)
         kb = sum(int(x) for x in out.stdout.split())
@@ -414,6 +418,10 @@ class ProotTerminalEnvironment:
         self.session_tmp = self.work_dir / "tmp"
         self.session_deltas = self.work_dir / "deltas"
         self._session_delta_binds: List[str] = []
+        self._runner_dir = self.session_tmp / ".pl_runner"
+        self._runner_guest_dir = "/tmp/.pl_runner"
+        self._runner_fifo: Optional[Path] = None
+        self._runner_counter = 0
 
         self.shell_process: Optional[subprocess.Popen] = None
         self.master_fd: Optional[int] = None
@@ -699,6 +707,15 @@ class ProotTerminalEnvironment:
             _force_rmtree(self.session_tmp)
             _force_rmtree(self.session_deltas)
 
+    @staticmethod
+    def _read_command_pgid(pgid_path: Path, current: Optional[int]) -> Optional[int]:
+        if current is not None or not pgid_path.exists():
+            return current
+        try:
+            return int(pgid_path.read_text().strip())
+        except (OSError, ValueError):
+            return current
+
     def _disk_monitor_loop(self) -> None:
         """Abort the session if its node-local scratch OR its process-group RSS
         exceeds the cap.
@@ -730,8 +747,168 @@ class ProotTerminalEnvironment:
             self._abort_session(kind or "resource", reason)
             return
 
+    def _subprocess_runner_script(self) -> str:
+        runner_dir = shlex.quote(self._runner_guest_dir)
+        return f"""set -u
+set -m
+runner_dir={runner_dir}
+fifo="$runner_dir/fifo"
+while true; do
+    if ! IFS= read -r job_id < "$fifo"; then
+        continue
+    fi
+    if [ "$job_id" = "__exit__" ]; then
+        exit 0
+    fi
+    script="$runner_dir/cmd_${{job_id}}.sh"
+    out="$runner_dir/out_${{job_id}}.txt"
+    rc="$runner_dir/rc_${{job_id}}"
+    pgid="$runner_dir/pgid_${{job_id}}"
+    rm -f "$rc" "$pgid"
+    /bin/bash "$script" > "$out" 2>&1 &
+    child=$!
+    printf '%s\n' "$child" > "$pgid"
+    wait "$child"
+    status=$?
+    printf '%s\n' "$status" > "$rc.tmp"
+    mv "$rc.tmp" "$rc"
+done
+"""
+
+    def _subprocess_command_script(self, command: str) -> str:
+        state = shlex.quote(f"{self._runner_guest_dir}/state.sh")
+        return f"""set -o pipefail 2>/dev/null || true
+export PS1='' HOME=/home/user PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat LESS=FRX EDITOR=true GIT_EDITOR=true DEBIAN_FRONTEND=noninteractive
+if [ -f {state} ]; then source {state} 2>/dev/null || true; fi
+{command}
+__pl_rc=$?
+(
+    declare -px
+    declare -pf
+    shopt -p
+    printf 'cd %q\n' "$PWD"
+) > {state}.tmp 2>/dev/null || true
+mv {state}.tmp {state} 2>/dev/null || true
+exit "$__pl_rc"
+"""
+
+    def _subprocess_command_prologue_lines(self) -> int:
+        placeholder = "__PIPELINERL_COMMAND_BODY__"
+        lines = self._subprocess_command_script(placeholder).splitlines()
+        return lines.index(placeholder)
+
+    def _clean_subprocess_output(self, raw: str, job_id: str, command: str) -> str:
+        prologue_lines = self._subprocess_command_prologue_lines()
+        command_lines = max(1, len(command.splitlines()))
+        script_names = [
+            f"{self._runner_guest_dir}/cmd_{job_id}.sh",
+            str(self._runner_dir / f"cmd_{job_id}.sh"),
+        ]
+        pattern = r"(?:%s): line (\d+):" % "|".join(re.escape(name) for name in script_names)
+
+        def _replace(match: re.Match[str]) -> str:
+            line = int(match.group(1)) - prologue_lines
+            line = min(max(line, 1), command_lines)
+            return f"bash: line {line}:"
+
+        normalized = re.sub(pattern, _replace, raw)
+        return ANSI_RE.sub("", normalized).replace("\r", "")
+
+    def _send_runner_job(self, job_id: str, timeout: float = 5.0) -> bool:
+        if self._runner_fifo is None:
+            return False
+        deadline = time.time() + timeout
+        data = f"{job_id}\n".encode()
+        while time.time() < deadline:
+            proc = self.shell_process
+            if proc is None or proc.poll() is not None:
+                return False
+            try:
+                fd = os.open(self._runner_fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as e:
+                if getattr(e, "errno", None) in (errno.ENOENT, errno.ENXIO):
+                    time.sleep(0.01)
+                    continue
+                logger.warning("command runner fifo open failed: %s", e)
+                return False
+            try:
+                os.write(fd, data)
+                return True
+            except OSError as e:
+                logger.warning("command runner fifo write failed: %s", e)
+                return False
+            finally:
+                os.close(fd)
+        return False
+
+    @staticmethod
+    def _terminate_command_group(pgid: int, grace_seconds: float = 2.0) -> None:
+        def _send(sig: signal.Signals) -> None:
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                logger.warning("failed to send %s to command group %s: %s", sig.name, pgid, e)
+
+        _send(signal.SIGTERM)
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if not _proc_group_exists(pgid):
+                return
+            time.sleep(0.05)
+        if _proc_group_exists(pgid):
+            _send(signal.SIGKILL)
+
+    def _start_subprocess_runner(self, source_startup_hooks: bool = True) -> bool:
+        if self.rootfs is None:
+            logger.error("start() called before build()")
+            return False
+        self.session_home.mkdir(parents=True, exist_ok=True)
+        self.session_tmp.mkdir(parents=True, exist_ok=True)
+        self._runner_dir.mkdir(parents=True, exist_ok=True)
+        self._runner_fifo = self._runner_dir / "fifo"
+        with contextlib.suppress(FileNotFoundError):
+            self._runner_fifo.unlink()
+        os.mkfifo(self._runner_fifo)
+
+        argv = _proot_argv(self.proot_bin, self.rootfs, "/home/user", binds=self._session_binds()) + [
+            "/bin/bash",
+            "-c",
+            self._subprocess_runner_script(),
+        ]
+        self.shell_process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        self._stop_event.clear()
+        time.sleep(0.2)
+        if self.shell_process.poll() is not None:
+            logger.error("proot command runner exited early (rc=%s)", self.shell_process.returncode)
+            return False
+
+        if source_startup_hooks:
+            ok, out, _ = self.exec(
+                'for f in /.singularity.d/env/*.sh; do [ -f "$f" ] && source "$f" 2>/dev/null; done; true'
+            )
+            if not ok:
+                logger.error("proot command runner startup hook failed:\n%s", out[-800:])
+                return False
+
+        if self.max_session_disk_bytes > 0 or self.max_session_rss_bytes > 0:
+            self._disk_monitor_thread = threading.Thread(target=self._disk_monitor_loop, daemon=True)
+            self._disk_monitor_thread.start()
+        return True
+
     def start(self, source_startup_hooks: bool = True) -> bool:
-        """Start the persistent proot bash session on a PTY."""
+        """Start the persistent proot session."""
+        if self.exec_mode == "subprocess":
+            return self._start_subprocess_runner(source_startup_hooks)
+
         if self.rootfs is None:
             logger.error("start() called before build()")
             return False
@@ -785,8 +962,67 @@ class ProotTerminalEnvironment:
             self._disk_monitor_thread.start()
         return True
 
+    def _exec_subprocess(self, command: str, timeout: Optional[float] = None) -> Tuple[bool, str, Optional[str]]:
+        if self._disk_exceeded.is_set():
+            reason = self._abort_reason or "local resource limit exceeded"
+            return False, f"session aborted: {reason}", self._abort_reason
+        if not self.shell_process or self.shell_process.poll() is not None:
+            return False, "command runner is not running", self._abort_reason
+
+        command = command.strip()
+        self._runner_counter += 1
+        job_id = str(self._runner_counter)
+        script_path = self._runner_dir / f"cmd_{job_id}.sh"
+        out_path = self._runner_dir / f"out_{job_id}.txt"
+        rc_path = self._runner_dir / f"rc_{job_id}"
+        pgid_path = self._runner_dir / f"pgid_{job_id}"
+        paths = (script_path, out_path, rc_path, pgid_path)
+        for path in paths:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        script_path.write_text(self._subprocess_command_script(command), encoding="utf-8")
+        script_path.chmod(0o700)
+
+        if not self._send_runner_job(job_id):
+            return False, "command runner is not accepting commands", self._abort_reason
+
+        pgid: Optional[int] = None
+        timeout_s = timeout if timeout is not None else self.read_timeout
+        try:
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                pgid = self._read_command_pgid(pgid_path, pgid)
+                if self._disk_exceeded.is_set():
+                    reason = self._abort_reason or "local resource limit exceeded"
+                    return False, f"session aborted: {reason}", self._abort_reason
+                if self.shell_process.poll() is not None:
+                    return False, "command runner exited", self._abort_reason
+                if rc_path.exists():
+                    code = int(rc_path.read_text().strip())
+                    raw = out_path.read_text(errors="replace") if out_path.exists() else ""
+                    cleaned = self._clean_subprocess_output(raw, job_id, command)
+                    return code == 0, cleaned, self._abort_reason
+                time.sleep(0.01)
+
+            pgid = self._read_command_pgid(pgid_path, pgid)
+            if pgid is not None:
+                self._terminate_command_group(pgid)
+                settle_deadline = time.time() + 2.0
+                while time.time() < settle_deadline and not rc_path.exists():
+                    time.sleep(0.02)
+            raw = out_path.read_text(errors="replace") if out_path.exists() else ""
+            cleaned = self._clean_subprocess_output(raw, job_id, command)
+            return False, f"command timed out after {timeout_s:.0f}s and was killed. Partial output:\n{cleaned[:1000]}", None
+        finally:
+            for path in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+
     def exec(self, command: str, timeout: Optional[float] = None) -> Tuple[bool, str, Optional[str]]:
         """Run a command, returning (success, output, abort_kind)."""
+        if self.exec_mode == "subprocess":
+            return self._exec_subprocess(command, timeout)
+
         if self._disk_exceeded.is_set():
             reason = self._abort_reason or "local resource limit exceeded"
             return False, f"session aborted: {reason}", self._abort_reason
@@ -879,7 +1115,10 @@ class ProotTerminalEnvironment:
         if self.shell_process:
             if self.shell_process.poll() is None:
                 try:
-                    os.write(self.master_fd, b"exit\n")
+                    if self.exec_mode == "subprocess":
+                        self._send_runner_job("__exit__", timeout=0.5)
+                    else:
+                        os.write(self.master_fd, b"exit\n")
                     self.shell_process.wait(timeout=2)
                 except Exception:
                     pass

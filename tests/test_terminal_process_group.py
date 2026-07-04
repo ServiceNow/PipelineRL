@@ -1,5 +1,8 @@
+import contextlib
+import errno
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -92,6 +95,7 @@ def test_read_until_marker_waits_for_complete_exit_code_line():
 
 def _started_env_for_exec():
     env = ProotTerminalEnvironment.__new__(ProotTerminalEnvironment)
+    env.exec_mode = "pty"
     env._disk_exceeded = SimpleNamespace(is_set=lambda: False)
     env._abort_reason = None
     env.shell_process = SimpleNamespace(poll=lambda: None)
@@ -266,6 +270,187 @@ def test_start_exports_noninteractive_environment(monkeypatch, tmp_path):
         "DEBIAN_FRONTEND=noninteractive",
     ]:
         assert expected in init
+
+
+def _started_subprocess_env(monkeypatch, tmp_path):
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        exec_mode="subprocess",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+        contamination_check=False,
+    )
+    env.rootfs = tmp_path
+    env._session_binds = lambda: []
+    env._runner_guest_dir = str(env._runner_dir)
+    monkeypatch.setattr(proot_env, "_proot_argv", lambda *args, **kwargs: [])
+
+    assert env.start(source_startup_hooks=False)
+    return env
+
+
+def test_proc_group_rss_bytes_counts_bash_job_control_children():
+    proc = subprocess.Popen(
+        ["bash", "-c", "set -m; sleep 10 & echo $!; wait"],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert proc.stdout is not None
+        child_pid = int(proc.stdout.readline().strip())
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not _pid_running(child_pid):
+            time.sleep(0.05)
+
+        assert _pid_running(child_pid)
+        assert proot_env._proc_group_rss_bytes(proc.pid) > 0
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=1.0)
+
+
+
+def test_send_runner_job_returns_false_on_unexpected_fifo_error(monkeypatch, tmp_path):
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        exec_mode="subprocess",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+    )
+    env._runner_fifo = tmp_path / "fifo"
+    env.shell_process = SimpleNamespace(poll=lambda: None)
+
+    def broken_open(*args, **kwargs):
+        raise OSError(errno.EINTR, "interrupted")
+
+    monkeypatch.setattr(proot_env.os, "open", broken_open)
+
+    assert not env._send_runner_job("1", timeout=0.1)
+
+def test_subprocess_start_returns_false_when_startup_hook_fails(monkeypatch, tmp_path):
+    env = ProotTerminalEnvironment(
+        base_rootfs=tmp_path,
+        work_dir=tmp_path / "work",
+        exec_mode="subprocess",
+        max_session_disk_bytes=0,
+        max_session_rss_bytes=0,
+        contamination_check=False,
+    )
+    env.rootfs = tmp_path
+    env._session_binds = lambda: []
+    env._runner_guest_dir = str(env._runner_dir)
+    monkeypatch.setattr(proot_env, "_proot_argv", lambda *args, **kwargs: [])
+    monkeypatch.setattr(env, "exec", lambda command: (False, "hook timed out", None))
+
+    try:
+        assert not env.start(source_startup_hooks=True)
+    finally:
+        env.cleanup(contamination_sample=False)
+
+
+def test_subprocess_exec_runs_commands_and_persists_shell_state(monkeypatch, tmp_path):
+    env = _started_subprocess_env(monkeypatch, tmp_path)
+    home = shlex.quote(str(env.session_home))
+    try:
+        ok, out, abort_kind = env.exec(
+            f"cd {home} && mkdir -p sub && cd sub && export FOO=bar && "
+            "hello_fn() { echo fn:$FOO:$(pwd); } && echo first",
+            timeout=2.0,
+        )
+
+        assert ok
+        assert abort_kind is None
+        assert "first" in out
+
+        ok, out, abort_kind = env.exec("hello_fn", timeout=2.0)
+
+        assert ok
+        assert abort_kind is None
+        assert f"fn:bar:{env.session_home / 'sub'}" in out
+    finally:
+        env.cleanup(contamination_sample=False)
+
+
+def test_subprocess_exec_syntax_error_keeps_session_alive(monkeypatch, tmp_path):
+    env = _started_subprocess_env(monkeypatch, tmp_path)
+    try:
+        ok, out, abort_kind = env.exec('echo "unterminated', timeout=1.0)
+
+        assert not ok
+        assert abort_kind is None
+        assert "bash: line 1: unexpected EOF" in out
+        assert ".pl_runner" not in out
+
+        ok, out, abort_kind = env.exec("echo alive", timeout=2.0)
+
+        assert ok
+        assert abort_kind is None
+        assert "alive" in out
+    finally:
+        env.cleanup(contamination_sample=False)
+
+
+def test_subprocess_commands_run_as_process_group_leaders(monkeypatch, tmp_path):
+    env = _started_subprocess_env(monkeypatch, tmp_path)
+    try:
+        ok, out, abort_kind = env.exec("printf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\"", timeout=2.0)
+
+        assert ok
+        assert abort_kind is None
+        pid, pgid = [int(part) for part in out.split()[-2:]]
+        assert pid == pgid
+    finally:
+        env.cleanup(contamination_sample=False)
+
+
+def test_subprocess_exec_timeout_kills_command_group_but_session_survives(monkeypatch, tmp_path):
+    env = _started_subprocess_env(monkeypatch, tmp_path)
+    try:
+        ok, out, abort_kind = env.exec("sleep 10", timeout=0.2)
+
+        assert not ok
+        assert abort_kind is None
+        assert "command timed out after" in out
+        assert "was killed" in out
+
+        ok, out, abort_kind = env.exec("echo alive", timeout=2.0)
+
+        assert ok
+        assert abort_kind is None
+        assert "alive" in out
+    finally:
+        env.cleanup(contamination_sample=False)
+
+
+def test_subprocess_timeout_preserves_prior_daemon(monkeypatch, tmp_path):
+    env = _started_subprocess_env(monkeypatch, tmp_path)
+    pidfile = env.session_home / "daemon.pid"
+    try:
+        ok, out, abort_kind = env.exec(f"sleep 30 & echo $! > {shlex.quote(str(pidfile))}", timeout=2.0)
+
+        assert ok
+        assert abort_kind is None
+        daemon_pid = int(pidfile.read_text().strip())
+        assert _pid_running(daemon_pid)
+
+        ok, out, abort_kind = env.exec("sleep 10", timeout=0.2)
+
+        assert not ok
+        assert abort_kind is None
+        assert "command timed out" in out
+        assert _pid_running(daemon_pid)
+    finally:
+        if pidfile.exists():
+            with contextlib.suppress(Exception):
+                os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+        env.cleanup(contamination_sample=False)
 
 
 def test_build_shared_rootfs_stages_base_and_uses_reflink(monkeypatch, tmp_path):
