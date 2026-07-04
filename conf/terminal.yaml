@@ -171,6 +171,13 @@ dataset_loader_params:
   task_complexity_keep:
     - moderate
     - complex
+  # Deterministic not-runnable tasks: zero successful starts across gspo_49,
+  # gspo_50, and probe_shadow_01 audits.
+  task_blocklist:
+    - task_008799_f9d60ee9
+    - task_003318_39c17430
+    - task_000373_da43b7c4
+    - task_004914_32fe5630
   limit: null
   seed: 0
 # The loader derives the split from the names (a name containing "test" -> held-out).

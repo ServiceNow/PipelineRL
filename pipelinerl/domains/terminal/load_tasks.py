@@ -27,6 +27,7 @@ def load_problems(
     train_ratio: float = 0.95,
     tmax_domains: Optional[List[str]] = None,
     task_complexity_keep: Optional[List[str]] = None,
+    task_blocklist: Optional[Sequence[str]] = None,
     limit: Optional[int] = None,
     seed: int = 0,
     subset: Optional[str] = None,
@@ -44,6 +45,8 @@ def load_problems(
             in this list. Used to remove trivial ``short`` tasks (all-pass ->
             zero-advantage filtered) and, in the cut regime, ``intricate`` tasks
             (all-fail within the turn cap). None = keep all buckets.
+        task_blocklist: exact task IDs to drop after the split without changing
+            the train/test partition.
         limit: cap the number of returned problems (after the split).
     """
     import pandas as pd
@@ -74,6 +77,12 @@ def load_problems(
     df = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
     cut = int(len(df) * train_ratio)
     df = df.iloc[cut:] if split == "test" else df.iloc[:cut]
+
+    if task_blocklist:
+        blocked = {task_id.strip() for task_id in task_blocklist if task_id.strip()}
+        before = len(df)
+        df = df[~df["task_id"].isin(blocked)]
+        logger.info("task blocklist: dropped %d/%d tasks with task_id in %s", before - len(df), before, sorted(blocked))
 
     if limit is not None:
         df = df.iloc[:limit]
