@@ -20,7 +20,7 @@ from litellm import BaseModel, Field
 
 from pipelinerl.finetune.logging_ import flatten_dict_config
 from pipelinerl.finetune_loop import calculate_train_steps
-from pipelinerl.shared_memory_array import SharedMemoryQueue
+from pipelinerl.shared_memory_array import EntrySizeExceeded, SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.utils import init_wandb, setup_logging, wait_for_inference_servers
 from pipelinerl.world import WorldMap
@@ -287,6 +287,19 @@ class SlidingWindowAggregator:
         }
 
 
+def _chunk_provenance(chunk) -> str:
+    """Summarize a raw chunk (list of training-text dicts) for oversize-drop logs.
+
+    group_id joins to rollout_audit to identify the dropped task offline. Kept
+    defensive because drops are the one path we cannot afford to crash in.
+    """
+    try:
+        group_ids = sorted({entry.get("group_id") for entry in chunk})
+        return f"n_entries={len(chunk)} group_ids={group_ids}"
+    except Exception:
+        return "provenance unavailable"
+
+
 def process_chunk(
     llm: TrainableLLM | None,
     tokenizer: transformers.PreTrainedTokenizerBase,
@@ -302,6 +315,7 @@ def process_chunk(
         worker_ref_source = llm.base_url if llm is not None else "rollout logprobs fallback"
         logger.info(f"Preprocessor worker started with reference source: {worker_ref_source}")
         while True:
+            chunk = None
             try:
                 chunk = input_queue.get()
                 dataset = preprocess_dataset(
@@ -315,7 +329,9 @@ def process_chunk(
             except Exception as e:
                 error_info = {
                     "error": str(e),
-                    "traceback": traceback.format_exc()
+                    "traceback": traceback.format_exc(),
+                    "oversized": isinstance(e, EntrySizeExceeded),
+                    "provenance": _chunk_provenance(chunk),
                 }
                 output_queue.put(error_info)
     except KeyboardInterrupt:
@@ -491,6 +507,7 @@ def run_preprocessing_loop(
     
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
+    dropped_oversized_chunks = 0  # Groups dropped because they exceed the shared-memory entry cap
 
     with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
@@ -540,10 +557,19 @@ def run_preprocessing_loop(
                             raw_chunk = raw_chunk_queue.get(timeout=0.001)
                             if isinstance(raw_chunk, Exception):
                                 raise raw_chunk
-                            
+
                             # Put chunk in the input queue for workers
-                            input_queue.put(raw_chunk)
-                            submitted_chunks += 1
+                            try:
+                                input_queue.put(raw_chunk)
+                            except EntrySizeExceeded as e:
+                                dropped_oversized_chunks += 1
+                                logger.warning(
+                                    f"Dropping oversized raw chunk before preprocessing (not fatal); "
+                                    f"total dropped={dropped_oversized_chunks}: {e} "
+                                    f"[{_chunk_provenance(raw_chunk)}]"
+                                )
+                            else:
+                                submitted_chunks += 1
                         except Empty:
                             pass
 
@@ -555,10 +581,21 @@ def run_preprocessing_loop(
                         if isinstance(dataset, Exception):
                             raise dataset
                         if isinstance(dataset, dict) and "error" in dataset:
-                            logger.error(f"Got exception from the result queue: {dataset['error']}")
-                            logger.error(f"Traceback: {dataset['traceback']}")
-                            raise Exception(dataset["error"])
-                        if rl_config.filter_zero_advantage_groups:
+                            if not dataset.get("oversized"):
+                                logger.error(f"Got exception from the result queue: {dataset['error']}")
+                                logger.error(f"Traceback: {dataset['traceback']}")
+                                raise Exception(dataset["error"])
+                            dropped_oversized_chunks += 1
+                            logger.warning(
+                                f"Dropping oversized preprocessed chunk (not fatal); "
+                                f"total dropped={dropped_oversized_chunks}: {dataset['error']} "
+                                f"[{dataset.get('provenance', 'provenance unavailable')}]"
+                            )
+                            # Drop this chunk but fall through so already-buffered valid
+                            # entries still flush; a sustained oversize stream must not
+                            # keep deferring buffered data.
+                            dataset = None
+                        elif rl_config.filter_zero_advantage_groups:
                             dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
                             total_filtered_out += num_filtered_out
                             if num_filtered_out > 0:
@@ -685,6 +722,7 @@ def run_preprocessing_loop(
                             "preprocessor/queue/output": output_queue.qsize(),
                             "preprocessor/filtered_out_samples": num_filtered_out,
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
+                            "preprocessor/dropped_oversized_chunks": dropped_oversized_chunks,
                         }
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
