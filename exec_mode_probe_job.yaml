@@ -1,0 +1,22 @@
+# B4 exec-mode parity probe (CPU-only). Submit with:
+#   eai job new -f exec_mode_probe_job.yaml --account snow.research.adea --non-preemptable -- \
+#     /opt/conda/bin/conda run -n pipeline-rl --no-capture-output bash -c \
+#     "python -m pipelinerl.entrypoints.exec_mode_probe \
+#        --exp-dir /mnt/llmd/results/exps/rafa/terminal/terminal_qwen35_9b_gspo_50 \
+#        --tasks 8 --rollouts-per-task 2 --cache-dir /tmp/exec_mode_probe_cache \
+#        --out /mnt/llmd/results/exps/rafa/terminal/exec_mode_probe_results.json"
+image: registry.toolkit-sp.yul201.service-now.com/snow.research.tapes/interactive-toolkit:throughput
+data:
+  - 'snow.research.tapes.rafael_pardinas_home:/home/toolkit'
+  - 'snow.research.tapes.data:/mnt/llmd/data'
+  - 'snow.research.tapes.results:/mnt/llmd/results'
+  - 'snow.research.tapes.transformers_cache:/transformers_cache'
+resources: {cpu: 32, gpu: 0, mem: 128}
+name: exec_mode_probe
+bid: 9999
+workdir: /home/toolkit/PipelineRL
+environmentVars:
+  - HOME=/home/toolkit
+  - PYTHONPATH=/home/toolkit/PipelineRL
+  - HF_HOME=/transformers_cache
+  - HF_DATASETS_CACHE=/transformers_cache
