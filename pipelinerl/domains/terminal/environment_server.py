@@ -196,6 +196,7 @@ class TerminalEnvironmentServer:
         session_delta_isolation: bool = True,
         contamination_check: bool = True,
         contamination_sample_every: int = 1,
+        exec_mode: str = "pty",
         session_ttl_seconds: float = 3600.0,
         session_reap_interval_seconds: float = 60.0,
     ):
@@ -216,6 +217,7 @@ class TerminalEnvironmentServer:
         self.session_delta_isolation = session_delta_isolation
         self.contamination_check = contamination_check
         self.contamination_sample_every = max(1, int(contamination_sample_every))
+        self.exec_mode = exec_mode
         self.session_ttl_seconds = session_ttl_seconds
         self.session_reap_interval_seconds = session_reap_interval_seconds
 
@@ -346,6 +348,7 @@ class TerminalEnvironmentServer:
             session_delta_max_bytes=self.session_delta_max_bytes,
             session_delta_isolation=self.session_delta_isolation,
             contamination_check=self.contamination_check,
+            exec_mode=self.exec_mode,
         )
         try:
             flags = await self._run(session.start, task)

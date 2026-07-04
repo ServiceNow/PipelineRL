@@ -42,6 +42,7 @@ class TerminalSession:
         session_delta_max_bytes: int = 512 * 2**20,
         session_delta_isolation: bool = True,
         contamination_check: bool = True,
+        exec_mode: str = "pty",
     ):
         self.bases_dir = bases_dir
         self.proot_bin = proot_bin
@@ -57,6 +58,7 @@ class TerminalSession:
         self.session_delta_max_bytes = session_delta_max_bytes
         self.session_delta_isolation = session_delta_isolation
         self.contamination_check = contamination_check
+        self.exec_mode = exec_mode
 
         self._env: Optional[ProotTerminalEnvironment] = None
         self._final_test: str = ""
@@ -93,6 +95,7 @@ class TerminalSession:
             session_delta_max_bytes=self.session_delta_max_bytes,
             session_delta_isolation=self.session_delta_isolation,
             contamination_check=self.contamination_check,
+            exec_mode=self.exec_mode,
         )
         build_ok, build_err = self._env.build(task["container_def"])
         if not build_ok:

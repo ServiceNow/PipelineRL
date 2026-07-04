@@ -5,6 +5,8 @@ import signal
 import subprocess
 import sys
 import time
+
+import pytest
 from types import SimpleNamespace
 
 from pipelinerl.domains.terminal import proot_env
@@ -100,6 +102,11 @@ def _started_env_for_exec():
     env._drain = lambda: ""
     env._read_until_marker = lambda timeout: ("ok\n", 0)
     return env
+
+
+def test_constructor_rejects_invalid_exec_mode(tmp_path):
+    with pytest.raises(ValueError, match="invalid exec_mode"):
+        ProotTerminalEnvironment(tmp_path, exec_mode="subproces")
 
 
 def test_exec_bash_precheck_rejects_unterminated_quote_without_touching_session(monkeypatch):

@@ -361,6 +361,7 @@ class ProotTerminalEnvironment:
         session_delta_max_bytes: int = 512 * 2**20,
         session_delta_isolation: bool = True,
         contamination_check: bool = True,
+        exec_mode: str = "pty",
     ):
         self.base_rootfs = Path(base_rootfs).resolve()
         self.proot_bin = proot_bin
@@ -385,6 +386,9 @@ class ProotTerminalEnvironment:
         self.session_delta_max_bytes = session_delta_max_bytes
         self.session_delta_isolation = session_delta_isolation
         self.contamination_check = contamination_check
+        if exec_mode not in {"pty", "subprocess"}:
+            raise ValueError(f"invalid exec_mode {exec_mode!r}")
+        self.exec_mode = exec_mode
 
         self._owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="terminal_env_"))

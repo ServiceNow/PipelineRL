@@ -101,6 +101,7 @@ environments:
     n_envs: 1
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
+    exec_mode: pty
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
     command_timeout: 180.0
     verifier_timeout: 180.0

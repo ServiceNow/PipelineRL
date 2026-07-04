@@ -6,6 +6,7 @@ import pytest
 import time
 from types import SimpleNamespace
 
+from pipelinerl.domains.terminal import environment as terminal_environment
 from pipelinerl.domains.terminal import rollouts
 from pipelinerl.domains.terminal.environment_server import TerminalEnvironmentServer
 from pipelinerl.domains.terminal.rollouts import (
@@ -497,6 +498,58 @@ class DummyRequest:
 
     async def json(self):
         return self.body
+
+
+def test_start_task_threads_exec_mode_to_proot_env(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeProotEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def build(self, container_def):
+            return True, ""
+
+        def start(self):
+            return True
+
+        def run_initial_tests(self, test):
+            return True
+
+        def cleanup(self, contamination_sample=True):
+            return 0, 0
+
+    async def run_case():
+        (tmp_path / "base_software_engineering").mkdir()
+        monkeypatch.setattr(terminal_environment, "ProotTerminalEnvironment", FakeProotEnvironment)
+        server = TerminalEnvironmentServer(
+            bases_dir=str(tmp_path),
+            n_envs=1,
+            exec_mode="subprocess",
+            session_ttl_seconds=60.0,
+            session_reap_interval_seconds=60.0,
+        )
+
+        response = await server.start_task(
+            DummyRequest(
+                {
+                    "task_data": {
+                        "tmax_domain": "software_engineering",
+                        "container_def": "",
+                        "test_initial_state": "",
+                        "test_final_state": "",
+                    }
+                }
+            )
+        )
+        server._executor.shutdown(wait=True)
+
+        body = json.loads(response.text)
+        assert response.status == 200
+        assert body["session_id"] is not None
+        assert captured["exec_mode"] == "subprocess"
+
+    asyncio.run(run_case())
 
 
 def test_close_background_records_contamination_in_health():
