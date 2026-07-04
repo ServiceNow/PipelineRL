@@ -101,7 +101,12 @@ environments:
     n_envs: 1
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
-    exec_mode: pty
+    # In-guest FIFO command runner (B2, commit 9119ad8): file-based per-command
+    # exec, no PTY. Kills the bash-syntax wedge class and pager hangs; a command
+    # timeout kills only that command's process group and the session continues
+    # to a real verdict. Parity vs pty proven on recorded gspo_50 traffic (B4
+    # probe: 16/16 verdicts, 527/528 commands). Flipped 2026-07-04 (env-v2).
+    exec_mode: subprocess
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
     command_timeout: 180.0
     verifier_timeout: 180.0

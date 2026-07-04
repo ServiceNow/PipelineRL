@@ -1,0 +1,58 @@
+defaults:
+  - terminal
+  - _self_
+
+# env-v2 mainline: frozen-probe SHADOW + exec_mode=subprocess (first run on the
+# in-guest runner after the B4 parity probe). Supersedes probe_shadow_01.
+# Deltas vs probe_shadow_01:
+#   1. exec_mode=subprocess. The REAL switch is terminal.yaml's exec_mode key
+#      (fleet jobs are launched with --config-name terminal); it is restated in
+#      the list below only so this file reads truthfully.
+#   2. Fleet DNS terminal-envs-probe2-{a..d} + fleet_name_prefix so this launcher
+#      never races probe_shadow_01's fleets during the cutover overlap.
+# Unchanged from 01: shadow probe (gspo_45 layer-31 artifact), accum 128 (the
+# 1024 restore is deliberately deferred: one variable per reset), eval off.
+# The environments list is restated wholesale because OmegaConf replaces lists on
+# merge; every other value is copied verbatim from terminal.yaml.
+
+finetune:
+  rl:
+    frozen_probe_credit: shadow
+    frozen_probe_path: /mnt/llmd/results/exps/rafa/terminal/terminal_qwen35_9b_gspo_45/probe_analysis/frozen_probe_layer31.pt
+
+orchestrator:
+  fleet_name_prefix: terminal_envs_probe2
+
+environments:
+  - key: terminal
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    placement: external
+    external_hosts:
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-probe2-a
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-probe2-b
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-probe2-c
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-probe2-d
+    external_start_port: 7777
+    external_count: 12
+    _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
+    bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
+    cache_dir: ${output_dir}/env_cache
+    rootfs_retention_seconds: 600.0
+    n_envs: 1
+    host: "0.0.0.0"
+    proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
+    exec_mode: subprocess
+    nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
+    command_timeout: 180.0
+    verifier_timeout: 180.0
+    max_observation_chars: 4000
+    check_initial_state: true
+    max_session_disk_bytes: 966367641   # 0.9 GiB
+    session_delta_isolation: false
+    session_delta_max_bytes: 536870912   # 512 MiB
+    contamination_check: true
+    contamination_sample_every: 20
+    max_session_rss_bytes: 17179869184  # 16 GiB
+    session_ttl_seconds: 2800.0
+    session_reap_interval_seconds: 60.0
