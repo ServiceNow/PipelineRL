@@ -3,11 +3,16 @@
 Replicates the pre-generation linear-probe methodology of arXiv:2604.01202 on our
 terminal domain, as groundwork for critic-free credit assignment. Two stages:
 
-  extract (GPU): read per-turn TrainingTexts from an experiment's raw actor stream,
-      run ONE forward pass per rollout over the last turn's sequence (every earlier
-      turn's prompt is a prefix of it, which we verify token-exactly), and save the
-      residual-stream hidden state at each turn's pre-generation position (the last
-      prompt token) for a strided subset of layers.
+  extract (GPU): read per-turn TrainingTexts from an experiment's raw actor stream
+      and save the residual-stream hidden state at each turn's pre-generation
+      position (the last prompt token) for a strided subset of layers. Two modes:
+      the default runs ONE forward pass per rollout over the last turn's sequence
+      and keeps only turns whose prompt is a token-exact prefix of it. In practice
+      that keeps ONLY the final turn (each turn's generation-prompt suffix is
+      rewritten in the next turn's history), so probes fit on it describe terminal
+      states. --all-turns instead runs one forward per sampled turn over that
+      turn's own recorded prompt (exactly the state the policy generated from),
+      giving true mid-rollout coverage at ~turns_per_rollout the compute.
 
   fit (CPU): train linear probes on the saved activations with GroupKFold by
       group_id (so the same task never spans train and test) and report AUROC /
@@ -90,6 +95,13 @@ def group_fold(group_id: str, n_folds: int) -> int:
     """Deterministic fold assignment by group so a task never spans train and test."""
     digest = hashlib.sha1(group_id.encode()).hexdigest()
     return int(digest[:8], 16) % n_folds
+
+
+def sample_turn_indices(n_turns: int, limit: int) -> list[int]:
+    """Evenly spaced turn indices, always including the first and last turn."""
+    if n_turns <= limit:
+        return list(range(n_turns))
+    return sorted(set(np.linspace(0, n_turns - 1, max(limit, 2)).round().astype(int).tolist()))
 
 
 def turn_bucket(step_index: int) -> str:
@@ -199,41 +211,53 @@ def extract(args: argparse.Namespace) -> None:
 
     features: list[torch.Tensor] = []
     meta: list[dict] = []
-    skipped_prefix = 0
+    skipped = 0
     try:
         for n_done, turns in enumerate(rollouts):
-            full_ids = turns[-1]["input_ids"]
-            if len(full_ids) > args.max_seq_len:
-                full_ids = full_ids[: args.max_seq_len]
-            valid_turns, positions = [], []
-            for rec in turns:
-                p = prompt_length(rec)
-                if p - 1 < 0 or p > len(full_ids) or not is_prefix(rec["input_ids"], full_ids, p):
-                    skipped_prefix += 1
-                    continue
-                valid_turns.append(rec)
-                positions.append(p - 1)
-            if not valid_turns:
-                continue
-            positions_holder[:] = positions
-            input_ids = torch.tensor([full_ids], device=args.device)
-            with torch.no_grad():
-                model(input_ids=input_ids, use_cache=False)
-            stacked = torch.stack([captured[i] for i in layer_indices], dim=1)  # [turns, layers, hidden]
-            features.append(stacked)
+            # Each forward is (input_ids, probed positions, the turn records they belong to).
+            forwards: list[tuple[np.ndarray, list[int], list[dict]]] = []
+            if args.all_turns:
+                for ti in sample_turn_indices(len(turns), args.turns_per_rollout):
+                    rec = turns[ti]
+                    p = prompt_length(rec)
+                    if p - 1 < 0 or p > args.max_seq_len:
+                        skipped += 1
+                        continue
+                    forwards.append((rec["input_ids"][:p], [p - 1], [rec]))
+            else:
+                full_ids = turns[-1]["input_ids"]
+                if len(full_ids) > args.max_seq_len:
+                    full_ids = full_ids[: args.max_seq_len]
+                valid_turns, positions = [], []
+                for rec in turns:
+                    p = prompt_length(rec)
+                    if p - 1 < 0 or p > len(full_ids) or not is_prefix(rec["input_ids"], full_ids, p):
+                        skipped += 1
+                        continue
+                    valid_turns.append(rec)
+                    positions.append(p - 1)
+                if valid_turns:
+                    forwards.append((full_ids, positions, valid_turns))
             rollout_reward = turns[-1]["reward"]
-            for rec, pos in zip(valid_turns, positions):
-                completion = tokenizer.decode(rec["input_ids"][prompt_length(rec):].tolist())
-                meta.append({
-                    "group_id": rec["group_id"],
-                    "rollout_index": rec["metadata"]["rollout_index"],
-                    "step_index": rec["metadata"]["step_index"],
-                    "n_turns": len(turns),
-                    "turn_reward": rec["reward"],
-                    "rollout_reward": rollout_reward,
-                    "is_submit": SUBMIT_MARKER in completion,
-                    "position": pos,
-                })
+            for ids, positions, recs in forwards:
+                positions_holder[:] = positions
+                input_ids = torch.tensor([ids], device=args.device)
+                with torch.no_grad():
+                    model(input_ids=input_ids, use_cache=False)
+                stacked = torch.stack([captured[i] for i in layer_indices], dim=1)  # [turns, layers, hidden]
+                features.append(stacked)
+                for rec, pos in zip(recs, positions):
+                    completion = tokenizer.decode(rec["input_ids"][prompt_length(rec):].tolist())
+                    meta.append({
+                        "group_id": rec["group_id"],
+                        "rollout_index": rec["metadata"]["rollout_index"],
+                        "step_index": rec["metadata"]["step_index"],
+                        "n_turns": len(turns),
+                        "turn_reward": rec["reward"],
+                        "rollout_reward": rollout_reward,
+                        "is_submit": SUBMIT_MARKER in completion,
+                        "position": pos,
+                    })
             if (n_done + 1) % 20 == 0:
                 logger.info("extracted %d/%d rollouts (%d turns)", n_done + 1, len(rollouts), len(meta))
     finally:
@@ -251,8 +275,9 @@ def extract(args: argparse.Namespace) -> None:
         out_path,
     )
     logger.info(
-        "saved %d turn activations x %d layers to %s (skipped %d prefix mismatches)",
-        len(meta), len(layer_indices), out_path, skipped_prefix,
+        "saved %d turn activations x %d layers to %s (skipped %d turns: %s)",
+        len(meta), len(layer_indices), out_path, skipped,
+        "over max-seq-len" if args.all_turns else "prefix mismatches",
     )
 
 
@@ -472,6 +497,10 @@ def main() -> None:
     p_ext.add_argument("--model-path", required=True)
     p_ext.add_argument("--out", default=None)
     p_ext.add_argument("--max-rollouts", type=int, default=400)
+    p_ext.add_argument("--all-turns", action="store_true",
+                       help="one forward per sampled turn over its own prompt (mid-rollout coverage) "
+                            "instead of one forward per rollout (final turn only)")
+    p_ext.add_argument("--turns-per-rollout", type=int, default=12)
     p_ext.add_argument("--layer-stride", type=int, default=4)
     p_ext.add_argument("--max-seq-len", type=int, default=65536)
     p_ext.add_argument("--device", default="cuda")

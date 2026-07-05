@@ -9,6 +9,7 @@ from pipelinerl.domains.terminal.turn_probes import (
     loo_centered_returns,
     pre_gen_position,
     prompt_length,
+    sample_turn_indices,
     turn_bucket,
 )
 
@@ -51,6 +52,18 @@ def test_turn_bucket_boundaries():
     assert turn_bucket(3) == "3-7"
     assert turn_bucket(15) == "8-15"
     assert turn_bucket(40) == "16+"
+
+
+def test_sample_turn_indices():
+    # short rollouts keep every turn
+    assert sample_turn_indices(5, 12) == [0, 1, 2, 3, 4]
+    # long rollouts are subsampled evenly, always keeping first and last
+    idx = sample_turn_indices(64, 12)
+    assert len(idx) == 12
+    assert idx[0] == 0 and idx[-1] == 63
+    assert idx == sorted(set(idx))
+    # degenerate limits still keep first and last
+    assert sample_turn_indices(64, 1) == [0, 63]
 
 
 def test_auroc_known_values():
