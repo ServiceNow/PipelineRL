@@ -8,7 +8,7 @@ defaults:
 # <probe-refit-step100>). Everything else matches probe_shadow_02's regime
 # minus the shadow probe, so its 230-step history is the control arm:
 # accum 128, exec_mode subprocess, frozen_probe off (verdict done).
-# Fleet DNS terminal-envs-ec01-{a..d} + fleet_name_prefix keep this launcher
+# Fleet DNS terminal-envs-ec02-{a..d} + fleet_name_prefix keep this launcher
 # clear of the other runs' fleets. The environments list is restated wholesale
 # because OmegaConf replaces lists on merge; identical to terminal.yaml.
 
@@ -17,7 +17,7 @@ finetune:
     event_credit_coef: 0.5
 
 orchestrator:
-  fleet_name_prefix: terminal_envs_ec01
+  fleet_name_prefix: terminal_envs_ec02
 
 environments:
   - key: terminal
@@ -25,10 +25,10 @@ environments:
     replicas_per_actor: ${world.env_replicas_per_actor}
     placement: external
     external_hosts:
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-a
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-b
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-c
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-d
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec02-a
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec02-b
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec02-c
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec02-d
     external_start_port: 7777
     external_count: 12
     _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
