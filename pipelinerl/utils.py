@@ -509,6 +509,16 @@ def wait_for_environments(cfg: DictConfig):
 
 @contextlib.contextmanager
 def better_crashing(entrypoint_name: str):
+    import faulthandler
+    import signal
+
+    faulthandler.enable()  # dump the crashing thread's own stack on a fatal signal (SIGSEGV/SIGABRT/...)
+    if hasattr(signal, "SIGUSR1"):
+        # On-demand all-thread dump: `kill -USR1 <pid>` a process you suspect is hung.
+        # Do NOT arm faulthandler.dump_traceback_later(repeat=True): the periodic timer walks a
+        # running thread's frames without GIL synchronization and SIGSEGVs on Triton JIT
+        # kernel-launch frames (see https://github.com/ServiceNow/PipelineRL/issues/149).
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     try:
         yield
     except Exception as e:
