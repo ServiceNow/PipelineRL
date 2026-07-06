@@ -79,9 +79,11 @@ preprocess:
   shared_memory_entry_size: 1000000000
 
 train_dataset_names:
-  - workarena_train
+  # - workarena_task_train
+  - workarena_goal_train
 test_dataset_names:
-  - workarena_eval
+  # - workarena_task_test
+  - workarena_goal_test
 
 # Shared shaping config — instruction-blind generic progress signals.
 # All weights are read by `miniwob_cube.shaping.RewardWeights` and are
@@ -110,19 +112,10 @@ reward_shaping: &reward_shaping
   shaping_gamma: 1.0
 
 dataset_loader_params:
-  workarena_train:
-    benchmark: &workarena_benchmark
-      _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigTrain
-      # port: 8010
-      # enable_step_verifier_rewards: ${reward_shaping.enable_step_verifier_rewards}
-      # inject_step_feedback: ${reward_shaping.inject_step_feedback}
-      # shaping_weight_terminal: ${reward_shaping.shaping_weight_terminal}
-      # shaping_weight_form_completion: ${reward_shaping.shaping_weight_form_completion}
-      # shaping_weight_affordance_breadth: ${reward_shaping.shaping_weight_affordance_breadth}
-      # shaping_weight_error: ${reward_shaping.shaping_weight_error}
-      # shaping_weight_stuck: ${reward_shaping.shaping_weight_stuck}
-      # shaping_weight_bad_target: ${reward_shaping.shaping_weight_bad_target}
-      # shaping_gamma: ${reward_shaping.shaping_gamma}
+  workarena_task_train:
+    benchmark: &workarena_benchmark_tasks
+      _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigTasks
+      split: train
       tool_config: &miniwob_tool_config
           _type: miniwob_cube.tools.MiniWobBgymToolConfig
           use_html: false
@@ -134,12 +127,28 @@ dataset_loader_params:
         _type: cube_harness.rl.llm.RolloutLLMConfig
         model_name: ${vllm_config.vllm_kwargs.served_model_name}
         tokenizer_name: ${model_path}
-        # timeout: 3600.0
         timeout: 500
         num_retries: 1
       max_actions: 10
-  workarena_eval:
+  workarena_task_test:
     benchmark:
-      <<: *workarena_benchmark
-      _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigEval
+      <<: *workarena_benchmark_tasks
+      split: test
+    agent: *workarena_agent
+  workarena_goal_train:
+    benchmark: &workarena_benchmark_goal
+      _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigGoals
+      meta_seed: 41
+      n_seeds_l1: 3
+      tool_config: &miniwob_tool_config
+          _type: miniwob_cube.tools.MiniWobBgymToolConfig
+          use_html: false
+          use_axtree: true
+          use_screenshot: false
+    agent: *workarena_agent
+  workarena_goal_test:
+    benchmark:
+      <<: *workarena_benchmark_goal
+      meta_seed: 42
+      n_seeds_l1: 10
     agent: *workarena_agent
