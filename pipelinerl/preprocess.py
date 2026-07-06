@@ -179,6 +179,9 @@ def preprocess_dataset(
         entry["model_version"] = entry["metadata"]["model_version"]
         entry["rollout_index"] = entry["metadata"]["rollout_index"]
         entry["step_index"] = entry["metadata"]["step_index"]
+        # event-credit fields; domains without per-turn events default to a no-op
+        entry["event_error"] = float(entry["metadata"].get("event_error", 0.0))
+        entry["rollout_error_mean"] = float(entry["metadata"].get("rollout_error_mean", 0.0))
     if not isinstance(tokenizer.eos_token_id, int):
         raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
     try:

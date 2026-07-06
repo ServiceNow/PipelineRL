@@ -315,6 +315,22 @@ def _stamp_training_text_model_version(training_text: TrainingText, llm_call: LL
         training_text.metadata["model_version"] = llm_call.model_version
 
 
+def stamp_event_credit(training_texts: List[TrainingText], errors: List[bool]) -> None:
+    """Stamp per-turn command-error flags for event-credit advantage shaping.
+
+    ``errors[i]`` is True when turn i's command produced an error (env exec
+    ``success`` False, or a format error). The rollout mean rides along so the
+    trainer can center the flags without seeing the other turns (they are
+    packed as independent samples).
+    """
+    if len(training_texts) != len(errors):
+        raise ValueError(f"got {len(training_texts)} training texts but {len(errors)} error flags")
+    error_mean = sum(map(float, errors)) / len(errors) if errors else 0.0
+    for training_text, error in zip(training_texts, errors):
+        training_text.metadata["event_error"] = float(error)
+        training_text.metadata["rollout_error_mean"] = error_mean
+
+
 # Per-URL rate limit for /start_task connection warnings. A dead env-fleet
 # endpoint can be hit by every concurrent rollout every loop iteration.
 _START_WARN_WINDOW = 60.0
@@ -450,6 +466,9 @@ async def _execute_rollout(
         tools = build_terminal_tools()
         llm_calls: List[LLMCall] = []
         llm_call_events: list[tuple[LLMCall, bool]] = []
+        # One flag per llm_calls entry: did this turn's command error? (submit
+        # turns never execute, so they are clean by definition)
+        command_errors: List[bool] = []
         disk_aborted = False
         timeout_aborted = False
         rss_aborted = False
@@ -512,9 +531,11 @@ async def _execute_rollout(
             assert action.command is not None
             if _is_submit_command(action.command):
                 submitted = True
+                command_errors.append(False)
                 break
 
             obs = await _post(session, f"{env_url}/step", {"session_id": session_id, "command": action.command}, call_timeout)
+            command_errors.append(not bool(obs.get("success", True)))
             messages.append({"role": "tool", "tool_call_id": action.tool_call_id or "call_0", "content": obs["output"]})
             step_abort_kind = obs.get("abort_kind")
             if step_abort_kind:
@@ -603,6 +624,8 @@ async def _execute_rollout(
             "finish_stdout_tail": _finish_stdout_tail(finish_output),
             "dropped": drop_reason is not None,
             "drop_reason": drop_reason,
+            "n_command_errors": int(sum(command_errors)),
+            "command_error_rate": sum(command_errors) / max(len(command_errors), 1),
         }
     )
 
@@ -617,8 +640,11 @@ async def _execute_rollout(
         training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
         for training_text, llm_call in zip(training_texts, llm_calls):
             _stamp_training_text_model_version(training_text, llm_call)
+        stamp_event_credit(training_texts, command_errors)
     else:
         training_texts = []
+        text_event_errors: List[bool] = []
+        action_turn = 0
         for llm_call, is_format_error in llm_call_events:
             try:
                 training_text = make_training_text(llm, llm_call)
@@ -639,6 +665,12 @@ async def _execute_rollout(
             training_text.reward = reward if max_format_retries_exceeded or not is_format_error else format_error_reward
             _stamp_training_text_model_version(training_text, llm_call)
             training_texts.append(training_text)
+            if is_format_error:
+                text_event_errors.append(True)
+            else:
+                text_event_errors.append(command_errors[action_turn])
+                action_turn += 1
+        stamp_event_credit(training_texts, text_event_errors)
     summary = summarize_training_texts(training_texts)
 
     n_format_errors = sum(format_counts.values())

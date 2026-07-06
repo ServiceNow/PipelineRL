@@ -1,0 +1,54 @@
+defaults:
+  - terminal
+  - _self_
+
+# Phase 1 event-credit run: within-rollout advantage redistribution from
+# env-reported per-command errors, A_t = z - coef*|z|*(e_t - rollout_mean_e)
+# (see AGENT_CHAT <event-credit-phase1>; offline evidence in
+# <probe-refit-step100>). Everything else matches probe_shadow_02's regime
+# minus the shadow probe, so its 230-step history is the control arm:
+# accum 128, exec_mode subprocess, frozen_probe off (verdict done).
+# Fleet DNS terminal-envs-ec01-{a..d} + fleet_name_prefix keep this launcher
+# clear of the other runs' fleets. The environments list is restated wholesale
+# because OmegaConf replaces lists on merge; identical to terminal.yaml.
+
+finetune:
+  rl:
+    event_credit_coef: 0.5
+
+orchestrator:
+  fleet_name_prefix: terminal_envs_ec01
+
+environments:
+  - key: terminal
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    placement: external
+    external_hosts:
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-a
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-b
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-c
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-ec01-d
+    external_start_port: 7777
+    external_count: 12
+    _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
+    bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
+    cache_dir: ${output_dir}/env_cache
+    rootfs_retention_seconds: 600.0
+    n_envs: 1
+    host: "0.0.0.0"
+    proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
+    exec_mode: subprocess
+    nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
+    command_timeout: 180.0
+    verifier_timeout: 180.0
+    max_observation_chars: 4000
+    check_initial_state: true
+    max_session_disk_bytes: 966367641   # 0.9 GiB
+    session_delta_isolation: false
+    session_delta_max_bytes: 536870912   # 512 MiB
+    contamination_check: true
+    contamination_sample_every: 20
+    max_session_rss_bytes: 17179869184  # 16 GiB
+    session_ttl_seconds: 2800.0
+    session_reap_interval_seconds: 60.0

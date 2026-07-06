@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, TYPE_CHECKING
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import numpy as np
 import pandas as pd
@@ -91,6 +91,18 @@ class RLConfig(BaseModel):
         default=False,
         description="Use rollout-level leave-one-out baseline instead of per-step-index baseline",
     )
+    event_credit_coef: float = Field(
+        default=0.0,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Redistribute the rollout advantage within the rollout toward command-error turns: "
+            "A_t = z - coef*|z|*(event_error_t - rollout_error_mean). Preserves the rollout total, "
+            "never flips the advantage sign (enforced by coef<1), and is a no-op for zero-advantage "
+            "rollouts. Requires rollout_level_loo (the formula is over rollout-level z) and the "
+            "domain stamping event_error/rollout_error_mean turn metadata. 0 disables."
+        ),
+    )
     overlong_filtering: bool = Field(default=False, description="Filter out sequence that do not have eos_token_id")
     group_normalization: bool = Field(
         default=False,
@@ -120,6 +132,15 @@ class RLConfig(BaseModel):
         default=None,
         description="Path to a frozen rollout-success probe artifact",
     )
+
+    @model_validator(mode="after")
+    def _event_credit_requires_rollout_level_loo(self):
+        if self.event_credit_coef > 0 and not self.rollout_level_loo:
+            raise ValueError(
+                "event_credit_coef > 0 requires rollout_level_loo: the redistribution "
+                "formula is defined over the rollout-level advantage z"
+            )
+        return self
 
 
 @dataclass
@@ -770,7 +791,11 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     assert isinstance(df_init, pd.DataFrame)
 
     # Step 1: calculate rollout-level token statistics and step-level reward statistics
-    df_stats = df_init[["group_id", "rollout_index", "step_index", "rewards"]].copy()
+    event_credit = config.event_credit_coef > 0 and "event_error" in df_init.columns
+    stats_columns = ["group_id", "rollout_index", "step_index", "rewards"]
+    if event_credit:
+        stats_columns += ["event_error", "rollout_error_mean"]
+    df_stats = df_init[stats_columns].copy()
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
     df_stats["step_reward"] = df_stats["rewards"].apply(lambda rewards: rewards[0])
     df_rollouts = (
@@ -818,7 +843,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         .reset_index()
     )
     df_advantages = pd.merge(
-        df_stats[["group_id", "rollout_index", "step_index", "rewards"]],
+        df_stats[stats_columns],
         df_current_rewards,
         on=current_reward_keys,
         how="left",
@@ -839,13 +864,23 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
             loo_mean = current_reward
         std = row["current_reward_std"]
         if config.divide_advantage_by_std:
-            return [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
-        return [(r - loo_mean) for r in rewards]
+            advantages = [(r - loo_mean) / (np.nan_to_num(std) + 1e-4) for r in rewards]
+        else:
+            advantages = [(r - loo_mean) for r in rewards]
+        if event_credit:
+            # Within-rollout redistribution: error turns take a larger share of
+            # the blame (z<0) or a smaller share of the credit (z>0). Mean-zero
+            # across the rollout's turns, bounded by coef*|advantage|.
+            delta = row["event_error"] - row["rollout_error_mean"]
+            if delta:
+                advantages = [a - config.event_credit_coef * abs(a) * delta for a in advantages]
+        return advantages
 
     df_advantages["advantages"] = df_advantages.apply(calculate_advantages, axis=1)
-    df_advantages = df_advantages.drop(
-        columns=["rewards", "current_reward", "current_reward_sum", "current_reward_count", "current_reward_std"]
-    )
+    drop_columns = ["rewards", "current_reward", "current_reward_sum", "current_reward_count", "current_reward_std"]
+    if event_credit:
+        drop_columns += ["event_error", "rollout_error_mean"]
+    df_advantages = df_advantages.drop(columns=drop_columns)
     assert df_advantages.columns.tolist() == [
         "group_id",
         "rollout_index",
