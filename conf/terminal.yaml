@@ -154,7 +154,11 @@ orchestrator:
   fleet_resources:
     cpu: 64
     mem: 512
-  bid: 9999
+  # Fleet bid MUST stay below the trainer bid (999 in the launch scripts).
+  # 2026-07-06: fleets at 9999 preempted our own bid-999 trainer replicas on a
+  # saturated pool; the restore churn cancelled two of three trainer runs.
+  # Fleets restart cheaply and should wait for capacity, never evict trainers.
+  bid: 500
   conda_env: pipeline-rl
   fleet_name_prefix: terminal_envs
   fleet_restores_per_hour: 3
