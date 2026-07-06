@@ -684,6 +684,13 @@ class RayActorLoop:
                         "Abandoning group %s after %d empty rollouts: task_id=%s domain=%s dataset=%s",
                         request.group_id, retry_count, task_id, domain, dataset_name,
                     )
+                    if (not self.is_training) or self.rollout_once:
+                        # For eval / rollout_once, count the abandoned group as
+                        # reward=0 so it stays in the denominator instead of
+                        # silently inflating the reported reward/success.
+                        result.dataset_name = dataset_name
+                        result.domain = domain
+                        self.update_stats([result])
                     self._abandon_group(local_group_id)
                     continue
                 self._empty_retry_counts[local_group_id] = retry_count
