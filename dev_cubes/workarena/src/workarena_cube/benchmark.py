@@ -50,18 +50,6 @@ class WorkArenaSeedGenerator(AbstractSeedGenerator):
             return self._l1_cache[task_metadata.id]
         return [self.meta_seed]
 
-
-class WorkArenaBenchmarkGoals(Benchmark["WorkArenaBenchmarkConfigGoals"]):
-    """Runtime pair — WorkArena tasks connect to a remote ServiceNow instance,
-    so there is no shared infrastructure to provision in _setup().
-    """
-
-    def _setup(self) -> None:
-        logger.info(f"WorkArena benchmark ready with {self.config.num_tasks} tasks")
-
-    def close(self) -> None:
-        logger.info("WorkArena benchmark closed.")
-
 class WorkArenaBenchmarkTasks(Benchmark["WorkArenaBenchmarkConfigTasks"]):
     """Runtime pair — WorkArena tasks connect to a remote ServiceNow instance,
     so there is no shared infrastructure to provision in _setup().
@@ -221,6 +209,19 @@ class WorkArenaBenchmarkConfigTasks(BenchmarkConfig[WorkArenaTaskMetadata]):
                     tool_config=self.tool_config,
                     seed=None,
                 )
+
+
+class WorkArenaBenchmarkGoals(Benchmark["WorkArenaBenchmarkConfigGoals"]):
+    """Runtime pair — WorkArena tasks connect to a remote ServiceNow instance,
+    so there is no shared infrastructure to provision in _setup().
+    """
+
+    def _setup(self) -> None:
+        logger.info(f"WorkArena benchmark ready with {self.config.num_tasks} tasks")
+
+    def close(self) -> None:
+        logger.info("WorkArena benchmark closed.")
+
 
 class WorkArenaBenchmarkConfigGoals(BenchmarkConfig[WorkArenaTaskMetadata]):
     """CUBE BenchmarkConfig for WorkArena ServiceNow tasks.

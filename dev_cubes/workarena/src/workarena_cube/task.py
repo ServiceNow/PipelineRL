@@ -7,7 +7,7 @@ from typing import Any, Literal, override
 import browsergym.workarena
 from browsergym.workarena.tasks.base import AbstractServiceNowTask
 from cube.benchmark import RuntimeContext
-from cube.core import Observation
+from cube.core import Observation, Content
 from cube.task import Task, TaskConfig, TaskMetadata
 from cube.tool import Toolbox
 from cube.tools.browser import BrowserTool
@@ -104,9 +104,11 @@ class WorkArenaTask(Task):
         page_obs = self._browser_tool.page_obs()
         if self._chat_tool is not None:
             self._chat_tool.add_message("user", goal)
-            obs = Observation.from_text(self._chat_tool.chat_obs()) + page_obs
+            obs = Observation(contents=[Content.from_data(self._chat_tool.chat_obs(), name="goal")]) + page_obs
+            # obs = Observation.from_text(self._chat_tool.chat_obs()) + page_obs
         else:
-            obs = Observation.from_text(goal) + page_obs
+            obs = Observation(contents=[Content.from_data(goal, name="goal")]) + page_obs
+            # obs = Observation.from_text(goal) + page_obs
         info = {
             "task_id": self.id,
             "task_class": task_class.__name__,

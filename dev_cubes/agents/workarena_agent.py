@@ -115,11 +115,11 @@ class WorkArenaAgent(Agent):
             f"LLM usage - prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens}, "
             f"cached: {usage.cached_tokens}, cache_created: {usage.cache_creation_tokens}, cost: ${usage.cost:.4f}"
         )
-        llm_output = call.output
-        action = parse_actions(llm_output)
-        self.last_action = action
+        llm_output = call.output    
+        actions, malformed = parse_actions(llm_output)
+        self.last_action = actions or None
         self._actions_cnt += 1
-        return AgentOutput(actions=action)
+        return AgentOutput(actions=actions)
 
     def _build_prompt_messages(self, user_prompt: str) -> list[dict | Message]:
         messages: list[dict | Message] = []
@@ -143,7 +143,7 @@ class WorkArenaAgent(Agent):
 
     def _set_goal(self, obs: Observation) -> None:
         for content in obs.contents:
-            if content.name is None and content.tool_call_id is None:
+            if content.name == "goal":
                 self.goal = content.data
                 break
     
