@@ -3,12 +3,13 @@
 from typing import Any, Protocol, runtime_checkable
 
 from browsergym.workarena.tasks.base import AbstractServiceNowTask
-from cube.core import Observation
+from cube.core import Action, Observation, StepError
 from cube.tool import Tool, ToolConfig, tool_action
 from cube_browser_playwright import PlaywrightSession
 from cube_browser_tool import PlaywrightConfig, SyncPlaywrightTool
 from cube_browser_playwright import PlaywrightSessionConfig
 from playwright.sync_api import Page
+from cube_browser_tool.bgym_tool import BgymTool, BgymToolConfig
 
 
 @runtime_checkable
@@ -106,3 +107,54 @@ class WorkArenaCheatToolConfig(PlaywrightConfig):
     def make(self, container: Any = None) -> WorkArenaCheatTool:
         session = self.browser.make()
         return WorkArenaCheatTool(self, session)
+
+class CustomBgymTool(BgymTool):
+    """`BgymTool` that exposes the most recent agent `Action`.
+
+    The cube `Action` object is stored on `agent_last_action` immediately on
+    entry to `execute_action` / `async_execute_action`, before the parent's
+    in-method `page_obs()` resets `_last_info`. `reset()` clears it.
+    """
+
+    def __init__(self, config: BgymToolConfig) -> None:
+        super().__init__(config)
+        self.agent_last_action: Action | None = None
+        # Records whether the most recent action returned a `StepError`
+        # (e.g. Playwright `Locator.clear` on a checkbox). The local-reward
+        # shaper reads this to debit Phi for failed tool calls.
+        self.agent_last_step_error: str | None = None
+
+    def _check_error(self, obs: Observation | StepError | None) -> None:
+        if isinstance(obs, StepError):
+            self.agent_last_step_error = obs.exception_str
+        elif isinstance(obs, Observation):
+            data = obs.contents[0].data if obs.contents else None
+            if data and data.startswith("Failed:"):
+                self.agent_last_step_error = data
+
+    def execute_action(self, action: Action) -> Observation | StepError:
+        self.agent_last_action = action
+        obs = super().execute_action(action)
+        self._check_error(obs)
+        return obs
+
+    async def async_execute_action(self, action: Action) -> Observation | StepError:
+        self.agent_last_action = action
+        obs = await super().async_execute_action(action)
+        self._check_error(obs)
+        return obs
+
+    def reset(self) -> None:
+        self.agent_last_action = None
+        self.agent_last_step_error = None
+        super().reset()
+
+
+class CustomBgymToolConfig(BgymToolConfig):
+    """`BgymToolConfig` that builds `CustomBgymTool` instead of `BgymTool`.
+
+    Inherits all `BgymToolConfig` fields unchanged — only `make()` changes.
+    """
+
+    def make(self, container: Any = None) -> CustomBgymTool:
+        return CustomBgymTool(self)

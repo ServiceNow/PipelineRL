@@ -116,8 +116,8 @@ dataset_loader_params:
     benchmark: &workarena_benchmark_tasks
       _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigTasks
       split: train
-      tool_config: &miniwob_tool_config
-          _type: miniwob_cube.tools.MiniWobBgymToolConfig
+      tool_config: &custom_tool_config
+          _type: workarena_cube.tools.CustomBgymToolConfig
           use_html: false
           use_axtree: true
           use_screenshot: false
@@ -140,8 +140,8 @@ dataset_loader_params:
       _type: workarena_cube.benchmark.WorkArenaBenchmarkConfigGoals
       meta_seed: 41
       n_seeds_l1: 3
-      tool_config: &miniwob_tool_config
-          _type: miniwob_cube.tools.MiniWobBgymToolConfig
+      tool_config: &custom_tool_config
+          _type: workarena_cube.tools.CustomBgymToolConfig
           use_html: false
           use_axtree: true
           use_screenshot: false
