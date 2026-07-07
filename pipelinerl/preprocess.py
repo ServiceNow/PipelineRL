@@ -355,6 +355,7 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
     - loss_masking_spans: list of (start, end) spans where loss IS computed (completion only)
     - advantage: scalar float (per-rollout GRPO advantage)
     - old_log_probabilities: list of floats, full sequence length (zeros for prompt tokens)
+    - reward: scalar float (raw per-rollout reward, a diagnostic; distinct from advantage)
     """
     input_ids = entry["input_ids"]
     tokens = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
@@ -389,6 +390,11 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
         advantages = entry["advantages"]
         if advantages:
             result["advantage"] = float(advantages[0])
+
+    # reward: raw (un-normalized) reward, a scalar per rollout (distinct from the group-relative
+    # advantage). Fast-LLM logs it as a diagnostic; it does not affect the loss.
+    if "reward" in entry:
+        result["reward"] = float(entry["reward"])
 
     # old_log_probabilities: full sequence length, zeros for prompt tokens
     # (prepare_rl_fields pads with zeros on the left to match len(input_ids))
