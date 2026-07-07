@@ -105,7 +105,8 @@ def _install_model_version_patches() -> None:
         from vllm.v1.engine.logprobs import LogprobsProcessor
 
         try:
-            # vLLM 0.18.1 restructured serving_chat.py into a chat_completion package.
+            # Newer vLLM keeps the chat serving class in a chat_completion package;
+            # older builds define it in serving_chat.py.
             from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
         except ImportError:
             from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
