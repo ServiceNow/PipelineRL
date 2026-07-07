@@ -71,10 +71,10 @@ logger.propagate = False
 #
 # Any missing link (unpatched vLLM build, flat logprobs, a token absent from its own
 # top-logprobs) simply omits the version; the consumer then falls back to the per-rollout
-# version. Exercises vLLM 0.18.1 v1 internals — validate on a live streaming run.
+# version.
 _current_model_version: dict[str, int | None] = {"value": None}
 # Set once if a patched seam ever raises: the annotation hooks then no-op cheaply and the
-# consumer falls back to the per-rollout version. Guarantees the patches cannot break inference.
+# consumer falls back to the per-rollout version.
 _version_tagging_disabled: dict[str, bool] = {"value": False}
 
 
@@ -118,18 +118,18 @@ def _install_model_version_patches() -> None:
 
     original_update_from_output = LogprobsProcessor.update_from_output
 
-    def update_from_output(self, output):
-        before = len(self.logprobs) if isinstance(self.logprobs, list) else None
-        original_update_from_output(self, output)
+    def update_from_output(self, *args, **kwargs):
+        previous_length = len(self.logprobs) if isinstance(self.logprobs, list) else None
+        original_update_from_output(self, *args, **kwargs)
         if _version_tagging_disabled["value"]:
             return
         try:
             version = _current_model_version["value"]
-            if version is None or before is None or not isinstance(self.logprobs, list):
+            if version is None or previous_length is None or not isinstance(self.logprobs, list):
                 return
             # Every logprob at a decode position shares that position's version; annotate all of
             # them so the serving layer reads the right value regardless of dict ordering.
-            for position in self.logprobs[before:]:
+            for position in self.logprobs[previous_length:]:
                 if isinstance(position, dict):
                     for logprob in position.values():
                         logprob.version = version
