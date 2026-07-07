@@ -872,6 +872,8 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
         worker_cls = hydra.utils.get_class(cfg.actor.rollout_policy)
         rollout_backend = str(getattr(cfg.actor, "rollout_backend", "ray"))
         logger.info("Using rollout backend: %s", rollout_backend)
+        rollout_wall_timeout_s = getattr(cfg.actor, "rollout_wall_timeout", None)
+        rollout_wall_timeout_s = float(rollout_wall_timeout_s) if rollout_wall_timeout_s else None
         train_manager = RayRolloutManager(
             worker_cls=worker_cls,
             worker_config=_worker_config(cfg, "train"),
@@ -880,6 +882,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
             execution_backend=rollout_backend,
             log_collector=ray_worker_log_collector,
             worker_name_prefix="train_rollout_worker",
+            rollout_wall_timeout_s=rollout_wall_timeout_s,
         )
 
         wait_for_inference_servers(llm_urls)
@@ -939,6 +942,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                         execution_backend=rollout_backend,
                         log_collector=ray_worker_log_collector,
                         worker_name_prefix=f"eval_v{current_eval}_rollout_worker",
+                        rollout_wall_timeout_s=rollout_wall_timeout_s,
                     )
                     if eval_dataset:
                         eval_loop = RayActorLoop(

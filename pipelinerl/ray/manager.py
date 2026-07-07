@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Type
 
@@ -26,6 +27,8 @@ class _WorkerSlot:
     actor: Any
     active_ref: Any | None = None
     active_request: RolloutRequest | None = None
+    active_start_time: float | None = None
+    setup_ref: Any | None = None
     retiring: bool = False
     ready: bool = False
 
@@ -57,6 +60,7 @@ class RayRolloutManager:
         context_extras: dict[str, Any] | None = None,
         worker_name_prefix: str = "ray_rollout_worker",
         max_pending: int | None = None,
+        rollout_wall_timeout_s: float | None = None,
     ) -> None:
         if num_workers < 0:
             raise ValueError("num_workers must be >= 0")
@@ -68,6 +72,9 @@ class RayRolloutManager:
         self.context_extras = context_extras or {}
         self.worker_name_prefix = worker_name_prefix
         self.max_pending = max_pending
+        self.rollout_wall_timeout_s = (
+            float(rollout_wall_timeout_s) if rollout_wall_timeout_s and rollout_wall_timeout_s > 0 else None
+        )
         self._slots: list[_WorkerSlot] = []
         self._next_worker_index = 0
         self._target_workers = 0
@@ -111,7 +118,7 @@ class RayRolloutManager:
         self._start_all_worker()
         self._retire_excess_idle_workers()
 
-    def _start_one_worker(self, lazy: bool = False) -> None:
+    def _start_one_worker(self, lazy: bool = False) -> _WorkerSlot:
         worker_index = self._next_worker_index
         self._next_worker_index += 1
         worker_name = f"{self.worker_name_prefix}_{worker_index}"
@@ -123,9 +130,10 @@ class RayRolloutManager:
         slot = _WorkerSlot(index=worker_index, actor=actor)
         self._slots.append(slot)
         if lazy:
-            return
+            return slot
         self._setup_slot(slot)
         logger.info("Started Ray rollout worker %s", slot.index)
+        return slot
 
     def _start_all_worker(self) -> None:
         logger.info("Creating Ray rollout ...")
@@ -138,13 +146,64 @@ class RayRolloutManager:
         self._setup_slots([slot])
 
     def _setup_slots(self, slots: list[_WorkerSlot]) -> None:
+        """Fire setup.remote() for the given slots and block until all finish."""
         if not slots:
             return
-        results = self.backend.get([slot.actor.setup.remote() for slot in slots])
-        for slot, ok in zip(slots, results):
+        for slot in slots:
+            if slot.setup_ref is None and not slot.ready:
+                slot.setup_ref = slot.actor.setup.remote()
+        pending = [s for s in slots if s.setup_ref is not None and not s.ready]
+        if not pending:
+            return
+        results = self.backend.get([s.setup_ref for s in pending])
+        for slot, ok in zip(pending, results):
+            slot.setup_ref = None
             if not ok:
                 raise RuntimeError(f"Ray rollout worker {slot.index} setup failed")
             slot.ready = True
+
+    def _spawn_missing_workers_async(self) -> None:
+        """Create new actors for every missing slot and fire setup.remote() without blocking.
+
+        Callers should later invoke `_reap_pending_setups()` (non-blocking) or
+        `_setup_slots(...)` (blocking) to promote the slot to ready.
+        """
+        while len(self._slots) < self._target_workers:
+            slot = self._start_one_worker(lazy=True)
+            slot.setup_ref = slot.actor.setup.remote()
+            logger.info("Spawning Ray rollout worker %s (setup in flight)", slot.index)
+
+    def _reap_pending_setups(self) -> None:
+        """Non-blocking: mark slots ready whose setup.remote() has resolved."""
+        pending = [s for s in self._slots if s.setup_ref is not None and not s.ready]
+        if not pending:
+            return
+        refs = [s.setup_ref for s in pending]
+        done_refs, _ = self.backend.wait(refs, num_returns=len(refs), timeout=0)
+        if not done_refs:
+            return
+        ref_to_slot = {ref: slot for ref, slot in zip(refs, pending)}
+        for ref in done_refs:
+            slot = ref_to_slot.get(ref)
+            if slot is None:
+                continue
+            try:
+                ok = self.backend.get(ref)
+            except Exception:
+                logger.exception("Ray rollout worker %s setup failed; will be respawned", slot.index)
+                slot.setup_ref = None
+                if slot in self._slots:
+                    self._slots.remove(slot)
+                continue
+            if not ok:
+                logger.error("Ray rollout worker %s setup returned False; will be respawned", slot.index)
+                slot.setup_ref = None
+                if slot in self._slots:
+                    self._slots.remove(slot)
+                continue
+            slot.setup_ref = None
+            slot.ready = True
+            logger.info("Ray rollout worker %s ready", slot.index)
 
     def _retire_excess_idle_workers(self) -> None:
         excess = len(self._slots) - self._target_workers
@@ -178,17 +237,20 @@ class RayRolloutManager:
     def try_submit(self, request: RolloutRequest) -> bool:
         if self.max_pending is not None and self.active_count >= self.max_pending:
             return False
+        self._reap_pending_setups()
         if len(self._slots) < self._target_workers:
-            self._start_one_worker()
+            self._spawn_missing_workers_async()
         slot = self._select_idle_slot()
         if slot is None:
             return False
         ref = slot.actor.generate.remote(request)
         slot.active_ref = ref
         slot.active_request = request
+        slot.active_start_time = time.monotonic()
         return True
 
     def wait_completed(self, *, timeout_s: float = 0.01, num_returns: int = 1) -> list[CompletedRollout]:
+        self._reap_pending_setups()
         refs = self.pending_refs
         if not refs:
             return []
@@ -206,6 +268,7 @@ class RayRolloutManager:
             except Exception as exc:
                 slot.active_ref = None
                 slot.active_request = None
+                slot.active_start_time = None
                 if slot.retiring:
                     self._close_slot(slot)
                     self._slots.remove(slot)
@@ -213,11 +276,69 @@ class RayRolloutManager:
                 raise RolloutExecutionError(request, slot.index, exc) from exc
             slot.active_ref = None
             slot.active_request = None
+            slot.active_start_time = None
             if slot.retiring:
                 self._close_slot(slot)
                 self._slots.remove(slot)
         self._retire_excess_idle_workers()
+        if not completed:
+            self._enforce_wall_timeout()
         return completed
+
+    def _enforce_wall_timeout(self) -> None:
+        """Kill any worker whose in-flight rollout has exceeded the wall-clock timeout.
+
+        Raises RolloutExecutionError so the actor loop's existing retry path handles it.
+        Only the first offending slot is raised for; remaining offenders (if any) will
+        be caught on subsequent calls.
+        """
+        if self.rollout_wall_timeout_s is None:
+            return
+        now = time.monotonic()
+        for slot in list(self._slots):
+            if slot.active_ref is None or slot.active_start_time is None:
+                continue
+            elapsed = now - slot.active_start_time
+            if elapsed <= self.rollout_wall_timeout_s:
+                continue
+            request = slot.active_request
+            worker_index = slot.index
+            request_id = request.request_id if request is not None else None
+            logger.warning(
+                "Rollout worker %s exceeded wall-clock timeout of %.1fs (elapsed %.1fs); killing worker (request_id=%s)",
+                worker_index,
+                self.rollout_wall_timeout_s,
+                elapsed,
+                request_id,
+            )
+            self._cancel_and_drop_slot(slot)
+            self._retire_excess_idle_workers()
+            # Kick off replacement setup immediately so its boot time overlaps
+            # with the actor loop's retry plumbing rather than being paid
+            # sequentially inside a later try_submit call.
+            self._spawn_missing_workers_async()
+            if request is None:
+                return
+            cause = TimeoutError(
+                f"rollout exceeded wall-clock timeout of {self.rollout_wall_timeout_s:.1f}s "
+                f"(elapsed {elapsed:.1f}s)"
+            )
+            raise RolloutExecutionError(request, worker_index, cause)
+
+    def _cancel_and_drop_slot(self, slot: _WorkerSlot) -> None:
+        ref = slot.active_ref
+        if ref is not None:
+            try:
+                import ray as _ray
+                _ray.cancel(ref, force=True, recursive=True)
+            except Exception:
+                logger.debug("ray.cancel failed for worker %s", slot.index, exc_info=True)
+        slot.active_ref = None
+        slot.active_request = None
+        slot.active_start_time = None
+        self.backend.kill_actor(slot.actor, logger, f"Ray rollout worker {slot.index} (timeout)")
+        if slot in self._slots:
+            self._slots.remove(slot)
 
     def _make_actor(
         self,

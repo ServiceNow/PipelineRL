@@ -28,6 +28,11 @@ actor:
   rollout_workers: 1
   rollout_once: false
   max_empty_retries: 5
+  # Wall-clock timeout (seconds) for a single Ray rollout call. If a rollout does
+  # not complete within this budget the worker is killed (ray.cancel + ray.kill)
+  # and the request is retried through the normal RolloutExecutionError path.
+  # Null/<=0 disables the timeout.
+  rollout_wall_timeout: null
   discount_factor: 1
   problem_queue_size: 64
   result_queue_size: 64
