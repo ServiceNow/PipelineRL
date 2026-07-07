@@ -61,6 +61,86 @@ logger.addHandler(handler)
 logger.propagate = False
 
 
+# --- Per-token model version capture --------------------------------------------------
+# The active weight version is a global, serialized quantity: it changes only inside a
+# weight swap, while generation is paused (`_pause_generation`). We record the version
+# active when the output processor commits each token, then ride it to the client inside
+# the existing per-token `token` string of the chat logprobs
+# (`token_id:<id>` -> `token_id:<id>:v<version>`), so no response-schema change is needed.
+# Both seams run in the API-server process, alongside the version-tracking monitor thread.
+#
+# Any missing link (unpatched vLLM build, flat logprobs, a token absent from its own
+# top-logprobs) simply omits the version; the consumer then falls back to the per-rollout
+# version. Exercises vLLM 0.18.1 v1 internals — validate on a live streaming run.
+_current_model_version: dict[str, int | None] = {"value": None}
+
+
+def _set_current_model_version(version: int | None) -> None:
+    _current_model_version["value"] = version
+
+
+def _install_model_version_patches() -> None:
+    """Monkeypatch the vLLM v1 output path to tag generated tokens with the model version.
+
+    Two seams, both in the API-server process:
+      1. `LogprobsProcessor.update_from_output` — annotate each newly committed position's
+         `Logprob` objects with `.version` = the version active at commit time.
+      2. `OpenAIServingChat._create_chat_logprobs` — append `:v<version>` to each per-token
+         `token` string, read back from the annotated `Logprob`.
+    Idempotent, and defensive: a version mismatch that moves these seams disables per-token
+    versions (consumer falls back to the per-rollout version) rather than crashing the server.
+    """
+    try:
+        from vllm.v1.engine.logprobs import LogprobsProcessor
+
+        try:
+            # vLLM 0.18.1 restructured serving_chat.py into a chat_completion package.
+            from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+        except ImportError:
+            from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    except ImportError as error:
+        logger.warning(f"[FastLLM] Per-token model_version disabled (vLLM layout changed): {error}")
+        return
+
+    if getattr(LogprobsProcessor, "_pipelinerl_version_patched", False):
+        return
+
+    original_update_from_output = LogprobsProcessor.update_from_output
+
+    def update_from_output(self, output):
+        before = len(self.logprobs) if isinstance(self.logprobs, list) else None
+        original_update_from_output(self, output)
+        version = _current_model_version["value"]
+        if version is None or before is None or not isinstance(self.logprobs, list):
+            return
+        # Every logprob at a decode position shares that position's version; annotate all of
+        # them so the serving layer reads the right value regardless of dict ordering.
+        for position in self.logprobs[before:]:
+            if isinstance(position, dict):
+                for logprob in position.values():
+                    logprob.version = version
+
+    original_create_chat_logprobs = OpenAIServingChat._create_chat_logprobs
+
+    def _create_chat_logprobs(self, token_ids, top_logprobs, *args, **kwargs):
+        result = original_create_chat_logprobs(self, token_ids, top_logprobs, *args, **kwargs)
+        content = getattr(result, "content", None)
+        if content:
+            for index, item in enumerate(content):
+                position = top_logprobs[index] if index < len(top_logprobs) else None
+                sampled = position.get(token_ids[index]) if position else None
+                version = getattr(sampled, "version", None)
+                # Only extend the `token_id:<id>` form; never mangle a decoded text token.
+                if version is not None and item.token.startswith("token_id:"):
+                    item.token = f"{item.token}:v{version}"
+        return result
+
+    LogprobsProcessor.update_from_output = update_from_output
+    OpenAIServingChat._create_chat_logprobs = _create_chat_logprobs
+    LogprobsProcessor._pipelinerl_version_patched = True
+    logger.info("[FastLLM] Per-token model_version patches installed")
+
+
 @runtime_checkable
 class LikeWorker(Protocol):
     rank: int
@@ -408,12 +488,16 @@ class EngineManager:
             f"Fast-LLM receiver initialized (Redis {self._redis_host}:{self._redis_port})"
         )
 
-    async def receive_weight_update_fast_llm(self):
+    async def receive_weight_update_fast_llm(self, version: int | None = None):
         """Run a fast-llm broadcast weight update paused-for-the-duration.
 
         Pause/resume wraps the collective RPC symmetrically with the HTTP path
         so that in-flight generation cannot interleave with a mid-broadcast
         parameter swap (the source of logprob drift PR #137 closed).
+
+        `version` is recorded as the active model version once the new weights are
+        loaded but before generation resumes, so tokens sampled after the swap are
+        stamped with the new version and those before it keep the old one.
 
         NOTE: this must NOT be used for the very first weights_ready event
         after process startup, because at that point the actor has not yet
@@ -434,8 +518,10 @@ class EngineManager:
                 await self.engine.engine_core.collective_rpc_async(
                     "receive_weight_update_fast_llm", args=()
                 )
+                # Weights are loaded; stamp subsequent tokens with the new version before resuming.
+                _set_current_model_version(version)
                 logger.info(
-                    f"Fast-llm weight update processed "
+                    f"Fast-llm weight update processed version={version} "
                     f"in {time.perf_counter() - update_started_at:.3f}s"
                 )
             finally:
@@ -505,24 +591,38 @@ class EngineManager:
 
                             event_type = event.get("type")
                             step = event.get("step")
+                            # Fast-LLM sends the cumulative document count as the model version
+                            # (aligns staleness with the trainer's document clock); fall back to
+                            # `step` for older trainers that only send the step.
+                            document_count = event.get("document_count")
+                            version = document_count if document_count is not None else step
 
                             if event_type == "weights_ready":
                                 if not first_weights_ready_seen:
                                     logger.info(
-                                        f"[FastLLM] weights_ready step={step} (initial broadcast — no pause wrap)"
+                                        f"[FastLLM] weights_ready step={step} document_count={document_count} "
+                                        f"(initial broadcast — no pause wrap)"
                                     )
                                     coro = self.engine.engine_core.collective_rpc_async(
                                         "receive_weight_update_fast_llm", args=()
                                     )
                                     first_weights_ready_seen = True
+                                    initial_broadcast = True
                                 else:
                                     logger.info(
-                                        f"[FastLLM] weights_ready step={step}, dispatching to workers"
+                                        f"[FastLLM] weights_ready step={step} document_count={document_count}, "
+                                        f"dispatching to workers"
                                     )
-                                    coro = self.receive_weight_update_fast_llm()
+                                    coro = self.receive_weight_update_fast_llm(version)
+                                    initial_broadcast = False
                                 try:
                                     future = asyncio.run_coroutine_threadsafe(coro, loop)
                                     future.result()
+                                    # The pause-wrapped path stamps the version internally (before
+                                    # resume); the initial raw path runs before the actor generates,
+                                    # so setting it here has no token to race with.
+                                    if initial_broadcast:
+                                        _set_current_model_version(version)
                                     logger.info(
                                         f"[FastLLM] Weight update complete: step={step}"
                                     )
@@ -640,6 +740,7 @@ class EngineManager:
 
                 # Initialize Fast-LLM mode if enabled
                 if weight_update_mode == "fast-llm":
+                    _install_model_version_patches()
                     await manager.init_fast_llm_receiver()
                     await manager.start_fast_llm_monitoring()
                     logger.info("Fast-LLM weight update mode enabled")
