@@ -73,10 +73,21 @@ logger.propagate = False
 # top-logprobs) simply omits the version; the consumer then falls back to the per-rollout
 # version. Exercises vLLM 0.18.1 v1 internals — validate on a live streaming run.
 _current_model_version: dict[str, int | None] = {"value": None}
+# Set once if a patched seam ever raises: the annotation hooks then no-op cheaply and the
+# consumer falls back to the per-rollout version. Guarantees the patches cannot break inference.
+_version_tagging_disabled: dict[str, bool] = {"value": False}
 
 
 def _set_current_model_version(version: int | None) -> None:
     _current_model_version["value"] = version
+
+
+def _disable_version_tagging(context: str, error: Exception) -> None:
+    if not _version_tagging_disabled["value"]:
+        _version_tagging_disabled["value"] = True
+        logger.warning(
+            f"[FastLLM] Per-token model_version tagging disabled after error in {context}: {error!r}"
+        )
 
 
 def _install_model_version_patches() -> None:
@@ -110,29 +121,41 @@ def _install_model_version_patches() -> None:
     def update_from_output(self, output):
         before = len(self.logprobs) if isinstance(self.logprobs, list) else None
         original_update_from_output(self, output)
-        version = _current_model_version["value"]
-        if version is None or before is None or not isinstance(self.logprobs, list):
+        if _version_tagging_disabled["value"]:
             return
-        # Every logprob at a decode position shares that position's version; annotate all of
-        # them so the serving layer reads the right value regardless of dict ordering.
-        for position in self.logprobs[before:]:
-            if isinstance(position, dict):
-                for logprob in position.values():
-                    logprob.version = version
+        try:
+            version = _current_model_version["value"]
+            if version is None or before is None or not isinstance(self.logprobs, list):
+                return
+            # Every logprob at a decode position shares that position's version; annotate all of
+            # them so the serving layer reads the right value regardless of dict ordering.
+            for position in self.logprobs[before:]:
+                if isinstance(position, dict):
+                    for logprob in position.values():
+                        logprob.version = version
+        except Exception as error:
+            # Best effort: never let version tagging break the output processor.
+            _disable_version_tagging("output processor", error)
 
     original_create_chat_logprobs = OpenAIServingChat._create_chat_logprobs
 
     def _create_chat_logprobs(self, token_ids, top_logprobs, *args, **kwargs):
         result = original_create_chat_logprobs(self, token_ids, top_logprobs, *args, **kwargs)
-        content = getattr(result, "content", None)
-        if content:
-            for index, item in enumerate(content):
-                position = top_logprobs[index] if index < len(top_logprobs) else None
-                sampled = position.get(token_ids[index]) if position else None
-                version = getattr(sampled, "version", None)
-                # Only extend the `token_id:<id>` form; never mangle a decoded text token.
-                if version is not None and item.token.startswith("token_id:"):
-                    item.token = f"{item.token}:v{version}"
+        if _version_tagging_disabled["value"]:
+            return result
+        try:
+            content = getattr(result, "content", None)
+            if content:
+                for index, item in enumerate(content):
+                    position = top_logprobs[index] if index < len(top_logprobs) else None
+                    sampled = position.get(token_ids[index]) if position else None
+                    version = getattr(sampled, "version", None)
+                    # Only extend the `token_id:<id>` form; never mangle a decoded text token.
+                    if version is not None and item.token.startswith("token_id:"):
+                        item.token = f"{item.token}:v{version}"
+        except Exception as error:
+            # Best effort: never let version tagging break the response.
+            _disable_version_tagging("chat logprobs", error)
         return result
 
     LogprobsProcessor.update_from_output = update_from_output
