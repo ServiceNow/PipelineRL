@@ -28,7 +28,8 @@ class WorkArenaAgentConfig(AgentConfig):
     can_finish: bool = True
     max_actions: int = 10
     safety_buffer: int = 32
-    min_useful_tokens: int = 256
+    min_useful_tokens: int = 128
+    capacity_guard_enabled: bool = True
     system_prompt: str = """You are a web automation agent. Use the available browser tools to make progress on the task. Call at most one tool per turn. Only call tools that are provided to you. Use visible element ids when an action requires an element. Do not invent tool names or arguments. If the previous tool call returned an error, use that information to choose a corrected next action."""
     user_prompt: str = """# Instructions
 Review the current state of the page and all other information to find the best possible next action to accomplish your goal. Your answer will be interpreted and executed by a program, make sure to follow the formatting instructions.
@@ -88,11 +89,30 @@ class WorkArenaAgent(Agent):
         super().attach_recorder(recorder)
         self.llm.attach_recorder(recorder)
 
+    def capacity_guard(self, prompt_tokens):
+        remaining = self.max_model_len - prompt_tokens - self.config.safety_buffer 
+        if remaining < self.config.min_useful_tokens:
+            logger.warning(
+                "Not enough room for a useful response (prompt=%d, remaining=%d, max=%d); stopping rollout",
+                prompt_tokens, remaining, self.max_model_len,
+            )
+            return AgentOutput(actions=[Action(id="stop", name=STOP_ACTION.name, arguments={})])
+        if remaining < self.max_completion_tokens:
+            logger.warning(
+                "capping max_completion_tokens from %d to %d (prompt=%d, max=%d)",
+                self.max_completion_tokens, remaining, prompt_tokens, self.max_model_len,
+            )
+            self.llm.config.max_completion_tokens = remaining
+            return None
+
     def step(self, obs: Observation) -> AgentOutput:
         if self.max_actions_reached():
             logger.info("Max actions reached, issuing STOP action.")
             return AgentOutput(actions=[Action(id="stop", name=STOP_ACTION.name, arguments={})])
-        
+
+        # reset in case it was modified in previous steps
+        self.llm.config.max_completion_tokens = self.max_completion_tokens 
+
         if self._actions_cnt == 0:
             self._set_goal(obs)
 
@@ -101,6 +121,11 @@ class WorkArenaAgent(Agent):
 
         prompt = Prompt(messages=messages, tools=self.tools)
         prompt_tokens = self.token_counter(messages=messages, tools=self.tools)
+
+        if self.config.capacity_guard_enabled:
+            result = self.capacity_guard(prompt_tokens)
+            if result is not None:
+                return result
 
         logger.info(f"Prompt tokens (estimated): {prompt_tokens}")
         try:
