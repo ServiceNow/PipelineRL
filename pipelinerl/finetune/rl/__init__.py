@@ -1,5 +1,7 @@
 import logging
 import os
+import random
+import zlib
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, TYPE_CHECKING
@@ -29,6 +31,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 logger = logging.getLogger(__name__)
+_event_credit_shuffle_logged = False
 
 RL_DATA_COLUMNS = [
     "overflow",
@@ -103,6 +106,10 @@ class RLConfig(BaseModel):
             "domain stamping event_error/rollout_error_mean turn metadata. 0 disables."
         ),
     )
+    event_credit_shuffle: bool = Field(
+        default=False,
+        description="Permute event_error values within each rollout before event-credit shaping; control arm only.",
+    )
     overlong_filtering: bool = Field(default=False, description="Filter out sequence that do not have eos_token_id")
     group_normalization: bool = Field(
         default=False,
@@ -135,6 +142,8 @@ class RLConfig(BaseModel):
 
     @model_validator(mode="after")
     def _event_credit_requires_rollout_level_loo(self):
+        if self.event_credit_shuffle and self.event_credit_coef <= 0:
+            raise ValueError("event_credit_shuffle requires event_credit_coef > 0")
         if self.event_credit_coef > 0 and not self.rollout_level_loo:
             raise ValueError(
                 "event_credit_coef > 0 requires rollout_level_loo: the redistribution "
@@ -784,6 +793,30 @@ def rl_step(
     return final_loss, stats
 
 
+def _shuffle_event_errors_by_rollout(df_stats: pd.DataFrame) -> pd.Series:
+    shuffled = df_stats["event_error"].copy()
+    groups = df_stats.groupby(["group_id", "rollout_index"], sort=False).groups
+    for (group_id, rollout_index), index in groups.items():
+        values = shuffled.loc[index].tolist()
+        if len(values) <= 1:
+            continue
+        seed = zlib.crc32(f"{group_id}/{rollout_index}".encode())
+        random.Random(seed).shuffle(values)
+        shuffled.loc[index] = values
+    return shuffled
+
+
+def _log_event_credit_shuffle_once() -> None:
+    global _event_credit_shuffle_logged
+    if _event_credit_shuffle_logged:
+        return
+    logger.warning(
+        "event_credit_shuffle is active; event_error values will be permuted within each rollout "
+        "before event-credit shaping"
+    )
+    _event_credit_shuffle_logged = True
+
+
 def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: RLConfig) -> list[dict[str, Any]]:
     """Populate RL-specific columns (advantages, overflow, num_labels) using a leave-one-out baseline."""
     # Convert to pandas for processing
@@ -796,6 +829,9 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     if event_credit:
         stats_columns += ["event_error", "rollout_error_mean"]
     df_stats = df_init[stats_columns].copy()
+    if event_credit and config.event_credit_shuffle:
+        _log_event_credit_shuffle_once()
+        df_stats["event_error"] = _shuffle_event_errors_by_rollout(df_stats)
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
     df_stats["step_reward"] = df_stats["rewards"].apply(lambda rewards: rewards[0])
     df_rollouts = (

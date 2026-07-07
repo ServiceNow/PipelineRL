@@ -126,6 +126,24 @@ class TerminalSession:
             "abort_kind": abort_kind,
         }
 
+    def replay(self, commands: list[str]) -> dict:
+        successes: list[bool] = []
+        abort_kind = None
+        last_output = ""
+        for command in commands:
+            result = self.exec(command)
+            successes.append(bool(result["success"]))
+            abort_kind = result.get("abort_kind")
+            last_output = result["output"]
+            if abort_kind is not None:
+                break
+        return {
+            "n_executed": len(successes),
+            "successes": successes,
+            "abort_kind": abort_kind,
+            "last_output": last_output,
+        }
+
     def finish(self) -> dict:
         env = self._env
         if env is None:

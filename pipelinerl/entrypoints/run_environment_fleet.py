@@ -10,6 +10,14 @@ The GPU training job reaches these servers over account-scoped internal-dns
 (``http://dns-<EAI_ACCOUNT_ID>-<name>:<port>``); see the external env placement in
 ``conf`` and ``WorldMap._place_environments`` (which skips external specs).
 
+Fleet processes rename their Linux ``comm`` field so in-guest broad kills like
+``killall python3`` do not match the host supervisor/server processes under
+proot's shared pid view. Accepted residual channels: ``pkill -f python`` can
+still match cmdline, ``killall bash`` can hit the job wrapper bash or tmp
+script shell plus other sessions' in-guest runners, and ``kill -9 -1`` remains
+process-wide; command filtering is intentionally out of scope because valid task
+solutions include process kills.
+
 Run with hydra overrides selecting the env config and the port range, e.g.::
 
     python -m pipelinerl.entrypoints.run_environment_fleet \
@@ -18,8 +26,10 @@ Run with hydra overrides selecting the env config and the port range, e.g.::
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import multiprocessing as mp
+import os
 import signal
 import time
 
@@ -31,8 +41,26 @@ from pipelinerl.utils import better_crashing, select_environment_config
 
 logger = logging.getLogger(__name__)
 
+_PR_SET_NAME = 15
+_FLEET_SUPERVISOR_COMM = "plenv-fleet"
+_FLEET_SERVER_COMM = "plenv-serve"
+
+
+def _set_process_comm(name: str) -> None:
+    try:
+        encoded = name.encode("utf-8")[:15]
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = libc.prctl(_PR_SET_NAME, ctypes.c_char_p(encoded), 0, 0, 0)
+        if result != 0:
+            errno = ctypes.get_errno()
+            message = os.strerror(errno) if errno else "prctl(PR_SET_NAME) returned non-zero"
+            raise OSError(errno, message)
+    except Exception as e:
+        logger.warning("failed to set process comm to %s: %s", name, e)
+
 
 def _serve(env_container: dict, port: int) -> None:
+    _set_process_comm(_FLEET_SERVER_COMM)
     # Rebuild the server in the child process and block in web.run_app.
     server = hydra.utils.instantiate(OmegaConf.create(env_container))
     server.launch(port=port)
@@ -46,6 +74,7 @@ def _spawn(env_container: dict, port: int) -> mp.Process:
 
 @hydra.main(config_path="../../conf", config_name="base", version_base="1.3.2")
 def hydra_entrypoint(cfg: DictConfig):
+    _set_process_comm(_FLEET_SUPERVISOR_COMM)
     with better_crashing("environment_fleet"):
         logger.info("env fleet git sha: %s", fleet_manager.git_sha())
         fleet = getattr(cfg, "fleet", None)

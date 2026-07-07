@@ -12,6 +12,7 @@ Endpoints:
     GET  /health                       -> {status, active, capacity}
     POST /start_task {task_data}       -> {session_id, build_ok, started, init_ok}
     POST /step       {session_id, command} -> {output, success, exit_code}
+    POST /replay     {session_id, commands} -> {n_executed, successes, abort_kind, last_output}
     POST /finish     {session_id}      -> {passed, output}
     POST /close      {session_id}      -> {status}
 """
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -36,6 +38,110 @@ from aiohttp import web
 from .environment import TerminalSession
 
 logger = logging.getLogger(__name__)
+
+_CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
+_CGROUP_V1_MEMORY_ROOT = Path("/sys/fs/cgroup/memory")
+_PROC_MEMINFO = Path("/proc/meminfo")
+
+
+def _read_int_file(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _host_memory_total_bytes() -> int | None:
+    try:
+        for line in _PROC_MEMINFO.read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key == "MemTotal":
+                return int(value.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _valid_cgroup_limit(limit: int) -> bool:
+    if limit <= 0:
+        return False
+    host_total = _host_memory_total_bytes()
+    return host_total is None or limit <= host_total
+
+
+def _cgroup_memory_from_paths(current_path: Path, limit_path: Path) -> tuple[int, int] | None:
+    current = _read_int_file(current_path)
+    if current is None:
+        return None
+    try:
+        limit_text = limit_path.read_text().strip()
+    except OSError:
+        return None
+    if limit_text == "max":
+        return None
+    try:
+        limit = int(limit_text)
+    except ValueError:
+        return None
+    if not _valid_cgroup_limit(limit):
+        return None
+    return current, limit
+
+
+def _cgroup_memory() -> tuple[int, int] | None:
+    memory = _cgroup_memory_from_paths(_CGROUP_V2_ROOT / "memory.current", _CGROUP_V2_ROOT / "memory.max")
+    if memory is not None:
+        return memory
+    return _cgroup_memory_from_paths(
+        _CGROUP_V1_MEMORY_ROOT / "memory.usage_in_bytes",
+        _CGROUP_V1_MEMORY_ROOT / "memory.limit_in_bytes",
+    )
+
+
+def _memory_fraction() -> float | None:
+    memory = _cgroup_memory()
+    if memory is None:
+        return None
+    current, limit = memory
+    return current / limit
+
+
+def _memory_stat_snapshot() -> str:
+    for path in (_CGROUP_V2_ROOT / "memory.stat", _CGROUP_V1_MEMORY_ROOT / "memory.stat"):
+        try:
+            stats: dict[str, int] = {}
+            for line in path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    stats[parts[0]] = int(parts[1])
+        except (OSError, ValueError):
+            continue
+        fields = [
+            f"anon={stats.get('anon', 'NA')}",
+            f"file={stats.get('file', 'NA')}",
+        ]
+        for key in ("rss", "cache", "total_rss", "total_cache"):
+            if key in stats:
+                fields.append(f"{key}={stats[key]}")
+        return " ".join(fields)
+    return "unavailable"
+
+
+def _memory_eviction_decision(
+    fraction: float | None,
+    active_sessions_by_age: list[str],
+    paused: bool,
+    evict_fraction: float,
+    resume_fraction: float,
+) -> tuple[list[str], bool]:
+    if evict_fraction <= 0 or fraction is None:
+        return [], False
+    if fraction >= evict_fraction:
+        max_evict = math.ceil(len(active_sessions_by_age) / 4)
+        return active_sessions_by_age[:max_evict], True
+    if paused and fraction > resume_fraction:
+        return [], True
+    return [], False
 
 
 def _start_local_disk_logger() -> None:
@@ -199,6 +305,8 @@ class TerminalEnvironmentServer:
         exec_mode: str = "pty",
         session_ttl_seconds: float = 3600.0,
         session_reap_interval_seconds: float = 60.0,
+        memory_evict_fraction: float = 0.0,
+        memory_resume_fraction: float = 0.75,
     ):
         self.bases_dir = Path(bases_dir)
         self.n_envs = n_envs
@@ -220,6 +328,9 @@ class TerminalEnvironmentServer:
         self.exec_mode = exec_mode
         self.session_ttl_seconds = session_ttl_seconds
         self.session_reap_interval_seconds = session_reap_interval_seconds
+        self.memory_evict_fraction = memory_evict_fraction
+        self.memory_resume_fraction = memory_resume_fraction
+        self._admission_paused = False
 
         self._sessions: Dict[str, TerminalSession | None] = {}
         self._session_last_activity: Dict[str, float] = {}
@@ -242,6 +353,8 @@ class TerminalEnvironmentServer:
                 "status": "ok",
                 "active": len(self._sessions),
                 "capacity": self.n_envs,
+                "memory_fraction": _memory_fraction(),
+                "admission_paused": self._admission_paused,
                 "contamination_events": self.contamination_events,
                 "contamination_closes_sampled": self.contamination_closes_sampled,
                 "contamination_contaminated_sampled": self.contamination_contaminated_sampled,
@@ -302,13 +415,52 @@ class TerminalEnvironmentServer:
             logger.warning("reaping terminal session %s after %.0fs ttl", session_id, self.session_ttl_seconds)
             self._close_session_background(session)
 
+    async def _evict_memory_pressure_sessions(self) -> None:
+        if self.memory_evict_fraction <= 0:
+            return
+        memory = _cgroup_memory()
+        fraction = None if memory is None else memory[0] / memory[1]
+        evicted: list[tuple[str, TerminalSession]] = []
+        active_count = 0
+        async with self._lock:
+            active_ids = sorted(
+                [session_id for session_id, session in self._sessions.items() if session is not None],
+                key=lambda session_id: self._session_last_activity.get(session_id, 0.0),
+            )
+            active_count = len(active_ids)
+            evict_ids, paused = _memory_eviction_decision(
+                fraction,
+                active_ids,
+                self._admission_paused,
+                self.memory_evict_fraction,
+                self.memory_resume_fraction,
+            )
+            self._admission_paused = paused
+            for session_id in evict_ids:
+                session = self._sessions.pop(session_id, None)
+                self._session_last_activity.pop(session_id, None)
+                if session is not None:
+                    evicted.append((session_id, session))
+
+        if not evicted:
+            return
+        stat_snapshot = _memory_stat_snapshot()
+        for session_id, session in evicted:
+            logger.warning(
+                "evicting terminal session %s for memory pressure: memory_fraction=%.3f "
+                "threshold=%.3f active=%d memory.stat consumer=terminal-memory-evictor %s",
+                session_id, fraction if fraction is not None else -1.0, self.memory_evict_fraction, active_count, stat_snapshot,
+            )
+            self._close_session_background(session)
+
     async def _reaper_loop(self, app: web.Application) -> None:
         while True:
             await asyncio.sleep(self.session_reap_interval_seconds)
             await self._reap_expired_sessions()
+            await self._evict_memory_pressure_sessions()
 
     async def _start_reaper(self, app: web.Application) -> None:
-        if self.session_ttl_seconds <= 0:
+        if self.session_ttl_seconds <= 0 and self.memory_evict_fraction <= 0:
             return
         app["terminal_session_reaper"] = asyncio.create_task(self._reaper_loop(app))
 
@@ -327,6 +479,8 @@ class TerminalEnvironmentServer:
         task = body["task_data"]
 
         async with self._lock:
+            if self._admission_paused:
+                return web.json_response({"error": "memory pressure"}, status=503)
             if len(self._sessions) >= self.n_envs:
                 return web.json_response({"error": "capacity reached"}, status=503)
             session_id = str(uuid.uuid4())
@@ -393,6 +547,16 @@ class TerminalEnvironmentServer:
         result = await self._run(session.exec, body["command"])
         return web.json_response(result)
 
+    async def replay(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        session_id = body["session_id"]
+        session = self._get(session_id)
+        result = await self._run(session.replay, body["commands"])
+        async with self._lock:
+            if self._sessions.get(session_id) is session:
+                self._session_last_activity[session_id] = time.monotonic()
+        return web.json_response(result)
+
     async def finish(self, request: web.Request) -> web.Response:
         body = await request.json()
         session_id = body["session_id"]
@@ -445,6 +609,7 @@ class TerminalEnvironmentServer:
                 web.get("/health", self.health),
                 web.post("/start_task", self.start_task),
                 web.post("/step", self.step),
+                web.post("/replay", self.replay),
                 web.post("/finish", self.finish),
                 web.post("/close", self.close),
             ]

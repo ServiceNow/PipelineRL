@@ -46,6 +46,8 @@ terminal:
   rollout_timeout: 2700      # hard cap per rollout, seconds (64 turns with a longer compile-friendly command_timeout tail)
   env_call_timeout: 300      # per HTTP call to the env server (/step, /finish)
   env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
+  session_resurrection: false # replay completed commands on another env after mid-rollout connection loss
+  max_resurrections: 1       # per rollout; default keeps at most one replay recovery attempt
   capacity_retry_sleep: 2.0  # wait instead of failing when all env slots are busy
   max_format_retries: 3      # malformed tool-call retries; separate from max_turns action budget
   # Optional event rewards. Keep format_error_reward null: a constant event
@@ -140,6 +142,10 @@ environments:
     # clear far sooner than the old one-hour TTL.
     session_ttl_seconds: 2800.0
     session_reap_interval_seconds: 60.0
+    # Fleet-level memory pressure valve. Disabled by default; when enabled, the
+    # server pauses admissions and evicts oldest active sessions before cgroup OOM.
+    memory_evict_fraction: 0.0
+    memory_resume_fraction: 0.75
 
 environment_key: terminal
 

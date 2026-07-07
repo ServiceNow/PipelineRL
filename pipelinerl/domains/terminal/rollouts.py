@@ -48,6 +48,8 @@ _FORMAT_ERROR_MESSAGE = (
     "Brief reasoning is allowed, but do not use markdown."
 )
 _FINISH_STDOUT_TAIL_CHARS = 2000
+_COMMAND_AUDIT_MAX_CHARS = 2000
+_COMMAND_TRUNCATION_SUFFIX = "...[truncated]"
 
 
 def _terminal_audit_base(problem: dict) -> dict:
@@ -67,6 +69,11 @@ def _terminal_audit_base(problem: dict) -> dict:
         "build_ok": True,
         "init_ok": True,
         "submitted": False,
+        "commands": [],
+        "command_errors": [],
+        "resurrected": False,
+        "resurrection_turn": None,
+        "resurrection_divergence": False,
         "format_retry_exceeded": False,
         "context_exhausted": False,
         "contamination_result": None,
@@ -87,6 +94,15 @@ def _contamination_audit(value) -> dict | None:
 
 def _finish_stdout_tail(output: str) -> str:
     return output[-_FINISH_STDOUT_TAIL_CHARS:]
+
+
+def _cap_commands(commands: list[str]) -> list[str]:
+    return [
+        command[:_COMMAND_AUDIT_MAX_CHARS] + _COMMAND_TRUNCATION_SUFFIX
+        if len(command) > _COMMAND_AUDIT_MAX_CHARS
+        else command
+        for command in commands
+    ]
 
 
 SYSTEM_PROMPT = (
@@ -158,6 +174,18 @@ class TerminalAction:
     has_prose: bool = False
 
 
+@dataclass(frozen=True)
+class _SessionHandle:
+    url: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class _ResurrectionResult:
+    handle: _SessionHandle
+    replay_successes: list[bool]
+
+
 def _failed_result(
     problem: dict,
     start_time: float,
@@ -205,7 +233,7 @@ async def _post(session: aiohttp.ClientSession, url: str, payload: dict, timeout
     async with session.post(url, json=payload, timeout=timeout) as resp:
         if resp.status != 200:
             text = await resp.text()
-            if resp.status == 503 and "capacity reached" in text:
+            if resp.status == 503 and ("capacity reached" in text or "memory pressure" in text):
                 raise EnvironmentCapacityError(f"{url} -> HTTP {resp.status}: {text}")
             raise RuntimeError(f"{url} -> HTTP {resp.status}: {text}")
         return await resp.json()
@@ -315,6 +343,13 @@ def _stamp_training_text_model_version(training_text: TrainingText, llm_call: LL
         training_text.metadata["model_version"] = llm_call.model_version
 
 
+def stamp_turn_mean_logprob(training_text: TrainingText, llm_call: LLMCall) -> None:
+    if not llm_call.logprobs:
+        return
+    mean_logprob = sum(lp.logprob for lp in llm_call.logprobs) / len(llm_call.logprobs)
+    training_text.metadata["turn_mean_logprob"] = mean_logprob
+
+
 def stamp_event_credit(training_texts: List[TrainingText], errors: List[bool]) -> None:
     """Stamp per-turn command-error flags for event-credit advantage shaping.
 
@@ -335,6 +370,70 @@ def stamp_event_credit(training_texts: List[TrainingText], errors: List[bool]) -
 # endpoint can be hit by every concurrent rollout every loop iteration.
 _START_WARN_WINDOW = 60.0
 _last_start_warn: dict[str, float] = {}
+_RESURRECT_EXCEPTIONS = (aiohttp.ClientConnectionError, asyncio.TimeoutError)
+
+
+async def _close_handle(session: aiohttp.ClientSession, handle: _SessionHandle) -> None:
+    try:
+        await _post(session, f"{handle.url}/close", {"session_id": handle.session_id}, 30)
+    except Exception:
+        logger.warning("failed to close session %s on %s", handle.session_id, handle.url)
+
+
+async def _resurrect(
+    handle: _SessionHandle,
+    problem: dict,
+    executed_commands: list[str],
+    candidate_urls: list[str] | None,
+    session: aiohttp.ClientSession,
+    tcfg: DictConfig,
+) -> _ResurrectionResult | None:
+    urls = list(candidate_urls or [handle.url])
+    other_urls = [url for url in urls if url != handle.url]
+    random.shuffle(other_urls)
+    attempts = other_urls + [handle.url]
+    start_timeout = getattr(tcfg, "env_start_timeout", 900)
+    call_timeout = getattr(tcfg, "env_call_timeout", 300)
+
+    for url in attempts:
+        new_handle = None
+        try:
+            start_timeout_cfg = aiohttp.ClientTimeout(total=start_timeout, connect=10)
+            start = await _post(session, f"{url}/start_task", {"task_data": problem}, start_timeout_cfg)
+        except (EnvironmentCapacityError, aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            continue
+        except Exception:
+            logger.warning("resurrection start_task failed for %s on %s", problem.get("task_id"), url, exc_info=True)
+            continue
+
+        session_id = start.get("session_id")
+        if session_id:
+            new_handle = _SessionHandle(url=url, session_id=session_id)
+        if not session_id or not start.get("started") or not start.get("init_ok"):
+            if new_handle is not None:
+                await _close_handle(session, new_handle)
+            return None
+
+        try:
+            replay = await _post(
+                session,
+                f"{url}/replay",
+                {"session_id": session_id, "commands": list(executed_commands)},
+                call_timeout,
+            )
+        except Exception:
+            logger.warning("resurrection replay failed for %s on %s", problem.get("task_id"), url, exc_info=True)
+            await _close_handle(session, new_handle)
+            return None
+
+        if replay.get("abort_kind") is not None or int(replay.get("n_executed", 0)) != len(executed_commands):
+            await _close_handle(session, new_handle)
+            return None
+        return _ResurrectionResult(
+            handle=new_handle,
+            replay_successes=[bool(value) for value in replay.get("successes", [])],
+        )
+    return None
 
 
 async def generate_terminal_rollout(
@@ -365,8 +464,20 @@ async def generate_terminal_rollout(
         saw_healthy = False
         for url in urls:
             try:
+                execute_kwargs = {}
+                if bool(getattr(tcfg, "session_resurrection", False)):
+                    execute_kwargs["candidate_env_urls"] = urls
                 return await asyncio.wait_for(
-                    _execute_rollout(cfg, llm, problem, session, start_time, url, model_version_provider),
+                    _execute_rollout(
+                        cfg,
+                        llm,
+                        problem,
+                        session,
+                        start_time,
+                        url,
+                        model_version_provider,
+                        **execute_kwargs,
+                    ),
                     timeout=max(1.0, deadline - time.time()),
                 )
             except EnvironmentConnectionError:
@@ -416,6 +527,7 @@ async def _execute_rollout(
     start_time: float,
     env_url: str,
     model_version_provider: Callable[[], int | None] | None = None,
+    candidate_env_urls: list[str] | None = None,
 ) -> RolloutResult:
     tcfg = cfg.terminal
     call_timeout = getattr(tcfg, "env_call_timeout", 300)
@@ -425,7 +537,7 @@ async def _execute_rollout(
     # session_id, the finally block must close it even on an early failed rollout.
     start_timeout = getattr(tcfg, "env_start_timeout", 900)
 
-    session_id = None
+    handle: _SessionHandle | None = None
     try:
         try:
             start_timeout_cfg = aiohttp.ClientTimeout(total=start_timeout, connect=10)
@@ -437,6 +549,8 @@ async def _execute_rollout(
                 _last_start_warn[env_url] = now
             raise EnvironmentConnectionError(str(e)) from e
         session_id = start.get("session_id")
+        if session_id:
+            handle = _SessionHandle(url=env_url, session_id=session_id)
         if not session_id or not start.get("started") or not start.get("init_ok"):
             logger.warning("task %s not runnable (start=%s), dropping", problem.get("task_id"), start)
             audit.update(
@@ -469,6 +583,7 @@ async def _execute_rollout(
         # One flag per llm_calls entry: did this turn's command error? (submit
         # turns never execute, so they are clean by definition)
         command_errors: List[bool] = []
+        executed_commands: list[str] = []
         disk_aborted = False
         timeout_aborted = False
         rss_aborted = False
@@ -479,6 +594,34 @@ async def _execute_rollout(
         verifier_ran = False
         submitted = False
         context_exhausted = False
+        session_resurrection = bool(getattr(tcfg, "session_resurrection", False))
+        max_resurrections = int(getattr(tcfg, "max_resurrections", 1))
+        resurrection_count = 0
+        resurrected = False
+        resurrection_turn = None
+        resurrection_divergence = False
+
+        async def _try_resurrect() -> bool:
+            nonlocal handle, resurrection_count, resurrected, resurrection_turn, resurrection_divergence
+            if (
+                not session_resurrection
+                or handle is None
+                or not executed_commands
+                or resurrection_count >= max_resurrections
+            ):
+                return False
+            result = await _resurrect(handle, problem, executed_commands, candidate_env_urls, session, tcfg)
+            if result is None:
+                return False
+            expected_successes = [not error for error in command_errors]
+            if result.replay_successes != expected_successes:
+                resurrection_divergence = True
+            if resurrection_turn is None:
+                resurrection_turn = len(executed_commands)
+            resurrected = True
+            resurrection_count += 1
+            handle = result.handle
+            return True
         # Context budget: vLLM rejects the request outright (400) when prompt +
         # max_tokens exceeds max_model_len, which failed the whole rollout once the
         # multi-turn history grew past that line. Predict it with the same tokenizer
@@ -531,10 +674,29 @@ async def _execute_rollout(
             assert action.command is not None
             if _is_submit_command(action.command):
                 submitted = True
+                executed_commands.append(action.command)
                 command_errors.append(False)
                 break
 
-            obs = await _post(session, f"{env_url}/step", {"session_id": session_id, "command": action.command}, call_timeout)
+            assert handle is not None
+            try:
+                obs = await _post(
+                    session,
+                    f"{handle.url}/step",
+                    {"session_id": handle.session_id, "command": action.command},
+                    call_timeout,
+                )
+            except _RESURRECT_EXCEPTIONS:
+                if not await _try_resurrect():
+                    raise
+                assert handle is not None
+                obs = await _post(
+                    session,
+                    f"{handle.url}/step",
+                    {"session_id": handle.session_id, "command": action.command},
+                    call_timeout,
+                )
+            executed_commands.append(action.command)
             command_errors.append(not bool(obs.get("success", True)))
             messages.append({"role": "tool", "tool_call_id": action.tool_call_id or "call_0", "content": obs["output"]})
             step_abort_kind = obs.get("abort_kind")
@@ -552,7 +714,14 @@ async def _execute_rollout(
             total_tests = 0
         else:
             verifier_ran = True
-            verifier = await _post(session, f"{env_url}/finish", {"session_id": session_id}, call_timeout)
+            assert handle is not None
+            try:
+                verifier = await _post(session, f"{handle.url}/finish", {"session_id": handle.session_id}, call_timeout)
+            except _RESURRECT_EXCEPTIONS:
+                if not await _try_resurrect():
+                    raise
+                assert handle is not None
+                verifier = await _post(session, f"{handle.url}/finish", {"session_id": handle.session_id}, call_timeout)
             verifier_pass = bool(verifier["passed"])
             passed_tests = int(verifier.get("passed_tests", 0))
             total_tests = int(verifier.get("total_tests", 0))
@@ -566,11 +735,8 @@ async def _execute_rollout(
             timeout_aborted = timeout_aborted or finish_abort_kind == "timeout"
             rss_aborted = rss_aborted or finish_abort_kind == "rss"
     finally:
-        if session_id:
-            try:
-                await _post(session, f"{env_url}/close", {"session_id": session_id}, 30)
-            except Exception:
-                logger.warning("failed to close session %s on %s", session_id, env_url)
+        if handle is not None:
+            await _close_handle(session, handle)
 
     # Graded reward (opt-in): map the pytest pass fraction onto [reward_fail,
     # reward_pass] so partially-correct rollouts give within-group variance and
@@ -618,6 +784,11 @@ async def _execute_rollout(
             "abort_kind": abort_kind,
             "abort_phase": abort_phase,
             "submitted": submitted,
+            "commands": _cap_commands(executed_commands),
+            "command_errors": list(command_errors),
+            "resurrected": resurrected,
+            "resurrection_turn": resurrection_turn,
+            "resurrection_divergence": resurrection_divergence,
             "format_retry_exceeded": max_format_retries_exceeded,
             "context_exhausted": context_exhausted,
             "contamination_result": contamination_result,
@@ -640,6 +811,7 @@ async def _execute_rollout(
         training_texts = make_training_texts_from_llm_calls(llm, llm_calls, reward=reward)
         for training_text, llm_call in zip(training_texts, llm_calls):
             _stamp_training_text_model_version(training_text, llm_call)
+            stamp_turn_mean_logprob(training_text, llm_call)
         stamp_event_credit(training_texts, command_errors)
     else:
         training_texts = []
@@ -664,6 +836,8 @@ async def _execute_rollout(
                 continue
             training_text.reward = reward if max_format_retries_exceeded or not is_format_error else format_error_reward
             _stamp_training_text_model_version(training_text, llm_call)
+            if not is_format_error:
+                stamp_turn_mean_logprob(training_text, llm_call)
             training_texts.append(training_text)
             if is_format_error:
                 text_event_errors.append(True)

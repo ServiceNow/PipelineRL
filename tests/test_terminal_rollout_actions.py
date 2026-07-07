@@ -317,6 +317,32 @@ def test_no_submit_penalty_applies_only_to_clean_max_turn_exit(monkeypatch):
     assert submitted_result.metrics.submitted
 
 
+def test_audit_records_per_turn_command_errors(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [
+            _llm_call(content="run", tool_calls=[_tool_call(arguments={"command": "make test"})]),
+            _llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})]),
+        ],
+        step_response={"output": "failed", "success": False, "abort_kind": None},
+    )
+
+    result = asyncio.run(
+        _execute_rollout(
+            _terminal_cfg(max_turns=2),
+            object(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+
+    assert result.audit["commands"] == ["make test", _SUBMIT_COMMAND]
+    assert result.audit["command_errors"] == [True, False]
+    assert result.audit["n_command_errors"] == 1
+
+
 def test_timeout_abort_breaks_loop_and_sets_metric(monkeypatch):
     _patch_rollout_fakes(
         monkeypatch,

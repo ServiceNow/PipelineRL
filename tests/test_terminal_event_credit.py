@@ -1,7 +1,10 @@
+import copy
+
+import pandas as pd
 import pytest
 
 from pipelinerl.domains.terminal.rollouts import stamp_event_credit
-from pipelinerl.finetune.rl import RLConfig, populate_rl_data
+from pipelinerl.finetune.rl import RLConfig, _shuffle_event_errors_by_rollout, populate_rl_data
 from pipelinerl.rollouts import TrainingText
 
 
@@ -51,8 +54,30 @@ def _make_entry(
     }
 
 
-def _config(coef: float) -> RLConfig:
-    return RLConfig(rollout_level_loo=True, divide_advantage_by_std=False, event_credit_coef=coef)
+def _config(coef: float, *, shuffle: bool = False) -> RLConfig:
+    return RLConfig(
+        rollout_level_loo=True,
+        divide_advantage_by_std=False,
+        event_credit_coef=coef,
+        event_credit_shuffle=shuffle,
+    )
+
+
+def _shuffle_fixture() -> list[dict]:
+    return [
+        _make_entry(
+            rollout_index=0, step_index=0, reward=1.0, event_error=0.0, rollout_error_mean=1 / 3
+        ),
+        _make_entry(
+            rollout_index=0, step_index=1, reward=1.0, event_error=1.0, rollout_error_mean=1 / 3
+        ),
+        _make_entry(
+            rollout_index=0, step_index=2, reward=1.0, event_error=0.0, rollout_error_mean=1 / 3
+        ),
+        _make_entry(
+            rollout_index=1, step_index=0, reward=0.0, event_error=0.0, rollout_error_mean=0.0
+        ),
+    ]
 
 
 def test_event_credit_redistributes_within_rollout() -> None:
@@ -105,3 +130,63 @@ def test_event_credit_without_metadata_columns_is_noop() -> None:
     processed = populate_rl_data(dataset=dataset, eos_token_id=999, config=_config(0.5))
     assert processed[0]["advantages"] == [1.0] * 4
     assert processed[1]["advantages"] == [-1.0] * 4
+
+
+def test_event_credit_shuffle_preserves_per_rollout_event_multisets() -> None:
+    df_stats = pd.DataFrame(
+        [
+            {"group_id": "g0", "rollout_index": 0, "event_error": 0.0},
+            {"group_id": "g0", "rollout_index": 0, "event_error": 1.0},
+            {"group_id": "g0", "rollout_index": 0, "event_error": 0.0},
+            {"group_id": "g0", "rollout_index": 1, "event_error": 1.0},
+            {"group_id": "g0", "rollout_index": 1, "event_error": 1.0},
+            {"group_id": "g0", "rollout_index": 1, "event_error": 0.0},
+        ]
+    )
+
+    shuffled = _shuffle_event_errors_by_rollout(df_stats)
+    with_shuffled = df_stats.assign(shuffled_event_error=shuffled)
+
+    for _key, rollout in with_shuffled.groupby(["group_id", "rollout_index"], sort=False):
+        assert sorted(rollout["shuffled_event_error"].tolist()) == sorted(rollout["event_error"].tolist())
+
+
+def test_event_credit_shuffle_changes_asymmetric_advantages() -> None:
+    unshuffled = populate_rl_data(
+        dataset=copy.deepcopy(_shuffle_fixture()), eos_token_id=999, config=_config(0.5)
+    )
+    shuffled = populate_rl_data(
+        dataset=copy.deepcopy(_shuffle_fixture()), eos_token_id=999, config=_config(0.5, shuffle=True)
+    )
+
+    unshuffled_advantages = [entry["advantages"][0] for entry in unshuffled[:3]]
+    shuffled_advantages = [entry["advantages"][0] for entry in shuffled[:3]]
+
+    assert shuffled_advantages != unshuffled_advantages
+    assert sorted(shuffled_advantages) == pytest.approx(sorted(unshuffled_advantages))
+    assert shuffled_advantages == pytest.approx([2 / 3, 7 / 6, 7 / 6])
+
+
+def test_event_credit_shuffle_is_deterministic() -> None:
+    first = populate_rl_data(
+        dataset=copy.deepcopy(_shuffle_fixture()), eos_token_id=999, config=_config(0.5, shuffle=True)
+    )
+    second = populate_rl_data(
+        dataset=copy.deepcopy(_shuffle_fixture()), eos_token_id=999, config=_config(0.5, shuffle=True)
+    )
+
+    assert [entry["advantages"] for entry in first] == [entry["advantages"] for entry in second]
+
+
+def test_event_credit_shuffle_requires_coef() -> None:
+    with pytest.raises(ValueError, match="event_credit_shuffle"):
+        RLConfig(rollout_level_loo=True, event_credit_shuffle=True)
+
+
+def test_event_credit_shuffle_false_matches_unshuffled_behavior() -> None:
+    processed = populate_rl_data(
+        dataset=copy.deepcopy(_shuffle_fixture()), eos_token_id=999, config=_config(0.5)
+    )
+
+    assert [entry["event_error"] for entry in processed] == [0.0, 1.0, 0.0, 0.0]
+    assert [entry["advantages"][0] for entry in processed] == pytest.approx([7 / 6, 2 / 3, 7 / 6, -1.0])
