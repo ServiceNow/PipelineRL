@@ -263,6 +263,7 @@ class RayActorLoop:
         self.init_stats()
 
         self._is_running = False
+        self._paused_new_groups = False
         self._expected_groups = -1
         self._retry_requests: deque[RolloutRequest] = deque()
         self._group_rollouts: dict[int, list[RolloutResult]] = {}
@@ -311,6 +312,18 @@ class RayActorLoop:
     @property
     def is_running(self) -> bool:
         return self._is_running
+
+    def pause_new_groups(self) -> None:
+        if not self.is_training or self._paused_new_groups:
+            return
+        self._paused_new_groups = True
+        logger.info("%s: pausing new group scheduling (in-flight groups will drain)", self.scheduler_name)
+
+    def resume_new_groups(self) -> None:
+        if not self.is_training or not self._paused_new_groups:
+            return
+        self._paused_new_groups = False
+        logger.info("%s: resuming new group scheduling", self.scheduler_name)
 
     def init_stats(self) -> None:
         self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -580,6 +593,8 @@ class RayActorLoop:
                 if trainer_finished:
                     break
                 if self._group_rollout_index == self.attempts:
+                    if self._paused_new_groups:
+                        break
                     blocked_by_lag = self.total_submitted_groups >= self.can_submit_before_update
                     if blocked_by_lag:
                         break
@@ -939,6 +954,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                             llms=eval_llms,
                         )
                         eval_loop.start()
+                        train_loop.pause_new_groups()
 
                 try:
                     if eval_loop is not None:
@@ -951,6 +967,7 @@ def run_actor_loop_ray(cfg: DictConfig) -> None:
                                 eval_manager = None
                             if resource_policy == "elastic_train":
                                 train_manager.set_target_workers(train_workers)
+                            train_loop.resume_new_groups()
                     if not draining_final_eval:
                         train_status = train_loop.step()
                 except Exception as exc:
