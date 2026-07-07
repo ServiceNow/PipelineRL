@@ -26,12 +26,16 @@ class TrainerState:
         self.use_fast_llm = use_fast_llm
         self.weight_broadcast = weight_broadcast
         self.propagated_weight_version: int | None = None if weight_broadcast else 0
+        # Raw trainer step behind the current weights (for logging only); the version stamped onto
+        # rollouts is `propagated_weight_version`, which is the document count when Fast-LLM sends it.
+        self.completed_step: int | None = None if weight_broadcast else 0
         self.samples_processed: int | None = None if weight_broadcast else 0
         self.training_done: bool = False
         self._training_done_event = threading.Event()
 
     def debug_mode_init(self):
         self.propagated_weight_version = 0
+        self.completed_step = 0
         self.samples_processed = 0
         self.training_done = True
         self._training_done_event.set()
@@ -105,10 +109,18 @@ class TrainerState:
 
                         event_type = event.get("type")
                         step = event.get("step")
+                        # Fast-LLM sends the cumulative document count as the model version (to align
+                        # staleness with DeepSpeed's document clock); fall back to `step` for older
+                        # trainers that only send the step.
+                        document_count = event.get("document_count")
+                        version = document_count if document_count is not None else step
 
                         if event_type == "weights_ready":
-                            logger.info(f"Received weights_ready event: step={step}")
-                            self.propagated_weight_version = step
+                            logger.info(
+                                f"Received weights_ready event: step={step}, document_count={document_count}"
+                            )
+                            self.propagated_weight_version = version
+                            self.completed_step = step
                         elif event_type == "training_finished":
                             logger.info("Received training_finished event")
                             self.training_done = True
