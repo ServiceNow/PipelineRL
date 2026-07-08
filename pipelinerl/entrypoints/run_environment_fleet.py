@@ -10,13 +10,14 @@ The GPU training job reaches these servers over account-scoped internal-dns
 (``http://dns-<EAI_ACCOUNT_ID>-<name>:<port>``); see the external env placement in
 ``conf`` and ``WorldMap._place_environments`` (which skips external specs).
 
-Fleet processes rename their Linux ``comm`` field so in-guest broad kills like
-``killall python3`` do not match the host supervisor/server processes under
-proot's shared pid view. Accepted residual channels: ``pkill -f python`` can
-still match cmdline, ``killall bash`` can hit the job wrapper bash or tmp
-script shell plus other sessions' in-guest runners, and ``kill -9 -1`` remains
-process-wide; command filtering is intentionally out of scope because valid task
-solutions include process kills.
+Fleet processes rename their Linux ``comm`` field and rewrite argv0 so in-guest
+broad kills like ``killall python3`` or ``pkill -f python`` do not match the host
+supervisor/server processes under proot's shared pid view. Accepted residual
+channels: ``killall bash`` can still hit the platform-owned wrapper bash/tmp
+script shell (the ``bash -c`` fleet command execs the single Python command, so
+there is no inner bash to rename) plus other sessions' in-guest runners, and
+``kill -9 -1`` remains process-wide; command filtering is intentionally out of
+scope because valid task solutions include process kills.
 
 Run with hydra overrides selecting the env config and the port range, e.g.::
 
@@ -59,8 +60,35 @@ def _set_process_comm(name: str) -> None:
         logger.warning("failed to set process comm to %s: %s", name, e)
 
 
+def _process_argv0_pointer() -> tuple[int, int]:
+    libc = ctypes.CDLL(None, use_errno=True)
+    pointer = ctypes.c_void_p.in_dll(libc, "program_invocation_name").value
+    if not pointer:
+        raise RuntimeError("program_invocation_name is null")
+    current = ctypes.string_at(pointer)
+    if not current:
+        raise RuntimeError("argv0 is empty")
+    return pointer, len(current)
+
+
+def _set_process_argv(name: str) -> None:
+    try:
+        encoded = name.encode("utf-8")
+        pointer, current_len = _process_argv0_pointer()
+        replacement = encoded[:current_len]
+        ctypes.memset(pointer, 0, current_len)
+        ctypes.memmove(pointer, replacement, len(replacement))
+        with open("/proc/self/cmdline", "rb") as f:
+            cmdline = f.read().lower()
+        if b"python" in cmdline:
+            raise RuntimeError("/proc/self/cmdline still contains python")
+    except Exception as e:
+        logger.warning("failed to set process argv to %s: %s", name, e)
+
+
 def _serve(env_container: dict, port: int) -> None:
     _set_process_comm(_FLEET_SERVER_COMM)
+    _set_process_argv(_FLEET_SERVER_COMM)
     # Rebuild the server in the child process and block in web.run_app.
     server = hydra.utils.instantiate(OmegaConf.create(env_container))
     server.launch(port=port)
@@ -75,6 +103,7 @@ def _spawn(env_container: dict, port: int) -> mp.Process:
 @hydra.main(config_path="../../conf", config_name="base", version_base="1.3.2")
 def hydra_entrypoint(cfg: DictConfig):
     _set_process_comm(_FLEET_SUPERVISOR_COMM)
+    _set_process_argv(_FLEET_SUPERVISOR_COMM)
     with better_crashing("environment_fleet"):
         logger.info("env fleet git sha: %s", fleet_manager.git_sha())
         fleet = getattr(cfg, "fleet", None)
