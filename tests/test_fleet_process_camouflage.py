@@ -4,13 +4,15 @@ from pathlib import Path
 from pipelinerl.entrypoints import run_environment_fleet
 
 
-def test_spawned_serve_child_sets_process_comm(monkeypatch, tmp_path):
+def test_spawned_serve_child_sets_process_comm_and_argv(monkeypatch, tmp_path):
     comm_path = tmp_path / "comm"
+    cmdline_path = tmp_path / "cmdline"
 
     def fake_instantiate(_cfg):
         class FakeServer:
             def launch(self, port):
                 comm_path.write_text(Path("/proc/self/comm").read_text().strip())
+                cmdline_path.write_bytes(Path("/proc/self/cmdline").read_bytes())
 
         return FakeServer()
 
@@ -24,6 +26,9 @@ def test_spawned_serve_child_sets_process_comm(monkeypatch, tmp_path):
 
     assert proc.exitcode == 0
     assert comm_path.read_text().strip() == "plenv-serve"
+    cmdline = cmdline_path.read_bytes()
+    assert cmdline.split(b"\0", 1)[0].startswith(b"plenv-")
+    assert b"python" not in cmdline.lower()
 
 
 def test_set_process_comm_failure_logs_and_continues(monkeypatch, caplog):
@@ -37,3 +42,16 @@ def test_set_process_comm_failure_logs_and_continues(monkeypatch, caplog):
 
     assert "failed to set process comm to plenv-fleet" in caplog.text
     assert "ctypes unavailable" in caplog.text
+
+
+def test_set_process_argv_failure_logs_and_continues(monkeypatch, caplog):
+    def fail_pointer():
+        raise RuntimeError("argv unavailable")
+
+    monkeypatch.setattr(run_environment_fleet, "_process_argv0_pointer", fail_pointer)
+
+    with caplog.at_level(logging.WARNING):
+        run_environment_fleet._set_process_argv("plenv-fleet")
+
+    assert "failed to set process argv to plenv-fleet" in caplog.text
+    assert "argv unavailable" in caplog.text
