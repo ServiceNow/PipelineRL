@@ -1,0 +1,81 @@
+defaults:
+  - terminal
+  - _self_
+
+# Full-infra run (2026-07-08). Every credit-instruments piece active plus the
+# throughput/staleness fixes from the async-pipeline diagnosis: the collapses are
+# env-LATENCY driven (long multi-turn rollouts on a slow/churny proot env ->
+# per-rollout staleness ~10-15 steps + trainer starvation -> stale off-policy
+# updates -> clip saturation -> format collapse), NOT reward fidelity (2.3 replay
+# fidelity 1.0) and NOT the credit mechanism (both arms collapsed).
+#
+# Changes vs terminal:
+#   - event_credit_coef 0.5 (real placement; the shuffle control proved placement
+#     matters, and event-credit delayed ec02's collapse ~100 steps).
+#   - session_resurrection true: a fleet death replays the completed command prefix
+#     onto another env instead of discarding the whole long rollout -> less lost
+#     work, shorter effective rollout lifetime, lower staleness.
+#   - max_turns 64->40: successes submit at ~29 median; truncating the long failing
+#     tail shortens rollout lifetime (less staleness AND less starvation, rollouts
+#     finish sooner) and removes -1-avalanche fuel for format collapse.
+#   - memory eviction on (0.9/0.75): graceful admission-pause + oldest-session evict
+#     before cgroup OOM. Insurance; unlikely to fire at the 512GiB cgroup limit.
+#   - fleet camouflage (comm + argv0), /replay, configurable context_margin(512),
+#     commands+command_errors audit: inherited from the merge, always on.
+#   - max_lag stays null: the trainer is data-starved (queue depth 1, wait growing);
+#     a hard staleness cap would starve it more. Staleness is cut at the source
+#     (resurrection + camouflage + shorter rollouts), not by dropping data.
+# NOT changed yet (deliberately): entropy_bonus stays 0, kl_coef stays 0 (no ref
+# model / extra GPU), accum stays 128. Isolate the infra+throughput effect first.
+#
+# Fleet DNS terminal-envs-fi01-{a..d} + fleet_name_prefix keep this launcher clear
+# of any other run's fleets. The environments list is restated wholesale because
+# OmegaConf replaces lists on merge; identical to terminal.yaml apart from the
+# fi01 hosts and memory_evict_fraction.
+
+finetune:
+  rl:
+    event_credit_coef: 0.5
+
+terminal:
+  max_turns: 40
+  session_resurrection: true
+
+orchestrator:
+  fleet_name_prefix: terminal_envs_fi01
+
+environments:
+  - key: terminal
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    placement: external
+    external_hosts:
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi01-a
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi01-b
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi01-c
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi01-d
+    external_start_port: 7777
+    external_count: 12
+    _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
+    bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
+    cache_dir: ${output_dir}/env_cache
+    rootfs_retention_seconds: 600.0
+    n_envs: 1
+    host: "0.0.0.0"
+    proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
+    exec_mode: subprocess
+    nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
+    command_timeout: 180.0
+    verifier_timeout: 180.0
+    max_observation_chars: 4000
+    check_initial_state: true
+    max_session_disk_bytes: 966367641   # 0.9 GiB
+    session_delta_isolation: false
+    session_delta_max_bytes: 536870912   # 512 MiB
+    contamination_check: true
+    contamination_sample_every: 20
+    max_session_rss_bytes: 17179869184  # 16 GiB
+    session_ttl_seconds: 2800.0
+    session_reap_interval_seconds: 60.0
+    memory_evict_fraction: 0.9
+    memory_resume_fraction: 0.75
