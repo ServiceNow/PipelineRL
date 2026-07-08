@@ -18,6 +18,9 @@ class TrainingText(BaseModel):
         n_predicted (int): The number of predicted tokens in the text.
         reward (float): The reward associated with the training instance. Defaults to 0.0.
         logprobs (List[float]): A list of log probabilities of the completion tokens from the assistant model.
+        token_versions (List[int]): Per-completion-token model version (parallel to logprobs). Captures
+            weight versions that change mid-generation when the server swaps weights in flight. Empty
+            when the server does not report per-token versions.
         ref_logprobs (List[float]): A list of reference log probabilities of the completion tokens from the reference model.
         input_ids (List[int]): A list of token IDs representing the input text, including the prompt and the predicted tokens.
         labels (List[int]): A list of token IDs that are used as labels for training. The last n_predicted tokens are set to MASKED_TOKEN_ID.
@@ -35,6 +38,7 @@ class TrainingText(BaseModel):
     n_predicted: int
     reward: float = 0.0
     logprobs: List[float] = Field(default_factory=list)
+    token_versions: List[int] = Field(default_factory=list)
     ref_logprobs: List[float] = Field(default_factory=list)
     input_ids: List[int] = Field(default_factory=list)
     labels: List[int] = Field(default_factory=list)

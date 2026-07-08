@@ -355,6 +355,9 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
     - loss_masking_spans: list of (start, end) spans where loss IS computed (completion only)
     - advantage: scalar float (per-rollout GRPO advantage)
     - old_log_probabilities: list of floats, full sequence length (zeros for prompt tokens)
+    - reward: scalar float (raw per-rollout reward, a diagnostic; distinct from advantage)
+    - model_version: list of ints, full sequence length (per-token weight version; prompt positions
+      padded and masked out on the trainer side)
     """
     input_ids = entry["input_ids"]
     tokens = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
@@ -390,12 +393,32 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
         if advantages:
             result["advantage"] = float(advantages[0])
 
+    # reward: raw (un-normalized) reward, a scalar per rollout (distinct from the group-relative
+    # advantage). Fast-LLM logs it as a diagnostic; it does not affect the loss.
+    if "reward" in entry:
+        result["reward"] = float(entry["reward"])
+
     # old_log_probabilities: full sequence length, zeros for prompt tokens
     # (prepare_rl_fields pads with zeros on the left to match len(input_ids))
     if "old_logprobs" in entry:
         old_logprobs = entry["old_logprobs"]
         old_logprobs = old_logprobs.tolist() if hasattr(old_logprobs, "tolist") else list(old_logprobs)
         result["old_log_probabilities"] = [float(x) for x in old_logprobs]
+
+    # model_version: full sequence length per-token weight version. When the server reports a
+    # per-completion-token version (`token_versions`, in-flight weight swaps), left-pad it to the full
+    # sequence like old_log_probabilities; prompt positions are masked out on the trainer side, so the
+    # pad value is inert. Otherwise fall back to the per-rollout scalar broadcast across all tokens.
+    scalar_version = entry.get("model_version")
+    token_versions = entry.get("token_versions")
+    if token_versions is not None and hasattr(token_versions, "tolist"):
+        token_versions = token_versions.tolist()
+    if token_versions:
+        pad_value = int(scalar_version) if scalar_version is not None else int(token_versions[0])
+        pad = [pad_value] * (len(tokens) - len(token_versions))
+        result["model_version"] = pad + [int(x) for x in token_versions]
+    elif scalar_version is not None:
+        result["model_version"] = [int(scalar_version)] * len(tokens)
 
     return result
 

@@ -67,6 +67,19 @@ LLMOutput: TypeAlias = litellm.utils.Message
 class TokenLogprob(BaseModel):
     logprob: float
     token_id: int
+    version: int | None = None
+
+
+def parse_token_id_and_version(token: str) -> tuple[int, int | None]:
+    """Parse a `--return-tokens-as-token-ids` token string into (token_id, version).
+
+    The server emits ``token_id:<id>`` and, when it reports a per-token weight version,
+    ``token_id:<id>:v<version>``. The version suffix is optional.
+    """
+    parts = token.split(":")
+    if len(parts) >= 2 and parts[-1].startswith("v") and parts[-1][1:].isdigit():
+        return int(parts[-2]), int(parts[-1][1:])
+    return int(parts[-1]), None
 
 
 class LLMCall(BaseModel):
@@ -391,10 +404,12 @@ class TrainableLLM(LLM):
                 try:
                     # We assume that the server was launched with --return-tokens-as-token-ids
                     # and that the tokens are provided as: ['token_id:1271', 'token_id:1505', '
+                    token_id, version = parse_token_id_and_version(logprob["token"])
                     logprobs.append(
                         TokenLogprob(
-                            token_id=int(logprob["token"].split(":")[-1]),
+                            token_id=token_id,
                             logprob=logprob["logprob"],
+                            version=version,
                         )
                     )
                 except Exception as e:
