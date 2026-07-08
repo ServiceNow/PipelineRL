@@ -499,6 +499,52 @@ def test_context_exhausted_with_verdict_stays_scored(monkeypatch):
     assert result.audit["context_exhausted"]
 
 
+def test_context_budget_uses_configured_margin(monkeypatch):
+    class TinyBudgetLLM:
+        parameters = {"max_tokens": 16}
+        chat_template_kwargs = {}
+
+        def load_tokenizer(self):
+            self.tokenizer = SimpleNamespace(apply_chat_template=lambda *args, **kwargs: list(range(100)))
+
+    # Equal to max_model_len is allowed: 100 prompt + 16 generation + 83 margin.
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})])],
+    )
+    cfg = _terminal_cfg(max_turns=2, context_margin=83)
+    cfg.vllm_config = SimpleNamespace(vllm_kwargs={"max_model_len": 199})
+    result = asyncio.run(
+        _execute_rollout(
+            cfg,
+            TinyBudgetLLM(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+    assert not result.metrics.context_exhausted
+    assert result.metrics.submitted
+
+    # Raising only the configured margin by one trips the same boundary.
+    _patch_rollout_fakes(monkeypatch, [])
+    cfg = _terminal_cfg(no_submit_penalty=0.4, max_turns=2, context_margin=84)
+    cfg.vllm_config = SimpleNamespace(vllm_kwargs={"max_model_len": 199})
+    result = asyncio.run(
+        _execute_rollout(
+            cfg,
+            TinyBudgetLLM(),
+            {"task": "fix it", "task_id": "task-1"},
+            object(),
+            time.time(),
+            "http://env",
+        )
+    )
+    assert result.metrics.context_exhausted
+    assert result.metrics.n_turns == 0
+
+
 class DummySession:
     def __init__(self):
         self.closed = False

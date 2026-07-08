@@ -44,6 +44,9 @@ actor:
 terminal:
   max_turns: 64              # TMax paper setting; avg rollout is ~13 turns, so this restores headroom without making short tasks dominant
   rollout_timeout: 2700      # hard cap per rollout, seconds (64 turns with a longer compile-friendly command_timeout tail)
+  # Predicted-overflow guard tokens for prompt + max_new_tokens vs max_model_len;
+  # 64 was too tight, and a near-limit rollout overflowed by 65 tokens.
+  context_margin: 512
   env_call_timeout: 300      # per HTTP call to the env server (/step, /finish)
   env_start_timeout: 900     # /start_task only: covers the cold per-task NFS build
   session_resurrection: false # replay completed commands on another env after mid-rollout connection loss

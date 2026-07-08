@@ -629,7 +629,7 @@ async def _execute_rollout(
         vllm_kwargs = getattr(getattr(cfg, "vllm_config", None), "vllm_kwargs", None)
         max_model_len = int(vllm_kwargs.get("max_model_len") or 0) if vllm_kwargs is not None else 0
         max_new_tokens = int((getattr(llm, "parameters", None) or {}).get("max_tokens") or 0)
-        context_margin = 64
+        context_margin = int(getattr(tcfg, "context_margin", 512))
         if max_model_len and max_new_tokens:
             # The tokenizer is lazily loaded by llm_async_generate; the precheck
             # runs before the first generation and must load it itself.
