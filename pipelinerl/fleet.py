@@ -60,6 +60,7 @@ class FleetHandle:
     exp_dir: Path
     manifest_path: Path
     orchestrator: DictConfig
+    config_name: str
     endpoints: dict[str, FleetEndpoint]
     jobs: dict[str, FleetJob]
     restore_history: dict[str, list[float]] = field(default_factory=dict)
@@ -159,21 +160,27 @@ def write_fleet_spec(exp_dir: Path, orchestrator: DictConfig, endpoint: FleetEnd
     return path
 
 
-def fleet_command(exp_dir: Path, endpoint: FleetEndpoint) -> str:
+def fleet_command(exp_dir: Path, endpoint: FleetEndpoint, config_name: str) -> str:
     return (
         "python -m pipelinerl.entrypoints.run_environment_fleet "
-        "--config-name terminal --config-dir /home/toolkit/PipelineRL/conf "
+        f"--config-name {config_name} --config-dir /home/toolkit/PipelineRL/conf "
         f"output_dir={exp_dir / 'fleet' / f'env_fleet_{endpoint.suffix}'} "
         "+fleet.environment_key=terminal "
         f"+fleet.start_port={endpoint.start_port} +fleet.count={endpoint.count}"
     )
 
 
-def submit_command(orchestrator: DictConfig, yaml_path: Path, endpoint: FleetEndpoint, exp_dir: Path) -> list[str]:
+def submit_command(
+    orchestrator: DictConfig,
+    yaml_path: Path,
+    endpoint: FleetEndpoint,
+    exp_dir: Path,
+    config_name: str,
+) -> list[str]:
     return [
         "eai", "job", "new", "-f", str(yaml_path), "--account", str(orchestrator.account), "--non-preemptable", "--",
         "/opt/conda/bin/conda", "run", "-n", str(orchestrator.conda_env), "--no-capture-output", "bash", "-c",
-        fleet_command(exp_dir, endpoint),
+        fleet_command(exp_dir, endpoint, config_name),
     ]
 
 
@@ -258,6 +265,7 @@ def write_manifest(handle: FleetHandle, event: dict[str, Any] | None = None) -> 
         events.append(event)
     payload = {
         "git_sha": git_sha(),
+        "config_name": handle.config_name,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "fleets": [job.__dict__ for job in handle.jobs.values()],
         "events": events,
@@ -289,10 +297,11 @@ def submit_one(
     orchestrator: DictConfig,
     endpoint: FleetEndpoint,
     run_id: str,
+    config_name: str,
     runner: Runner = run_eai,
 ) -> FleetJob:
     yaml_path = write_fleet_spec(exp_dir, orchestrator, endpoint, run_id)
-    cmd = submit_command(orchestrator, yaml_path, endpoint, exp_dir)
+    cmd = submit_command(orchestrator, yaml_path, endpoint, exp_dir, config_name)
     result = runner(cmd)
     job_id = parse_job_id(result.stdout + "\n" + result.stderr)
     if job_id is None:
@@ -310,7 +319,13 @@ def submit_one(
     )
 
 
-def start_fleets(cfg: DictConfig, exp_dir: Path, runner: Runner = run_eai, dry_run: bool = False) -> FleetHandle | None:
+def start_fleets(
+    cfg: DictConfig,
+    exp_dir: Path,
+    config_name: str,
+    runner: Runner = run_eai,
+    dry_run: bool = False,
+) -> FleetHandle | None:
     if not should_manage_fleets(cfg):
         return None
     orchestrator = cfg.orchestrator
@@ -320,19 +335,20 @@ def start_fleets(cfg: DictConfig, exp_dir: Path, runner: Runner = run_eai, dry_r
     if dry_run:
         for endpoint in endpoints:
             yaml_path = write_fleet_spec(exp_dir, orchestrator, endpoint, run_id)
-            cmd = submit_command(orchestrator, yaml_path, endpoint, exp_dir)
+            cmd = submit_command(orchestrator, yaml_path, endpoint, exp_dir, config_name)
             logger.info("DRY_RUN fleet submit: %s", " ".join(cmd))
         return None
 
     kill_stale_fleets(orchestrator, runner)
     jobs = {
-        endpoint.suffix: submit_one(exp_dir, orchestrator, endpoint, run_id, runner)
+        endpoint.suffix: submit_one(exp_dir, orchestrator, endpoint, run_id, config_name, runner)
         for endpoint in endpoints
     }
     handle = FleetHandle(
         exp_dir=exp_dir,
         manifest_path=manifest_path(exp_dir),
         orchestrator=orchestrator,
+        config_name=config_name,
         endpoints={endpoint.suffix: endpoint for endpoint in endpoints},
         jobs=jobs,
         restores_per_hour=int(orchestrator.fleet_restores_per_hour),
@@ -362,7 +378,14 @@ def restore_fleet(handle: FleetHandle, suffix: str, runner: Runner = run_eai, no
     kill_ids(runner, ids, "fleet")
     wait_dead_by_filter(runner, name_filter, "fleet")
     run_id = str(int(time.time()))
-    job = submit_one(handle.exp_dir, handle.orchestrator, endpoint, run_id, runner)
+    job = submit_one(
+        handle.exp_dir,
+        handle.orchestrator,
+        endpoint,
+        run_id,
+        handle.config_name,
+        runner,
+    )
     handle.jobs[suffix] = job
     handle.restore_history.setdefault(suffix, []).append(now)
     handle.restore_limit_reported.discard(suffix)

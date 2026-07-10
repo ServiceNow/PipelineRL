@@ -76,6 +76,7 @@ def _handle(tmp_path, restore_history=None):
         exp_dir=tmp_path,
         manifest_path=tmp_path / "fleet" / "manifest.json",
         orchestrator=cfg.orchestrator,
+        config_name="terminal_full_infra",
         endpoints={endpoint.suffix: endpoint for endpoint in endpoints},
         jobs=jobs,
         restore_history=restore_history or {},
@@ -95,11 +96,18 @@ def test_fleet_spec_and_submit_command_shape(tmp_path):
     assert "resources: {cpu: 64, gpu: 0, mem: 512}" in text
 
     yaml_path = tmp_path / "fleet.yaml"
-    cmd = fleet.submit_command(cfg.orchestrator, yaml_path, endpoint, tmp_path)
+    cmd = fleet.submit_command(
+        cfg.orchestrator,
+        yaml_path,
+        endpoint,
+        tmp_path,
+        "terminal_full_infra",
+    )
     assert cmd[:4] == ["eai", "job", "new", "-f"]
     assert "--non-preemptable" in cmd
     assert cmd.index("--non-preemptable") < cmd.index("--")
     assert "output_dir=" + str(tmp_path / "fleet" / "env_fleet_a") in cmd[-1]
+    assert "--config-name terminal_full_infra" in cmd[-1]
 
 
 def test_stale_kill_uses_me_and_wait_dead_fail_closed():
@@ -137,6 +145,8 @@ def test_restore_bounding_appends_event_without_submit(monkeypatch, tmp_path):
     assert manifest["events"][-1]["kind"] == "restore"
     assert handle.jobs["a"].id == NEW_ID
     assert "a" not in handle.restore_limit_reported
+    submit = next(call for call in runner.calls if call[:3] == ["eai", "job", "new"])
+    assert "--config-name terminal_full_infra" in submit[-1]
 
 
 def test_teardown_kills_jobs_and_appends_manifest_event(monkeypatch, tmp_path):
@@ -162,6 +172,7 @@ def test_manifest_round_trip_and_event_append(monkeypatch, tmp_path):
 
     manifest = fleet.read_manifest(handle.manifest_path)
     assert manifest["git_sha"] == "sha"
+    assert manifest["config_name"] == "terminal_full_infra"
     assert [event["kind"] for event in manifest["events"]] == ["startup", "restore"]
     assert manifest["events"][1]["job_id"] == NEW_ID
 
@@ -172,9 +183,24 @@ def test_dry_run_writes_specs_without_eai_or_manifest(monkeypatch, tmp_path):
     def forbidden_runner(cmd):
         raise AssertionError(cmd)
 
-    handle = fleet.start_fleets(_cfg(), tmp_path, forbidden_runner, dry_run=True)
+    config_names = []
+    real_submit_command = fleet.submit_command
+
+    def record_submit_command(orchestrator, yaml_path, endpoint, exp_dir, config_name):
+        config_names.append(config_name)
+        return real_submit_command(orchestrator, yaml_path, endpoint, exp_dir, config_name)
+
+    monkeypatch.setattr(fleet, "submit_command", record_submit_command)
+    handle = fleet.start_fleets(
+        _cfg(),
+        tmp_path,
+        "terminal_full_infra",
+        runner=forbidden_runner,
+        dry_run=True,
+    )
 
     assert handle is None
+    assert config_names == ["terminal_full_infra", "terminal_full_infra"]
     assert (tmp_path / "fleet" / "env_fleet_a.yaml").exists()
     assert (tmp_path / "fleet" / "env_fleet_b.yaml").exists()
     assert not (tmp_path / "fleet" / "manifest.json").exists()

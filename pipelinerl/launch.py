@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, TextIO
 
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from pipelinerl import fleet
@@ -711,6 +712,7 @@ def main(cfg: DictConfig):
             fleet_handle = fleet.start_fleets(
                 cfg,
                 exp_dir,
+                config_name=HydraConfig.get().job.config_name,
                 dry_run=os.environ.get("DRY_RUN", "0") == "1",
             )
         if cfg.streams.backend == "redis":
