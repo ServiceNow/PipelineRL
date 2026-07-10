@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import logging
 import os
 import signal
@@ -422,15 +421,8 @@ class WorkerExtension:
 
 
 async def _pause_generation(engine: AsyncLLM) -> None:
-    """Pause generation without draining in-flight requests.
-
-    Adapts to the installed vLLM version at runtime: newer builds expose
-    pause_generation(mode=) while older ones use wait_for_inflight_requests=.
-    """
-    if 'mode' in inspect.signature(engine.pause_generation).parameters:
-        await engine.pause_generation(mode="keep", clear_cache=False)
-    else:
-        await engine.pause_generation(wait_for_inflight_requests=False, clear_cache=False)
+    """Pause generation, keeping in-flight requests, for an in-place weight update."""
+    await engine.pause_generation(mode="keep", clear_cache=False)
 
 
 class EngineManager:
