@@ -303,6 +303,7 @@ class TerminalEnvironmentServer:
         contamination_check: bool = True,
         contamination_sample_every: int = 1,
         exec_mode: str = "pty",
+        clean_verifier: bool = False,
         session_ttl_seconds: float = 3600.0,
         session_reap_interval_seconds: float = 60.0,
         memory_evict_fraction: float = 0.0,
@@ -325,6 +326,7 @@ class TerminalEnvironmentServer:
         self.session_delta_isolation = session_delta_isolation
         self.contamination_check = contamination_check
         self.contamination_sample_every = max(1, int(contamination_sample_every))
+        self.clean_verifier = clean_verifier
         self.exec_mode = exec_mode
         self.session_ttl_seconds = session_ttl_seconds
         self.session_reap_interval_seconds = session_reap_interval_seconds
@@ -501,6 +503,7 @@ class TerminalEnvironmentServer:
             max_session_rss_bytes=self.max_session_rss_bytes,
             session_delta_max_bytes=self.session_delta_max_bytes,
             session_delta_isolation=self.session_delta_isolation,
+            clean_verifier=self.clean_verifier,
             contamination_check=self.contamination_check,
             exec_mode=self.exec_mode,
         )

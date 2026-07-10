@@ -115,6 +115,8 @@ environments:
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
     command_timeout: 180.0
     verifier_timeout: 180.0
+    # P1a one-shot verifier harness; deploy only at a Rafa-approved run boundary.
+    clean_verifier: false
     max_observation_chars: 4000
     check_initial_state: true
     # Hard cap on each session's node-local writable scratch. One runaway agent

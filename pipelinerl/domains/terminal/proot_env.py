@@ -109,14 +109,21 @@ def _bash_precheck_error(command: str) -> Optional[str]:
     return None
 
 
-def _proot_argv(proot_bin: str, rootfs: Path, cwd: str, binds: Sequence[str] = ()) -> List[str]:
+def _proot_argv(
+    proot_bin: str,
+    rootfs: Path,
+    cwd: str,
+    binds: Sequence[str] = (),
+    container_env: Optional[Sequence[str]] = None,
+) -> List[str]:
     argv = [proot_bin, "-0", "-r", str(rootfs)]
     for b in _BIND_PATHS:
         if Path(b).exists():
             argv += ["-b", b]
     for spec in binds:
         argv += ["-b", spec]
-    argv += ["-w", cwd, "--kill-on-exit", "/usr/bin/env", "-i", *_CONTAINER_ENV]
+    env = _CONTAINER_ENV if container_env is None else container_env
+    argv += ["-w", cwd, "--kill-on-exit", "/usr/bin/env", "-i", *env]
     return argv
 
 
@@ -366,6 +373,7 @@ class ProotTerminalEnvironment:
         session_delta_isolation: bool = True,
         contamination_check: bool = True,
         exec_mode: str = "pty",
+        clean_verifier: bool = False,
     ):
         self.base_rootfs = Path(base_rootfs).resolve()
         self.proot_bin = proot_bin
@@ -392,6 +400,7 @@ class ProotTerminalEnvironment:
         self.contamination_check = contamination_check
         if exec_mode not in {"pty", "subprocess"}:
             raise ValueError(f"invalid exec_mode {exec_mode!r}")
+        self.clean_verifier = clean_verifier
         self.exec_mode = exec_mode
 
         self._owns_work_dir = work_dir is None
@@ -432,6 +441,9 @@ class ProotTerminalEnvironment:
         self._disk_exceeded = threading.Event()
         self._abort_reason: Optional[str] = None
         self._abort_lock = threading.Lock()
+        self._verifier_integrity: Optional[str] = None
+        self._verifier_source_sha256: Optional[str] = None
+        self._verifier_integrity_override: Optional[str] = None
         self._disk_monitor_thread: Optional[threading.Thread] = None
         self._marker = f"__CMD_DONE__{uuid.uuid4().hex}__"
 
@@ -1060,7 +1072,79 @@ exit "$__pl_rc"
     # ------------------------------------------------------------------
     # verifiers
     # ------------------------------------------------------------------
+    def _run_clean_pytest(self, test_text: str, name: str) -> Tuple[bool, str, Optional[str]]:
+        if self._disk_exceeded.is_set():
+            reason = self._abort_reason or "local resource limit exceeded"
+            self._verifier_integrity = "error"
+            self._verifier_integrity_override = "drop"
+            return False, f"clean verifier skipped: session aborted ({reason})", "verifier_integrity"
+        nonce = uuid.uuid4().hex
+        host_dir = self.work_dir / f".verifier_{nonce}"
+        guest_dir = f"/tmp/.pl_verifier_{nonce}"
+        test_path = host_dir / name
+        expected_sha256 = hashlib.sha256(test_text.encode("utf-8")).hexdigest()
+        self._verifier_source_sha256 = expected_sha256
+        self._verifier_integrity = None
+        self._verifier_integrity_override = None
+        try:
+            host_dir.mkdir(mode=0o700, parents=True)
+            test_path.write_text(test_text, encoding="utf-8")
+            test_path.chmod(0o600)
+            command = (
+                f"cd /home/user && /usr/bin/python3 -I -m pytest -q --no-header --noconftest "
+                f"{shlex.quote(f'{guest_dir}/{name}')}"
+            )
+            argv = _proot_argv(
+                self.proot_bin,
+                self.rootfs,
+                "/home/user",
+                binds=[*self._session_binds(), f"{host_dir}:{guest_dir}"],
+                container_env=[*_CONTAINER_ENV, "PYTHONNOUSERSITE=1"],
+            ) + ["/bin/bash", "-c", command]
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                output, _ = proc.communicate(timeout=self.verifier_timeout)
+            except subprocess.TimeoutExpired as exc:
+                _terminate_process_group(proc)
+                output = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+                self._verifier_integrity = "error"
+                self._verifier_integrity_override = "drop"
+                return False, f"verifier timed out after {self.verifier_timeout:.0f}s:\n{output}", "verifier_integrity"
+            actual_sha256 = hashlib.sha256(test_path.read_bytes()).hexdigest()
+            if actual_sha256 != expected_sha256:
+                self._verifier_integrity = "tampered"
+                self._verifier_integrity_override = "fail"
+                return False, "verifier source changed during isolated verification", None
+            self._verifier_integrity = "ok"
+            return proc.returncode == 0, output or "", None
+        except Exception as exc:
+            logger.exception("clean verifier failed")
+            self._verifier_integrity = "error"
+            self._verifier_integrity_override = "drop"
+            return False, f"clean verifier infrastructure error: {exc}", "verifier_integrity"
+        finally:
+            _force_rmtree(host_dir)
+
+    def verifier_metadata(self) -> dict[str, str]:
+        if not self.clean_verifier:
+            return {}
+        result = {
+            "verifier_integrity": self._verifier_integrity or "error",
+            "verifier_source_sha256": self._verifier_source_sha256 or "",
+        }
+        if self._verifier_integrity_override is not None:
+            result["verifier_integrity_override"] = self._verifier_integrity_override
+        return result
+
     def _run_pytest(self, test_text: str, name: str) -> Tuple[bool, str, Optional[str]]:
+        if self.clean_verifier:
+            return self._run_clean_pytest(test_text, name)
         if self._disk_exceeded.is_set():
             reason = self._abort_reason or "local resource limit exceeded"
             return False, f"session aborted: {reason}", self._abort_reason

@@ -591,6 +591,9 @@ async def _execute_rollout(
         abort_phase = None
         finish_output = ""
         contamination_result = None
+        verifier_integrity = None
+        verifier_source_sha256 = None
+        verifier_integrity_override = None
         verifier_ran = False
         submitted = False
         context_exhausted = False
@@ -724,6 +727,11 @@ async def _execute_rollout(
                 verifier = await _post(session, f"{handle.url}/finish", {"session_id": handle.session_id}, call_timeout)
             verifier_pass = bool(verifier["passed"])
             passed_tests = int(verifier.get("passed_tests", 0))
+            verifier_integrity = verifier.get("verifier_integrity")
+            verifier_source_sha256 = verifier.get("verifier_source_sha256")
+            verifier_integrity_override = verifier.get("verifier_integrity_override")
+            if verifier_integrity_override == "fail":
+                verifier_pass = False
             total_tests = int(verifier.get("total_tests", 0))
             finish_output = str(verifier.get("output", ""))
             contamination_result = _contamination_audit(verifier.get("contamination_result"))
@@ -767,9 +775,13 @@ async def _execute_rollout(
         and not max_format_retries_exceeded
     ):
         reward = max(tcfg.reward_fail, reward - no_submit_penalty)
+    if verifier_integrity_override == "fail":
+        reward = tcfg.reward_fail
 
     drop_reason = None
-    if verifier_ran and abort_phase == "finish":
+    if verifier_integrity_override == "drop":
+        drop_reason = "verifier_integrity_error"
+    elif verifier_ran and abort_phase == "finish":
         drop_reason = "finish_abort"
     elif verifier_ran and total_tests == 0:
         drop_reason = "no_tests_resolved"
@@ -799,6 +811,14 @@ async def _execute_rollout(
             "command_error_rate": sum(command_errors) / max(len(command_errors), 1),
         }
     )
+    if verifier_integrity is not None:
+        audit.update(
+            {
+                "verifier_integrity": verifier_integrity,
+                "verifier_source_sha256": verifier_source_sha256,
+                "verifier_integrity_override": verifier_integrity_override,
+            }
+        )
 
     format_error_texts_dropped = 0
     if drop_reason is not None:

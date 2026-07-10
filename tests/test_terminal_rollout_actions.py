@@ -946,3 +946,55 @@ def test_context_budget_with_real_tokenizer_ends_rollout_cleanly(monkeypatch):
     assert result.metrics.n_turns == 2
 
 
+
+
+def _p1a_finish_response(**overrides):
+    response = {
+        "passed": False,
+        "passed_tests": 0,
+        "total_tests": 0,
+        "abort_kind": "verifier_integrity",
+        "output": "clean verifier failed",
+        "verifier_integrity": "error",
+        "verifier_source_sha256": "abc",
+        "verifier_integrity_override": "drop",
+    }
+    response.update(overrides)
+    return response
+
+
+def test_env_integrity_fail_override_forces_reward_fail(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})])],
+        finish_response=_p1a_finish_response(
+            passed=True,
+            passed_tests=1,
+            total_tests=1,
+            abort_kind=None,
+            output="pytest output",
+            verifier_integrity="tampered",
+            verifier_integrity_override="fail",
+        ),
+    )
+    result = asyncio.run(
+        _execute_rollout(_terminal_cfg(), object(), {"task": "fix it", "task_id": "task-1"}, object(), time.time(), "http://env")
+    )
+    assert result.metrics.reward == -1.0
+    assert not result.metrics.verifier_pass
+    assert result.training_texts[0].reward == -1.0
+    assert result.audit["verifier_integrity_override"] == "fail"
+
+
+def test_env_integrity_drop_override_drops_training_text(monkeypatch):
+    _patch_rollout_fakes(
+        monkeypatch,
+        [_llm_call(content="submit", tool_calls=[_tool_call(arguments={"command": _SUBMIT_COMMAND})])],
+        finish_response=_p1a_finish_response(),
+    )
+    result = asyncio.run(
+        _execute_rollout(_terminal_cfg(), object(), {"task": "fix it", "task_id": "task-1"}, object(), time.time(), "http://env")
+    )
+    assert result.training_texts == []
+    assert result.audit["dropped"]
+    assert result.audit["drop_reason"] == "verifier_integrity_error"

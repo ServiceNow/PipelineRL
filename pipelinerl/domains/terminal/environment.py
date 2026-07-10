@@ -43,6 +43,7 @@ class TerminalSession:
         session_delta_isolation: bool = True,
         contamination_check: bool = True,
         exec_mode: str = "pty",
+        clean_verifier: bool = False,
     ):
         self.bases_dir = bases_dir
         self.proot_bin = proot_bin
@@ -58,6 +59,7 @@ class TerminalSession:
         self.session_delta_max_bytes = session_delta_max_bytes
         self.session_delta_isolation = session_delta_isolation
         self.contamination_check = contamination_check
+        self.clean_verifier = clean_verifier
         self.exec_mode = exec_mode
 
         self._env: Optional[ProotTerminalEnvironment] = None
@@ -94,6 +96,7 @@ class TerminalSession:
             max_session_rss_bytes=self.max_session_rss_bytes,
             session_delta_max_bytes=self.session_delta_max_bytes,
             session_delta_isolation=self.session_delta_isolation,
+            clean_verifier=self.clean_verifier,
             contamination_check=self.contamination_check,
             exec_mode=self.exec_mode,
         )
@@ -149,13 +152,15 @@ class TerminalSession:
         if env is None:
             raise RuntimeError("session not started")
         passed, output, passed_tests, total_tests, abort_kind = env.run_final_tests(self._final_test)
-        return {
+        result = {
             "passed": passed,
             "output": truncate(output, self.max_observation_chars),
             "abort_kind": abort_kind,
             "passed_tests": passed_tests,
             "total_tests": total_tests,
         }
+        result.update(env.verifier_metadata())
+        return result
 
     def sample_contamination(self) -> tuple[int, int]:
         if self._env is None:
