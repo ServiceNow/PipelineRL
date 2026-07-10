@@ -1,12 +1,12 @@
 #!/bin/bash
 # Full-infra run: --config-name terminal_full_infra (event_credit 0.5, session
 # resurrection on, max_turns 40, memory eviction on, camouflage/replay/context-margin
-# inherited; fi02 fleet DNS). Same 4x8 H100 recipe as the event-credit launchers.
-# _02: clean verifier on (P1a), the single variable vs full_infra_01.
+# inherited; fi03 fleet DNS). Same 4x8 H100 recipe as the event-credit launchers.
+# _03: clean verifier and the intended fleet-side settings now propagate end to end.
 
 TIMESTAMP=$(date +%s)
 OUTPUT_DIR_BASE=/mnt/llmd/results/exps/rafa/terminal
-JOB_NAME=${JOB_NAME:-terminal_qwen35_9b_full_infra_02}
+JOB_NAME=${JOB_NAME:-terminal_qwen35_9b_full_infra_03}
 CONDA_ENV=${CONDA_ENV:-pipeline-rl}
 CONDA_EXE=${CONDA_EXE:-/opt/conda/bin/conda}
 

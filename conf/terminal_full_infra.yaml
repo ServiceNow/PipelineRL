@@ -28,10 +28,10 @@ defaults:
 # NOT changed yet (deliberately): entropy_bonus stays 0, kl_coef stays 0 (no ref
 # model / extra GPU), accum stays 128. Isolate the infra+throughput effect first.
 #
-# Fleet DNS terminal-envs-fi02-{a..d} + fleet_name_prefix keep this launcher clear
+# Fleet DNS terminal-envs-fi03-{a..d} + fleet_name_prefix keep this launcher clear
 # of any other run's fleets. The environments list is restated wholesale because
 # OmegaConf replaces lists on merge; identical to terminal.yaml apart from the
-# fi02 hosts and memory_evict_fraction.
+# fi03 hosts, clean_verifier, and memory_evict_fraction.
 
 finetune:
   rl:
@@ -42,7 +42,7 @@ terminal:
   session_resurrection: true
 
 orchestrator:
-  fleet_name_prefix: terminal_envs_fi02
+  fleet_name_prefix: terminal_envs_fi03
 
 environments:
   - key: terminal
@@ -50,10 +50,10 @@ environments:
     replicas_per_actor: ${world.env_replicas_per_actor}
     placement: external
     external_hosts:
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi02-a
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi02-b
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi02-c
-      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi02-d
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi03-a
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi03-b
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi03-c
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-fi03-d
     external_start_port: 7777
     external_count: 12
     _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
@@ -64,8 +64,7 @@ environments:
     host: "0.0.0.0"
     proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
     exec_mode: subprocess
-    # P1a one-shot clean verifier, parity-validated 2026-07-09. The single
-    # variable vs full_infra_01.
+    # P1a one-shot clean verifier, parity-validated 2026-07-09.
     clean_verifier: true
     nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
     command_timeout: 180.0
