@@ -118,6 +118,14 @@ def _get_quantization_args(cfg: DictConfig) -> list[str]:
             f"vllm_config.quantization='{quantization}' is incompatible with PipelineRL's "
             "required FP32 lm_head inference path"
         )
+    # The bf16_last_layer_fp32 method forces a bf16 body with an fp32 lm_head, which overrides
+    # --dtype. When inference runs at a non-bf16 dtype (e.g. to match a fp16/fp32 trainer),
+    # skip it so vLLM honors the requested dtype; the fp32 lm_head is dropped, which is
+    # consistent since the whole model then runs at that dtype.
+    vllm_kwargs = cfg.vllm_config.get("vllm_kwargs") or {}
+    dtype = vllm_kwargs.get("dtype")
+    if dtype not in (None, "auto", "bf16", "bfloat16"):
+        return []
     return ["--quantization", "bf16_last_layer_fp32"]
 
 
