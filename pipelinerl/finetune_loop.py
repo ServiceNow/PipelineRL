@@ -390,7 +390,9 @@ def run_finetuning_loop(
 
     logger.info(f"Using {'packed' if args.seq_packing else 'unpacked'} collate function")
 
-    optimizer = get_optimizer(args.optim, model, args.learning_rate, args.weight_decay)
+    optimizer = get_optimizer(
+        args.optim, model, args.learning_rate, args.weight_decay, betas=(args.adam_beta1, args.adam_beta2)
+    )
     lr_scheduler = get_scheduler(
         args.lr_scheduler_type,
         optimizer,

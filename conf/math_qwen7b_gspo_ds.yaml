@@ -2,9 +2,8 @@
 #   python -m pipelinerl.launch --config-name math_qwen7b_gspo_ds
 # Node count is set by the launcher (env WORLD_SIZE), not here.
 #
-# Same recipe as the 0.5B DeepSpeed config — this inherits it and overrides only the model
-# and the ZeRO stage. Adam betas: same env caveat as the 0.5B DS config (set ADAM_BETA1 /
-# ADAM_BETA2 in the job env for parity).
+# Same recipe as the 0.5B DeepSpeed config — this inherits it (including the config-driven
+# sqrt-rule Adam betas) and overrides only the model and the ZeRO stage.
 
 defaults:
   - math_qwen05_gspo_ds
