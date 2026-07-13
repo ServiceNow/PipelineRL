@@ -5,7 +5,8 @@
 #   python -m pipelinerl.launch --config-name math_qwen05_gspo
 # Rationale for each value is in Fast-LLM docs/recipes/reinforcement-learning.md.
 #
-# Precision/engine variants layer on top (see math_qwen05_gspo_fp16 / _ds).
+# Precision/engine variants (fp16/fp32-matched, DeepSpeed) can layer on top of this config
+# by overriding compute_dtype + the vLLM dtype, or use_fast_llm + deepspeed_config.
 
 defaults:
   - math
