@@ -1,0 +1,18 @@
+# Qwen2.5-7B GSPO — DeepSpeed trainer backend (bf16 reference arm). Multi-node launch:
+#   python -m pipelinerl.launch --config-name math_qwen7b_gspo_ds
+# Node count is set by the launcher (env WORLD_SIZE), not here.
+#
+# Same recipe as the 0.5B DeepSpeed config — this inherits it and overrides only the model
+# and the ZeRO stage. Adam betas: same env caveat as the 0.5B DS config (set ADAM_BETA1 /
+# ADAM_BETA2 in the job env for parity).
+
+defaults:
+  - math_qwen05_gspo_ds
+  - _self_
+
+# Public HF id; override with a local snapshot path on the CLI if it can't be resolved.
+model_path: Qwen/Qwen2.5-7B
+
+# ZeRO-3 shards parameters + optimizer state + gradients across the multi-GPU trainer
+# (memory is tight for the 7B trainer; see the zero_stage note in the FL config).
+deepspeed_config: deepspeed_stage3_bf16
