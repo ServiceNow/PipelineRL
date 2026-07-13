@@ -1,0 +1,89 @@
+# Qwen2.5-0.5B GSPO reinforcement-learning experiment (bf16, Fast-LLM trainer).
+#
+# Single committed source of truth for the run's hyperparameters. The launch script
+# supplies only environment (model/output paths, W&B identity, caches) and calls:
+#   python -m pipelinerl.launch --config-name math_qwen05_gspo
+# Rationale for each value is in Fast-LLM docs/recipes/reinforcement-learning.md.
+#
+# Precision/engine variants layer on top (see math_qwen05_gspo_fp16 / _ds).
+
+defaults:
+  - math
+  - _self_
+
+seed: 43
+# Public HF id; override with a local snapshot path on the CLI if it can't be resolved.
+model_path: Qwen/Qwen2.5-0.5B
+
+# Topology: 7 vLLM actors + 1 Fast-LLM trainer on 8 GPUs (trainer FSDP size 1).
+world:
+  actor_fraction: 7
+  preprocessor_fraction: 0
+  finetune_fraction: 1
+
+llm:
+  parameters:
+    max_tokens: 7000
+    temperature: 0.7
+test_llm:
+  parameters:
+    max_tokens: 7000
+    temperature: 0.7
+
+actor:
+  llm_max_rollouts: 128
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 10000
+
+finetune:
+  seq_length: 10000
+  max_train_steps: 2000
+  save_checkpoint_steps: 100
+  attempts: 8
+  rl:
+    policy_loss: gspo
+    epsilon_low: 0.003
+    epsilon_high: 0.004
+    group_normalization: false
+    filter_zero_advantage_groups: true
+
+# Fast-LLM trainer config (written to a YAML at launch and passed to fast-llm).
+fast_llm:
+  training:
+    train_iters: 2000
+    checkpoint:
+      interval: 100
+  data:
+    micro_batch_size: 10000  # tokens; must be >= the packed sequence length
+  schedule:
+    depth_first_micro_batches: 48
+    docs_per_step: 256       # accumulate to this many rollouts, then step
+  optimizer:
+    learning_rate:
+      base: 5.0e-7
+      warmup_iterations: 0
+      decay_style: constant
+      decay_iterations: 400
+    beta_1: 0.974004         # sqrt-rule, effective-batch multiplier m=4
+    beta_2: 0.999750
+    gradient_norm_clipping: 76.8   # 0.3 * docs_per_step
+  model:
+    distributed:
+      sequence_data_parallel: 1
+      timeout: 3600
+    multi_stage:
+      zero_stage: 1          # trainer is a single GPU (FSDP size 1) -> stage is a no-op
+    base_model:
+      head:
+        fp32_lm_head: true
+        losses:
+          # Overrides PipelineRL's base `grpo` loss entry in place; `type: gspo` selects
+          # GSPO. (The dict key stays `grpo`, so diagnostic metrics carry a `grpo_` prefix.)
+          grpo:
+            type: gspo
+            epsilon_low: 0.003
+            epsilon_high: 0.004
+            logits_scale_factor: 1.4285714   # = 1 / sampling temperature (0.7)
+            metrics: basic                    # log staleness/clip/ratio/KL/advantage/reward
