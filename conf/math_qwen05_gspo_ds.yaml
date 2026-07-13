@@ -1,0 +1,25 @@
+# Qwen2.5-0.5B GSPO — DeepSpeed trainer backend (bf16 reference arm). Launch:
+#   python -m pipelinerl.launch --config-name math_qwen05_gspo_ds
+# Shared recipe (sampling/topology/preprocessor/orchestration) comes from _common.
+#
+# NOTE: Adam betas are NOT config-drivable in PipelineRL (no betas field); the cluster
+# optim.py reads ADAM_BETA1 / ADAM_BETA2 from env. For parity with the Fast-LLM arm's
+# sqrt-rule betas, set ADAM_BETA1=0.974004 ADAM_BETA2=0.999750 in the job env, or this arm
+# falls back to PipelineRL's AdamW defaults. (Making betas config-driven is a small upstream
+# change, not yet done.)
+
+defaults:
+  - math_qwen05_gspo_common
+  - _self_
+
+use_fast_llm: false
+deepspeed_config: deepspeed_stage1_bf16   # single-GPU trainer -> stage is a no-op; 1 is minimal
+
+# DeepSpeed trainer optimizer/schedule (the Fast-LLM arm uses fast_llm.optimizer.* instead).
+finetune:
+  learning_rate: 5.0e-7
+  num_warmup_steps: 0
+  lr_scheduler_type: constant
+  gradient_accumulation_passes: 256   # = rollouts (documents) per optimizer step
+  rl:
+    policy_loss: gspo   # selects the DeepSpeed GSPO loss; its clip = finetune.rl.epsilon_* (from _common)
