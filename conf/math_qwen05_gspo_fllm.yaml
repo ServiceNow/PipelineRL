@@ -18,6 +18,8 @@ fast_llm:
     train_iters: ${finetune.max_train_steps}
     checkpoint:
       interval: ${finetune.save_checkpoint_steps}
+    export:
+      interval: 1000         # periodic HF-format export cadence
   data:
     micro_batch_size: ${finetune.seq_length}   # tokens; one packed sequence per micro-batch
   schedule:
@@ -34,6 +36,7 @@ fast_llm:
     gradient_norm_clipping: 76.8   # 0.3 * docs_per_step
   model:
     distributed:
+      compute_dtype: bfloat16   # bf16 arm; fp16/fp32 variants override this + the vLLM dtype
       sequence_data_parallel: 1
       timeout: 3600
     multi_stage:
@@ -42,9 +45,9 @@ fast_llm:
       head:
         fp32_lm_head: true
         losses:
-          # Overrides PipelineRL's base `grpo` entry in place; `type: gspo` selects GSPO.
-          # (Dict key stays `grpo`, so diagnostic metrics carry a `grpo_` prefix.)
-          grpo:
+          # base no longer defines a default loss, so this is the only one. The dict key is
+          # also the metric-name prefix (gspo_*).
+          gspo:
             type: gspo
             epsilon_low: ${finetune.rl.epsilon_low}    # shared clip (defined in _common)
             epsilon_high: ${finetune.rl.epsilon_high}
