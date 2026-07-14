@@ -1,4 +1,3 @@
-import inspect
 import json
 import logging
 import random
@@ -8,18 +7,9 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import datasets
 import hydra
-from datasets import load_dataset as _hf_load_dataset
 from omegaconf import DictConfig
 
-# `trust_remote_code` was removed from datasets>=4. Wrap load_dataset so callers can keep
-# passing it: forward it when the installed version accepts it, drop it otherwise.
-_LOAD_DATASET_ACCEPTS_TRUST_REMOTE_CODE = "trust_remote_code" in inspect.signature(_hf_load_dataset).parameters
-
-
-def load_dataset(*args, **kwargs):
-    if not _LOAD_DATASET_ACCEPTS_TRUST_REMOTE_CODE:
-        kwargs.pop("trust_remote_code", None)
-    return _hf_load_dataset(*args, **kwargs)
+from pipelinerl.domains._datasets_compat import load_dataset
 
 """
 math_verify expects the following LaTeX format for the gold answer (with $ or \\boxed).

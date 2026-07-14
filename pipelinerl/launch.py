@@ -124,7 +124,7 @@ def _get_quantization_args(cfg: DictConfig) -> list[str]:
     # consistent since the whole model then runs at that dtype.
     vllm_kwargs = cfg.vllm_config.get("vllm_kwargs") or {}
     dtype = vllm_kwargs.get("dtype")
-    if dtype not in (None, "auto", "bf16", "bfloat16"):
+    if dtype not in (None, "auto", "bfloat16"):
         return []
     return ["--quantization", "bf16_last_layer_fp32"]
 
@@ -346,7 +346,7 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
     if cfg.use_fsdp and cfg.use_deepspeed:
         raise ValueError("Cannot use both FSDP and DeepSpeed")
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "accelerate.commands.launch",
     ]
