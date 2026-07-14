@@ -647,7 +647,7 @@ def run_preprocessing_loop(
                             write_micro_batch_slices(trainer_id, data_writer, batch_encoding, cfg.finetune.seq_parallel)
                             published_samples += len(batch_entries)
                             samples_per_trainer[trainer_id] += len(batch_entries)
-                            logger.debug(f"[inner loop] Packed microbatch with {len(batch_entries)} samples for trainer {trainer_id}")
+                            logger.debug(f"[inner loop] Unpacked microbatch with {len(batch_entries)} samples for trainer {trainer_id}")
                             trainer_id = (trainer_id + cfg.finetune.seq_parallel) % num_trainers
 
                         batch_done = published_samples == batch_boundary and trainer_id == 0

@@ -117,7 +117,7 @@ def _get_quantization_args(cfg: DictConfig) -> list[str]:
     # consistent since the whole model then runs at that dtype.
     vllm_kwargs = cfg.vllm_config.get("vllm_kwargs") or {}
     dtype = vllm_kwargs.get("dtype")
-    if dtype not in (None, "auto", "bf16", "bfloat16"):
+    if dtype not in (None, "auto", "bfloat16"):
         return []
     return ["--quantization", "bf16_last_layer_fp32"]
 
