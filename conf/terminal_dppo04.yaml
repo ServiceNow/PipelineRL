@@ -1,0 +1,60 @@
+defaults:
+  - terminal_dppo03
+  - _self_
+
+# dppo_04 (2026-07-14). Single THROUGHPUT delta bundle vs dppo_03, no training/
+# preprocess/loss change: actor.llm_max_rollouts 2->4 (vLLM max-num-seqs follows it;
+# 51.35 GiB free KV = 24.89x theoretical concurrency, ample headroom) AND env
+# capacity 48->96 via eight dppo04 fleets x 12 slots. Actor admission (24 LLMs x 4
+# = 96) matches env slots exactly, same as dppo_03's 48/48. Never scale one side
+# alone. rollout_workers stays 8.
+#
+# The environments list is restated wholesale because OmegaConf replaces lists on
+# merge; identical to terminal_dppo03 apart from dppo04-{a..h} hosts.
+
+actor:
+  llm_max_rollouts: 4
+
+orchestrator:
+  fleet_name_prefix: terminal_envs_dppo04
+
+environments:
+  - key: terminal
+    mode: remote
+    replicas_per_actor: ${world.env_replicas_per_actor}
+    placement: external
+    external_hosts:
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-a
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-b
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-c
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-d
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-e
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-f
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-g
+      - dns-${oc.env:EAI_ACCOUNT_ID}-terminal-envs-dppo04-h
+    external_start_port: 7777
+    external_count: 12
+    _target_: pipelinerl.domains.terminal.environment_server.TerminalEnvironmentServer
+    bases_dir: ${oc.env:TERMINAL_BASES_DIR,/mnt/llmd/data/terminal_bases}
+    cache_dir: ${output_dir}/env_cache
+    rootfs_retention_seconds: 600.0
+    n_envs: 1
+    host: "0.0.0.0"
+    proot_bin: ${oc.env:PROOT_BIN,/mnt/llmd/data/terminal_bin/proot}
+    exec_mode: subprocess
+    clean_verifier: true
+    nameserver: ${oc.env:TERMINAL_NAMESERVER,10.150.0.10}
+    command_timeout: 180.0
+    verifier_timeout: 180.0
+    max_observation_chars: 4000
+    check_initial_state: true
+    max_session_disk_bytes: 966367641   # 0.9 GiB
+    session_delta_isolation: false
+    session_delta_max_bytes: 536870912   # 512 MiB
+    contamination_check: true
+    contamination_sample_every: 20
+    max_session_rss_bytes: 17179869184  # 16 GiB
+    session_ttl_seconds: 2800.0
+    session_reap_interval_seconds: 60.0
+    memory_evict_fraction: 0.9
+    memory_resume_fraction: 0.75
