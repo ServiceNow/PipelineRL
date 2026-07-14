@@ -109,6 +109,13 @@ def _aggregate_step_rl_metrics(rl_metrics: Dict[str, List], num_samples: int) ->
 
     metrics = aggregate_rl_stats(rl_metrics, num_samples)
     metrics.update(frozen_probe_metrics)
+    protected_tokens = metrics.get("rl/gspo_token_protected_tokens_sum")
+    response_tokens = metrics.get("rl/gspo_token_response_tokens_sum")
+    if protected_tokens is not None or response_tokens is not None:
+        assert protected_tokens is not None and response_tokens is not None
+        metrics["rl/gspo_token_protected_frac"] = (
+            protected_tokens / response_tokens if response_tokens > 0 else 0.0
+        )
     return metrics
 
 

@@ -48,7 +48,7 @@ class RLConfig(BaseModel):
     policy_loss: str = Field(
         default="ppo",
         description="Policy Loss to use for RL",
-        choices=["ppo", "reinforce", "gspo", "dppo"],
+        choices=["ppo", "reinforce", "gspo", "gspo_token", "dppo"],
     )
     use_advantages: bool = Field(
         default=True,
@@ -65,6 +65,16 @@ class RLConfig(BaseModel):
         gt=0.0,
         le=1.0,
         description="Binary-TV threshold for DPPO trust-region masking",
+    )
+    gspo_token_protect_confident: bool = Field(
+        default=False,
+        description="Do not apply negative-advantage policy gradients to confident tokens",
+    )
+    gspo_token_confidence_threshold: float = Field(
+        default=0.95,
+        gt=0.5,
+        le=1.0,
+        description="Minimum behavior-policy token probability protected by GSPO-token",
     )
     batch_size: int = Field(default=0, description="Batch size is required for normalization")
     reward_minus_kl_coef: float = Field(
@@ -152,6 +162,13 @@ class RLConfig(BaseModel):
 
     @model_validator(mode="after")
     def _event_credit_requires_rollout_level_loo(self):
+        if self.gspo_token_protect_confident and self.policy_loss != "gspo_token":
+            raise ValueError("gspo_token_protect_confident requires policy_loss='gspo_token'")
+        if self.policy_loss == "gspo_token" and self.relu_log_p_weights:
+            raise ValueError(
+                "relu_log_p_weights is unsupported with policy_loss='gspo_token': "
+                "GSPO-token uses raw advantages"
+            )
         if self.event_credit_shuffle and self.event_credit_coef <= 0:
             raise ValueError("event_credit_shuffle requires event_credit_coef > 0")
         if self.event_credit_coef > 0 and not self.rollout_level_loo:
@@ -481,11 +498,12 @@ def rl_step(
         num_sequences = masks.shape[0]
         segments = None
 
+    is_gspo_family = config.policy_loss in {"gspo", "gspo_token"}
     if config.multi_turn_credit:
         if not has_value_head:
             raise ValueError("multi_turn_credit requires a value head")
-        if config.policy_loss != "gspo":
-            raise ValueError("multi_turn_credit requires policy_loss='gspo'")
+        if not is_gspo_family:
+            raise ValueError("multi_turn_credit requires policy_loss='gspo' or 'gspo_token'")
         if segments is None:
             raise ValueError("multi_turn_credit requires packed sequences with segments")
 
@@ -494,8 +512,8 @@ def rl_step(
     if config.frozen_probe_credit != "off":
         if frozen_probe is None:
             raise ValueError("frozen_probe_credit requires frozen_probe_path")
-        if config.policy_loss != "gspo":
-            raise ValueError("frozen_probe_credit requires policy_loss='gspo'")
+        if not is_gspo_family:
+            raise ValueError("frozen_probe_credit requires policy_loss='gspo' or 'gspo_token'")
         if segments is None:
             raise ValueError("frozen_probe_credit requires packed sequences with segments")
 
@@ -598,7 +616,7 @@ def rl_step(
     turn_advantages = None
     if has_value_head:
         value_predictions = outputs.value[:, :-1]  # no target for the last token
-        if config.policy_loss == "gspo":
+        if is_gspo_family:
             assert segments is not None
             centered_targets = batch.advantages[:, 1:]
             (
@@ -643,6 +661,7 @@ def rl_step(
     policy_loss_total = None
     dppo_mask = None
     dppo_divergence = None
+    gspo_token_protected_mask = None
     match config.policy_loss:
         case "ppo":
             surr1 = ratio_new_old * log_p_weights
@@ -710,11 +729,76 @@ def rl_step(
             for (start, end), val in zip(segments, clamp_log_ratio_new_old_indicators.flatten()):
                 expanded_indicators[0, start:end] = float(val)
             clamp_log_ratio_new_old_indicators = expanded_indicators
+        case "gspo_token":
+            if segments is None:
+                raise ValueError("GSPO-token loss requires packed sequences with segments")
+            lrn_sum, _, tok_count = per_segment_sums(
+                batch.segment_ids,
+                masks_shifted,
+                log_ratio_new_old,
+                advantages,
+                seq_parallel_group=seq_parallel_group,
+            )
+            group_ratio_new_old = torch.exp(lrn_sum / tok_count.clamp(min=1e-6))
+
+            assert batch.segment_ids is not None
+            token_segment_ids = batch.segment_ids[:, 1:].to(
+                device=new_logprobs.device,
+                dtype=torch.long,
+            )
+            token_group_ratio = group_ratio_new_old[token_segment_ids]
+            token_advantages = advantages.detach()
+            token_ratio_new_old = token_group_ratio.detach() * torch.exp(
+                new_logprobs - new_logprobs.detach()
+            )
+
+            with torch.no_grad():
+                clamp_log_ratio_new_old_indicators = (
+                    (
+                        (token_advantages > 0)
+                        & (token_group_ratio > 1 + config.epsilon_high)
+                    )
+                    | (
+                        (token_advantages < 0)
+                        & (token_group_ratio < 1 - config.epsilon_low)
+                    )
+                ) & masks_shifted
+                clamped_group_ratio = torch.clamp(
+                    token_group_ratio,
+                    1 - config.epsilon_low,
+                    1 + config.epsilon_high,
+                )
+                gspo_token_protected_mask = torch.zeros_like(masks_shifted)
+                if config.gspo_token_protect_confident:
+                    confidence_log_threshold = float(np.log(config.gspo_token_confidence_threshold))
+                    gspo_token_protected_mask = (
+                        (token_advantages < 0)
+                        & (old_logprobs.detach() >= confidence_log_threshold)
+                        & masks_shifted
+                    )
+            policy_terms = torch.where(
+                clamp_log_ratio_new_old_indicators,
+                clamped_group_ratio.detach() * token_advantages,
+                token_ratio_new_old * token_advantages,
+            )
+            policy_terms = torch.where(
+                gspo_token_protected_mask,
+                torch.zeros_like(policy_terms),
+                policy_terms,
+            )
+            policy_term_sum, _, _ = per_segment_sums(
+                batch.segment_ids,
+                masks_shifted,
+                policy_terms * tokens_weights,
+                torch.zeros_like(advantages),
+                seq_parallel_group=seq_parallel_group,
+            )
+            policy_loss_total = -policy_term_sum.sum()
         case _:
             raise ValueError(f"Unknown algorithm {config.policy_loss}")
 
     # combine loss components
-    if config.policy_loss != "gspo":
+    if not is_gspo_family:
         if use_entropy_loss:
             loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy
         else:
@@ -732,7 +816,7 @@ def rl_step(
         assert values.shape == tokens_weights.shape, (
             f"Values shape {values.shape} does not match example weights shape {tokens_weights.shape}"
         )
-        if config.policy_loss == "gspo":
+        if is_gspo_family:
             assert turn_end_idx is not None
             assert turn_values is not None
             assert turn_value_targets is not None
@@ -817,6 +901,10 @@ def rl_step(
         ).item()
         stats["dppo_binary_tv_max"] = dppo_divergence[masks_shifted].max().item()
 
+    if gspo_token_protected_mask is not None:
+        stats["gspo_token_protected_tokens_sum"] = gspo_token_protected_mask.sum().item()
+        stats["gspo_token_response_tokens_sum"] = masks_shifted.sum().item()
+
     if frozen_probe_turn_probs is not None:
         assert frozen_probe_turn_targets is not None
         # Emit the raw per-turn (p, R) pairs instead of per-micro-batch summaries:
@@ -833,7 +921,7 @@ def rl_step(
         stats["value_max"] = value_predictions[masks_shifted].max().item() if masks_shifted.any() else 0.0
         stats["value_min"] = value_predictions[masks_shifted].min().item() if masks_shifted.any() else 0.0
         stats["value_loss"] = value_loss.item()
-        if config.policy_loss == "gspo":
+        if is_gspo_family:
             assert turn_values is not None
             assert turn_value_targets is not None
             assert turn_advantages is not None
