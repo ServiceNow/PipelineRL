@@ -1,16 +1,16 @@
 #!/bin/bash
-# dppo_02: --config-name terminal_dppo02 (terminal_dppo + gradient clip 0.1->1.0,
-# dppo02 fleet DNS). Single-variable threshold ablation; same 4x8 H100 recipe.
+# dppo_02: --config-name terminal_dppo03 (terminal_dppo + gradient clip 0.1->1.0,
+# dppo03 fleet DNS). Post-fix baseline; same 4x8 H100 recipe.
 
 TIMESTAMP=$(date +%s)
 OUTPUT_DIR_BASE=/mnt/llmd/results/exps/rafa/terminal
-JOB_NAME=${JOB_NAME:-terminal_qwen35_9b_dppo_02}
+JOB_NAME=${JOB_NAME:-terminal_qwen35_9b_dppo_03}
 CONDA_ENV=${CONDA_ENV:-pipeline-rl}
 CONDA_EXE=${CONDA_EXE:-/opt/conda/bin/conda}
 
 COMMAND="python -m pipelinerl.launch \
 output_dir=${OUTPUT_DIR_BASE}/${JOB_NAME} \
---config-name terminal_dppo02 \
+--config-name terminal_dppo03 \
 --config-dir /home/toolkit/PipelineRL/conf"
 
 make multi-replica-job \
