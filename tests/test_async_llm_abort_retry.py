@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -89,10 +90,12 @@ def _good_payload() -> dict:
                 "logprobs": {
                     "content": [{"token": "token_id:42", "logprob": -0.1}]
                 },
+                "token_ids": [42],
                 "finish_reason": "stop",
             }
         ],
         "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+        "prompt_token_ids": list(range(10)),
     }
 
 
@@ -106,6 +109,8 @@ def test_llm_async_generate_retries_once_on_abort_response() -> None:
     assert session.calls == 2
     assert llm_call.output.content == "ok"
     assert [lp.token_id for lp in llm_call.logprobs] == [42]
+    assert llm_call.prompt_token_ids == list(range(10))
+    assert llm_call.output_token_ids == [42]
 
 
 def test_llm_async_generate_raises_after_repeated_abort_responses() -> None:
@@ -134,6 +139,7 @@ def test_llm_async_generate_keeps_tool_call_history_arguments_as_wire_strings() 
 
     sent_args = session.last_payload["messages"][2]["tool_calls"][0]["function"]["arguments"]
     stored_args = llm_call.prompt.messages[2]["tool_calls"][0]["function"]["arguments"]
+    assert session.last_payload["return_token_ids"] is True
     assert sent_args == '{"command": "ls"}'
     assert stored_args == '{"command": "ls"}'
 
@@ -149,12 +155,39 @@ def test_llm_async_generate_stringifies_dict_tool_call_history_for_wire() -> Non
     assert sent_args == '{"command": "ls"}'
 
 
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda payload: payload.pop("prompt_token_ids"), "missing valid prompt_token_ids"),
+        (lambda payload: payload["choices"][0].pop("token_ids"), "missing valid completion token_ids"),
+        (lambda payload: payload["choices"][0].update(token_ids=[43]), "do not match logprob token IDs"),
+        (lambda payload: payload.update(prompt_token_ids=[1]), "does not match usage.prompt_tokens"),
+        (
+            lambda payload: payload["usage"].update(completion_tokens=2),
+            "does not match usage.completion_tokens",
+        ),
+    ],
+)
+def test_llm_async_generate_fails_loud_on_token_identity_mismatch(mutate, match) -> None:
+    payload = copy.deepcopy(_good_payload())
+    mutate(payload)
+
+    with pytest.raises(ValueError, match=match):
+        asyncio.run(
+            llm_async_generate(
+                DummyLLM(), Prompt.from_user_message("hello"), DummySession([payload])
+            )
+        )
+
+
 def test_make_training_text_rejects_abort_responses_even_with_logprobs() -> None:
     llm_call = LLMCall(
         prompt=Prompt.from_user_message("hello"),
         output=LLMOutput(content="partial"),
         cached=False,
         llm_info={"finish_reason": "abort"},
+        prompt_token_ids=[11],
+        output_token_ids=[42],
         logprobs=[TokenLogprob(token_id=42, logprob=-0.1, generated=1)],
     )
     llm = SimpleNamespace()
@@ -168,6 +201,8 @@ class ChatTemplateTokenizer:
     eos_token = "<eos>"
 
     def apply_chat_template(self, conversation, tokenize=True, return_dict=True, **kwargs):
+        if tokenize:
+            raise AssertionError("TrainingText must use token IDs captured from vLLM")
         if not tokenize:
             if conversation[-1]["role"] == "assistant":
                 return "<user>hello<assistant>ok"
@@ -178,12 +213,16 @@ class ChatTemplateTokenizer:
         return token_ids
 
 
-def test_make_training_text_requests_token_id_list_from_chat_template() -> None:
+def test_make_training_text_uses_captured_ids_without_retokenizing() -> None:
     llm_call = LLMCall(
         prompt=Prompt.from_user_message("hello"),
         output=LLMOutput(content="ok"),
         cached=False,
         llm_info={"finish_reason": "stop"},
+        prompt_length_tokens=2,
+        output_length_tokens=1,
+        prompt_token_ids=[101, 102],
+        output_token_ids=[42],
         logprobs=[TokenLogprob(token_id=42, logprob=-0.1, generated=1)],
     )
     llm = SimpleNamespace(
@@ -194,8 +233,22 @@ def test_make_training_text_requests_token_id_list_from_chat_template() -> None:
 
     training_text = make_training_text(llm, llm_call)
 
-    assert training_text.input_ids == [11, 12, 13, 42]
-    assert training_text.labels == [MASKED_TOKEN_ID, MASKED_TOKEN_ID, MASKED_TOKEN_ID, 42]
+    assert training_text.input_ids == [101, 102, 42]
+    assert training_text.labels == [MASKED_TOKEN_ID, MASKED_TOKEN_ID, 42]
+
+
+def test_make_training_text_rejects_missing_captured_ids() -> None:
+    llm_call = LLMCall(
+        prompt=Prompt.from_user_message("hello"),
+        output=LLMOutput(content="ok"),
+        cached=False,
+        logprobs=[TokenLogprob(token_id=42, logprob=-0.1, generated=1)],
+    )
+
+    with pytest.raises(
+        ValueError, match="Exact prompt and completion token IDs are required"
+    ):
+        make_training_text(SimpleNamespace(), llm_call)
 
 
 def test_resolve_weight_update_name_maps_qwen35_wrapper_text_weights() -> None:
@@ -369,6 +422,8 @@ def test_make_training_text_normalizes_multiturn_tool_call_history():
         logprobs=[TokenLogprob(token_id=77, logprob=-0.1, generated=1)],
         prompt_length_tokens=0,
         output_length_tokens=1,
+        prompt_token_ids=[90, 91],
+        output_token_ids=[77],
     )
     llm = SimpleNamespace(
         model_name="dummy-model",
@@ -378,15 +433,6 @@ def test_make_training_text_normalizes_multiturn_tool_call_history():
 
     training_text = make_training_text(llm, llm_call)
 
-    canonical_prompt = _tool_history_messages({"command": "ls"})
-    expected_prompt_ids = tokenizer.apply_chat_template(
-        canonical_prompt,
-        tokenize=True,
-        return_dict=False,
-        add_generation_prompt=True,
-        tools=_bash_tool_definition(),
-        enable_thinking=False,
-    )
-    assert training_text.input_ids[:-1] == expected_prompt_ids
-    assert training_text.labels[:-1] == [MASKED_TOKEN_ID] * len(expected_prompt_ids)
+    assert training_text.input_ids[:-1] == [90, 91]
+    assert training_text.labels[:-1] == [MASKED_TOKEN_ID, MASKED_TOKEN_ID]
     assert training_text.input_ids[-1] == 77

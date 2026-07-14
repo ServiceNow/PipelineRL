@@ -150,16 +150,45 @@ def replace_oov_tokens_with_the(data: list[dict], tokenizer: transformers.PreTra
     return new_data
 
 
+def drop_oov_groups(
+    data: list[dict], tokenizer: transformers.PreTrainedTokenizerBase
+) -> tuple[list[dict], int, int]:
+    """Drop complete task groups containing IDs outside the trainer vocabulary."""
+    valid_token_ids = set(tokenizer.get_vocab().values())
+    invalid_group_ids = {
+        entry.get("group_id")
+        for entry in data
+        if any(token_id not in valid_token_ids for token_id in entry["input_ids"])
+    }
+    if not invalid_group_ids:
+        return data, 0, 0
+
+    filtered = [entry for entry in data if entry.get("group_id") not in invalid_group_ids]
+    dropped_entries = len(data) - len(filtered)
+    logger.warning(
+        "Strict TITO dropped %d entries from %d group(s) containing out-of-vocabulary token IDs",
+        dropped_entries,
+        len(invalid_group_ids),
+    )
+    return filtered, len(invalid_group_ids), dropped_entries
+
+
 def preprocess_dataset(
     llm: TrainableLLM | None,
     data: list[dict],
     tokenizer: transformers.PreTrainedTokenizerBase,
     seq_length: int,
     rl_config: RLConfig,
+    strict_tito: bool = False,
 ) -> list[dict]:
     preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True)
 
-    data = replace_oov_tokens_with_the(data, tokenizer)
+    if strict_tito:
+        data, _, _ = drop_oov_groups(data, tokenizer)
+        if not data:
+            return []
+    else:
+        data = replace_oov_tokens_with_the(data, tokenizer)
 
     # inplace update of the traces with ref logprobs
     if llm is not None:
@@ -311,6 +340,7 @@ def process_chunk(
     rl_config: RLConfig,
     input_queue: SharedMemoryQueue,
     output_queue: SharedMemoryQueue,
+    strict_tito: bool,
 ):
     """Worker process function to preprocess chunks of data"""
     try:
@@ -328,6 +358,7 @@ def process_chunk(
                     tokenizer=tokenizer,
                     seq_length=seq_length,
                     rl_config=rl_config,
+                    strict_tito=strict_tito,
                 )
                 output_queue.put(dataset)
             except Exception as e:
@@ -539,6 +570,7 @@ def run_preprocessing_loop(
                         rl_config,
                         input_queue,
                         output_queue,
+                        bool(getattr(cfg.preprocess, "strict_tito", False)),
                     )
                 )
                 worker.start()

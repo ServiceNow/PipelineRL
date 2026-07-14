@@ -162,6 +162,7 @@ async def llm_async_generate(
             {
                 "logprobs": 1,
                 "include_stop_str_in_output": True,
+                "return_token_ids": True,
                 "skip_special_tokens": False,
             }
         )
@@ -230,15 +231,16 @@ async def llm_async_generate(
     assert response_data is not None, "response_data is None"
 
     try:
-        content = response_data["choices"][0]["message"]["content"]
-        raw_tool_calls = response_data["choices"][0]["message"].get("tool_calls", [])
+        choice = response_data["choices"][0]
+        content = choice["message"]["content"]
+        raw_tool_calls = choice["message"].get("tool_calls", [])
         if not content and not raw_tool_calls:
             logger.warning(f"Empty completion {response_data}")
 
         parsed_logprobs = []
         finish_reason = None
         if llm.collect_logprobs:
-            completion_logprobs = response_data["choices"][0]["logprobs"]["content"]
+            completion_logprobs = choice["logprobs"]["content"]
             for logprob in completion_logprobs:
                 if logprob:
                     try:
@@ -254,7 +256,36 @@ async def llm_async_generate(
                     except Exception as e:
                         logger.error(f"Failed to process logprobs: {logprob}")
                         logger.error(e)
-        finish_reason = response_data["choices"][0].get("finish_reason")
+
+            prompt_token_ids = response_data.get("prompt_token_ids")
+            output_token_ids = choice.get("token_ids")
+            if not isinstance(prompt_token_ids, list) or not all(
+                isinstance(token_id, int) for token_id in prompt_token_ids
+            ):
+                raise ValueError("vLLM response is missing valid prompt_token_ids")
+            if not isinstance(output_token_ids, list) or not all(
+                isinstance(token_id, int) for token_id in output_token_ids
+            ):
+                raise ValueError("vLLM response is missing valid completion token_ids")
+
+            logprob_token_ids = [logprob.token_id for logprob in parsed_logprobs]
+            if output_token_ids != logprob_token_ids:
+                raise ValueError(
+                    "vLLM completion token_ids do not match logprob token IDs: "
+                    f"{output_token_ids} != {logprob_token_ids}"
+                )
+            usage = response_data["usage"]
+            if len(prompt_token_ids) != usage["prompt_tokens"]:
+                raise ValueError(
+                    "vLLM prompt_token_ids length does not match usage.prompt_tokens: "
+                    f"{len(prompt_token_ids)} != {usage['prompt_tokens']}"
+                )
+            if len(output_token_ids) != usage["completion_tokens"]:
+                raise ValueError(
+                    "vLLM completion token_ids length does not match usage.completion_tokens: "
+                    f"{len(output_token_ids)} != {usage['completion_tokens']}"
+                )
+        finish_reason = choice.get("finish_reason")
     except Exception:
         logger.exception(f"Failed to parse llm response: {response_data}")
         raise
@@ -268,6 +299,9 @@ async def llm_async_generate(
     if finish_reason:
         llm_call.llm_info["finish_reason"] = finish_reason
     assert llm_call is not None, "llm_call is None"
+    if llm.collect_logprobs:
+        llm_call.prompt_token_ids = prompt_token_ids
+        llm_call.output_token_ids = output_token_ids
     llm_call.logprobs = parsed_logprobs
     return llm_call
 
@@ -278,6 +312,9 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         raise RetryableAbortedCompletionError(
             f"Aborted completion for prompt {llm_call.prompt.id} should be retried"
         )
+
+    if llm_call.prompt_token_ids is None or llm_call.output_token_ids is None:
+        raise ValueError("Exact prompt and completion token IDs are required for RL training data")
 
     # Extract visual features if present
     images = []
@@ -321,19 +358,6 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
                 full_messages,
                 tokenize=False,
             )
-
-            # Process prompt with images to get token IDs with image placeholders
-            prompt_inputs = processor(
-                text=processor.apply_chat_template(
-                    prompt_messages, tokenize=False, add_generation_prompt=True
-                ),
-                images=images,
-                return_tensors=None,
-            )
-
-            # prompt_inputs["input_ids"] is a list of list
-            prompt_token_ids = prompt_inputs["input_ids"][0]
-
             # Process images to get visual features
             processed = processor(
                 text=[prompt_text], images=images, padding=True, return_tensors=None
@@ -363,13 +387,6 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
             tokenize=False,
             **chat_kwargs,
         )
-        prompt_token_ids = llm.tokenizer.apply_chat_template(
-            prompt_messages,
-            tokenize=True,
-            return_dict=False,
-            add_generation_prompt=True,
-            **chat_kwargs,
-        )
 
     output_text = text[len(prompt_text) :]
 
@@ -381,10 +398,15 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     if not llm_call.logprobs:
         raise ValueError("Logprobs are required to make training data for RL")
 
-    # We add the exact token ids and logprobs to "training_text" to ensure inference/training consistency
-    labels = [lp.token_id for lp in llm_call.logprobs]
+    logprob_token_ids = [lp.token_id for lp in llm_call.logprobs]
+    if llm_call.output_token_ids != logprob_token_ids:
+        raise ValueError(
+            "Completion token IDs do not match logprob token IDs: "
+            f"{llm_call.output_token_ids} != {logprob_token_ids}"
+        )
+    prompt_token_ids = list(llm_call.prompt_token_ids)
+    labels = list(llm_call.output_token_ids)
     input_ids = prompt_token_ids + labels
-    # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
     logprobs = [lp.logprob for lp in llm_call.logprobs]
     if finish_reason is not None:

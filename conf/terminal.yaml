@@ -252,6 +252,8 @@ preprocess:
   input_queue_size: 2
   output_queue_size: 2
   shared_memory_entry_size: 1000000000
+  # Never mutate rollout token IDs before terminal RL training.
+  strict_tito: true
 
 vllm_config:
   vllm_kwargs:
