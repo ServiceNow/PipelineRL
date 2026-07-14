@@ -237,16 +237,23 @@ def init_wandb(
     else:
         raise ValueError(f"Unknown value for wandb_resume: {cfg.finetune.wandb_resume}")
 
-    wandb_name = str(run_dir)
+    run_path_name = str(run_dir)
     root = cfg.wandb.wandb_workspace_root
     if root:
-        if not wandb_name.startswith(root + "/"):
+        if not run_path_name.startswith(root + "/"):
             raise ValueError(f"run_dir {run_dir} does not start with root {root}")
-        wandb_name = wandb_name[len(root) + 1 :]
+        run_path_name = run_path_name[len(root) + 1 :]
+
+    # Display name: an explicit short name (with the component suffix, so the per-service runs
+    # stay distinguishable in a legend) when set, else the full root-relative run dir. The id
+    # stays derived from the unique run-dir path, so a short name may repeat across experiments
+    # without colliding.
+    component = run_path_name.rstrip("/").split("/")[-1]
+    wandb_name = f"{cfg.wandb.wandb_name}/{component}" if cfg.wandb.wandb_name else run_path_name
 
     wandb_id = cfg.wandb.wandb_id
     if not wandb_id:
-        wandb_id = wandb_name.replace("/", "_")
+        wandb_id = run_path_name.replace("/", "_")
 
     if len(wandb_name) > 128:
         logger.warning(f"wandb_name: {wandb_name} is longer than 128 characters. Truncating to 128 characters.")
