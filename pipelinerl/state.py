@@ -109,15 +109,15 @@ class TrainerState:
 
                         event_type = event.get("type")
                         step = event.get("step")
-                        # Fast-LLM sends the cumulative document count as the model version (to align
-                        # staleness with DeepSpeed's document clock); fall back to `step` for older
-                        # trainers that only send the step.
-                        document_count = event.get("document_count")
-                        version = document_count if document_count is not None else step
+                        # Fast-LLM sends the cumulative document count (`documents_seen`) as the model
+                        # version, to align staleness with DeepSpeed's document clock; fall back to
+                        # `step` for older trainers that only send the step.
+                        documents_seen = event.get("documents_seen")
+                        version = documents_seen if documents_seen is not None else step
 
                         if event_type == "weights_ready":
                             logger.info(
-                                f"Received weights_ready event: step={step}, document_count={document_count}"
+                                f"Received weights_ready event: step={step}, documents_seen={documents_seen}"
                             )
                             self.propagated_weight_version = version
                             self.completed_step = step

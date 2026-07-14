@@ -607,16 +607,16 @@ class EngineManager:
 
                             event_type = event.get("type")
                             step = event.get("step")
-                            # Fast-LLM sends the cumulative document count as the model version
-                            # (aligns staleness with the trainer's document clock); fall back to
-                            # `step` for older trainers that only send the step.
-                            document_count = event.get("document_count")
-                            version = document_count if document_count is not None else step
+                            # Fast-LLM sends the cumulative document count (`documents_seen`) as the
+                            # model version, to align staleness with the trainer's document clock;
+                            # fall back to `step` for older trainers that only send the step.
+                            documents_seen = event.get("documents_seen")
+                            version = documents_seen if documents_seen is not None else step
 
                             if event_type == "weights_ready":
                                 if not first_weights_ready_seen:
                                     logger.info(
-                                        f"[FastLLM] weights_ready step={step} document_count={document_count} "
+                                        f"[FastLLM] weights_ready step={step} documents_seen={documents_seen} "
                                         f"(initial broadcast — no pause wrap)"
                                     )
                                     coro = self.engine.engine_core.collective_rpc_async(
@@ -626,7 +626,7 @@ class EngineManager:
                                     initial_broadcast = True
                                 else:
                                     logger.info(
-                                        f"[FastLLM] weights_ready step={step} document_count={document_count}, "
+                                        f"[FastLLM] weights_ready step={step} documents_seen={documents_seen}, "
                                         f"dispatching to workers"
                                     )
                                     coro = self.receive_weight_update_fast_llm(version)
