@@ -545,33 +545,6 @@ class TestBasicGeneration:
             assert outputs[0] == outputs[1], f"Outputs differ: '{outputs[0]}' vs '{outputs[1]}'"
 
 
-class TestWorkerExtension:
-    """Test WorkerExtension loading and methods."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
-    async def test_extension_loaded(self, vllm_engine_factory):
-        """Test that WorkerExtension is properly loaded."""
-        from vllm.v1.engine.core_client import AsyncMPClient
-
-        async with vllm_engine_factory(disable_weight_updates=True) as manager:
-            # Check that engine has the extension methods
-            assert isinstance(manager.engine.engine_core, AsyncMPClient)
-
-            # Test that we can call the extension method
-            # This verifies the extension is loaded on workers
-            # collective_rpc_async returns a list of results (one per worker)
-            results = await manager.is_extension_loaded()
-            # Extension should be loaded on all workers
-            assert isinstance(results, list)
-            assert len(results) > 0  # At least one worker
-            # Results are PIDs (integers > 0)
-            assert all(isinstance(r, int) and r > 0 for r in results), f"Expected PIDs, got: {results}"
-            print(f"WorkerExtension successfully loaded on {len(results)} worker(s)")
-            print(f"Worker PIDs: {results}")
-            print(f"Unique PIDs: {len(set(results))} (indicates {len(set(results))} separate processes)")
-
-
 class TestWeightUpdateDistributed:
     """Test weight updates with 2-GPU distributed setup."""
 

@@ -26,11 +26,10 @@ from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
-from pipelinerl.finetune_loop import WeightUpdateRequest, ParameterInfo
+from pipelinerl.finetune_loop import WeightUpdateRequest
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
-from typing import Any, Protocol, runtime_checkable, Dict, Optional
+from typing import Any, Protocol, runtime_checkable
 from fastapi import BackgroundTasks
-import pipelinerl.torch_utils
 from pipelinerl.torch_utils import stateless_init_process_group
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -42,18 +41,11 @@ except ModuleNotFoundError:
     from vllm.tool_parsers import ToolParserManager
 
 logger = logging.getLogger(__name__)
-# configure this logger individually, in order to avoid messing
-# with the default vllm logger configuration
-# Check environment variable to enable DEBUG logging (for tests)
-import os
-
-log_level = logging.DEBUG if os.getenv("PIPELINERL_DEBUG") else logging.INFO
-logger.setLevel(log_level)
+# Configure this logger with its own handler to avoid interfering with vLLM's logger configuration.
+logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-handler.setLevel(log_level)
-formatter = logging.Formatter(
-    "[%(asctime)s] [VLLM-%(levelname)s] %(message)s", datefmt="%H:%M:%S"
-)
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter("[%(asctime)s] [VLLM-%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 # Prevent propagation to vLLM's loggers to avoid double logging
@@ -176,16 +168,6 @@ class LikeWorker(Protocol):
 
 
 class WorkerExtension:
-    def is_extension_loaded(self: LikeWorker) -> int:
-        """Simple method to verify the extension is loaded on workers.
-
-        Returns:
-            PID of the worker process
-        """
-        import os
-
-        return os.getpid()
-
     def init_actor_update_group(
         self: LikeWorker,
         actor_idx: int,
@@ -267,33 +249,21 @@ class WorkerExtension:
         expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
 
         for i, info in enumerate(request.parameters_info):
-            logger.debug(
-                f"[{i+1}/{len(request.parameters_info)}] Preparing to receive: {info.name}"
-            )
-            logger.debug(f"  - shape: {info.shape}, dtype: {info.dtype}")
-
             target_dtype = string_to_dtype(info.dtype)
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
 
-            logger.debug(f"  - Creating buffer for {info.name}")
             buffer = torch.empty(
                 tuple(info.shape), dtype=target_dtype, device=self.device
             )
-            logger.debug(
-                f"  - Buffer created: shape={buffer.shape}, dtype={buffer.dtype}, device={buffer.device}"
-            )
 
-            logger.debug(f"  - Calling broadcast for {info.name}...")
             # StatelessProcessGroup exposes .broadcast(); torch.distributed.ProcessGroup
             # (fast-llm path) uses the functional torch.distributed.broadcast.
             if isinstance(self.model_update_group, torch.distributed.ProcessGroup):
                 torch.distributed.broadcast(buffer, src=0, group=self.model_update_group)
             else:
                 self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
-            logger.debug(f"  - Broadcast received for {info.name}")
 
-            logger.debug(f"  - Loading weights for {info.name}...")
             try:
                 loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])  # type: ignore
                 if len(loaded_params) == 0:
@@ -302,9 +272,7 @@ class WorkerExtension:
                     raise ValueError(
                         f"Parameter {info.name} not found in vLLM model state dict"
                     )
-                elif len(loaded_params) == 1:
-                    logger.debug(f"  - Weights loaded for {info.name}")
-                else:
+                elif len(loaded_params) > 1:
                     logger.error(
                         f"  - ERROR: load_weights returned {len(loaded_params)} params for {info.name}"
                     )
@@ -344,9 +312,7 @@ class WorkerExtension:
 
         while True:
             # Receive metadata
-            logger.debug(f"[Worker rank={self.rank}] Waiting for metadata broadcast...")
             meta = _broadcast_object(None, self.model_update_group, src=0)
-            logger.debug(f"[Worker rank={self.rank}] Received metadata: {meta}")
 
             # Check for end signal
             if meta is None:
@@ -372,14 +338,8 @@ class WorkerExtension:
                 continue
 
             param_count += 1
-            logger.debug(
-                f"[{param_count}] Receiving: {param_name}, shape={shape}, dtype={dtype}"
-            )
-
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {param_name}: {dtype}")
-
-            logger.debug(f"[{param_count}] Received tensor for {param_name}")
 
             # Load weights
             try:
@@ -391,9 +351,7 @@ class WorkerExtension:
                     raise ValueError(
                         f"Parameter {param_name} not found in vLLM model state dict"
                     )
-                elif len(loaded_params) == 1:
-                    logger.debug(f"[{param_count}] Loaded {param_name}")
-                else:
+                elif len(loaded_params) > 1:
                     logger.error(
                         f"ERROR: load_weights returned {len(loaded_params)} params for {param_name}"
                     )
@@ -431,12 +389,6 @@ class EngineManager:
         self.engine = engine
         self.engine_config = engine_config
         self.update_lock = asyncio.Lock()
-
-    async def is_extension_loaded(self):
-        return await self.engine.engine_core.collective_rpc_async(
-            "is_extension_loaded",
-            args=(),
-        )
 
     async def init_actor_update_group(self):
         await self.engine.engine_core.collective_rpc_async(

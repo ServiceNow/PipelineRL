@@ -357,9 +357,7 @@ When `use_fast_llm: true` (default in `conf/math.yaml`), the DeepSpeed ZeRO-3 tr
 - Trainer: `fast_llm train gpt` launched via torchrun (`pipelinerl/launch.py:run_finetune`); rank 0 also serves the broadcast `TCPStore`.
 - Fast-LLM's `StreamingTrainerCallback` gathers full-precision weights after each optimizer step and broadcasts them on a persistent NCCL group whose name is `WEIGHTS_BROADCAST_PG_NAME`.
 - vLLM workers join the same group via `vllm1.init_actor_update_group(...)` and copy parameters into the model in place.
-- Coordinated NCCL teardown (`pipelinerl/vllm1.py:484-547`) listens to a `training_finished` redis xadd from the trainer and destroys the process group on the vLLM side so `dist.destroy_process_group()` doesn't hang.
-
-This path is **WIP** — see [`docs/FAST_LLM_INTEGRATION.md`](docs/FAST_LLM_INTEGRATION.md) for known issues, configuration knobs, and example interactive-job scripts.
+- Coordinated NCCL teardown (`pipelinerl/vllm1.py`) listens to a `training_finished` redis xadd from the trainer and destroys the process group on the vLLM side so `dist.destroy_process_group()` doesn't hang.
 
 ### 6. Verifier
 - Entrypoint: `pipelinerl/entrypoints/verifier.py`
@@ -371,7 +369,7 @@ This path is **WIP** — see [`docs/FAST_LLM_INTEGRATION.md`](docs/FAST_LLM_INTE
 - Defined in `pipelinerl/streams.py`.
 - Implements `SingleStreamSpec` and `StreamRangeSpec` for file-system or Redis-based queues.
 - `write_to_streams(...)` and `read_stream(...)` provide a JSON-line protocol for inter-process messaging.
-- Pass `shared=True` to these helpers when multiple actors must fan-in to a single Redis stream (e.g., ServiceNow/Fast-LLM trainer). The shared mode encodes payloads via `orjson`, tags them with a global index, and lets the trainer perform downstream sharding safely.
+- Pass `shared=True` to `write_to_streams(...)` when multiple actors must fan-in to a single Redis stream (e.g., the Fast-LLM trainer), which encodes payloads via `orjson` and tags them with a global index.
 - Available backends:
   - File system: default.
   - Redis: requires Redis server.
@@ -434,8 +432,6 @@ Each resumed job must still use a fresh `world.run_id` (the new job's ID, not th
 
 # Install FastLLM+PipelineRL
 
-> **Status (2026-05-06):** This integration is WIP — see [`docs/FAST_LLM_INTEGRATION.md`](docs/FAST_LLM_INTEGRATION.md) for the full handover (architecture, known issues, TODO).
-
 ### 1. Container image
 
 To **use**: reference the prebuilt image
@@ -485,5 +481,3 @@ pip install --no-cache-dir -e ".[lora]"
 - **`pyproject.toml:81-87`** — `[tool.uv]` overrides `transformers>=4.51.0` and `accelerate>=1.7.0` because `tapeagents==0.1.16` pins them lower; the `[tapeagents]` extra is **broken at runtime** until tapeagents bumps support. Track this as a TODO; do not enable `[tapeagents]` on the fast-llm path.
 - **`PIP_CONSTRAINT=""`** is required — the toolkit image sets a constraint file that conflicts with our pinned versions.
 - **Triton must be `==3.5.1`** — newer triton breaks the fast-llm GSPO kernels.
-
-

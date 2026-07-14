@@ -258,64 +258,6 @@ class RedisSharedStreamWriter(StreamWriter):
         self._redis.xadd(self._stream_name, record, maxlen=self._maxlen, approximate=True)
 
 
-class RedisSharedStreamReader(StreamReader):
-    """Redis reader that validates fan-in ordering for a shared stream."""
-
-    def __init__(self, stream: SingleStreamSpec, *, fail_on_gap: bool = True):
-        self.stream = stream
-        assert isinstance(_backend, RedisConfig)
-        self._redis = connect_to_redis(_backend)
-        self._stream_name = str(self.stream)
-        self._last_id = 0
-        self._expected_index: int | None = None
-        self._fail_on_gap = fail_on_gap
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self._redis.close()
-
-    def _update_expected_index(self, entry: dict[bytes, bytes]):
-        raw_index = entry.get(b"index")
-        if raw_index is None:
-            return
-
-        index_value = int(raw_index.decode("utf-8"))
-        if self._expected_index is None:
-            self._expected_index = index_value
-        elif index_value != self._expected_index:
-            message = (
-                f"Index mismatch for shared stream {self.stream}: expected {self._expected_index}, got {index_value}"
-            )
-            if self._fail_on_gap:
-                raise ValueError(message)
-            logger.warning(message)
-            self._expected_index = index_value
-
-        self._expected_index += 1
-
-    def read(self):
-        block = int(_REREAD_DELAY * 1000)
-        while True:
-            response = self._redis.xread({self._stream_name: self._last_id}, count=1, block=block)
-            if not response:
-                continue
-
-            stream_name, result = response[0]
-            assert stream_name.decode("utf-8") == self._stream_name
-            assert isinstance(result, list) and len(result) == 1
-            entry_id, entry = result[0]
-            self._last_id = entry_id
-            self._update_expected_index(entry)
-
-            payload = entry.get(b"data")
-            if payload is None:
-                raise ValueError(f"Shared stream entry missing 'data' field: {entry}")
-
-            yield orjson.loads(payload)
-
-
 class RoundRobinRedisStreamWriter(StreamWriter):
     # TODO: share the connection across writers
 
@@ -532,23 +474,14 @@ class RoundRobinFileStreamWriter(StreamWriter):
 # Below are the public stream APIs. Easy to replace files with Redis or another pubsub system.
 
 
-def read_stream(stream: SingleStreamSpec, *, shared: bool = False, fail_on_gap: bool = True) -> StreamReader:
-    """Start reading the stream from the beginning.
-
-    When ``shared`` is True, multiple producers are assumed to append to the same
-    Redis stream and the reader will validate ordering using the stored index
-    metadata.
-    """
+def read_stream(stream: SingleStreamSpec) -> StreamReader:
+    """Start reading the stream from the beginning"""
     raise_if_backend_not_set()
     if not isinstance(stream, SingleStreamSpec):
         raise ValueError(f"Invalid stream spec: {stream}")
     if isinstance(_backend, RedisConfig):
-        if shared:
-            return RedisSharedStreamReader(stream, fail_on_gap=fail_on_gap)
         return RedisStreamReader(stream)
     elif _backend == "files":
-        if shared:
-            raise ValueError("Shared stream mode is only supported with the Redis backend")
         return FileStreamReader(stream)
     else:
         assert False
