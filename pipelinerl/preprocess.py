@@ -1,8 +1,10 @@
 import os
+import zlib
 from collections import defaultdict, deque
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
+from dataclasses import dataclass
 import logging
 import queue
 import threading
@@ -36,7 +38,7 @@ from pipelinerl.finetune.checkpoints import (
 from pipelinerl.finetune.data import collate, collate_packed, preprocess_fn
 from pipelinerl.finetune.rl import RLConfig, populate_rl_data
 from pipelinerl.finetune.types import PipelineBatchEncoding
-from pipelinerl.finetune.utils import create_sentinel_batch
+from pipelinerl.finetune.utils import create_sentinel_batch, create_sentinel_example
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.streams import (
     SingleStreamSpec,
@@ -48,6 +50,134 @@ from pipelinerl.streams import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def validate_rollout_turn_sampling(mode: str) -> None:
+    if mode not in {"all", "uniform_one"}:
+        raise ValueError(
+            f"Unknown preprocess.rollout_turn_sampling={mode!r}; expected 'all' or 'uniform_one'"
+        )
+
+
+def select_uniform_one_turns(dataset: list[dict]) -> list[list[dict]]:
+    """Select one unchanged training entry per rollout, grouped by task."""
+    selected_groups, _ = select_uniform_one_turns_and_positions(dataset)
+    return selected_groups
+
+
+def select_uniform_one_turns_and_positions(
+    dataset: list[dict],
+) -> tuple[list[list[dict]], list[float]]:
+    group_order = []
+    rollouts_by_group = {}
+    for entry in dataset:
+        group_id = entry["group_id"]
+        if group_id not in rollouts_by_group:
+            group_order.append(group_id)
+            rollouts_by_group[group_id] = defaultdict(list)
+        rollouts_by_group[group_id][entry["rollout_index"]].append(entry)
+    selected_positions = []
+
+    selected_groups = []
+    for group_id in group_order:
+        selected = []
+        rollouts = rollouts_by_group[group_id]
+        for rollout_index in sorted(rollouts):
+            entries = sorted(rollouts[rollout_index], key=lambda entry: entry["step_index"])
+            seed = zlib.crc32(f"{group_id}/{rollout_index}".encode())
+            selected_index = seed % len(entries)
+            selected.append(entries[selected_index])
+            selected_positions.append(
+                selected_index / (len(entries) - 1) if len(entries) > 1 else 0.0
+            )
+        selected_groups.append(selected)
+    return selected_groups, selected_positions
+
+
+@dataclass
+class UniformOneUpdate:
+    entries: list[dict]
+    n_groups: int
+    padding: int
+
+
+class UniformOneGroupBuffer:
+    """Bound complete task-group envelopes and stage one protected update."""
+
+    def __init__(self, capacity: int, samples_per_step: int):
+        if capacity <= 0 or samples_per_step <= 0:
+            raise ValueError("uniform_one queue capacity and samples_per_step must be positive")
+        self.capacity = capacity
+        self.samples_per_step = samples_per_step
+        self.ready_groups = deque()
+        self.ready_entries = 0
+        self.staged_groups = []
+        self.staged_entries = 0
+        self.evicted_groups = 0
+        self.evicted_entries = 0
+        self.dropped_oversized_groups = 0
+        self.dropped_oversized_entries = 0
+
+    def enqueue(self, group: list[dict], pop_old_data: bool) -> bool:
+        """Queue one envelope; return False only when backpressure must retain it."""
+        if not group:
+            return True
+        if len(group) > self.samples_per_step:
+            self.dropped_oversized_groups += 1
+            self.dropped_oversized_entries += len(group)
+            logger.warning(
+                "Dropping uniform_one group with %d rollouts: exceeds samples_per_step=%d",
+                len(group),
+                self.samples_per_step,
+            )
+            return True
+        if len(group) > self.capacity:
+            self.dropped_oversized_groups += 1
+            self.dropped_oversized_entries += len(group)
+            logger.warning(
+                "Dropping uniform_one group with %d rollouts: exceeds ring_buffer_size=%d",
+                len(group),
+                self.capacity,
+            )
+            return True
+
+        if not pop_old_data and self.ready_entries + len(group) > self.capacity:
+            return False
+        while self.ready_groups and self.ready_entries + len(group) > self.capacity:
+            evicted = self.ready_groups.popleft()
+            self.ready_entries -= len(evicted)
+            self.evicted_groups += 1
+            self.evicted_entries += len(evicted)
+        self.ready_groups.append(group)
+        self.ready_entries += len(group)
+        return True
+
+    def compose_update(self) -> UniformOneUpdate | None:
+        """Move whole groups into the protected accumulator until an update closes."""
+        while self.ready_groups:
+            group = self.ready_groups[0]
+            if self.staged_entries + len(group) > self.samples_per_step:
+                return self._finish_update()
+
+            self.ready_groups.popleft()
+            self.ready_entries -= len(group)
+            self.staged_groups.append(group)
+            self.staged_entries += len(group)
+            if self.staged_entries == self.samples_per_step:
+                return self._finish_update()
+        return None
+
+    def _finish_update(self) -> UniformOneUpdate:
+        assert self.staged_groups and 0 < self.staged_entries <= self.samples_per_step
+        entries = [entry for group in self.staged_groups for entry in group]
+        update = UniformOneUpdate(
+            entries=entries,
+            n_groups=len(self.staged_groups),
+            padding=self.samples_per_step - self.staged_entries,
+        )
+        self.staged_groups = []
+        self.staged_entries = 0
+        return update
 
 
 def _needs_reference_logprobs(rl_config: RLConfig) -> bool:
@@ -180,11 +310,15 @@ def preprocess_dataset(
     seq_length: int,
     rl_config: RLConfig,
     strict_tito: bool = False,
+    processing_stats: dict[str, int] | None = None,
 ) -> list[dict]:
     preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True)
 
     if strict_tito:
-        data, _, _ = drop_oov_groups(data, tokenizer)
+        data, dropped_groups, dropped_entries = drop_oov_groups(data, tokenizer)
+        if processing_stats is not None:
+            processing_stats["strict_tito_dropped_groups"] = dropped_groups
+            processing_stats["strict_tito_dropped_entries"] = dropped_entries
         if not data:
             return []
     else:
@@ -352,6 +486,7 @@ def process_chunk(
             chunk = None
             try:
                 chunk = input_queue.get()
+                processing_stats = {}
                 dataset = preprocess_dataset(
                     llm=llm,
                     data=chunk,
@@ -359,8 +494,15 @@ def process_chunk(
                     seq_length=seq_length,
                     rl_config=rl_config,
                     strict_tito=strict_tito,
+                    processing_stats=processing_stats,
                 )
-                output_queue.put(dataset)
+                if strict_tito:
+                    output_queue.put({
+                        "dataset": dataset,
+                        **processing_stats,
+                    })
+                else:
+                    output_queue.put(dataset)
             except Exception as e:
                 error_info = {
                     "error": str(e),
@@ -447,6 +589,9 @@ def run_preprocessing_loop(
         wandb_run = None
 
     tokenizer = load_tokenizer(cfg.finetune.config_name)
+    rollout_turn_sampling = str(getattr(cfg.preprocess, "rollout_turn_sampling", "all"))
+    validate_rollout_turn_sampling(rollout_turn_sampling)
+    logger.info("Rollout turn sampling mode: %s", rollout_turn_sampling)
     
     llm_urls = str(cfg.me.llm_urls).split("+") if cfg.me.llm_urls else []
     rl_config = RLConfig(**cfg.finetune.rl)
@@ -516,6 +661,7 @@ def run_preprocessing_loop(
 
     stats_aggregator = SlidingWindowAggregator(window_size=max(10, 1000 // cfg.preprocess.chunk_n_groups))
 
+    uniform_selected_turn_positions = deque(maxlen=10000)
     buffer = deque()
     
     # Sequence packing configuration
@@ -524,7 +670,12 @@ def run_preprocessing_loop(
     gradient_accumulation_passes_per_lead = cfg.finetune.gradient_accumulation_passes // num_lead_trainers
     samples_per_lead_per_step = cfg.finetune.train_batch_size * gradient_accumulation_passes_per_lead
     train_batch_size = samples_per_lead_per_step * num_lead_trainers
-    processed_entries_queue = deque(maxlen=cfg.preprocess.ring_buffer_size)
+    uniform_one = rollout_turn_sampling == "uniform_one"
+    processed_entries_queue = deque() if uniform_one else deque(maxlen=cfg.preprocess.ring_buffer_size)
+    uniform_group_buffer = (
+        UniformOneGroupBuffer(cfg.preprocess.ring_buffer_size, train_batch_size)
+        if uniform_one else None
+    )
     published_samples = trainer_state.wait_for_processed_samples()
     last_published_samples = published_samples
     assert published_samples % num_lead_trainers == 0
@@ -543,6 +694,44 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
     dropped_oversized_chunks = 0  # Groups dropped because they exceed the shared-memory entry cap
+    strict_tito_dropped_groups = 0
+    strict_tito_dropped_entries = 0
+    uniform_eligible_rollouts = 0
+    uniform_selected_rollouts = 0
+    uniform_updates = 0
+    uniform_update_groups = 0
+    uniform_update_real_rollouts = 0
+    uniform_update_padding = 0
+
+    def prepare_uniform_update() -> None:
+        nonlocal max_model_version
+        nonlocal uniform_updates
+        nonlocal uniform_update_groups
+        nonlocal uniform_update_real_rollouts
+        nonlocal uniform_update_padding
+        if not uniform_one or processed_entries_queue or current_batch:
+            return
+        assert uniform_group_buffer is not None
+        update = uniform_group_buffer.compose_update()
+        if update is None:
+            return
+        update_model_version = max(entry["model_version"] for entry in update.entries)
+        processed_entries_queue.extend(update.entries)
+        for _ in range(update.padding):
+            processed_entries_queue.append(
+                create_sentinel_example(8, tokenizer=tokenizer, model_version=update_model_version)
+            )
+        assert len(processed_entries_queue) == train_batch_size
+        max_model_version = update_model_version
+        uniform_updates += 1
+        uniform_update_groups = update.n_groups
+        uniform_update_real_rollouts = len(update.entries)
+        uniform_update_padding = update.padding
+        stats_aggregator.update([len(entry["input_ids"]) for entry in update.entries])
+        logger.info(
+            "Composed uniform_one update %d with %d groups, %d rollouts, and %d sentinel slots",
+            uniform_updates, update.n_groups, len(update.entries), update.padding,
+        )
 
     with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
@@ -631,7 +820,15 @@ def run_preprocessing_loop(
                             # entries still flush; a sustained oversize stream must not
                             # keep deferring buffered data.
                             dataset = None
-                        elif rl_config.filter_zero_advantage_groups:
+                        elif isinstance(dataset, dict) and "dataset" in dataset:
+                            strict_tito_dropped_groups += int(
+                                dataset.get("strict_tito_dropped_groups", 0)
+                            )
+                            strict_tito_dropped_entries += int(
+                                dataset.get("strict_tito_dropped_entries", 0)
+                            )
+                            dataset = dataset["dataset"]
+                        if dataset is not None and rl_config.filter_zero_advantage_groups:
                             dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
                             total_filtered_out += num_filtered_out
                             if num_filtered_out > 0:
@@ -641,30 +838,51 @@ def run_preprocessing_loop(
                         pass
                     
                     if dataset:
-                        for entry in dataset:
-                            buffer.append(entry)
+                        if uniform_one:
+                            selected_groups, selected_positions = (
+                                select_uniform_one_turns_and_positions(dataset)
+                            )
+                            for group in selected_groups:
+                                buffer.append(group)
+                            selected_rollouts = sum(len(group) for group in selected_groups)
+                            uniform_eligible_rollouts += selected_rollouts
+                            uniform_selected_rollouts += selected_rollouts
+                            uniform_selected_turn_positions.extend(selected_positions)
+                        else:
+                            for entry in dataset:
+                                buffer.append(entry)
                         processed_chunks += 1
 
-                    if len(buffer) < cfg.preprocess.dataset_buffer_size:
+                    buffered_samples = sum(len(group) for group in buffer) if uniform_one else len(buffer)
+                    if buffered_samples < cfg.preprocess.dataset_buffer_size:
                         continue
                     if cfg.preprocess.dataset_buffer_size:
                         # If buffer size is not set, no point in logging
-                        logger.info(f"Buffer is full with {len(buffer)} samples, start writing")
+                        logger.info(f"Buffer is full with {buffered_samples} samples, start writing")
 
-                    while len(buffer) > 0:
-                        if len(processed_entries_queue) == processed_entries_queue.maxlen:
-                            if not pop_old_data:
-                                break 
-                            else:
+                    if uniform_one:
+                        assert uniform_group_buffer is not None
+                        prepare_uniform_update()
+                        while buffer:
+                            group = buffer[0]
+                            if not uniform_group_buffer.enqueue(group, pop_old_data):
+                                break
+                            buffer.popleft()
+                        prepare_uniform_update()
+                    else:
+                        while len(buffer) > 0:
+                            if len(processed_entries_queue) == processed_entries_queue.maxlen:
+                                if not pop_old_data:
+                                    break
                                 processed_entries_queue_popped_data += 1
                                 if processed_entries_queue_popped_data % 100 == 0 and last_time_notice != processed_entries_queue_popped_data // 100:
                                     logger.warning(f"Popped {processed_entries_queue_popped_data} old entries from processed entries queue")
                                     last_time_notice = processed_entries_queue_popped_data // 100
-                        entry = buffer.popleft()
-                        processed_entries_queue.append(entry) # drop from the left if full
+                            entry = buffer.popleft()
+                            processed_entries_queue.append(entry)  # drop from the left if full
 
-                        stats_aggregator.update([len(entry["input_ids"]) for entry in processed_entries_queue])
-                        max_model_version = max([entry["model_version"] for entry in processed_entries_queue]) if processed_entries_queue else 0
+                            stats_aggregator.update([len(entry["input_ids"]) for entry in processed_entries_queue])
+                            max_model_version = max([entry["model_version"] for entry in processed_entries_queue]) if processed_entries_queue else 0
                     
                     max_unconsumed_samples = cfg.preprocess.max_ready_samples_per_lead * num_trainers
 
@@ -759,9 +977,40 @@ def run_preprocessing_loop(
                             "preprocessor/filtered_out_samples": num_filtered_out,
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
                             "preprocessor/dropped_oversized_chunks": dropped_oversized_chunks,
+                            "preprocessor/strict_tito_dropped_groups": strict_tito_dropped_groups,
+                            "preprocessor/strict_tito_dropped_entries": strict_tito_dropped_entries,
                         }
+                        if uniform_one:
+                            assert uniform_group_buffer is not None
+                            stats.update({
+                                "preprocessor/uniform_one/eligible_rollouts": uniform_eligible_rollouts,
+                                "preprocessor/uniform_one/selected_rollouts": uniform_selected_rollouts,
+                                "preprocessor/uniform_one/ready_groups": len(uniform_group_buffer.ready_groups),
+                                "preprocessor/uniform_one/ready_rollouts": uniform_group_buffer.ready_entries,
+                                "preprocessor/uniform_one/staged_groups": len(uniform_group_buffer.staged_groups),
+                                "preprocessor/uniform_one/staged_rollouts": uniform_group_buffer.staged_entries,
+                                "preprocessor/uniform_one/evicted_groups": uniform_group_buffer.evicted_groups,
+                                "preprocessor/uniform_one/evicted_rollouts": uniform_group_buffer.evicted_entries,
+                                "preprocessor/uniform_one/dropped_oversized_groups": uniform_group_buffer.dropped_oversized_groups,
+                                "preprocessor/uniform_one/dropped_oversized_rollouts": uniform_group_buffer.dropped_oversized_entries,
+                                "preprocessor/uniform_one/updates": uniform_updates,
+                                "preprocessor/uniform_one/last_update_groups": uniform_update_groups,
+                                "preprocessor/uniform_one/last_update_real_rollouts": uniform_update_real_rollouts,
+                                "preprocessor/uniform_one/last_update_padding": uniform_update_padding,
+                            })
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
+                        if uniform_one and uniform_selected_turn_positions:
+                            ordered_positions = sorted(uniform_selected_turn_positions)
+                            for name, quantile in (
+                                ("p25", 0.25),
+                                ("p50", 0.5),
+                                ("p75", 0.75),
+                            ):
+                                index = round(quantile * (len(ordered_positions) - 1))
+                                stats[
+                                    f"preprocessor/uniform_one/selected_turn_position_{name}"
+                                ] = ordered_positions[index]
                         if wandb_run is not None:
                             wandb_run.log(stats)
                         stats_writer.write(stats)

@@ -39,6 +39,9 @@ preprocess:
   ring_buffer_size: 128
   # Preserve legacy OOV replacement unless a domain explicitly requires strict TITO.
   strict_tito: false
+  # Train on every emitted turn (legacy) or one deterministic turn per rollout
+  # with complete task groups composed atomically into optimizer updates.
+  rollout_turn_sampling: all
   # "virtual" sample queue per lead trainer
   max_ready_samples_per_lead: 64
   pop_old_data: ${..pop_old_data}
