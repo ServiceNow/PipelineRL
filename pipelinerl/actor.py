@@ -145,6 +145,7 @@ async def schedule_rollouts(
     samples_target = final_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
     retryable_rollout_exceptions = (
         aiohttp.ServerTimeoutError,
+        aiohttp.ServerDisconnectedError,
         asyncio.TimeoutError,
         TimeoutError,
         RetryableAbortedCompletionError,
@@ -192,21 +193,35 @@ async def schedule_rollouts(
                     break
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:
-                    is_retryable = isinstance(exc, retryable_rollout_exceptions)
-                    can_retry = max_rollout_retries < 0 or retry_count < max_rollout_retries
-                    if is_retryable and can_retry and not is_trainer_finished():
-                        retry_count += 1
-                        backoff_s = min(retry_max_delay_s, retry_initial_delay_s * (2 ** (retry_count - 1)))
-                        if retry_count == 1 or retry_count % 10 == 0:
-                            logger.warning(
-                                f"{scheduler_name}: rollout {group_id}/{rollout_index} failed with "
-                                f"{exc.__class__.__name__}, retry {retry_count}"
-                            )
-                        await asyncio.sleep(backoff_s)
-                        continue
-                    handle_rollout_exception(exc)
-                    return
+                except aiohttp.ClientResponseError as http_exc:
+                    if 400 <= http_exc.status < 500:
+                        logger.warning(
+                            f"Rollout failed with HTTP {http_exc.status} for group {group_id}, "
+                            f"skipping this rollout: {http_exc.message}"
+                        )
+                        rollout_result = RolloutResult(
+                            training_texts=[],
+                            metrics=BaseMetrics(reward=0.0, success=False, no_error=False, no_answer=True),
+                            latency=0.0,
+                        )
+                        break
+                    exc = http_exc
+                except Exception as exc_:
+                    exc = exc_
+                is_retryable = isinstance(exc, retryable_rollout_exceptions)
+                can_retry = max_rollout_retries < 0 or retry_count < max_rollout_retries
+                if is_retryable and can_retry and not is_trainer_finished():
+                    retry_count += 1
+                    backoff_s = min(retry_max_delay_s, retry_initial_delay_s * (2 ** (retry_count - 1)))
+                    if retry_count == 1 or retry_count % 10 == 0:
+                        logger.warning(
+                            f"{scheduler_name}: rollout {group_id}/{rollout_index} failed with "
+                            f"{exc.__class__.__name__}, retry {retry_count}"
+                        )
+                    await asyncio.sleep(backoff_s)
+                    continue
+                handle_rollout_exception(exc)
+                return
             rollout_result.model_version = model_version
             # Make a group id that will be different from groups made by another rollout maker
             full_group_id = f"{scheduler_name}_{group_id}"
@@ -219,10 +234,19 @@ async def schedule_rollouts(
                 sample.group_id = full_group_id
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
-                # This is blocking call, but there's just one other thread reading from this queue.
-                random.shuffle(group_rollouts[group_id])
-                result_queue.put(group_rollouts[group_id])
+                # Filter out empty results (failed rollouts with no training data)
+                valid_results = [r for r in group_rollouts[group_id] if r.training_texts]
+                if not valid_results:
+                    logger.warning(
+                        f"Dropping group {group_id}: all {attempts} rollouts failed "
+                        f"(no training samples produced)"
+                    )
+                    del group_rollouts[group_id]
+                    finished_rollouts += 1
+                    return
+                random.shuffle(valid_results)
                 del group_rollouts[group_id]
+                await asyncio.get_event_loop().run_in_executor(None, result_queue.put, valid_results)
             finished_rollouts += 1
         except Exception as e:
             handle_rollout_exception(e)
@@ -589,8 +613,8 @@ class ActorLoop:
 
                 assert isinstance(rollout_results, list)
                 assert isinstance(rollout_results[0], RolloutResult)
-                assert len(rollout_results) == attempts, (
-                    f"Expected {attempts} rollouts, got {len(rollout_results)}"
+                assert 0 < len(rollout_results) <= attempts, (
+                    f"Expected 1-{attempts} rollouts, got {len(rollout_results)}"
                 )
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
