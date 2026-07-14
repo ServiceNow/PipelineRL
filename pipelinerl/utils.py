@@ -195,6 +195,14 @@ def get_environment_jobs(cfg: DictConfig, key: str | None = None) -> list[Job]:
     filtered = [job for job in env_jobs if getattr(job, "environment_key", None) == key]
     return filtered or env_jobs
 
+
+def _login_wandb_from_api_key_path() -> None:
+    api_key_path = os.environ.get("WANDB_API_KEY_PATH")
+    if api_key_path is None:
+        return
+    wandb.login(key=Path(api_key_path).read_text().strip())
+
+
 def init_wandb(
     cfg: DictConfig,
     run_dir: Path,
@@ -210,7 +218,14 @@ def init_wandb(
 
     python_env = {}
     for dist in distributions():
-        python_env[dist.metadata["Name"]] = dist.version
+        if dist.metadata is None:
+            continue
+        try:
+            name = dist.metadata["Name"]
+            if name is not None:
+                python_env[name] = dist.version
+        except Exception as e:
+            logger.warning(f"Accessing {dist} resulted in error {e}")
     config_for_wandb["python_env"] = python_env
 
     if cfg.wandb.wandb_resume == "always":
@@ -222,21 +237,29 @@ def init_wandb(
     else:
         raise ValueError(f"Unknown value for wandb_resume: {cfg.finetune.wandb_resume}")
 
-    wandb_name = str(run_dir)
+    run_path_name = str(run_dir)
     root = cfg.wandb.wandb_workspace_root
     if root:
-        if not wandb_name.startswith(root + "/"):
+        if not run_path_name.startswith(root + "/"):
             raise ValueError(f"run_dir {run_dir} does not start with root {root}")
-        wandb_name = wandb_name[len(root) + 1 :]
+        run_path_name = run_path_name[len(root) + 1 :]
+
+    # Display name: an explicit short name (with the component suffix, so the per-service runs
+    # stay distinguishable in a legend) when set, else the full root-relative run dir. The id
+    # stays derived from the unique run-dir path, so a short name may repeat across experiments
+    # without colliding.
+    component = run_path_name.rstrip("/").split("/")[-1]
+    wandb_name = f"{cfg.wandb.wandb_name}/{component}" if cfg.wandb.wandb_name else run_path_name
 
     wandb_id = cfg.wandb.wandb_id
     if not wandb_id:
-        wandb_id = wandb_name.replace("/", "_")
+        wandb_id = run_path_name.replace("/", "_")
 
     if len(wandb_name) > 128:
         logger.warning(f"wandb_name: {wandb_name} is longer than 128 characters. Truncating to 128 characters.")
 
     logging.info(f"Initializing W&B with\nname: {wandb_name[:128]}\nid: {wandb_id}\nresume: {resume}")
+    _login_wandb_from_api_key_path()
     run = wandb.init(
         name=wandb_name[:128],  # wandb limits name to 128 characters
         entity=cfg.wandb.wandb_entity_name,
@@ -493,6 +516,16 @@ def wait_for_environments(cfg: DictConfig):
 
 @contextlib.contextmanager
 def better_crashing(entrypoint_name: str):
+    import faulthandler
+    import signal
+
+    faulthandler.enable()  # dump the crashing thread's own stack on a fatal signal (SIGSEGV/SIGABRT/...)
+    if hasattr(signal, "SIGUSR1"):
+        # On-demand all-thread dump: `kill -USR1 <pid>` a process you suspect is hung.
+        # Do NOT arm faulthandler.dump_traceback_later(repeat=True): the periodic timer walks a
+        # running thread's frames without GIL synchronization and SIGSEGVs on Triton JIT
+        # kernel-launch frames (see https://github.com/ServiceNow/PipelineRL/issues/149).
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     try:
         yield
     except Exception as e:
