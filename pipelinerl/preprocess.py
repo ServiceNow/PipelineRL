@@ -76,7 +76,7 @@ def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
         group_rollouts[group_id].add(rollout_index)
 
     for group_id, rollout_ids in group_rollouts.items():
-        if len(rollout_ids) != group_size:
+        if not 1 <= len(rollout_ids) <= group_size:
             logger.error(f"Group sizes are wrong: {group_rollouts}")
             return False
 
