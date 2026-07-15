@@ -369,7 +369,7 @@ When `use_fast_llm: true` (default in `conf/math.yaml`), the DeepSpeed ZeRO-3 tr
 - Defined in `pipelinerl/streams.py`.
 - Implements `SingleStreamSpec` and `StreamRangeSpec` for file-system or Redis-based queues.
 - `write_to_streams(...)` and `read_stream(...)` provide a JSON-line protocol for inter-process messaging.
-- Pass `shared=True` to `write_to_streams(...)` when multiple actors must fan-in to a single Redis stream (e.g., the Fast-LLM trainer), which encodes payloads via `orjson` and tags them with a global index.
+- Pass `shared=True` to `write_to_streams(...)` when multiple actors must fan-in to a single Redis stream (e.g., the Fast-LLM trainer), which encodes payloads via `orjson`.
 - Available backends:
   - File system: default.
   - Redis: requires Redis server.

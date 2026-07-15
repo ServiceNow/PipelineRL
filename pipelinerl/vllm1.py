@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 from pipelinerl.finetune_loop import WeightUpdateRequest
+from pipelinerl.state import FAST_LLM_EVENTS_STREAM, FAST_LLM_EVENT_PAYLOAD_KEY, fast_llm_event_version
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from typing import Any, Protocol, runtime_checkable
 from fastapi import BackgroundTasks
@@ -522,8 +523,8 @@ class EngineManager:
             import time
 
             r = redis.Redis(host=self._redis_host, port=self._redis_port)
-            stream_key = "fast_llm_events"
-            payload_key = b"event"
+            stream_key = FAST_LLM_EVENTS_STREAM
+            payload_key = FAST_LLM_EVENT_PAYLOAD_KEY
             last_id = "0-0"
             # First weights_ready event since this vLLM process started is the
             # initial broadcast (step can be 0 on fresh start or k>0 on resume).
@@ -559,11 +560,8 @@ class EngineManager:
 
                             event_type = event.get("type")
                             step = event.get("step")
-                            # Fast-LLM sends the cumulative document count (`documents_seen`) as the
-                            # model version, to align staleness with the trainer's document clock;
-                            # fall back to `step` for older trainers that only send the step.
                             documents_seen = event.get("documents_seen")
-                            version = documents_seen if documents_seen is not None else step
+                            version = fast_llm_event_version(event)
 
                             if event_type == "weights_ready":
                                 if not first_weights_ready_seen:
@@ -641,8 +639,8 @@ class EngineManager:
             self._fast_llm_monitor_thread.join(timeout=5)
             logger.info("[FastLLM] Main-process monitoring thread stopped")
 
-    @asynccontextmanager
     @staticmethod
+    @asynccontextmanager
     async def create_engine(
         args: Any,
         cleanup: bool = True,
@@ -699,10 +697,10 @@ class EngineManager:
 
         logger.info("vLLM engine created successfully")
 
+        assert isinstance(engine.engine_core, AsyncMPClient)
+        manager = EngineManager(args, engine, engine_config)
+        weight_update_mode = getattr(args, "weight_update_mode", "http")
         try:
-            assert isinstance(engine.engine_core, AsyncMPClient)
-            manager = EngineManager(args, engine, engine_config)
-            weight_update_mode = getattr(args, "weight_update_mode", "http")
             if not args.disable_weight_updates:
                 await manager.init_actor_update_group()
 

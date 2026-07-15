@@ -198,41 +198,15 @@ class RedisSharedStreamWriter(StreamWriter):
     def __init__(
         self,
         stream: SingleStreamSpec,
-        mode: Literal["w", "a"] = "a",
         *,
-        writer_id: str | None = None,
         maxlen: int = 1_000_000,
         stream_name_override: str | None = None,
-        pipelinerl_metadata: bool = True,
     ):
         self.stream = stream
         assert isinstance(_backend, RedisConfig)
         self._redis = connect_to_redis(_backend)
         self._stream_name = stream_name_override if stream_name_override is not None else str(self.stream)
-        self._counter_key = f"stream:{self._stream_name}:next_index"
-        self._writer_id = str(writer_id) if writer_id is not None else None
         self._maxlen = maxlen
-        self._pipelinerl_metadata = pipelinerl_metadata
-
-        if mode not in {"w", "a"}:
-            raise ValueError(f"Invalid mode: {mode}. Only 'w' and 'a' are supported.")
-
-        if mode == "w":
-            last_entry = self._redis.xrevrange(self._stream_name, count=1)
-            if last_entry:
-                raise ValueError(f"Stream {self.stream} already exists. Cannot overwrite it.")
-            self._redis.delete(self._counter_key)
-            self._redis.set(self._counter_key, -1)
-        else:
-            if not self._redis.exists(self._counter_key):
-                last_entry = self._redis.xrevrange(self._stream_name, count=1)
-                if last_entry:
-                    _, entry = last_entry[0]
-                    raw_index = entry.get(b"index")
-                    next_index = int(raw_index.decode("utf-8")) + 1 if raw_index else 0
-                else:
-                    next_index = 0
-                self._redis.set(self._counter_key, next_index - 1)
 
     def __enter__(self):
         return self
@@ -241,21 +215,9 @@ class RedisSharedStreamWriter(StreamWriter):
         self._redis.close()
 
     def write(self, data, partition: int | None = None):
-        # Note: partition is ignored for shared streams - all data goes to a single stream
-        # This is intentional for Fast-LLM integration where Fast-LLM handles its own sharding
+        # partition is ignored: all producers fan in to one stream and Fast-LLM shards downstream.
         serialized = _serialize_with_orjson(data)
-        if self._pipelinerl_metadata:
-            entry_index = self._redis.incr(self._counter_key)
-            record: dict[str, Any] = {
-                "index": str(entry_index),
-                "data": serialized,
-                "ts": f"{time.time():.6f}",
-            }
-            if self._writer_id is not None:
-                record["writer"] = self._writer_id
-        else:
-            record = {"data": serialized}
-        self._redis.xadd(self._stream_name, record, maxlen=self._maxlen, approximate=True)
+        self._redis.xadd(self._stream_name, {"data": serialized}, maxlen=self._maxlen, approximate=True)
 
 
 class RoundRobinRedisStreamWriter(StreamWriter):
@@ -492,14 +454,12 @@ def write_to_streams(
     mode: Literal["w", "a"] = "a",
     *,
     shared: bool = False,
-    writer_id: str | None = None,
     stream_name_override: str | None = None,
-    pipelinerl_metadata: bool = True,
 ) -> StreamWriter:
     """Append to the end of the stream.
 
     Set ``shared`` to True when multiple producers must append to the same Redis
-    stream and ServiceNow/Fast-LLM will perform downstream sharding.
+    stream and Fast-LLM will perform downstream sharding.
 
     ``stream_name_override`` bypasses the stream spec naming and writes directly
     to the given Redis key. Only supported for shared Redis streams.
@@ -510,7 +470,7 @@ def write_to_streams(
     if isinstance(_backend, RedisConfig):
         if isinstance(streams, SingleStreamSpec):
             if shared:
-                return RedisSharedStreamWriter(streams, mode, writer_id=writer_id, stream_name_override=stream_name_override, pipelinerl_metadata=pipelinerl_metadata)
+                return RedisSharedStreamWriter(streams, stream_name_override=stream_name_override)
             return RedisStreamWriter(streams, mode)
         elif isinstance(streams, StreamRangeSpec):
             if shared:

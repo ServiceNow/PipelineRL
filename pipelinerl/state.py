@@ -18,6 +18,16 @@ logger = logging.getLogger(__name__)
 
 # Fast-LLM event stream name (must match fast-llm config events.redis.stream_key)
 FAST_LLM_EVENTS_STREAM = "fast_llm_events"
+# Redis field holding the serialized event payload.
+FAST_LLM_EVENT_PAYLOAD_KEY = b"event"
+
+
+def fast_llm_event_version(event: dict) -> int | None:
+    """Model version carried by a Fast-LLM event: the cumulative document count
+    (``documents_seen``) when present, to align staleness with the trainer's document
+    clock, else the raw optimizer ``step`` (older trainers that only send the step)."""
+    documents_seen = event.get("documents_seen")
+    return documents_seen if documents_seen is not None else event.get("step")
 
 
 class TrainerState:
@@ -69,8 +79,8 @@ class TrainerState:
         from fast_llm.data.dataset.config import REDIS_DATA_STREAM, REDIS_GROUP_NAME
 
         # Fast-LLM event stream config (must match fast-llm config)
-        stream_key = FAST_LLM_EVENTS_STREAM  # "fast_llm_events"
-        payload_key = b"event"  # Fast-LLM uses "event" as payload key
+        stream_key = FAST_LLM_EVENTS_STREAM
+        payload_key = FAST_LLM_EVENT_PAYLOAD_KEY
 
         # Initialize to 0 so wait_for_processed_samples() doesn't block at startup.
         # The lag thread below will update this once the data stream/consumer group exists.
@@ -105,11 +115,8 @@ class TrainerState:
 
                         event_type = event.get("type")
                         step = event.get("step")
-                        # Fast-LLM sends the cumulative document count (`documents_seen`) as the model
-                        # version, to align staleness with DeepSpeed's document clock; fall back to
-                        # `step` for older trainers that only send the step.
                         documents_seen = event.get("documents_seen")
-                        version = documents_seen if documents_seen is not None else step
+                        version = fast_llm_event_version(event)
 
                         if event_type == "weights_ready":
                             logger.info(
