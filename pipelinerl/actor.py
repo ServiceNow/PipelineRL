@@ -155,6 +155,11 @@ async def schedule_rollouts(
     retry_max_delay_s = float(getattr(cfg.actor, "rollout_retry_max_delay_s", 30.0))
 
     def is_trainer_finished() -> bool:
+        # Fast-LLM ignores `gradient_accumulation_passes` and overshoots `docs_per_step`
+        # by a few docs per step, so the sample-counting formula below fires several
+        # optimizer steps early. Use the explicit `training_finished` event instead.
+        if cfg.use_fast_llm:
+            return trainer_state.training_done
         return (
             trainer_state.samples_processed is not None
             and trainer_state.samples_processed >= samples_target
@@ -318,7 +323,7 @@ def rollout_maker_entrypoint(
     llms: list[TrainableLLM],
     scheduler_name: str,
 ):
-    trainer_state = TrainerState(Path(cfg.output_dir))
+    trainer_state = TrainerState(Path(cfg.output_dir), use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode:
         trainer_state.propagated_weight_version = 0
     else:
@@ -566,9 +571,18 @@ class ActorLoop:
                 # the user function must do next(...) to run each iteration
                 yield
 
-                final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
-                samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
-                if self.trainer_state.samples_processed is not None and self.trainer_state.samples_processed >= samples_target:
+                # Mirror `is_trainer_finished` (above): use the explicit training_done
+                # event under Fast-LLM; fall back to sample counting for HF/DeepSpeed.
+                if self.cfg.use_fast_llm:
+                    trainer_finished = self.trainer_state.training_done
+                else:
+                    final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
+                    samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
+                    trainer_finished = (
+                        self.trainer_state.samples_processed is not None
+                        and self.trainer_state.samples_processed >= samples_target
+                    )
+                if trainer_finished:
                     logger.info("Trainer signalled completion; stopping actor loop")
                     break
 
@@ -687,7 +701,7 @@ class ActorLoop:
                 time_to_publish_train_stats = (
                     self.is_training
                     and trainer_version_to_publish is not None
-                ) or self.debug_mode 
+                ) or self.debug_mode
                 time_to_publish_test_stats = finished_groups == expected_rollouts
 
                 # Publish stats at every new model version or if all tapes are finished
@@ -698,20 +712,19 @@ class ActorLoop:
                             "problem_queue_size": self.problem_queue.qsize(),
                             "result_queue_size": self.result_queue.qsize(),
                             "finished_groups": finished_groups,
-                            "trainer_model_version": trainer_version_to_publish, 
+                            "trainer_model_version": trainer_version_to_publish,
                             "time_since_start": time.time() - loop_start_time,
                         }
                         trainer_version_to_publish = None
                     else:
                         loop_stats = {
-                            "trainer_model_version": last_trainer_version
+                            "trainer_model_version": last_trainer_version,
                             }
 
                     self.publish_stats(
                         stats_writer=stats_writer,
                         loop_stats=loop_stats,
                     )
-
 
                 if finished_groups == expected_rollouts:
                     logger.info(f"Finished {expected_rollouts} rollouts, stopping actor loop")
@@ -866,7 +879,7 @@ def run_actor_loop(cfg: DictConfig):
 
     wait_for_inference_servers(llm_urls)
     wait_for_environments(cfg)
-    trainer_state = TrainerState(exp_path)
+    trainer_state = TrainerState(exp_path, use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode:
         trainer_state.debug_mode_init()
     else:
