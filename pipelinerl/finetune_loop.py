@@ -883,10 +883,10 @@ def rl_finetuning_worker(
                     "stats/max_actor_version": lag_stats["max_version"],
                     "stats/queue/batches": batch_queue.qsize(),
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
-                    "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
                     "stats/lag_min": training_metrics.last_broadcasted_version - lag_stats["max_version"],
                     "stats/lag_mean": training_metrics.last_broadcasted_version
                     - lag_stats["sum_version"] / lag_stats["count"],
+                    "stats/lag_max": training_metrics.last_broadcasted_version - lag_stats["min_version"],
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
                     "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
