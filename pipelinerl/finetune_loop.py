@@ -690,8 +690,11 @@ def rl_finetuning_worker(
         lag_stats["max_version"] = max(
             lag_stats.get("max_version", batch.model_version), batch.model_version
         )
-
         if not is_sentinel_batch:
+            # Sentinel batches carry the newest version, so they would bias the mean; exclude them.
+            lag_stats["sum_version"] = lag_stats.get("sum_version", 0) + batch.model_version
+            lag_stats["count"] = lag_stats.get("count", 0) + 1
+
             # We exclude time waiting for data from the pass time
             time_before_pass = time.time()
             training_metrics.passes += 1
@@ -881,6 +884,9 @@ def rl_finetuning_worker(
                     "stats/queue/batches": batch_queue.qsize(),
                     "stats/time_waiting_for_data": training_metrics.time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
+                    "stats/lag_min": training_metrics.last_broadcasted_version - lag_stats["max_version"],
+                    "stats/lag_mean": training_metrics.last_broadcasted_version
+                    - lag_stats["sum_version"] / lag_stats["count"],
                     "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
                     "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
