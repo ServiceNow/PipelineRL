@@ -593,7 +593,7 @@ def run_preprocessing_loop(
         _log_dir.mkdir(parents=True, exist_ok=True)
         pipeline_log_file = open(_log_dir / "preprocessor.jsonl", "a")
 
-    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name, pipelinerl_metadata=not cfg.use_fast_llm) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)

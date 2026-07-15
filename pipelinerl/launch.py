@@ -417,12 +417,7 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
     save_command(exp_dir / "finetune", cmd, suffix=node_suffix)
     env = dict(os.environ)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
-    save_dir = exp_dir / "finetune"
-    os.makedirs(save_dir, exist_ok=True)
-    log_file_path = save_dir / f"stdout{node_suffix}.log"
-    err_file_path = save_dir / f"stderr{node_suffix}.log"
-    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
-        proc = _popen(cmd, env=env, stdout=log_file, stderr=err_file)
+    proc = _popen(cmd, env=env)
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
 
