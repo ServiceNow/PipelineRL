@@ -57,7 +57,7 @@ class WorldMap:
         tp = llm_kwargs.get("tensor-parallel-size", 1)
         pp = llm_kwargs.get("pipeline-parallel-size", 1)
         self.gpus_per_llm = tp * pp
-        self.node_size = 8 if self.world_size > 1 else torch.cuda.device_count()
+        self.node_size = int(os.environ.get("GPUS_PER_NODE", torch.cuda.device_count()))
 
         place_inference_jobs = not cfg.debug.mode or cfg.debug.place_inference_workers
         if place_inference_jobs:

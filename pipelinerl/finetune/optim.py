@@ -22,11 +22,11 @@ def get_grouped_params(
     ]
 
 
-def get_optimizer(name, model, learning_rate, weight_decay):
+def get_optimizer(name, model, learning_rate, weight_decay, betas=(0.9, 0.999)):
     grouped_params = get_grouped_params(model, weight_decay)
     match name:
         case "adamw_torch":
-            optimizer = AdamW(grouped_params, lr=learning_rate)
+            optimizer = AdamW(grouped_params, lr=learning_rate, betas=betas)
         case "adafactor":
             optimizer = Adafactor(
                 grouped_params,
@@ -37,7 +37,7 @@ def get_optimizer(name, model, learning_rate, weight_decay):
         case "cpuadam":
             import deepspeed.ops.adam
 
-            optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(grouped_params, lr=learning_rate)
+            optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(grouped_params, lr=learning_rate, betas=betas)
         case "lion":
             optimizer = Lion(grouped_params, lr=learning_rate)
         case _:

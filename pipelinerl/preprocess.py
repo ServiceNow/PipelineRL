@@ -76,7 +76,7 @@ def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
         group_rollouts[group_id].add(rollout_index)
 
     for group_id, rollout_ids in group_rollouts.items():
-        if len(rollout_ids) != group_size:
+        if not 1 <= len(rollout_ids) <= group_size:
             logger.error(f"Group sizes are wrong: {group_rollouts}")
             return False
 
@@ -637,14 +637,17 @@ def run_preprocessing_loop(
                                     current_length = 0
                                     logger.debug(f"[inner loop] Packed microbatch with {len(current_batch)} samples for trainer {trainer_id}")
                         else:
+                            # Unpacked path: need a full micro-batch before collating.
+                            if len(processed_entries_queue) < cfg.finetune.train_batch_size:
+                                break  # wait for more data; outer loop will refill the queue
                             batch_entries = []
-                            for _ in range(cfg.finetune.train_batch_size ):
+                            for _ in range(cfg.finetune.train_batch_size):
                                 batch_entries.append(processed_entries_queue.popleft())
                             batch_encoding = collate(batch_entries, tokenizer=tokenizer)
                             write_micro_batch_slices(trainer_id, data_writer, batch_encoding, cfg.finetune.seq_parallel)
                             published_samples += len(batch_entries)
                             samples_per_trainer[trainer_id] += len(batch_entries)
-                            logger.debug(f"[inner loop] Packed microbatch with {len(batch_entries)} samples for trainer {trainer_id}")
+                            logger.debug(f"[inner loop] Unpacked microbatch with {len(batch_entries)} samples for trainer {trainer_id}")
                             trainer_id = (trainer_id + cfg.finetune.seq_parallel) % num_trainers
 
                         batch_done = published_samples == batch_boundary and trainer_id == 0

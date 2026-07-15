@@ -111,6 +111,14 @@ def _get_quantization_args(cfg: DictConfig) -> list[str]:
             f"vllm_config.quantization='{quantization}' is incompatible with PipelineRL's "
             "required FP32 lm_head inference path"
         )
+    # The bf16_last_layer_fp32 method forces a bf16 body with an fp32 lm_head, which overrides
+    # --dtype. When inference runs at a non-bf16 dtype (e.g. to match a fp16/fp32 trainer),
+    # skip it so vLLM honors the requested dtype; the fp32 lm_head is dropped, which is
+    # consistent since the whole model then runs at that dtype.
+    vllm_kwargs = cfg.vllm_config.get("vllm_kwargs") or {}
+    dtype = vllm_kwargs.get("dtype")
+    if dtype not in (None, "auto", "bfloat16"):
+        return []
     return ["--quantization", "bf16_last_layer_fp32"]
 
 
@@ -155,7 +163,7 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     os.makedirs(log_dir, exist_ok=True)
 
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "vllm.entrypoints.openai.api_server",
         "--model",
@@ -202,7 +210,7 @@ def run_actor_llm(
     os.makedirs(log_dir, exist_ok=True)
     entrypoint = "pipelinerl.entrypoints.run_vllm1"
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         entrypoint,
         "--model",
@@ -224,6 +232,9 @@ def run_actor_llm(
     cmd.extend(_get_quantization_args(cfg))
 
     kwargs = _get_vllm_kwargs(cfg)
+    # vLLM v1 rejects num-scheduler-steps; defensively drop it.
+    if "num-scheduler-steps" in kwargs:
+        kwargs.pop("num-scheduler-steps")
     if kwargs:
         _append_vllm_kwargs(cmd, kwargs)
 
@@ -235,7 +246,9 @@ def run_actor_llm(
     save_command(log_dir, cmd)
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
+    # Give each actor a distinct base port so vLLM's get_open_port() race condition
+    # (TOCTOU: find-free-port then bind) doesn't cause EADDRINUSE when multiple servers start simultaneously.
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, "VLLM_PORT": str(30000 + actor_llm_idx * 20), **_get_quantization_env(cfg)}
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
@@ -252,7 +265,7 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 actor yet")
     llm_urls = "+".join(world_map.get_actor_urls())
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_actor",
         "--config-dir",
@@ -276,7 +289,7 @@ def run_environment(cfg: DictConfig, job: Job):
     # run in a subprocess like in the rest of the code
     run_dir = Path(cfg.output_dir) / f"environment_{job.replica_idx}"
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_environment",
         "--config-dir",
@@ -307,7 +320,7 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     if cfg.use_fsdp and cfg.use_deepspeed:
         raise ValueError("Cannot use both FSDP and DeepSpeed")
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "accelerate.commands.launch",
     ]
@@ -404,7 +417,7 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
         raise NotImplementedError("Can only do 1 preprocessor yet")
     llm_urls = "+".join(world_map.get_preprocessor_urls())
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "pipelinerl.entrypoints.run_preprocess",
         "--config-dir",
@@ -426,7 +439,11 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
 
 
 def run_redis(cfg: DictConfig):
-    # Launch redis-server
+    # Launch redis-server. Resolve paths to absolutes because redis-server
+    # chdir's to --dir before opening --logfile, which breaks relative paths.
+    output_dir = Path(cfg.output_dir).resolve()
+    redis_dir = output_dir / "redis"
+    os.makedirs(redis_dir, exist_ok=True)
     cmd = [
         "redis-server",
         "--bind",
@@ -434,11 +451,15 @@ def run_redis(cfg: DictConfig):
         "--port",
         str(cfg.streams.port),
         "--dir",
-        str(cfg.output_dir),
+        str(output_dir),
         "--protected-mode",
         "no",
         "--save",
         cfg.streams.save,
+        "--logfile",
+        str(redis_dir / "redis.log"),
+        "--loglevel",
+        "verbose",
     ]
     logger.info(f"Running redis with command: {' '.join(cmd)}")
     save_command(Path(cfg.output_dir) / "redis", cmd)
