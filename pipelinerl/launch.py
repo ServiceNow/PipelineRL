@@ -341,6 +341,13 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         yield from _run_finetune_deepspeed(cfg, world_map, gpus, exp_dir)
 
 
+def _node_suffix(world_map: WorldMap) -> str:
+    """Per-node filename suffix, empty unless finetuning spans multiple nodes."""
+    finetune_nodes = world_map.nodes_with_finetuning()
+    finetune_rank = world_map.my_finetuning_rank()
+    return f"_node{finetune_rank}" if len(finetune_nodes) > 1 else ""
+
+
 def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
     if cfg.use_fsdp and cfg.use_deepspeed:
         raise ValueError("Cannot use both FSDP and DeepSpeed")
@@ -408,9 +415,7 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
     if cfg.debug.mode in ["finetune", "open_loop", "finetune+preprocessor"]:
         cmd.append("finetune.send_weight_updates=False")
 
-    finetune_nodes = world_map.nodes_with_finetuning()
-    finetune_rank = world_map.my_finetuning_rank()
-    node_suffix = f"_node{finetune_rank}" if len(finetune_nodes) > 1 else ""
+    node_suffix = _node_suffix(world_map)
 
     logger.info(f"Running DeepSpeed finetune with command: {' '.join(cmd)}")
     save_command(exp_dir / "finetune", cmd, suffix=node_suffix)
@@ -467,8 +472,7 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
     model_type = cfg.fast_llm_finetune.model_type
     torchrun_port = cfg.fast_llm_finetune.torchrun_port
     finetune_nodes = world_map.nodes_with_finetuning()
-    finetune_rank = world_map.my_finetuning_rank()
-    node_suffix = f"_node{finetune_rank}" if len(finetune_nodes) > 1 else ""
+    node_suffix = _node_suffix(world_map)
 
     config_path = save_dir / f"fast_llm_config{node_suffix}.yaml"
     OmegaConf.save(OmegaConf.create(fast_llm_cfg), config_path)
@@ -751,7 +755,7 @@ def _get_pod_ip() -> str:
         sock.close()
 
 
-def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path, run_id: str) -> None:
+def _exchange_pod_ips(world_map: WorldMap, exp_dir: Path, run_id: str) -> None:
     """Exchange pod IPs across replicas via the shared NFS mount.
 
     Kubernetes Services only expose the declared master port; all other ports

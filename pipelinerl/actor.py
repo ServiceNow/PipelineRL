@@ -155,15 +155,7 @@ async def schedule_rollouts(
     retry_max_delay_s = float(getattr(cfg.actor, "rollout_retry_max_delay_s", 30.0))
 
     def is_trainer_finished() -> bool:
-        # Fast-LLM ignores `gradient_accumulation_passes` and overshoots `docs_per_step`
-        # by a few docs per step, so the sample-counting formula below fires several
-        # optimizer steps early. Use the explicit `training_finished` event instead.
-        if cfg.use_fast_llm:
-            return trainer_state.training_done
-        return (
-            trainer_state.samples_processed is not None
-            and trainer_state.samples_processed >= samples_target
-        )
+        return trainer_state.is_finished(samples_target)
 
     def handle_rollout_exception(exc: Exception):
         if isinstance(exc, retryable_rollout_exceptions) and is_trainer_finished():
@@ -563,6 +555,8 @@ class ActorLoop:
             can_submit_before_update = math.inf
 
         logger.info(f"Start {'train' if self.is_training else 'test'} actor loop")
+        final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
+        samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
         with (
             write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
@@ -571,18 +565,7 @@ class ActorLoop:
                 # the user function must do next(...) to run each iteration
                 yield
 
-                # Mirror `is_trainer_finished` (above): use the explicit training_done
-                # event under Fast-LLM; fall back to sample counting for HF/DeepSpeed.
-                if self.cfg.use_fast_llm:
-                    trainer_finished = self.trainer_state.training_done
-                else:
-                    final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
-                    samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
-                    trainer_finished = (
-                        self.trainer_state.samples_processed is not None
-                        and self.trainer_state.samples_processed >= samples_target
-                    )
-                if trainer_finished:
+                if self.trainer_state.is_finished(samples_target):
                     logger.info("Trainer signalled completion; stopping actor loop")
                     break
 
