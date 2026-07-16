@@ -30,6 +30,45 @@ def fast_llm_event_version(event: dict) -> int | None:
     return documents_seen if documents_seen is not None else event.get("step")
 
 
+def read_fast_llm_events(redis_client, stop_event: threading.Event | None = None):
+    """Yield ``(event_type, version, step, documents_seen)`` for each event on the
+    Fast-LLM Redis stream, until ``stop_event`` is set (indefinitely if it is ``None``).
+    Transient read failures are retried; malformed messages are skipped."""
+    import orjson
+
+    last_id = "0-0"
+    while stop_event is None or not stop_event.is_set():
+        try:
+            result = redis_client.xread({FAST_LLM_EVENTS_STREAM: last_id}, count=1, block=1000)
+        except Exception as e:
+            logger.error(f"Failed to read Fast-LLM events: {e}")
+            if stop_event is not None and stop_event.is_set():
+                break
+            time.sleep(1)
+            continue
+        if not result:
+            continue
+        for _stream_name, messages in result:
+            for message_id, message_data in messages:
+                last_id = message_id
+                if FAST_LLM_EVENT_PAYLOAD_KEY not in message_data:
+                    logger.warning(
+                        f"Fast-LLM event missing '{FAST_LLM_EVENT_PAYLOAD_KEY.decode()}' field: {message_data}"
+                    )
+                    continue
+                try:
+                    event = orjson.loads(message_data[FAST_LLM_EVENT_PAYLOAD_KEY])
+                except Exception as e:
+                    logger.error(f"Failed to parse Fast-LLM event: {e}")
+                    continue
+                yield (
+                    event.get("type"),
+                    fast_llm_event_version(event),
+                    event.get("step"),
+                    event.get("documents_seen"),
+                )
+
+
 class TrainerState:
     def __init__(self, exp_path: Path, use_fast_llm: bool = False, weight_broadcast: bool = True):
         self.exp_path = exp_path
@@ -73,14 +112,9 @@ class TrainerState:
 
     def _start_listening_fast_llm(self):
         """Listen to Fast-LLM trainer events directly from Redis."""
-        import orjson
         from pipelinerl.streams import RedisConfig, _backend, connect_to_redis
 
         from fast_llm.data.dataset.config import REDIS_DATA_STREAM, REDIS_GROUP_NAME
-
-        # Fast-LLM event stream config (must match fast-llm config)
-        stream_key = FAST_LLM_EVENTS_STREAM
-        payload_key = FAST_LLM_EVENT_PAYLOAD_KEY
 
         # Initialize to 0 so wait_for_processed_samples() doesn't block at startup.
         # The lag thread below will update this once the data stream/consumer group exists.
@@ -89,46 +123,17 @@ class TrainerState:
         def listen_events():
             assert isinstance(_backend, RedisConfig)
             r = connect_to_redis(_backend)
-            last_id = "0-0"
-
-            logger.info(f"Listening for Fast-LLM events on Redis stream '{stream_key}'")
-
-            while True:
-                result = r.xread({stream_key: last_id}, count=1, block=1000)
-
-                if not result:
-                    continue
-
-                for stream_name, messages in result:
-                    for msg_id, msg_data in messages:
-                        last_id = msg_id
-
-                        if payload_key not in msg_data:
-                            logger.warning(f"Fast-LLM event missing '{payload_key.decode()}' field: {msg_data}")
-                            continue
-
-                        try:
-                            event = orjson.loads(msg_data[payload_key])
-                        except Exception as e:
-                            logger.error(f"Failed to parse Fast-LLM event: {e}")
-                            continue
-
-                        event_type = event.get("type")
-                        step = event.get("step")
-                        documents_seen = event.get("documents_seen")
-                        version = fast_llm_event_version(event)
-
-                        if event_type == "weights_ready":
-                            logger.info(
-                                f"Received weights_ready event: step={step}, documents_seen={documents_seen}"
-                            )
-                            self.propagated_weight_version = version
-                        elif event_type == "training_finished":
-                            logger.info("Received training_finished event")
-                            self.training_done = True
-                            self._training_done_event.set()
-                        else:
-                            logger.warning(f"Unknown Fast-LLM event type: {event_type}")
+            logger.info(f"Listening for Fast-LLM events on Redis stream '{FAST_LLM_EVENTS_STREAM}'")
+            for event_type, version, step, documents_seen in read_fast_llm_events(r):
+                if event_type == "weights_ready":
+                    logger.info(f"Received weights_ready event: step={step}, documents_seen={documents_seen}")
+                    self.propagated_weight_version = version
+                elif event_type == "training_finished":
+                    logger.info("Received training_finished event")
+                    self.training_done = True
+                    self._training_done_event.set()
+                else:
+                    logger.warning(f"Unknown Fast-LLM event type: {event_type}")
 
         def poll_lag():
             assert isinstance(_backend, RedisConfig)

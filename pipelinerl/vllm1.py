@@ -27,7 +27,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 from pipelinerl.finetune_loop import WeightUpdateRequest
-from pipelinerl.state import FAST_LLM_EVENTS_STREAM, FAST_LLM_EVENT_PAYLOAD_KEY, fast_llm_event_version
+from pipelinerl.state import read_fast_llm_events
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from typing import Any, Protocol, runtime_checkable
 from fastapi import BackgroundTasks
@@ -103,7 +103,7 @@ class WorkerExtension:
             ):
                 os.environ.pop(_k, None)
 
-        if weight_update_mode == 'http':
+        if weight_update_mode == "http":
             # HTTP mode uses vLLM's StatelessProcessGroup to match the trainer,
             # which in pipelinerl/finetune_loop.py uses torch_utils.stateless_init_process_group.
             self.model_update_group = stateless_init_process_group(
@@ -172,7 +172,7 @@ class WorkerExtension:
                 )
 
             if (i + 1) % 10 == 0:
-                logger.info(f"Received {i+1}/{len(request.parameters_info)} parameters")
+                logger.info(f"Received {i + 1}/{len(request.parameters_info)} parameters")
 
         pipelinerl.vllm_quantization.invalidate_fp32_cache()
         logger.info("Weight update received - all parameters processed")
@@ -185,10 +185,10 @@ class WorkerExtension:
         identical concurrency model to receive_weight_update (HTTP path).
 
         Protocol:
-        1. Loop: receive metadata via broadcast_object_list
+        1. Loop: receive metadata via broadcast_object
         2. Receive tensor via broadcast
         3. Call model.load_weights() for each parameter
-        4. Exit when metadata is [None] (end signal)
+        4. Exit when metadata is None (end signal)
         """
         torch.cuda.synchronize(self.device)
         logger.info(f"[Worker rank={self.rank}] Start receiving Fast-LLM weight update")
@@ -199,10 +199,8 @@ class WorkerExtension:
         from fast_llm.core.distributed import broadcast as _broadcast, broadcast_object as _broadcast_object
 
         while True:
-            # Receive metadata
             meta = _broadcast_object(None, self.model_update_group, src=0)
 
-            # Check for end signal
             if meta is None:
                 logger.info(
                     f"[Worker rank={self.rank}] Received end signal, finished receiving {param_count} parameters"
@@ -213,7 +211,6 @@ class WorkerExtension:
             # shard_name is a category label ("weights", "grads", etc.), not part of the HF param name
             shard_name, param_name, shape, dtype = meta
 
-            # Convert dtype to torch dtype
             target_dtype = string_to_dtype(str(dtype))
 
             # Allocate buffer and receive tensor (must happen for every broadcast to stay in sync)
@@ -248,13 +245,6 @@ class WorkerExtension:
         logger.info(
             f"[Worker rank={self.rank}] Fast-LLM weight update complete - {param_count} parameters processed"
         )
-
-    def close_communicator(self):
-        """Closes the communicator when weight synchronization is no longer needed."""
-        if hasattr(self, "model_update_group") and self.model_update_group is not None:
-            del self.model_update_group
-            self.model_update_group = None
-            logger.info("Weight update communicator closed")
 
 
 async def _pause_generation(engine: AsyncLLM) -> None:
@@ -323,10 +313,6 @@ class EngineManager:
                     f"in {time.perf_counter() - resume_started_at:.3f}s"
                 )
 
-    async def close_communicator(self):
-        """Closes the communicator when weight synchronization is no longer needed."""
-        await self.engine.engine_core.collective_rpc_async("close_communicator")
-
     async def init_fast_llm_receiver(self):
         """Store Redis connection info for the main-process monitoring thread."""
         self._redis_host = self.args.redis_host
@@ -390,12 +376,8 @@ class EngineManager:
 
         def monitor_redis_stream():
             import redis
-            import orjson
 
             r = redis.Redis(host=self._redis_host, port=self._redis_port)
-            stream_key = FAST_LLM_EVENTS_STREAM
-            payload_key = FAST_LLM_EVENT_PAYLOAD_KEY
-            last_id = "0-0"
             # First weights_ready event since this vLLM process started is the
             # initial broadcast (step can be 0 on fresh start or k>0 on resume).
             # Actor is still blocked in wait_for_model_version at this point, so
@@ -406,82 +388,48 @@ class EngineManager:
 
             logger.info("[FastLLM] Main-process Redis monitoring started")
 
-            while not self._fast_llm_stop_event.is_set():
-                try:
-                    result = r.xread({stream_key: last_id}, count=1, block=1000)
-                    if not result:
-                        continue
+            try:
+                for event_type, version, step, documents_seen in read_fast_llm_events(
+                    r, self._fast_llm_stop_event
+                ):
+                    if event_type == "weights_ready":
+                        if not first_weights_ready_seen:
+                            logger.info(
+                                f"[FastLLM] weights_ready step={step} documents_seen={documents_seen} "
+                                f"(initial broadcast — no pause wrap)"
+                            )
+                            coro = self.engine.engine_core.collective_rpc_async(
+                                "receive_weight_update_fast_llm", args=()
+                            )
+                            first_weights_ready_seen = True
+                        else:
+                            logger.info(
+                                f"[FastLLM] weights_ready step={step} documents_seen={documents_seen}, "
+                                f"dispatching to workers"
+                            )
+                            coro = self.receive_weight_update_fast_llm(version)
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(coro, loop)
+                            future.result()
+                            logger.info(f"[FastLLM] Weight update complete: step={step}")
+                        except Exception as e:
+                            logger.error(f"[FastLLM] Error receiving weight update: {e}")
 
-                    for _stream_name, messages in result:
-                        for msg_id, msg_data in messages:
-                            last_id = msg_id
-
-                            if payload_key not in msg_data:
-                                logger.warning(
-                                    f"[FastLLM] Event missing 'event' field: {msg_data}"
-                                )
-                                continue
-
-                            try:
-                                event = orjson.loads(msg_data[payload_key])
-                            except Exception as e:
-                                logger.error(f"[FastLLM] Failed to parse event: {e}")
-                                continue
-
-                            event_type = event.get("type")
-                            step = event.get("step")
-                            documents_seen = event.get("documents_seen")
-                            version = fast_llm_event_version(event)
-
-                            if event_type == "weights_ready":
-                                if not first_weights_ready_seen:
-                                    logger.info(
-                                        f"[FastLLM] weights_ready step={step} documents_seen={documents_seen} "
-                                        f"(initial broadcast — no pause wrap)"
-                                    )
-                                    coro = self.engine.engine_core.collective_rpc_async(
-                                        "receive_weight_update_fast_llm", args=()
-                                    )
-                                    first_weights_ready_seen = True
-                                else:
-                                    logger.info(
-                                        f"[FastLLM] weights_ready step={step} documents_seen={documents_seen}, "
-                                        f"dispatching to workers"
-                                    )
-                                    coro = self.receive_weight_update_fast_llm(version)
-                                try:
-                                    future = asyncio.run_coroutine_threadsafe(coro, loop)
-                                    future.result()
-                                    logger.info(
-                                        f"[FastLLM] Weight update complete: step={step}"
-                                    )
-                                except Exception as e:
-                                    logger.error(
-                                        f"[FastLLM] Error receiving weight update: {e}"
-                                    )
-
-                            elif event_type == "training_finished":
-                                logger.info(
-                                    "[FastLLM] training_finished received, destroying process group"
-                                )
-                                try:
-                                    future = asyncio.run_coroutine_threadsafe(
-                                        self.destroy_actor_update_group(), loop
-                                    )
-                                    future.result()
-                                except Exception as e:
-                                    logger.error(
-                                        f"[FastLLM] Error destroying process group: {e}"
-                                    )
-                                self._fast_llm_stop_event.set()
-
-                except Exception as e:
-                    logger.error(f"[FastLLM] Error in Redis monitor: {e}")
-                    if not self._fast_llm_stop_event.is_set():
-                        time.sleep(1)
-
-            logger.info("[FastLLM] Main-process Redis monitoring stopped")
-            r.close()
+                    elif event_type == "training_finished":
+                        logger.info(
+                            "[FastLLM] training_finished received, destroying process group"
+                        )
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(
+                                self.destroy_actor_update_group(), loop
+                            )
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"[FastLLM] Error destroying process group: {e}")
+                        self._fast_llm_stop_event.set()
+            finally:
+                logger.info("[FastLLM] Main-process Redis monitoring stopped")
+                r.close()
 
         self._fast_llm_monitor_thread = threading.Thread(
             target=monitor_redis_stream,
@@ -518,18 +466,9 @@ class EngineManager:
                 await init_app_state(manager.engine, manager.engine_config, ...)
                 ...
 
-        Args:
-            args: Arguments object with vLLM engine configuration.
-                Must be compatible with AsyncEngineArgs.from_cli_args().
-                Required attributes: model
-                Optional attributes: tensor_parallel_size, disable_log_stats,
-                                    disable_log_requests, etc.
-            cleanup: Whether to cleanup engine on exit (default: True).
-                    Set to False for server usage where engine runs indefinitely.
-
-        Yields:
-            EngineManager wrapping the AsyncLLM engine; its ``.engine`` and
-            ``.engine_config`` attributes hold the engine and its VllmConfig.
+        With ``cleanup=False`` the engine is left running on exit, for server usage
+        where it runs indefinitely. Yields an ``EngineManager`` whose ``.engine`` and
+        ``.engine_config`` hold the ``AsyncLLM`` and its ``VllmConfig``.
         """
         engine_args = AsyncEngineArgs.from_cli_args(args)
         engine_args.worker_extension_cls = "pipelinerl.vllm1.WorkerExtension"
@@ -552,7 +491,6 @@ class EngineManager:
             if not args.disable_weight_updates:
                 await manager.init_actor_update_group()
 
-                # Initialize Fast-LLM mode if enabled
                 if weight_update_mode == "fast-llm":
                     await manager.init_fast_llm_receiver()
                     await manager.start_fast_llm_monitoring()
@@ -561,7 +499,6 @@ class EngineManager:
             yield manager
         finally:
             if not args.disable_weight_updates:
-                # Stop Fast-LLM monitoring if enabled
                 if weight_update_mode == "fast-llm":
                     await manager.stop_fast_llm_monitoring()
 
@@ -572,10 +509,8 @@ class EngineManager:
                     )
             if cleanup:
                 logger.info("Cleaning up vLLM engine")
-                # Clear manager reference to engine first
                 manager.engine = None
                 manager.engine_config = None
-                # Delete engine and force immediate garbage collection
                 del engine
                 del manager
                 import gc
