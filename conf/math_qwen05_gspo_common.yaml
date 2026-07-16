@@ -1,0 +1,48 @@
+# Shared Qwen2.5-0.5B GSPO recipe — backend-agnostic parts only: sampling, topology, the
+# preprocessor's RL data prep, and orchestration. Composed by the per-backend configs:
+#   math_qwen05_gspo_fllm  (Fast-LLM trainer)   /   math_qwen05_gspo_ds  (DeepSpeed trainer)
+# Change a shared hyperparameter HERE; trainer values that must match across backends are
+# interpolated from here (e.g. the FL config reads ${finetune.seq_length} / ${finetune.rl.epsilon_*}).
+# Rationale for each value: Fast-LLM docs/recipes/reinforcement-learning.md.
+
+defaults:
+  - math
+  - _self_
+
+seed: 43
+# Public HF id; override with a local snapshot path on the CLI if it can't be resolved.
+model_path: Qwen/Qwen2.5-0.5B
+
+# Topology: 7 vLLM actors + 1 trainer on 8 GPUs.
+world:
+  actor_fraction: 7
+  preprocessor_fraction: 0
+  finetune_fraction: 1
+
+llm:
+  parameters: {max_tokens: 7000, temperature: 0.7}
+test_llm:
+  parameters: {max_tokens: 7000, temperature: 0.7}
+
+actor:
+  llm_max_rollouts: 128
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 10000
+
+# PipelineRL's preprocessor + orchestration config (runs for BOTH backends). The DeepSpeed
+# *trainer* fields live in math_qwen05_gspo_ds; the Fast-LLM trainer fields in _fllm.
+finetune:
+  seq_length: 10000            # sample packing in the preprocessor; the FL trainer's
+                               # micro_batch_size interpolates this.
+  max_train_steps: 2000
+  save_checkpoint_steps: 100
+  attempts: 8                  # rollouts per problem
+  rl:                          # RLConfig(**cfg.finetune.rl) — advantage/reward prep (preprocessor)
+    group_normalization: false
+    filter_zero_advantage_groups: true
+    # Canonical clip epsilon. The DeepSpeed loss uses these directly; the Fast-LLM loss
+    # interpolates them (so the value is defined once, shared across backends).
+    epsilon_low: 0.003
+    epsilon_high: 0.004
