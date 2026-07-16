@@ -443,12 +443,6 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
     return result
 
 
-def write_sample_for_fast_llm(data_writer: StreamWriter, entry: dict):
-    """Write a single sample to the stream in Fast-LLM format."""
-    fast_llm_sample = convert_to_fast_llm_format(entry)
-    data_writer.write(fast_llm_sample)
-
-
 def run_preprocessing_loop(
     
     cfg: DictConfig,
@@ -531,9 +525,7 @@ def run_preprocessing_loop(
     samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
     def is_trainer_finished() -> bool:
-        if cfg.use_fast_llm:
-            return trainer_state.training_done
-        return trainer_state.samples_processed is not None and trainer_state.samples_processed >= samples_target
+        return trainer_state.is_finished(samples_target)
 
     # Load published samples from state file
     llms = [
@@ -721,7 +713,7 @@ def run_preprocessing_loop(
                                 if pipeline_log_file is not None:
                                     write_samples += 1
                                     write_tokens += len(entry.get("input_ids", []))
-                                write_sample_for_fast_llm(data_writer, entry)
+                                data_writer.write(convert_to_fast_llm_format(entry))
                                 published_samples += 1
                             if pipeline_log_file is not None and write_samples > 0:
                                 pipeline_log_file.write(_json.dumps({
@@ -732,7 +724,7 @@ def run_preprocessing_loop(
                                     "tokens": write_tokens,
                                 }) + "\n")
                                 pipeline_log_file.flush()
-                            batch_done = True  # Always mark done for Fast-LLM (no batching)
+                            batch_done = True
                         elif cfg.finetune.seq_packing:
                             if samples_per_trainer[trainer_id] == target_samples_per_lead:
                                 logger.debug(f"[inner loop] trainer {trainer_id} has all {target_samples_per_lead} samples, creating sentinel batch")
@@ -827,11 +819,12 @@ def run_preprocessing_loop(
                         processing_took = time.time() - start_processing
                         processed_samples = published_samples - last_published_samples
                         last_published_samples = published_samples
+                        consumed_samples = trainer_state.samples_processed or 0
                         logger.info(
                             f"Processed {processed_samples} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
                             f" (fetching took {fetching_took:.3f} and writing took {writing_took:.3f})"
                             f" and wrote to {output_stream}, total {published_samples} samples so far"
-                            f" (trainer consumed {trainer_state.samples_processed}, unconsumed {published_samples - trainer_state.samples_processed}),"
+                            f" (trainer consumed {consumed_samples}, unconsumed {published_samples - consumed_samples}),"
                             f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
                         )
                         start_processing = time.time()

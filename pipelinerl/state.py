@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+import typing
 from pathlib import Path
 
 from pydantic import TypeAdapter
@@ -13,6 +14,9 @@ from pipelinerl.finetune_loop import (
     TrainingDone,
 )
 from pipelinerl.streams import SingleStreamSpec, read_stream
+
+if typing.TYPE_CHECKING:
+    import redis
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +34,9 @@ def fast_llm_event_version(event: dict) -> int | None:
     return documents_seen if documents_seen is not None else event.get("step")
 
 
-def read_fast_llm_events(redis_client, stop_event: threading.Event | None = None):
+def read_fast_llm_events(
+    redis_client: "redis.Redis", stop_event: threading.Event | None = None
+) -> typing.Iterator[tuple[str | None, int | None, int | None, int | None]]:
     """Yield ``(event_type, version, step, documents_seen)`` for each event on the
     Fast-LLM Redis stream, until ``stop_event`` is set (indefinitely if it is ``None``).
     Transient read failures are retried; malformed messages are skipped."""
@@ -126,9 +132,9 @@ class TrainerState:
 
         def listen_events():
             assert isinstance(_backend, RedisConfig)
-            r = connect_to_redis(_backend)
+            redis_client = connect_to_redis(_backend)
             logger.info(f"Listening for Fast-LLM events on Redis stream '{FAST_LLM_EVENTS_STREAM}'")
-            for event_type, version, step, documents_seen in read_fast_llm_events(r):
+            for event_type, version, step, documents_seen in read_fast_llm_events(redis_client):
                 if event_type == "weights_ready":
                     logger.info(f"Received weights_ready event: step={step}, documents_seen={documents_seen}")
                     self.propagated_weight_version = version
@@ -142,19 +148,19 @@ class TrainerState:
 
         def poll_lag():
             assert isinstance(_backend, RedisConfig)
-            r = connect_to_redis(_backend)
+            redis_client = connect_to_redis(_backend)
             lag_check_interval = 0.5  # seconds
 
             while True:
                 try:
-                    stream_info = r.xinfo_stream(REDIS_DATA_STREAM)
+                    stream_info = redis_client.xinfo_stream(REDIS_DATA_STREAM)
                     total_len = stream_info.get("length", 0)
-                    groups = r.xinfo_groups(REDIS_DATA_STREAM)
+                    groups = redis_client.xinfo_groups(REDIS_DATA_STREAM)
                     for group in groups:
-                        gname = group.get("name", "")
-                        if isinstance(gname, bytes):
-                            gname = gname.decode()
-                        if gname == REDIS_GROUP_NAME:
+                        group_name = group.get("name", "")
+                        if isinstance(group_name, bytes):
+                            group_name = group_name.decode()
+                        if group_name == REDIS_GROUP_NAME:
                             entries_read = group.get("entries-read")
                             if entries_read is None:
                                 lag = group.get("lag", 0) or 0
@@ -188,3 +194,11 @@ class TrainerState:
             logger.info("Waiting for the trainer to declare the initial weight version")
             time.sleep(1)
         return self.propagated_weight_version
+
+    def is_finished(self, samples_target: int) -> bool:
+        # Fast-LLM ignores `gradient_accumulation_passes` and overshoots `docs_per_step`
+        # by a few docs per step, so the sample-counting formula fires several optimizer
+        # steps early. Use the explicit `training_finished` event instead.
+        if self.use_fast_llm:
+            return self.training_done
+        return self.samples_processed is not None and self.samples_processed >= samples_target

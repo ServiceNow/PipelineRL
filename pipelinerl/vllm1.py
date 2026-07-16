@@ -3,8 +3,12 @@ import logging
 import os
 import signal
 import time
+from contextlib import asynccontextmanager
+from typing import Any, Protocol, runtime_checkable
+
 import torch
 import uvloop
+from fastapi import BackgroundTasks
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.system_utils import set_ulimit
 from vllm.entrypoints.openai.cli_args import (
@@ -25,16 +29,11 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-
+import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
 from pipelinerl.finetune_loop import WeightUpdateRequest
 from pipelinerl.state import read_fast_llm_events
-from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
-from typing import Any, Protocol, runtime_checkable
-from fastapi import BackgroundTasks
 from pipelinerl.torch_utils import stateless_init_process_group
-import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
-from vllm.distributed import cleanup_dist_env_and_memory
-from contextlib import asynccontextmanager
+from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 
 try:
     from vllm.entrypoints.openai.tool_parsers import ToolParserManager
@@ -239,7 +238,7 @@ class WorkerExtension:
         # StatelessProcessGroup has no shutdown method; rely on GC.
 
     def is_actor_update_group_destroyed(self: LikeWorker) -> bool:
-        return getattr(self, "_process_group_destroyed", False)
+        return self._process_group_destroyed
 
     def receive_weight_update(self: LikeWorker, request_json: str):
         request = WeightUpdateRequest.model_validate_json(request_json)
@@ -487,7 +486,7 @@ class EngineManager:
         def monitor_redis_stream():
             import redis
 
-            r = redis.Redis(host=self._redis_host, port=self._redis_port)
+            redis_client = redis.Redis(host=self._redis_host, port=self._redis_port)
             # First weights_ready event since this vLLM process started is the
             # initial broadcast (step can be 0 on fresh start or k>0 on resume).
             # Actor is still blocked in wait_for_model_version at this point, so
@@ -500,7 +499,7 @@ class EngineManager:
 
             try:
                 for event_type, version, step, documents_seen in read_fast_llm_events(
-                    r, self._fast_llm_stop_event
+                    redis_client, self._fast_llm_stop_event
                 ):
                     if event_type == "weights_ready":
                         if not first_weights_ready_seen:
@@ -546,7 +545,7 @@ class EngineManager:
                         self._fast_llm_stop_event.set()
             finally:
                 logger.info("[FastLLM] Main-process Redis monitoring stopped")
-                r.close()
+                redis_client.close()
 
         self._fast_llm_monitor_thread = threading.Thread(
             target=monitor_redis_stream,
@@ -569,23 +568,12 @@ class EngineManager:
 
     @staticmethod
     @asynccontextmanager
-    async def create_engine(
-        args: Any,
-        cleanup: bool = True,
-    ):
+    async def create_engine(args: Any):
         """Create a vLLM AsyncLLM engine wrapped in an EngineManager.
 
-        Async context manager that manages the engine lifecycle, optionally
-        cleaning up on exit.
-
-        Usage:
-            async with create_engine(args, cleanup=False) as manager:
-                await init_app_state(manager.engine, manager.engine_config, ...)
-                ...
-
-        With ``cleanup=False`` the engine is left running on exit, for server usage
-        where it runs indefinitely. Yields an ``EngineManager`` whose ``.engine`` and
-        ``.engine_config`` hold the ``AsyncLLM`` and its ``VllmConfig``.
+        Async context manager yielding an ``EngineManager`` whose ``.engine`` and
+        ``.engine_config`` hold the ``AsyncLLM`` and its ``VllmConfig``. The engine is
+        left running on exit (server usage runs indefinitely).
         """
         engine_args = AsyncEngineArgs.from_cli_args(args)
         engine_args.worker_extension_cls = "pipelinerl.vllm1.WorkerExtension"
@@ -625,16 +613,6 @@ class EngineManager:
                         "training_finished was not called before shutdown; "
                         "NCCL process group was not destroyed — potential resource leak"
                     )
-            if cleanup:
-                logger.info("Cleaning up vLLM engine")
-                manager.engine = None
-                manager.engine_config = None
-                del engine
-                del manager
-                import gc
-
-                gc.collect()
-                cleanup_dist_env_and_memory()
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
@@ -670,15 +648,14 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Create engine (cleanup=False since server runs indefinitely)
-    async with EngineManager.create_engine(args, cleanup=False) as manager:
+    async with EngineManager.create_engine(args) as manager:
         # Run HTTP server
         sock_addr = (args.host or "", args.port)
         sock = create_server_socket(sock_addr)
         # vLLM 0.18.1+ requires supported_tasks to build the app and app state;
         # older vllm (e.g. 0.14.x) has 1-arg build_app / 3-arg init_app_state.
-        import inspect as _inspect
-        _build_app_params = _inspect.signature(build_app).parameters
+        import inspect
+        _build_app_params = inspect.signature(build_app).parameters
         if "supported_tasks" in _build_app_params and hasattr(manager.engine, "get_supported_tasks"):
             supported_tasks = await manager.engine.get_supported_tasks()
             logger.info(f"Supported tasks: {supported_tasks}")
@@ -704,7 +681,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         else:
             logger.info("Fast-LLM mode: using Redis stream (no HTTP endpoint registered)")
 
-        if "supported_tasks" in _inspect.signature(init_app_state).parameters:
+        if "supported_tasks" in inspect.signature(init_app_state).parameters:
             await init_app_state(manager.engine, app.state, args, supported_tasks)
         else:
             await init_app_state(manager.engine, app.state, args)
