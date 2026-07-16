@@ -434,11 +434,7 @@ Each resumed job must still use a fresh `world.run_id` (the new job's ID, not th
 
 ### 1. Container image
 
-To **use**: reference the prebuilt image
-```
-registry.toolkit-sp.yul201.service-now.com/snow.research.afm/interactive-toolkit:25.12-py3-vllm014rc1redis
-```
-It bundles the redis server.
+To **use** (on ServiceNow infrastructure): reference the prebuilt `interactive-toolkit:25.12-py3-vllm014rc1redis` image from the internal container registry. It bundles the redis server.
 
 To **build** (from the [`ServiceNow/research-interactive-toolkit`](https://github.com/ServiceNow/research-interactive-toolkit/tree/fml/pytorch_vllm014rc1) repo, branch `fml/pytorch_vllm014rc1` — SN-internal, link is gated): set `~/.research-interactive-env` and run the toolkit's build target.
 
@@ -446,7 +442,7 @@ To **build** (from the [`ServiceNow/research-interactive-toolkit`](https://githu
 USE_ACCOUNT_REPO := 1
 BASE_IMAGE := nvcr.io/nvidia/pytorch:25.12-py3
 IMAGE_REVISION := 25.12-py3-vllm014rc1redis
-EAI_PROFILE := yul201
+EAI_PROFILE := <your-eai-profile>
 ```
 
 Base layer is `nvcr.io/nvidia/pytorch:25.12-py3`; the toolkit branch layers on vLLM 0.14.0rc1, redis, and the EAI helpers.
@@ -464,10 +460,9 @@ cd PipelineRL
 source .venv/bin/activate
 export PIP_CONSTRAINT=""
 
-# Fast-LLM: GSPO branch is the one paired with the PipelineRL fast-llm branch
+# Fast-LLM: the RL functionality (GSPO loss + metrics, fp32 LM head, reward/model-version tagging) is on main
 cd ../Fast-LLM
 git submodule update --init --recursive
-git checkout gspo
 pip install --no-cache-dir --no-build-isolation -e ".[CORE,OPTIONAL,HUGGINGFACE,SSM,VISION,GENERATION,STREAMING,DEV]" triton==3.5.1
 
 # PipelineRL: fast-llm branch
