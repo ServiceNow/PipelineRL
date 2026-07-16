@@ -158,8 +158,8 @@ class WorldMap:
         # set. Snap all three components; actor takes whatever remains.
         # When fast-llm lands on a single node proportional allocation is fine.
         if self.world_size > 1 and cfg.get("use_fast_llm", False):
-            finetune_frac = cfg.world.finetune_fraction / fraction_sum
-            finetune_nodes = max(1, round(self.world_size * finetune_frac))
+            finetune_fraction = cfg.world.finetune_fraction / fraction_sum
+            finetune_nodes = max(1, round(self.world_size * finetune_fraction))
             preprocessor_nodes = (
                 max(1, round(self.world_size * preprocessor_fraction))
                 if cfg.world.preprocessor_fraction else 0

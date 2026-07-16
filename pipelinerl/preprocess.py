@@ -372,7 +372,7 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
 
     Fast-LLM RedisDocument fields:
     - tokens: list of token IDs (full sequence: prompt + completion)
-    - loss_masking_spans: list of (start, end) spans where loss IS computed (completion only)
+    - loss_masking_spans: list of (start, end) spans masked out of the loss (label == -100; prompt tokens)
     - advantage: scalar float (per-rollout GRPO advantage)
     - old_log_probabilities: list of floats, full sequence length (zeros for prompt tokens)
     - reward: scalar float (raw per-rollout reward, a diagnostic; distinct from advantage)
@@ -481,8 +481,8 @@ def run_preprocessing_loop(
     # For Fast-LLM: use SingleStreamSpec with shared=True (uses orjson serialization)
     # For standard PipelineRL: use StreamRangeSpec with partitions per GPU
     if cfg.use_fast_llm:
-        from fast_llm.data.dataset.config import REDIS_DATA_STREAM as _FAST_LLM_DATA_STREAM
-        fast_llm_stream_name = _FAST_LLM_DATA_STREAM
+        from fast_llm.data.dataset.config import REDIS_DATA_STREAM
+        fast_llm_stream_name = REDIS_DATA_STREAM
         output_stream = SingleStreamSpec(
             exp_path=exp_root_dir,
             topic=cfg.preprocess.output,
