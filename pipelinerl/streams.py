@@ -192,6 +192,9 @@ class RedisStreamReader(StreamReader):
                 yield pickle.loads(entry[b"data"])
 
 
+_REDIS_STREAM_MAXLEN = 1_000_000
+
+
 class RedisSharedStreamWriter(StreamWriter):
     """Redis writer that supports multiple producers appending to a single stream."""
 
@@ -199,14 +202,12 @@ class RedisSharedStreamWriter(StreamWriter):
         self,
         stream: SingleStreamSpec,
         *,
-        maxlen: int = 1_000_000,
         stream_name_override: str | None = None,
     ):
         self.stream = stream
         assert isinstance(_backend, RedisConfig)
         self._redis = connect_to_redis(_backend)
         self._stream_name = stream_name_override if stream_name_override is not None else str(self.stream)
-        self._maxlen = maxlen
 
     def __enter__(self):
         return self
@@ -217,7 +218,7 @@ class RedisSharedStreamWriter(StreamWriter):
     def write(self, data, partition: int | None = None):
         # partition is ignored: all producers fan in to one stream and Fast-LLM shards downstream.
         serialized = _serialize_with_orjson(data)
-        self._redis.xadd(self._stream_name, {"data": serialized}, maxlen=self._maxlen, approximate=True)
+        self._redis.xadd(self._stream_name, {"data": serialized}, maxlen=_REDIS_STREAM_MAXLEN, approximate=True)
 
 
 class RoundRobinRedisStreamWriter(StreamWriter):

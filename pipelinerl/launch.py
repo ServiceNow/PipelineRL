@@ -352,7 +352,7 @@ def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int
     if world_map.world_size > 1:
         assert cfg.use_deepspeed
         # Use original DNS names (pod IP exchange may have replaced address_map with IPs).
-        dns_map = getattr(world_map, "dns_address_map", world_map.address_map)
+        dns_map = world_map.dns_address_map
         hosts = [dns_map[i] for i in range(world_map.world_size)]
         filter_parts = []
         for rank, job_list in world_map.job_map.items():
@@ -675,10 +675,6 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                 stop_alive_processes(alive, "Trainer completion detected")
             elif alive and all(is_inference_process(proc) for proc in alive):
                 # shut down inference servers after training is complete
-                if trainer_state is not None and not trainer_state.training_done:
-                    # check if training is completed
-                    wait_for_training_done_signal()
-                    continue
                 stop_alive_processes(alive, "Trainer completion detected")
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
@@ -750,12 +746,12 @@ def setup_logging(log_file: Path):
 
 def _get_pod_ip() -> str:
     """Return this pod's primary IP (bypasses Kubernetes Service kube-proxy)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
     finally:
-        s.close()
+        sock.close()
 
 
 def _exchange_pod_ips(world_map: "WorldMap", exp_dir: Path, run_id: str) -> None:
@@ -895,7 +891,7 @@ def main(cfg: DictConfig):
 
         if world_map.world_size > 1:
             # Use original DNS names (pod IP exchange may have replaced address_map with IPs).
-            dns_map = getattr(world_map, "dns_address_map", world_map.address_map)
+            dns_map = world_map.dns_address_map
             hosts = [dns_map[i] for i in range(world_map.world_size)]
             hostfile_lines = [f"{host} slots=8" for host in hosts]
             deepspeed_hostfile_content = "\n".join(hostfile_lines)
@@ -925,6 +921,8 @@ def main(cfg: DictConfig):
     # clients in _create_c10d_store; without a pre-existing server the port is
     # never opened and both fast-llm and vLLM hang forever.  Only the master
     # node (my_rank == 0) hosts the server; vLLM workers connect via master_addr.
+    # Keep this handle bound for the lifetime of main(): dropping it would
+    # garbage-collect the TCPStore and close the server socket.
     broadcast_store = None
     if cfg.use_fast_llm and cfg.weight_broadcast and world_map.my_rank == 0:
         from torch.distributed import TCPStore
