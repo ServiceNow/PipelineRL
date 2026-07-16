@@ -216,7 +216,6 @@ def run_actor_llm(
     log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
     entrypoint = "pipelinerl.entrypoints.run_vllm1"
-    broadcast_port = cfg.world.actor_group_port
     cmd = [
         sys.executable,
         "-m",
@@ -232,7 +231,7 @@ def run_actor_llm(
         "--actor-llm-idx",
         str(actor_llm_idx),
         "--weight-update-group-init-method",
-        f"tcp://{world_map.master_addr}:{broadcast_port}",
+        f"tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
         "--weight-update-group-world-size",
         str(world_map.weight_update_group_size),
     ]
@@ -432,9 +431,12 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
             "Download the model first and set model_path to its local directory."
         )
 
-    # Build fast-llm config, stripping callbacks when weight broadcast is disabled or in debug mode.
+    # Callbacks (weight-broadcast streaming) are only meaningful when broadcasting outside debug mode.
+    include_callbacks = cfg.weight_broadcast and not bool(cfg.debug.mode)
+
+    # Build fast-llm config, stripping callbacks when they aren't used.
     fast_llm_cfg = OmegaConf.to_container(cfg.fast_llm, resolve=True, throw_on_missing=False)
-    if not cfg.weight_broadcast or bool(cfg.debug.mode):
+    if not include_callbacks:
         fast_llm_cfg.pop("callbacks", None)
 
     # Derive experiment name for wandb from save_dir relative to workspace root.
@@ -451,7 +453,7 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
     fast_llm_cfg["training"]["wandb"]["entity_name"] = cfg.wandb.wandb_entity_name
     fast_llm_cfg["training"]["wandb"]["project_name"] = cfg.wandb.wandb_project_name
     fast_llm_cfg["training"]["wandb"]["group_name"] = cfg.wandb.wandb_group
-    if cfg.weight_broadcast and not bool(cfg.debug.mode):
+    if include_callbacks:
         fast_llm_cfg["callbacks"]["streaming"]["host"] = cfg.streams.host
         fast_llm_cfg["callbacks"]["streaming"]["port"] = cfg.streams.port
         # fast-llm runs on node 0 (same node as the TCPStore server); use localhost
@@ -473,8 +475,7 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
 
     if len(finetune_nodes) > 1:
         finetune_master = world_map.address_map[finetune_nodes[0]]
-        cmd = [
-            "torchrun",
+        torchrun_args = [
             f"--nproc_per_node={len(gpus)}",
             f"--nnodes={len(finetune_nodes)}",
             f"--node_rank={finetune_rank}",
@@ -483,25 +484,22 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
             f"--rdzv_endpoint={finetune_master}:{torchrun_port}",
             "--rdzv_conf=timeout=3600",
             "--max_restarts=0",
-            "--no_python",
-            str(Path(sys.executable).parent / "fast-llm"),
-            "train",
-            model_type,
-            "--config",
-            str(config_path),
         ]
     else:
-        cmd = [
-            "torchrun",
+        torchrun_args = [
             f"--nproc_per_node={len(gpus)}",
             f"--master_port={torchrun_port}",
-            "--no_python",
-            str(Path(sys.executable).parent / "fast-llm"),
-            "train",
-            model_type,
-            "--config",
-            str(config_path),
         ]
+    cmd = [
+        "torchrun",
+        *torchrun_args,
+        "--no_python",
+        str(Path(sys.executable).parent / "fast-llm"),
+        "train",
+        model_type,
+        "--config",
+        str(config_path),
+    ]
 
     logger.info(f"Running finetune with command: {' '.join(cmd)}")
     save_command(save_dir, cmd, suffix=node_suffix)

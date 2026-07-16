@@ -150,7 +150,7 @@ class TrainerState:
                                 lag = group.get("lag", 0) or 0
                                 entries_read = total_len - lag
                             self.samples_processed = int(entries_read)
-                            logger.info(
+                            logger.debug(
                                 f"Fast-LLM lag check: stream_len={total_len} entries_read={entries_read} "
                                 f"samples_processed={self.samples_processed}"
                             )
