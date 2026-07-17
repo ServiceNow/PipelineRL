@@ -444,10 +444,15 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
     if not include_callbacks:
         fast_llm_cfg.pop("callbacks", None)
 
-    # Derive experiment name for wandb from save_dir relative to workspace root.
+    # Derive experiment name for wandb: use the explicit run name (so the finetune run groups with
+    # the actor/preprocess runs, which init_wandb names `{wandb_name}/{component}`), falling back to
+    # the save_dir path relative to workspace root when no run name is set.
     root = cfg.wandb.wandb_workspace_root
     save_dir_str = str(save_dir)
-    experiment_name = save_dir_str[len(root) + 1:] if root and save_dir_str.startswith(root + "/") else save_dir.name
+    if cfg.wandb.wandb_name:
+        experiment_name = f"{cfg.wandb.wandb_name}/finetune"
+    else:
+        experiment_name = save_dir_str[len(root) + 1:] if root and save_dir_str.startswith(root + "/") else save_dir.name
 
     # Fill in all dynamic values so the saved config is fully functional.
     fast_llm_cfg["pretrained"]["path"] = cfg.model_path
