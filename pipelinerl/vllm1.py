@@ -102,7 +102,7 @@ def _install_model_version_patches() -> None:
         except ImportError:
             from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
     except ImportError as error:
-        logger.warning(f"[FastLLM] Per-token model_version disabled (vLLM layout changed): {error}")
+        logger.warning(f"[FastLLM] Per-token model_version disabled (vLLM layout changed): {error!r}")
         return
 
     if getattr(LogprobsProcessor, "_pipelinerl_version_patched", False):
@@ -131,16 +131,19 @@ def _install_model_version_patches() -> None:
 
     original_create_chat_logprobs = OpenAIServingChat._create_chat_logprobs
 
-    def _create_chat_logprobs(self, token_ids, top_logprobs, *args, **kwargs):
-        result = original_create_chat_logprobs(self, token_ids, top_logprobs, *args, **kwargs)
+    def _create_chat_logprobs(self, *args, **kwargs):
+        result = original_create_chat_logprobs(self, *args, **kwargs)
         if _version_tagging_disabled["value"]:
             return result
         try:
+            token_ids = args[0] if args else kwargs.get("token_ids")
+            top_logprobs = args[1] if len(args) > 1 else kwargs.get("top_logprobs")
             content = getattr(result, "content", None)
-            if content:
+            if content and token_ids is not None and top_logprobs is not None:
                 for index, item in enumerate(content):
                     position = top_logprobs[index] if index < len(top_logprobs) else None
-                    sampled = position.get(token_ids[index]) if position else None
+                    token_id = token_ids[index] if index < len(token_ids) else None
+                    sampled = position.get(token_id) if position is not None and token_id is not None else None
                     version = getattr(sampled, "version", None)
                     # Only extend the `token_id:<id>` form; never mangle a decoded text token.
                     if version is not None and item.token.startswith("token_id:"):

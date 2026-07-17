@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
 import contextlib
+import json
 import logging
 import queue
 import threading
@@ -580,13 +581,11 @@ def run_preprocessing_loop(
     pipeline_log_file = None
 
     with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name) as data_writer, write_to_streams(stats_streams) as stats_writer, contextlib.ExitStack() as pipeline_log_stack:
-        if cfg.use_fast_llm and cfg.debug.get("log_data_pipeline", False):
-            import json as _json
-            import pathlib as _pathlib
+        if cfg.use_fast_llm and cfg.debug.log_data_pipeline:
             # Write alongside fast-llm rank files: {exp_dir}/finetune/data_pipeline_log/
-            _log_dir = _pathlib.Path(cfg.output_dir) / "finetune" / "data_pipeline_log"
-            _log_dir.mkdir(parents=True, exist_ok=True)
-            pipeline_log_file = pipeline_log_stack.enter_context(open(_log_dir / "preprocessor.jsonl", "a"))
+            log_dir = Path(cfg.output_dir) / "finetune" / "data_pipeline_log"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            pipeline_log_file = pipeline_log_stack.enter_context(open(log_dir / "preprocessor.jsonl", "a"))
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
@@ -706,7 +705,7 @@ def run_preprocessing_loop(
 
                         # Fast-LLM path: write individual samples directly (Fast-LLM does its own packing)
                         if cfg.use_fast_llm:
-                            write_start = time.time() if pipeline_log_file else None
+                            write_start = time.time() if pipeline_log_file is not None else None
                             write_samples = 0
                             write_tokens = 0
                             while len(processed_entries_queue) > 0:
@@ -717,7 +716,7 @@ def run_preprocessing_loop(
                                 data_writer.write(convert_to_fast_llm_format(entry))
                                 published_samples += 1
                             if pipeline_log_file is not None and write_samples > 0:
-                                pipeline_log_file.write(_json.dumps({
+                                pipeline_log_file.write(json.dumps({
                                     "event": "WRITE",
                                     "t_start": round(write_start, 3),
                                     "t_end": round(time.time(), 3),
