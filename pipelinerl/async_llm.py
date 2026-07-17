@@ -6,7 +6,7 @@ import aiohttp
 import litellm
 import numpy as np
 from PIL import Image
-from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM
+from pipelinerl.llm import LLMCall, LLMOutput, Prompt, TokenLogprob, TrainableLLM, parse_token_id_and_version
 
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from pipelinerl.rollouts import TrainingText, apply_rollout_reward
@@ -184,10 +184,12 @@ async def llm_async_generate(
                     try:
                         # We assume that the server was launched with --return-tokens-as-token-ids
                         # and that the tokens are provided as: ['token_id:1271', 'token_id:1505', '
+                        token_id, version = parse_token_id_and_version(logprob["token"])
                         parsed_logprobs.append(
                             TokenLogprob(
-                                token_id=int(logprob["token"].split(":")[-1]),
+                                token_id=token_id,
                                 logprob=logprob["logprob"],
+                                version=version,
                                 generated=1,
                             )
                         )
@@ -325,6 +327,12 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
     # Apply masking to input tokens that aren't generated
     labels = [MASKED_TOKEN_ID] * len(prompt_token_ids) + labels
     logprobs = [lp.logprob for lp in llm_call.logprobs]
+    # Per-token model version, parallel to logprobs. Kept only when the server reported a
+    # version for every token; otherwise left empty so the trainer falls back to the
+    # per-rollout version.
+    token_versions = [lp.version for lp in llm_call.logprobs]
+    if any(version is None for version in token_versions):
+        token_versions = []
     if finish_reason is not None:
         finished = finish_reason != "length"
     else:
@@ -339,6 +347,7 @@ def make_training_text(llm: TrainableLLM, llm_call: LLMCall) -> TrainingText:
         input_ids=input_ids,
         labels=labels,
         logprobs=logprobs,
+        token_versions=token_versions,
         finished=finished,
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,

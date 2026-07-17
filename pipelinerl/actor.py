@@ -696,12 +696,14 @@ class ActorLoop:
                             "result_queue_size": self.result_queue.qsize(),
                             "finished_groups": finished_groups,
                             "trainer_model_version": trainer_version_to_publish,
+                            "trainer_completed_step": self.trainer_state.completed_step,
                             "time_since_start": time.time() - loop_start_time,
                         }
                         trainer_version_to_publish = None
                     else:
                         loop_stats = {
                             "trainer_model_version": last_trainer_version,
+                            "trainer_completed_step": self.trainer_state.completed_step,
                             }
 
                     self.publish_stats(

@@ -1,0 +1,53 @@
+# Qwen2.5-0.5B GSPO — Fast-LLM trainer backend (bf16). Launch:
+#   python -m pipelinerl.launch --config-name math_qwen05_gspo_fllm
+# Shared recipe (sampling/topology/preprocessor/orchestration) comes from _common.
+# Precision variants: add on the CLI
+#   fast_llm.model.distributed.compute_dtype=float16 vllm_config.vllm_kwargs.dtype=float16   (fp16-matched)
+#   fast_llm.model.distributed.compute_dtype=float32 vllm_config.vllm_kwargs.dtype=float32   (fp32-matched)
+
+defaults:
+  - math_qwen05_gspo_common
+  - _self_
+
+use_fast_llm: true
+
+# Fast-LLM trainer config (written to a YAML at launch and passed to fast-llm). Must-match
+# values are interpolated from the shared _common config so they can't drift.
+fast_llm:
+  training:
+    train_iters: ${finetune.max_train_steps}
+    checkpoint:
+      interval: ${finetune.save_checkpoint_steps}
+    export:
+      interval: 1000         # periodic HF-format export cadence
+  data:
+    micro_batch_size: ${finetune.seq_length}   # tokens; one packed sequence per micro-batch
+  schedule:
+    depth_first_micro_batches: 48
+    docs_per_step: 256       # accumulate to this many rollouts, then step
+  optimizer:
+    learning_rate:
+      base: 5.0e-7
+      warmup_iterations: 0
+      decay_style: constant
+    beta_1: 0.974004         # sqrt-rule, effective-batch multiplier m=4
+    beta_2: 0.999750
+    gradient_norm_clipping: 76.8   # 0.3 * docs_per_step
+  model:
+    distributed:
+      compute_dtype: bfloat16   # bf16 arm; fp16/fp32 variants override this + the vLLM dtype
+      sequence_data_parallel: 1
+      timeout: 3600
+    multi_stage:
+      zero_stage: 1          # single-GPU trainer (FSDP size 1) -> stage is a no-op
+    base_model:
+      head:
+        fp32_lm_head: true
+        losses:
+          # `losses` is a dict keyed by metric-name prefix; this entry logs as gspo_*.
+          gspo:
+            type: gspo
+            epsilon_low: ${finetune.rl.epsilon_low}    # shared clip (defined in _common)
+            epsilon_high: ${finetune.rl.epsilon_high}
+            logits_scale_factor: 1.4285714             # = 1 / sampling temperature (0.7)
+            metrics: basic                              # staleness/clip/ratio/KL/advantage/reward

@@ -81,12 +81,16 @@ class TrainerState:
         self.use_fast_llm = use_fast_llm
         self.weight_broadcast = weight_broadcast
         self.propagated_weight_version: int | None = None if weight_broadcast else 0
+        # Raw trainer step behind the current weights (for logging only); the version stamped onto
+        # rollouts is `propagated_weight_version`, which is the document count when Fast-LLM sends it.
+        self.completed_step: int | None = None if weight_broadcast else 0
         self.samples_processed: int | None = None if weight_broadcast else 0
         self.training_done: bool = False
         self._training_done_event = threading.Event()
 
     def debug_mode_init(self):
         self.propagated_weight_version = 0
+        self.completed_step = 0
         self.samples_processed = 0
         self.training_done = True
         self._training_done_event.set()
@@ -134,6 +138,7 @@ class TrainerState:
                 if event_type == "weights_ready":
                     logger.info(f"Received weights_ready event: step={step}, documents_seen={documents_seen}")
                     self.propagated_weight_version = version
+                    self.completed_step = step
                 elif event_type == "training_finished":
                     logger.info("Received training_finished event")
                     self.training_done = True

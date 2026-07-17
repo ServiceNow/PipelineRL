@@ -1,0 +1,21 @@
+# Qwen2.5-0.5B GSPO — DeepSpeed trainer backend (bf16 reference arm). Launch:
+#   python -m pipelinerl.launch --config-name math_qwen05_gspo_ds
+# Shared recipe (sampling/topology/preprocessor/orchestration) comes from _common.
+
+defaults:
+  - math_qwen05_gspo_common
+  - _self_
+
+use_fast_llm: false
+deepspeed_config: deepspeed_stage1_bf16   # single-GPU trainer -> stage is a no-op; 1 is minimal
+
+# DeepSpeed trainer optimizer/schedule (the Fast-LLM arm uses fast_llm.optimizer.* instead).
+finetune:
+  learning_rate: 5.0e-7
+  num_warmup_steps: 0
+  lr_scheduler_type: constant
+  gradient_accumulation_passes: 256   # = rollouts (documents) per optimizer step
+  adam_beta1: 0.974004   # sqrt-rule betas (m=4), matching the Fast-LLM arm
+  adam_beta2: 0.999750
+  rl:
+    policy_loss: gspo   # selects the DeepSpeed GSPO loss; its clip = finetune.rl.epsilon_* (from _common)

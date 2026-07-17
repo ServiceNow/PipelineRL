@@ -3,6 +3,8 @@ from collections import defaultdict, deque
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
+import contextlib
+import json
 import logging
 import queue
 import threading
@@ -375,6 +377,9 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
     - loss_masking_spans: list of (start, end) spans masked out of the loss (label == -100; prompt tokens)
     - advantage: scalar float (per-rollout GRPO advantage)
     - old_log_probabilities: list of floats, full sequence length (zeros for prompt tokens)
+    - reward: scalar float (raw per-rollout reward, a diagnostic; distinct from advantage)
+    - model_version: list of ints, full sequence length (per-token weight version; prompt positions
+      padded and masked out on the trainer side)
     """
     input_ids = entry["input_ids"]
     tokens = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
@@ -410,12 +415,32 @@ def convert_to_fast_llm_format(entry: dict) -> dict:
         if advantages:
             result["advantage"] = float(advantages[0])
 
+    # reward: raw (un-normalized) reward, a scalar per rollout (distinct from the group-relative
+    # advantage). Fast-LLM logs it as a diagnostic; it does not affect the loss.
+    if "reward" in entry:
+        result["reward"] = float(entry["reward"])
+
     # old_log_probabilities: full sequence length, zeros for prompt tokens
     # (prepare_rl_fields pads with zeros on the left to match len(input_ids))
     if "old_logprobs" in entry:
         old_logprobs = entry["old_logprobs"]
         old_logprobs = old_logprobs.tolist() if hasattr(old_logprobs, "tolist") else list(old_logprobs)
         result["old_log_probabilities"] = [float(x) for x in old_logprobs]
+
+    # model_version: full sequence length per-token weight version. When the server reports a
+    # per-completion-token version (`token_versions`, in-flight weight swaps), left-pad it to the full
+    # sequence like old_log_probabilities; prompt positions are masked out on the trainer side, so the
+    # pad value is inert. Otherwise fall back to the per-rollout scalar broadcast across all tokens.
+    scalar_version = entry.get("model_version")
+    token_versions = entry.get("token_versions")
+    if token_versions is not None and hasattr(token_versions, "tolist"):
+        token_versions = token_versions.tolist()
+    if token_versions:
+        pad_value = int(scalar_version) if scalar_version is not None else int(token_versions[0])
+        pad = [pad_value] * (len(tokens) - len(token_versions))
+        result["model_version"] = pad + [int(x) for x in token_versions]
+    elif scalar_version is not None:
+        result["model_version"] = [int(scalar_version)] * len(tokens)
 
     return result
 
@@ -553,7 +578,14 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
-    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    pipeline_log_file = None
+
+    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name) as data_writer, write_to_streams(stats_streams) as stats_writer, contextlib.ExitStack() as pipeline_log_stack:
+        if cfg.use_fast_llm and cfg.debug.log_data_pipeline:
+            # Write alongside fast-llm rank files: {exp_dir}/finetune/data_pipeline_log/
+            log_dir = Path(cfg.output_dir) / "finetune" / "data_pipeline_log"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            pipeline_log_file = pipeline_log_stack.enter_context(open(log_dir / "preprocessor.jsonl", "a"))
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
@@ -589,6 +621,7 @@ def run_preprocessing_loop(
                 fetching_took = 0
                 writing_took = 0
                 num_filtered_out = 0
+                last_backpressure_log = 0.0
                 while True:
                     if is_trainer_finished():
                         logger.info("Trainer signalled completion; stopping preprocessor loop")
@@ -656,6 +689,13 @@ def run_preprocessing_loop(
                     assert isinstance(trainer_state.samples_processed, int)
                     if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
                         # wait for the finetune loop to finish processing data
+                        now = time.time()
+                        if now - last_backpressure_log >= 10.0:
+                            last_backpressure_log = now
+                            logger.info(
+                                f"Back-pressure: published={published_samples} consumed={trainer_state.samples_processed}"
+                                f" unconsumed={published_samples - trainer_state.samples_processed} > max={max_unconsumed_samples}, waiting"
+                            )
                         continue
 
                     batch_done = False
@@ -665,10 +705,25 @@ def run_preprocessing_loop(
 
                         # Fast-LLM path: write individual samples directly (Fast-LLM does its own packing)
                         if cfg.use_fast_llm:
+                            write_start = time.time() if pipeline_log_file is not None else None
+                            write_samples = 0
+                            write_tokens = 0
                             while len(processed_entries_queue) > 0:
                                 entry = processed_entries_queue.popleft()
+                                if pipeline_log_file is not None:
+                                    write_samples += 1
+                                    write_tokens += len(entry.get("input_ids", []))
                                 data_writer.write(convert_to_fast_llm_format(entry))
                                 published_samples += 1
+                            if pipeline_log_file is not None and write_samples > 0:
+                                pipeline_log_file.write(json.dumps({
+                                    "event": "WRITE",
+                                    "t_start": round(write_start, 3),
+                                    "t_end": round(time.time(), 3),
+                                    "samples": write_samples,
+                                    "tokens": write_tokens,
+                                }) + "\n")
+                                pipeline_log_file.flush()
                             batch_done = True
                         elif cfg.finetune.seq_packing:
                             if samples_per_trainer[trainer_id] == target_samples_per_lead:
