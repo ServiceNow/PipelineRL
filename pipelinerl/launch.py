@@ -487,6 +487,7 @@ def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int]
 
     if len(finetune_nodes) > 1:
         finetune_master = world_map.address_map[finetune_nodes[0]]
+        finetune_rank = world_map.my_finetuning_rank()
         torchrun_args = [
             f"--nproc_per_node={len(gpus)}",
             f"--nnodes={len(finetune_nodes)}",
