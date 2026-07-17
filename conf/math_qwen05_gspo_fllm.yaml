@@ -30,7 +30,6 @@ fast_llm:
       base: 5.0e-7
       warmup_iterations: 0
       decay_style: constant
-      decay_iterations: 400
     beta_1: 0.974004         # sqrt-rule, effective-batch multiplier m=4
     beta_2: 0.999750
     gradient_norm_clipping: 76.8   # 0.3 * docs_per_step
@@ -45,8 +44,7 @@ fast_llm:
       head:
         fp32_lm_head: true
         losses:
-          # base no longer defines a default loss, so this is the only one. The dict key is
-          # also the metric-name prefix (gspo_*).
+          # `losses` is a dict keyed by metric-name prefix; this entry logs as gspo_*.
           gspo:
             type: gspo
             epsilon_low: ${finetune.rl.epsilon_low}    # shared clip (defined in _common)
