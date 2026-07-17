@@ -3,6 +3,7 @@ from collections import defaultdict, deque
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
+import contextlib
 import logging
 import queue
 import threading
@@ -577,15 +578,15 @@ def run_preprocessing_loop(
     total_filtered_out = 0  # Track total filtered samples across all batches
 
     pipeline_log_file = None
-    if cfg.use_fast_llm and cfg.debug.get("log_data_pipeline", False):
-        import json as _json
-        import pathlib as _pathlib
-        # Write alongside fast-llm rank files: {exp_dir}/finetune/data_pipeline_log/
-        _log_dir = _pathlib.Path(cfg.output_dir) / "finetune" / "data_pipeline_log"
-        _log_dir.mkdir(parents=True, exist_ok=True)
-        pipeline_log_file = open(_log_dir / "preprocessor.jsonl", "a")
 
-    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name) as data_writer, write_to_streams(stats_streams) as stats_writer, contextlib.ExitStack() as pipeline_log_stack:
+        if cfg.use_fast_llm and cfg.debug.get("log_data_pipeline", False):
+            import json as _json
+            import pathlib as _pathlib
+            # Write alongside fast-llm rank files: {exp_dir}/finetune/data_pipeline_log/
+            _log_dir = _pathlib.Path(cfg.output_dir) / "finetune" / "data_pipeline_log"
+            _log_dir.mkdir(parents=True, exist_ok=True)
+            pipeline_log_file = pipeline_log_stack.enter_context(open(_log_dir / "preprocessor.jsonl", "a"))
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
