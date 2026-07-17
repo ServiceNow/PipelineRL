@@ -120,6 +120,23 @@ def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
     return {"PIPELINERL_FP32_LAYER_PREFIX": prefix}
 
 
+def _get_vllm_cache_env(exp_dir: Path, tag: str) -> dict[str, str]:
+    """Per-process compile cache dirs for a vLLM server.
+
+    vLLM engines must not share one torch_compile_cache directory, because
+    concurrent inductor writes can race. The compile artifacts are also large
+    enough that putting all per-engine caches under /tmp can exceed EAI's
+    ephemeral storage limit, so keep them isolated under the mounted experiment
+    directory.
+    """
+    base = str(exp_dir / "vllm_cache" / tag)
+    return {
+        "VLLM_CACHE_ROOT": base,
+        "TORCHINDUCTOR_CACHE_DIR": f"{base}/inductor",
+        "TRITON_CACHE_DIR": f"{base}/triton",
+    }
+
+
 def _get_vllm_kwargs(cfg: DictConfig) -> dict:
     """Return launchable vLLM CLI kwargs for the supported V1 server path."""
     kwargs = OmegaConf.to_container(cfg.vllm_config.vllm_kwargs, resolve=True)
@@ -176,7 +193,12 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
+    env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": gpu_str,
+        **_get_quantization_env(cfg),
+        **_get_vllm_cache_env(exp_dir, f"ref_{preprocessor_llm_idx}"),
+    }
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
@@ -235,7 +257,12 @@ def run_actor_llm(
     save_command(log_dir, cmd)
     log_file_path = os.path.join(log_dir, "stdout.log")
     err_file_path = os.path.join(log_dir, "stderr.log")
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str, **_get_quantization_env(cfg)}
+    env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": gpu_str,
+        **_get_quantization_env(cfg),
+        **_get_vllm_cache_env(exp_dir, f"actor_{actor_llm_idx}"),
+    }
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         proc = _popen(
             cmd,
@@ -473,6 +500,9 @@ def clean_up(exp_dir, force_restart):
         if os.path.exists(f"{exp_dir}/finetune"):
             logger.info("Cleaning up finetune directory")
             shutil.rmtree(f"{exp_dir}/finetune")
+        if os.path.exists(f"{exp_dir}/vllm_cache"):
+            logger.info("Cleaning up vLLM cache directory")
+            shutil.rmtree(f"{exp_dir}/vllm_cache")
 
         # erase all the logs
         log_files = list(exp_dir.glob("**/*.log"))

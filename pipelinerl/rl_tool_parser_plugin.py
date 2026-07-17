@@ -6,14 +6,14 @@ import json
 import logging
 import re
 
-from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import ToolParser
-from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-from vllm.entrypoints.openai.protocol import (
+from vllm.tool_parsers.abstract_tool_parser import ToolParser
+from vllm.tool_parsers import ToolParserManager
+from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
-    ExtractedToolCallInformation,
     ToolCall,
     FunctionCall,
 )
+from vllm.entrypoints.openai.engine.protocol import ExtractedToolCallInformation
 
 _JSON_SCALAR_TYPES = (dict, list, str, int, float, bool)
 

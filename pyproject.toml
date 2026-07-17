@@ -20,12 +20,15 @@ authors = [
 ]
 dependencies = [
     "aiohttp>=3.9.0",
-    "vllm==0.18.1",
+    "vllm==0.19.1",
     "accelerate==1.13.0",
     "deepspeed~=0.18.0",
     "datasets>=2.21.0",
-    "transformers~=4.57.0" ,
+    "transformers~=5.5.1" ,
     "fastapi>=0.115.0",
+    # vLLM's metrics middleware: 8.0.2 handles FastAPI's _IncludedRouter (0.116+),
+    # otherwise /health returns 500 and actor readiness checks deadlock.
+    "prometheus-fastapi-instrumentator>=8.0.2",
     "joblib>=1.3.2",
     "jsonref>=1.1.0",
     "litellm>=1.61.0",

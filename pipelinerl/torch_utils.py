@@ -43,9 +43,11 @@ def _create_stateless_pg(host, port, rank, world_size):
         # Bind to all interfaces so it works regardless of hostname resolution
         listen_socket.bind(("0.0.0.0", port))
         listen_socket.listen()
-        listen_fd = listen_socket.fileno()
+        # Transfer fd ownership to TCPStore. vLLM >=0.19.1 dropped the
+        # StatelessProcessGroup.socket field that previously kept this fd alive,
+        # so detach() hands the fd to TCPStore instead of relying on the PG.
+        listen_fd = listen_socket.detach()
     else:
-        listen_socket = None
         listen_fd = None
 
     store = TCPStore(
@@ -62,7 +64,6 @@ def _create_stateless_pg(host, port, rank, world_size):
         rank=rank,
         world_size=world_size,
         store=store,
-        socket=listen_socket,
         data_expiration_seconds=3600,
     )
 

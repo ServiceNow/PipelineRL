@@ -13,7 +13,7 @@ from packaging import version
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     AutoTokenizer,
     AutoProcessor,
     BitsAndBytesConfig,
@@ -117,7 +117,7 @@ def get_auto_model_class(
         case "seq2seq-language-modeling":
             return AutoModelForSeq2SeqLM
         case "vision2seq-language-modeling":
-            return AutoModelForVision2Seq
+            return AutoModelForImageTextToText
         case _:
             raise ValueError(f"Unsupported model class: {model_class}")
 
