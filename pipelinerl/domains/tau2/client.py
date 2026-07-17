@@ -11,10 +11,12 @@ from pydantic import BaseModel, ConfigDict
 
 
 NEMO_GYM_SHA = "5f92a73217258074b74b7be26526c69f0ce3075d"
+NEMO_GYM_TITO_PATCH_SHA = "c03eceb3ba4473a7779d6ff37b82de76ccea9dd0c1ed4e6baea2df9f2b3bfcee"
 TAU2_RUNTIME_SHA = "befd120003fb55f48b498f6549556dcaf74582d5"
 TAU2_DATA_SHA = "ce4013b0afe03c873488878b72851414f92f458b"
 
 _GYM_SHA_KEY = "pipelinerl_nemo_gym_sha"
+_GYM_PATCH_SHA_KEY = "pipelinerl_gym_patch_sha"
 _TAU2_RUNTIME_SHA_KEY = "pipelinerl_tau2_runtime_sha"
 _TAU2_DATA_SHA_KEY = "pipelinerl_tau2_data_sha"
 _POLICY_MODEL_NAME_KEY = "pipelinerl_policy_model_name"
@@ -92,6 +94,7 @@ def validate_executed_gym_config(
 ) -> dict[str, Tau2AgentBinding]:
     expected_pins = {
         _GYM_SHA_KEY: NEMO_GYM_SHA,
+        _GYM_PATCH_SHA_KEY: NEMO_GYM_TITO_PATCH_SHA,
         _TAU2_RUNTIME_SHA_KEY: TAU2_RUNTIME_SHA,
         _TAU2_DATA_SHA_KEY: TAU2_DATA_SHA,
     }

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -7,9 +8,17 @@ from typing import Any
 
 from pipelinerl.domains.tau2.client import (
     NEMO_GYM_SHA,
+    NEMO_GYM_TITO_PATCH_SHA,
     TAU2_DATA_SHA,
     TAU2_RUNTIME_SHA,
     normalize_openai_base_url,
+)
+
+_GYM_APP_PATH = Path("responses_api_models/vllm_model/app.py")
+_GYM_APP_BASE_SHA256 = "80daf9e3c9edc6954e323eb0408e70a2af5f8c08579b171ebaa07cdcf3c15ae1"
+_GYM_APP_POST_PATCH_SHA256 = "1dc0a6ab94f353a36527ff2f7595d3258f277422578df3e038a31e429fd0e1f6"
+_GYM_TITO_PATCH_PATH = (
+    Path(__file__).resolve().parents[1] / "domains" / "tau2" / "patches" / "nemo_gym_strict_tito.patch"
 )
 
 
@@ -48,6 +57,7 @@ def build_gym_config(
         "head_server": {"host": host, "port": head_port},
         "error_on_almost_servers": True,
         "pipelinerl_nemo_gym_sha": NEMO_GYM_SHA,
+        "pipelinerl_gym_patch_sha": NEMO_GYM_TITO_PATCH_SHA,
         "pipelinerl_tau2_runtime_sha": TAU2_RUNTIME_SHA,
         "pipelinerl_tau2_data_sha": TAU2_DATA_SHA,
         "pipelinerl_policy_model_name": policy_model_name,
@@ -117,6 +127,55 @@ def assert_gym_checkout(gym_root: Path) -> None:
         raise RuntimeError(f"NeMo Gym checkout is {head}, expected {NEMO_GYM_SHA}")
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def assert_dedicated_gym_checkout(gym_root: Path, run_dir: Path) -> None:
+    gym_root = gym_root.resolve()
+    run_dir = run_dir.resolve()
+    if gym_root == run_dir or not gym_root.is_relative_to(run_dir):
+        raise RuntimeError(
+            f"NeMo Gym checkout {gym_root} must be dedicated to this run and live inside {run_dir}"
+        )
+
+
+def apply_gym_tito_patch(
+    gym_root: Path,
+    patch_path: Path = _GYM_TITO_PATCH_PATH,
+) -> None:
+    patch_path = patch_path.resolve()
+    if _sha256(patch_path) != NEMO_GYM_TITO_PATCH_SHA:
+        raise RuntimeError("NeMo Gym strict-TITO patch content does not match its pinned SHA256")
+
+    target = gym_root / _GYM_APP_PATH
+    target_sha = _sha256(target)
+    status = subprocess.check_output(
+        ["git", "-C", str(gym_root), "status", "--porcelain=v1", "--untracked-files=no"],
+        text=True,
+    )
+    tracked_paths = {line[3:] for line in status.splitlines()}
+    if target_sha == _GYM_APP_POST_PATCH_SHA256:
+        if tracked_paths != {str(_GYM_APP_PATH)}:
+            raise RuntimeError("Patched NeMo Gym checkout contains unexpected tracked changes")
+        return
+    if target_sha != _GYM_APP_BASE_SHA256:
+        raise RuntimeError("NeMo Gym vllm_model/app.py does not match the pinned base or patched content")
+    if tracked_paths:
+        raise RuntimeError("NeMo Gym checkout contains tracked changes before strict-TITO patching")
+
+    subprocess.run(
+        ["git", "-C", str(gym_root), "apply", "--check", str(patch_path)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(gym_root), "apply", str(patch_path)],
+        check=True,
+    )
+    if _sha256(target) != _GYM_APP_POST_PATCH_SHA256:
+        raise RuntimeError("NeMo Gym strict-TITO patched content has the wrong SHA256")
+
+
 def prepare_tau2_data(gym_root: Path, env: dict[str, str]) -> None:
     """Initialize the shared Tau2 data once before parallel agents start."""
     python = gym_root / ".venv" / "bin" / "python"
@@ -137,7 +196,7 @@ def prepare_tau2_data(gym_root: Path, env: dict[str, str]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch the pinned Tau2 Gym service cluster.")
     parser.add_argument("--gym-root", type=Path, required=True)
-    parser.add_argument("--output-config", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--policy-url", action="append", required=True)
     parser.add_argument("--policy-model-name", required=True)
     parser.add_argument("--user-model-url", required=True)
@@ -159,7 +218,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     gym_root = args.gym_root.resolve()
+    run_dir = args.run_dir.resolve()
+    assert_dedicated_gym_checkout(gym_root, run_dir)
     assert_gym_checkout(gym_root)
+    apply_gym_tito_patch(gym_root)
     if not os.environ.get(args.user_api_key_env):
         raise RuntimeError(f"Required user-model API key environment variable {args.user_api_key_env} is unset")
 
@@ -180,8 +242,8 @@ def main() -> None:
         user_api_key_env=args.user_api_key_env,
         uses_reasoning_parser=args.uses_reasoning_parser,
     )
-    output_config = args.output_config.resolve()
-    output_config.parent.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output_config = run_dir / "tau2_gym_config.json"
     output_config.write_text(json.dumps(config, indent=2) + "\n")
 
     env = dict(os.environ)

@@ -7,6 +7,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from pipelinerl.domains.tau2.client import (
+    NEMO_GYM_TITO_PATCH_SHA,
     Tau2GymClient,
     Tau2GymSettings,
     validate_executed_gym_config,
@@ -48,6 +49,7 @@ def test_generated_config_has_one_agent_per_policy_endpoint():
     config = _config()
     bindings = validate_executed_gym_config(config, POLICY_URLS, _settings())
 
+    assert config["pipelinerl_gym_patch_sha"] == NEMO_GYM_TITO_PATCH_SHA
     assert set(bindings) == set(POLICY_URLS)
     assert bindings[POLICY_URLS[0]].agent_url == "http://gym-host:12003"
     assert bindings[POLICY_URLS[1]].agent_url == "http://gym-host:12004"

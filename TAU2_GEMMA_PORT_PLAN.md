@@ -173,8 +173,9 @@ Each wave is reviewed before commit.
    cache isolation.
 2. **Gym bridge:** service lifecycle, prepared Tau2 config, frozen user
    simulator, policy-proxy forwarding, and request-scoped endpoint affinity.
-3. **All-turn TITO:** response-side capture, prefix reconstruction, masks,
-   old logprobs, context checks, and whole-rollout drops.
+3. **All-turn TITO:** first apply and content-verify the response-side Gym
+   capture patch in a dedicated per-run checkout; then reconstruct prefixes,
+   masks, old logprobs, context checks, and whole-rollout drops.
 4. **Provenance:** per-call versions, mixed-version rollout metadata,
    conservative lag accounting, and audit stream.
 5. **Buffering:** atomic group envelopes, oversize handling, counters, and
@@ -243,6 +244,8 @@ counter intentionally.
 ## Pinned Sources And Lifecycle
 
 - NeMo Gym: 5f92a73217258074b74b7be26526c69f0ce3075d
+- PipelineRL strict-TITO Gym patch SHA256:
+  c03eceb3ba4473a7779d6ff37b82de76ccea9dd0c1ed4e6baea2df9f2b3bfcee
 - Tau2 runtime: befd120003fb55f48b498f6549556dcaf74582d5
 - Tau2 prepared-data source: ce4013b0afe03c873488878b72851414f92f458b
 
@@ -253,9 +256,17 @@ PipelineRL maps its selected actor endpoint to the matching agent and verifies
 the executed Gym config, source pins, service health, and user/policy
 separation at launch and periodically while collecting rollouts.
 
-The in-repo launcher owns the generated Gym config and exact source refs. A v2
-follow-up moves this cluster under PipelineRL orchestrator lifecycle management;
-external supervision is a deliberate v1 waypoint, not the target architecture.
+The in-repo launcher owns the generated Gym config and exact source refs. Each
+run uses a NeMo Gym checkout inside its run directory; shared mutable checkouts
+are forbidden. The launcher requires the exact Gym base commit, verifies the
+patch artifact digest, runs `git apply --check`, applies the patch, verifies the
+exact patched-file SHA256, and stamps the patch digest into the executed Gym
+config for periodic revalidation.
+
+A v2 follow-up moves this cluster under PipelineRL orchestrator lifecycle
+management and replaces the patch artifact with the same content in a pinned
+fork or upstream commit. External supervision and the versioned patch are
+deliberate v1 waypoints, not the target architecture.
 
 ## Explicit TBDs
 
