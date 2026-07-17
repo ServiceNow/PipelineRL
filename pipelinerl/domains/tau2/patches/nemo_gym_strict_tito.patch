@@ -1,8 +1,54 @@
 diff --git a/responses_api_models/vllm_model/app.py b/responses_api_models/vllm_model/app.py
-index 2395dc3b..9434e68a 100644
+index 2395dc3b4230471295bd7138784b34d7e9ac23df..095e5d846530de5f329ffe94fef5e4a8a700ddbe 100644
 --- a/responses_api_models/vllm_model/app.py
 +++ b/responses_api_models/vllm_model/app.py
-@@ -259,11 +259,7 @@ class VLLMModel(SimpleResponsesAPIModel):
+@@ -45,6 +45,45 @@ from nemo_gym.responses_converter import (
+ from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
+ 
+ 
++def _validate_pipelinerl_token_capture(chat_completion_dict, choice_dict, log_probs):
++    generation_log_probs = [log_prob["logprob"] for log_prob in log_probs]
++    try:
++        logprob_token_ids = [
++            int(log_prob["token"].removeprefix("token_id:"))
++            for log_prob in log_probs
++        ]
++    except (KeyError, TypeError, ValueError) as exc:
++        raise RuntimeError("vLLM returned malformed logprob token IDs") from exc
++
++    prompt_token_ids = chat_completion_dict.get("prompt_token_ids")
++    generation_token_ids = choice_dict.get("token_ids")
++    if not isinstance(prompt_token_ids, list) or not all(
++        isinstance(token_id, int) for token_id in prompt_token_ids
++    ):
++        raise RuntimeError("vLLM response is missing valid prompt_token_ids")
++    if not isinstance(generation_token_ids, list) or not all(
++        isinstance(token_id, int) for token_id in generation_token_ids
++    ):
++        raise RuntimeError("vLLM response is missing valid completion token_ids")
++    if generation_token_ids != logprob_token_ids:
++        raise RuntimeError(
++            "vLLM completion token_ids do not match logprob token IDs: "
++            f"{generation_token_ids} != {logprob_token_ids}"
++        )
++    usage = chat_completion_dict.get("usage") or {}
++    if len(prompt_token_ids) != usage.get("prompt_tokens"):
++        raise RuntimeError(
++            "vLLM prompt_token_ids length does not match usage.prompt_tokens: "
++            f"{len(prompt_token_ids)} != {usage.get('prompt_tokens')}"
++        )
++    if len(generation_token_ids) != usage.get("completion_tokens"):
++        raise RuntimeError(
++            "vLLM completion token_ids length does not match usage.completion_tokens: "
++            f"{len(generation_token_ids)} != {usage.get('completion_tokens')}"
++        )
++    return prompt_token_ids, generation_token_ids, generation_log_probs
++
++
+ class VLLMModelConfig(BaseResponsesAPIModelConfig):
+     base_url: Union[str, List[str]]
+     api_key: str
+@@ -259,11 +298,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                  top_logprobs=0,
                  # Typically passed via OpenAI client extra_body.
                  return_tokens_as_token_ids=True,
@@ -15,10 +61,11 @@ index 2395dc3b..9434e68a 100644
              )
  
          if self.config.uses_reasoning_parser:
-@@ -458,38 +454,45 @@ class VLLMModel(SimpleResponsesAPIModel):
+@@ -457,39 +492,14 @@ class VLLMModel(SimpleResponsesAPIModel):
+                     f"had none (choice.logprobs={logprobs_block!r}). Cannot extract token ids or logprobs."
                  )
              log_probs = logprobs_block["content"]
-             generation_log_probs = [log_prob["logprob"] for log_prob in log_probs]
+-            generation_log_probs = [log_prob["logprob"] for log_prob in log_probs]
 -
 -            """
 -            START TODO remove this when NeMo RL upgrades to vLLM 0.10.2 support for prompt token ids
@@ -43,40 +90,9 @@ index 2395dc3b..9434e68a 100644
 -            """
 -            END
 -            """
-+            try:
-+                logprob_token_ids = [
-+                    int(log_prob["token"].removeprefix("token_id:"))
-+                    for log_prob in log_probs
-+                ]
-+            except (KeyError, TypeError, ValueError) as exc:
-+                raise RuntimeError("vLLM returned malformed logprob token IDs") from exc
-+
-+            prompt_token_ids = chat_completion_dict.get("prompt_token_ids")
-+            generation_token_ids = choice_dict.get("token_ids")
-+            if not isinstance(prompt_token_ids, list) or not all(
-+                isinstance(token_id, int) for token_id in prompt_token_ids
-+            ):
-+                raise RuntimeError("vLLM response is missing valid prompt_token_ids")
-+            if not isinstance(generation_token_ids, list) or not all(
-+                isinstance(token_id, int) for token_id in generation_token_ids
-+            ):
-+                raise RuntimeError("vLLM response is missing valid completion token_ids")
-+            if generation_token_ids != logprob_token_ids:
-+                raise RuntimeError(
-+                    "vLLM completion token_ids do not match logprob token IDs: "
-+                    f"{generation_token_ids} != {logprob_token_ids}"
-+                )
-+            usage = chat_completion_dict.get("usage") or {}
-+            if len(prompt_token_ids) != usage.get("prompt_tokens"):
-+                raise RuntimeError(
-+                    "vLLM prompt_token_ids length does not match usage.prompt_tokens: "
-+                    f"{len(prompt_token_ids)} != {usage.get('prompt_tokens')}"
-+                )
-+            if len(generation_token_ids) != usage.get("completion_tokens"):
-+                raise RuntimeError(
-+                    "vLLM completion token_ids length does not match usage.completion_tokens: "
-+                    f"{len(generation_token_ids)} != {usage.get('completion_tokens')}"
-+                )
++            prompt_token_ids, generation_token_ids, generation_log_probs = (
++                _validate_pipelinerl_token_capture(chat_completion_dict, choice_dict, log_probs)
++            )
  
              message_dict = choice_dict["message"]
              message_dict.update(
@@ -89,7 +105,7 @@ index 2395dc3b..9434e68a 100644
                      generation_token_ids=generation_token_ids,
                      generation_log_probs=generation_log_probs,
                  )
-@@ -497,9 +500,8 @@ class VLLMModel(SimpleResponsesAPIModel):
+@@ -497,9 +507,8 @@ class VLLMModel(SimpleResponsesAPIModel):
  
              # Clean the duplicated information
              choice_dict.pop("logprobs")

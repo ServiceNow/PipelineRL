@@ -579,16 +579,27 @@ def prepare_rl_fields(
     """
     Convert reward per agent step to reward per token and add returns and advantages placeholders
     """
+    labels = encoding["labels"]
     target_tokens = [token for token in encoding["labels"] if token != -100]
-    assert len(target_tokens) == len(old_logprobs), (
-        f"Target tokens: {len(target_tokens)}, old logprobs: {len(old_logprobs)}"
-    )
+    full_alignment = len(old_logprobs) == len(labels)
+    if full_alignment:
+        assert len(ref_logprobs) == len(labels), (
+            f"Labels: {len(labels)}, ref logprobs: {len(ref_logprobs)}"
+        )
+        aligned_old_logprobs = list(old_logprobs)
+        aligned_ref_logprobs = list(ref_logprobs)
+    else:
+        assert len(target_tokens) == len(old_logprobs), (
+            f"Target tokens: {len(target_tokens)}, old logprobs: {len(old_logprobs)}"
+        )
+        aligned_old_logprobs = [0] * (len(labels) - len(old_logprobs)) + old_logprobs
+        aligned_ref_logprobs = [0] * (len(labels) - len(ref_logprobs)) + ref_logprobs
 
-    encoding["rewards"] = [reward] * len(encoding["labels"])
-    encoding["advantages"] = [0.0] * len(encoding["labels"])  # place holder
-    encoding["old_logprobs"] = [0] * (len(encoding["labels"]) - len(old_logprobs)) + old_logprobs
-    encoding["ref_logprobs"] = [0] * (len(encoding["labels"]) - len(ref_logprobs)) + ref_logprobs
-    encoding["overflow"] = [0] * len(encoding["labels"])  # place holder
-    encoding["group_tokens"] = [0] * len(encoding["labels"])  # place holder
-    encoding["num_labels"] = [1 if label != -100 else 0 for label in encoding["labels"]]  # count only output tokens
+    encoding["rewards"] = [reward] * len(labels)
+    encoding["advantages"] = [0.0] * len(labels)  # place holder
+    encoding["old_logprobs"] = aligned_old_logprobs
+    encoding["ref_logprobs"] = aligned_ref_logprobs
+    encoding["overflow"] = [0] * len(labels)  # place holder
+    encoding["group_tokens"] = [0] * len(labels)  # place holder
+    encoding["num_labels"] = [1 if label != -100 else 0 for label in labels]  # count only output tokens
     return encoding

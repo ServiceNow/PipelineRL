@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import requests
 from omegaconf import OmegaConf
 
 from pipelinerl.domains.tau2.client import (
@@ -11,6 +12,7 @@ from pipelinerl.domains.tau2.client import (
     Tau2GymClient,
     Tau2GymSettings,
     validate_executed_gym_config,
+    validate_tau2_gym_sync,
 )
 from pipelinerl.domains.tau2.dataset import load_tau2_problems
 from pipelinerl.entrypoints.run_tau2_gym import build_gym_config, prepare_tau2_data
@@ -179,3 +181,75 @@ def test_tau2_data_is_initialized_once_before_parallel_agents(tmp_path: Path):
     assert args[0][0] == str(gym_root / ".venv" / "bin" / "python")
     assert "ensure_tau2_data_dir" in args[0][2]
     assert kwargs == {"cwd": gym_root, "env": env, "check": True}
+
+
+class _SyncResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+def test_launch_validation_retries_only_service_readiness_errors():
+    config = _config()
+    responses = [
+        requests.ConnectionError("head booting"),
+        _SyncResponse(config),
+        _SyncResponse({"status": "ok"}),
+        _SyncResponse({"status": "ok"}),
+    ]
+
+    with (
+        patch("pipelinerl.domains.tau2.client.requests.get", side_effect=responses) as get,
+        patch("pipelinerl.domains.tau2.client.time.sleep") as sleep,
+    ):
+        bindings = validate_tau2_gym_sync(_settings(), POLICY_URLS)
+
+    assert set(bindings) == set(POLICY_URLS)
+    assert get.call_count == 4
+    sleep.assert_called_once_with(1.0)
+
+
+def test_launch_validation_does_not_retry_bad_executed_config():
+    config = _config()
+    config["pipelinerl_policy_1"]["responses_api_models"]["vllm_model"]["base_url"] = (
+        "http://actor-wrong:8000/v1"
+    )
+
+    with (
+        patch(
+            "pipelinerl.domains.tau2.client.requests.get",
+            return_value=_SyncResponse(config),
+        ) as get,
+        patch("pipelinerl.domains.tau2.client.time.sleep") as sleep,
+    ):
+        with pytest.raises(ValueError, match="is not bound"):
+            validate_tau2_gym_sync(_settings(), POLICY_URLS)
+
+    get.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_launch_validation_stops_at_startup_deadline():
+    settings = _settings().model_copy(update={"startup_timeout_s": 1.0})
+
+    with (
+        patch(
+            "pipelinerl.domains.tau2.client.requests.get",
+            side_effect=requests.ConnectionError("still booting"),
+        ) as get,
+        patch(
+            "pipelinerl.domains.tau2.client.time.monotonic",
+            side_effect=[0.0, 0.1, 1.1],
+        ),
+        patch("pipelinerl.domains.tau2.client.time.sleep") as sleep,
+    ):
+        with pytest.raises(requests.ConnectionError, match="still booting"):
+            validate_tau2_gym_sync(settings, POLICY_URLS)
+
+    assert get.call_count == 2
+    sleep.assert_called_once_with(0.9)

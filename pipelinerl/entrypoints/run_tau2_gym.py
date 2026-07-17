@@ -16,7 +16,7 @@ from pipelinerl.domains.tau2.client import (
 
 _GYM_APP_PATH = Path("responses_api_models/vllm_model/app.py")
 _GYM_APP_BASE_SHA256 = "80daf9e3c9edc6954e323eb0408e70a2af5f8c08579b171ebaa07cdcf3c15ae1"
-_GYM_APP_POST_PATCH_SHA256 = "1dc0a6ab94f353a36527ff2f7595d3258f277422578df3e038a31e429fd0e1f6"
+_GYM_APP_POST_PATCH_SHA256 = "0e0053c94051b8fcdb3cf5f4ec3e775adad8a24afff50326f5890c7bc54aa994"
 _GYM_TITO_PATCH_PATH = (
     Path(__file__).resolve().parents[1] / "domains" / "tau2" / "patches" / "nemo_gym_strict_tito.patch"
 )

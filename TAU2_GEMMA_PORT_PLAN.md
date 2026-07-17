@@ -245,7 +245,7 @@ counter intentionally.
 
 - NeMo Gym: 5f92a73217258074b74b7be26526c69f0ce3075d
 - PipelineRL strict-TITO Gym patch SHA256:
-  c03eceb3ba4473a7779d6ff37b82de76ccea9dd0c1ed4e6baea2df9f2b3bfcee
+  046c5ba122517b51b6fd371485941a3bab619348c9543e2998b98da5ea9b3713
 - Tau2 runtime: befd120003fb55f48b498f6549556dcaf74582d5
 - Tau2 prepared-data source: ce4013b0afe03c873488878b72851414f92f458b
 
@@ -285,6 +285,22 @@ These inputs must be resolved and recorded before recipe implementation:
 - **Context budget:** measure real Tau2 call-prefix and complete merged-rollout
   token distributions before setting model length, generation margin, or
   maximum episode steps.
+- **Actor queue sizing:** the Wave 3b boundary fixture measures about 2.05 MB
+  for one 65,536-token all-turn result, so a G16 payload projects to about
+  32.9 MB and cannot fit the base actor queue's 10 MB entry cap. Wave 5 must
+  retain typed whole-group oversize drops, and the recipe must set the cap from
+  measured real Tau2 group payloads rather than the single-rollout size.
+- **Strict-TITO OOV handling:** before launch, Wave 5 must replace terminal's
+  silent OOV token rewrite with a typed whole-group drop and counter for Tau2.
+- **Seeded-call accounting:** validate against the pinned Tau2 runtime that
+  `num_agent_calls` includes exactly one unlabeled seeded assistant greeting;
+  retain the current fail-loud `captured_calls == num_agent_calls - 1` check.
+- **Alignment activation:** full-length old/ref alignment is currently selected
+  by field shape. Before the recipe lands, either config-gate that shared-code
+  behavior or document why the shape contract satisfies invariant 5.
+- **Derived text views:** all-turn samples intentionally set `n_predicted=0`,
+  so `prompt_text` and `output_text` are degenerate. Document or replace those
+  views before any Tau2 audit or training consumer relies on them.
 
 ## First Experiment Boundary
 

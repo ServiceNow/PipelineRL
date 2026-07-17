@@ -87,9 +87,18 @@ def batch_annotate_traces_with_ref_logprobs(llm: TrainableLLM, traces: List[dict
     logger.info(f"Annotating {len(traces)} samples with ref logprobs")
     prompt_token_ids = []
     completion_token_ids = []
+    full_alignment = []
     for trace in traces:
-        prompt_token_ids.append(trace["input_ids"][: -len(trace["logprobs"])])
-        completion_token_ids.append(trace["input_ids"][-len(trace["logprobs"]) :])
+        is_full_alignment = len(trace["logprobs"]) == len(trace["input_ids"])
+        full_alignment.append(is_full_alignment)
+        if is_full_alignment:
+            if len(trace["input_ids"]) < 2:
+                raise ValueError("Full-length logprob alignment requires at least two tokens")
+            prompt_token_ids.append(trace["input_ids"][:1])
+            completion_token_ids.append(trace["input_ids"][1:])
+        else:
+            prompt_token_ids.append(trace["input_ids"][: -len(trace["logprobs"])])
+            completion_token_ids.append(trace["input_ids"][-len(trace["logprobs"]) :])
     try:
         all_ref_logprobs = llm.get_batch_logprobs_token_ids(prompt_token_ids, completion_token_ids)
     except Exception as e:
@@ -97,11 +106,23 @@ def batch_annotate_traces_with_ref_logprobs(llm: TrainableLLM, traces: List[dict
         assert (response := getattr(e, "response", None))
         logger.error(f"Response content: {response.text}")
         raise e
-    for trace, ref_logprobs in zip(traces, all_ref_logprobs):
-        trace["ref_logprobs"] = [c["logprob"] for c in ref_logprobs["content"]]
-        assert len(trace["ref_logprobs"]) == len(trace["logprobs"]), (
-            f"{len(trace['ref_logprobs'])} != {len(trace['logprobs'])}"
-        )
+    for trace, ref_logprobs, is_full_alignment in zip(traces, all_ref_logprobs, full_alignment):
+        values = [c["logprob"] for c in ref_logprobs["content"]]
+        if is_full_alignment:
+            assert len(values) == len(trace["input_ids"]) - 1, (
+                f"{len(values)} != {len(trace['input_ids']) - 1}"
+            )
+            values = [0.0] + values
+            assert len(trace["labels"]) == len(values)
+            trace["ref_logprobs"] = [
+                value if label != -100 else 0.0
+                for value, label in zip(values, trace["labels"])
+            ]
+        else:
+            trace["ref_logprobs"] = values
+            assert len(trace["ref_logprobs"]) == len(trace["logprobs"]), (
+                f"{len(trace['ref_logprobs'])} != {len(trace['logprobs'])}"
+            )
 
 
 def replace_oov_tokens_with_the(data: list[dict], tokenizer: transformers.PreTrainedTokenizerBase) -> list[dict]:

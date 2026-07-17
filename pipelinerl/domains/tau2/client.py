@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -11,9 +12,11 @@ from pydantic import BaseModel, ConfigDict
 
 
 NEMO_GYM_SHA = "5f92a73217258074b74b7be26526c69f0ce3075d"
-NEMO_GYM_TITO_PATCH_SHA = "c03eceb3ba4473a7779d6ff37b82de76ccea9dd0c1ed4e6baea2df9f2b3bfcee"
+NEMO_GYM_TITO_PATCH_SHA = "046c5ba122517b51b6fd371485941a3bab619348c9543e2998b98da5ea9b3713"
 TAU2_RUNTIME_SHA = "befd120003fb55f48b498f6549556dcaf74582d5"
 TAU2_DATA_SHA = "ce4013b0afe03c873488878b72851414f92f458b"
+
+logger = logging.getLogger(__name__)
 
 _GYM_SHA_KEY = "pipelinerl_nemo_gym_sha"
 _GYM_PATCH_SHA_KEY = "pipelinerl_gym_patch_sha"
@@ -31,6 +34,7 @@ class Tau2GymSettings(BaseModel):
     user_model_name: str
     validation_interval_s: float = 30.0
     request_timeout_s: float = 3600.0
+    startup_timeout_s: float = 300.0
 
 
 class Tau2RunResponse(BaseModel):
@@ -168,14 +172,26 @@ def validate_tau2_gym_sync(
     actor_llm_urls: Sequence[str],
 ) -> dict[str, Tau2AgentBinding]:
     parsed_settings = Tau2GymSettings.model_validate(settings)
-    response = requests.get(_head_config_url(parsed_settings.head_url), timeout=10.0)
-    response.raise_for_status()
-    config = parse_executed_gym_config(response.json())
-    bindings = validate_executed_gym_config(config, actor_llm_urls, parsed_settings)
-    for binding in bindings.values():
-        health = requests.get(f"{binding.agent_url}/", timeout=10.0)
-        health.raise_for_status()
-    return bindings
+    deadline = time.monotonic() + parsed_settings.startup_timeout_s
+    retry_delay_s = 1.0
+    while True:
+        try:
+            response = requests.get(_head_config_url(parsed_settings.head_url), timeout=10.0)
+            response.raise_for_status()
+            config = parse_executed_gym_config(response.json())
+            bindings = validate_executed_gym_config(config, actor_llm_urls, parsed_settings)
+            for binding in bindings.values():
+                health = requests.get(f"{binding.agent_url}/", timeout=10.0)
+                health.raise_for_status()
+            return bindings
+        except requests.RequestException as exc:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise
+            sleep_s = min(retry_delay_s, remaining_s)
+            logger.warning("Tau2 Gym is not ready; retrying in %.1fs: %s", sleep_s, exc)
+            time.sleep(sleep_s)
+            retry_delay_s = min(retry_delay_s * 2, 10.0)
 
 
 class Tau2GymClient:
