@@ -240,6 +240,23 @@ rollout and visible both as counters and audit records. A zero count is not
 treated as proof until the corresponding adversarial acceptance test fires the
 counter intentionally.
 
+## Pinned Sources And Lifecycle
+
+- NeMo Gym: 5f92a73217258074b74b7be26526c69f0ce3075d
+- Tau2 runtime: befd120003fb55f48b498f6549556dcaf74582d5
+- Tau2 prepared-data source: ce4013b0afe03c873488878b72851414f92f458b
+
+The v1 service boundary is one externally supervised Gym cluster per
+PipelineRL run. It contains one single-endpoint policy proxy and Tau2 agent for
+each PipelineRL actor vLLM endpoint, plus one shared frozen user-model proxy.
+PipelineRL maps its selected actor endpoint to the matching agent and verifies
+the executed Gym config, source pins, service health, and user/policy
+separation at launch and periodically while collecting rollouts.
+
+The in-repo launcher owns the generated Gym config and exact source refs. A v2
+follow-up moves this cluster under PipelineRL orchestrator lifecycle management;
+external supervision is a deliberate v1 waypoint, not the target architecture.
+
 ## Explicit TBDs
 
 These inputs must be resolved and recorded before recipe implementation:
@@ -257,8 +274,6 @@ These inputs must be resolved and recorded before recipe implementation:
 - **Context budget:** measure real Tau2 call-prefix and complete merged-rollout
   token distributions before setting model length, generation margin, or
   maximum episode steps.
-- **Backend pins:** record exact NeMo Gym and Tau2 source revisions and the
-  deployed service images.
 
 ## First Experiment Boundary
 

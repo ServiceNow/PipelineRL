@@ -635,6 +635,16 @@ def setup_logging(log_file: Path):
     logger.info("Logging setup complete")
 
 
+def validate_external_services(cfg: DictConfig, world_map: WorldMap) -> None:
+    tau2_gym = cfg.get("tau2_gym")
+    if not tau2_gym:
+        return
+    from pipelinerl.domains.tau2.client import validate_tau2_gym_sync
+
+    settings = OmegaConf.to_container(tau2_gym, resolve=True)
+    validate_tau2_gym_sync(settings, world_map.get_actor_urls())
+
+
 @hydra.main(
     config_path="../conf/",
     config_name="base",
@@ -652,6 +662,8 @@ def main(cfg: DictConfig):
     world_map = WorldMap(cfg, verbose=True)
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
 
+    if world_map.my_rank == 0:
+        validate_external_services(cfg, world_map)
     group = str(exp_dir)
     root = cfg.wandb.wandb_workspace_root
     if root:
