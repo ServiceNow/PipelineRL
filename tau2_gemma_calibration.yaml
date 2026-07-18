@@ -1,0 +1,95 @@
+# Calibration evidence job only. Rafa must approve this exact file after every
+# placeholder below is resolved. It is not a production topology.
+image: registry.toolkit-sp.yul201.service-now.com/snow.research.tapes/interactive-toolkit:throughput
+data:
+  - snow.research.tapes.rafael_pardinas_home:/home/toolkit:rw
+  - snow.research.tapes.transformers_cache:/transformers_cache:rw
+  - snow.research.tapes.data:/mnt/llmd/data:rw
+  - snow.research.tapes.results:/mnt/llmd/results:rw
+  - snow.research.tapes.base_models:/mnt/llmd/base_models:rw
+command:
+  - /opt/conda/bin/conda
+  - run
+  - -n
+  - pipeline-rl
+  - --no-capture-output
+  - bash
+  - tau2_gemma.sh
+  - calibration
+
+resources:
+  cpu: 128
+  gpu: 8
+  mem: 1536
+  replicas: 4
+options:
+  infiniband: true
+  internal-dns:
+    name: tau2-gemma-calibration
+    ports:
+      - {port: 9000, target-port: 9000, protocol: TCP}
+      - {port: 9001, target-port: 9001, protocol: TCP}
+      - {port: 8080, target-port: 8080, protocol: TCP}
+      - {port: 8082, target-port: 8082, protocol: TCP}
+      - {port: 8084, target-port: 8084, protocol: TCP}
+      - {port: 8086, target-port: 8086, protocol: TCP}
+      - {port: 11000, target-port: 11000, protocol: TCP}
+      - {port: 12000, target-port: 12000, protocol: TCP}
+      - {port: 12001, target-port: 12001, protocol: TCP}
+      - {port: 12002, target-port: 12002, protocol: TCP}
+      - {port: 12003, target-port: 12003, protocol: TCP}
+      - {port: 12004, target-port: 12004, protocol: TCP}
+      - {port: 12005, target-port: 12005, protocol: TCP}
+      - {port: 12006, target-port: 12006, protocol: TCP}
+      - {port: 12007, target-port: 12007, protocol: TCP}
+      - {port: 12008, target-port: 12008, protocol: TCP}
+
+name: tau2-gemma-calibration-pending
+bid: 9999
+interactive: false
+# EAI silently ignores this YAML field. Rafa's approved submission command
+# must also carry --non-preemptable or the evidence job may be preempted.
+preemptable: false
+restartable: false
+workdir: /home/toolkit/PipelineRL
+environmentVars:
+  - HOME=/home/toolkit
+  - TAU2_OUTPUT_DIR=PENDING_CALIBRATION_OUTPUT_DIR
+  - TAU2_MODEL_SNAPSHOT=PENDING_IMMUTABLE_MODEL_SNAPSHOT
+  - TAU2_PRERUN_SPEC=PENDING_APPROVED_PRERUN_SPEC_JSON
+  - TAU2_PRERUN_MANIFEST=PENDING_OUTPUT_MANIFEST_JSON
+  - TAU2_JOB_SPEC_PATH=/home/toolkit/PipelineRL/tau2_gemma_calibration.yaml
+  - TAU2_AIRLINE_JSONL=PENDING_PREPARED_AIRLINE_JSONL
+  - TAU2_RETAIL_JSONL=PENDING_PREPARED_RETAIL_JSONL
+  - TAU2_TELECOM_JSONL=PENDING_PREPARED_TELECOM_JSONL
+  - TAU2_USER_API_KEY=PENDING_SECRET_INJECTION
+  - TAU2_USER_SIMULATOR_MODEL=gpt-4.1-2025-04-14
+  - TAU2_USER_SIMULATOR_ENDPOINT=https://api.openai.com/v1
+  - TAU2_USER_SIMULATOR_PLACEMENT=OpenAI-managed external service; zero EAI GPUs
+  - TAU2_USER_SIMULATOR_PROVENANCE=official OpenAI model and API docs checked 2026-07-18
+  - TAU2_POLICY_MODEL=google/gemma-4-26B-A4B-it@01e5b3ee840d3a9e0b0b493c593e85398a30ef75
+  - TAU2_MODEL_REVISION_STATUS=UNVERIFIED_PLACEHOLDER_FAIL_CLOSED
+  - TAU2_POLICY_LOSS=gspo
+  - TAU2_POLICY_LOSS_DECISION=Rafa selected GSPO from Wave 6 gate-8 evidence
+  - TAU2_POLICY_LOSS_FALLBACK=dppo
+  - TAU2_POLICY_LOSS_FALLBACK_TRIGGER=bringup shows drift-attributable instability
+  - TAU2_GSPO_TOKEN_UPGRADE_TRIGGER=demonstrated need for nonuniform token credit
+  - TAU2_CALIBRATION_SAMPLE_SIZE=192 rollouts / 12 G16 groups
+  - TAU2_CALIBRATION_SAMPLE_CAVEAT=small-sample maxima plus headroom; typed whole-group drops remain the runtime safety net
+  - TAU2_CALIBRATION_PACKING=false
+  - TAU2_CALIBRATION_SEQ_PARALLEL=1
+  # Full 262,144-token context avoids biasing the length measurement, but at
+  # SP1 a roughly 100-150k+ merged trajectory can OOM the trainer even with
+  # optimizer CPU offload. That loud failure is accepted: actor-side length
+  # evidence survives on disk. Recover by using those records to qualify gate
+  # 5 packing+SP or a larger-memory lane, then rerun without lowering context.
+  - TAU2_CALIBRATION_CONTEXT_TOKENS=262144
+  - TAU2_CALIBRATION_QUEUE_ENTRY_BYTES=134217728
+  - TAU2_CALIBRATION_MEMORY_LEVER=ZeRO-3 BF16 optimizer CPU offload plus one-G16 scheduling; packing remains off
+  - TAU2_PARITY_MAX_ABS_TOLERANCE=0.05
+  - TAU2_PARITY_TOLERANCE_BASIS=6.4 BF16 epsilons for TP2 cross-implementation noise with FP32 output heads
+  - TAU2_NEMO_GYM_SHA=5f92a73217258074b74b7be26526c69f0ce3075d
+  - TAU2_STRICT_TITO_PATCH_SHA256=5baf7f5cac1f0fa8dba3f3883f4e3a93ee89f38f23cc1d82467972e528c80250
+  - TAU2_RUNTIME_SHA=befd120003fb55f48b498f6549556dcaf74582d5
+  - TAU2_DATA_SHA=ce4013b0afe03c873488878b72851414f92f458b
+  - 'TAU2_S5_MEMORY_BUDGET_TABLE_JSON=[{"name":"4x8-sp1","nodes":4,"actor_gpus":8,"trainer_gpus":24,"seq_parallel":1,"optimizer_cpu_offload":false,"sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"},{"name":"6x8-sp2","nodes":6,"actor_gpus":8,"trainer_gpus":40,"seq_parallel":2,"optimizer_cpu_offload":false,"sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"},{"name":"8x8-sp8-cpu-offload","nodes":8,"actor_gpus":8,"trainer_gpus":56,"seq_parallel":8,"optimizer_cpu_offload":true,"sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"}]'

@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import math
 import os
@@ -33,6 +34,594 @@ class LaunchedProcess:
     kind: str
     handle: subprocess.Popen
 
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _required_prerun_path(prerun: DictConfig, key: str) -> Path:
+    value = str(prerun.get(key, ""))
+    if not value or value.startswith("PENDING_"):
+        raise ValueError(f"Tau2/Gemma {key} is unresolved")
+    path = Path(value)
+    if not path.is_file():
+        raise ValueError(f"Tau2/Gemma {key} does not exist: {path}")
+    return path
+
+
+def _require_equal(actual, expected, label: str) -> None:
+    if actual != expected:
+        raise ValueError(
+            f"Tau2/Gemma {label}={actual!r}, expected {expected!r}"
+        )
+
+
+def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
+    from pipelinerl.domains.tau2.prerun import (
+        GSPO_TOKEN_UPGRADE_TRIGGER,
+        POLICY_LOSS_FALLBACK,
+        POLICY_LOSS_FALLBACK_TRIGGER,
+        RUN1_POLICY_LOSS,
+        USER_SIMULATOR_ENDPOINT,
+        USER_SIMULATOR_MODEL,
+    )
+    from pipelinerl.prerun_evidence import (
+        GEMMA_MODEL_ID,
+        GEMMA_MODEL_REVISION,
+        GEMMA_POLICY_IDENTITY,
+    )
+
+    prerun = cfg.tau2_prerun
+    _require_equal(str(cfg.model_path), GEMMA_MODEL_ID, "model_path")
+    _require_equal(
+        str(cfg.finetune.config_name),
+        GEMMA_MODEL_ID,
+        "finetune.config_name",
+    )
+    _require_equal(
+        str(cfg.finetune.get("model_revision")),
+        GEMMA_MODEL_REVISION,
+        "finetune.model_revision",
+    )
+    _require_equal(
+        bool(cfg.finetune.get("text_only_gemma4", False)),
+        True,
+        "finetune.text_only_gemma4",
+    )
+    _require_equal(
+        str(cfg.finetune.rl.policy_loss),
+        RUN1_POLICY_LOSS,
+        "policy_loss",
+    )
+    _require_equal(
+        str(prerun.policy_model),
+        GEMMA_POLICY_IDENTITY,
+        "policy_model",
+    )
+    _require_equal(
+        str(prerun.policy_loss_fallback),
+        POLICY_LOSS_FALLBACK,
+        "policy_loss_fallback",
+    )
+    _require_equal(
+        str(prerun.policy_loss_fallback_trigger),
+        POLICY_LOSS_FALLBACK_TRIGGER,
+        "policy_loss_fallback_trigger",
+    )
+    _require_equal(
+        str(prerun.gspo_token_upgrade_trigger),
+        GSPO_TOKEN_UPGRADE_TRIGGER,
+        "gspo_token_upgrade_trigger",
+    )
+    _require_equal(
+        str(cfg.tau2_gym.policy_model_name),
+        GEMMA_POLICY_IDENTITY,
+        "Gym policy model",
+    )
+    _require_equal(
+        str(cfg.tau2_gym.user_model_url),
+        USER_SIMULATOR_ENDPOINT,
+        "user endpoint",
+    )
+    _require_equal(
+        str(cfg.tau2_gym.user_model_name),
+        USER_SIMULATOR_MODEL,
+        "user model",
+    )
+    _require_equal(
+        int(cfg.vllm_config.vllm_kwargs["tensor-parallel-size"]),
+        2,
+        "vLLM tensor parallel size",
+    )
+    _require_equal(
+        bool(cfg.use_deepspeed),
+        True,
+        "DeepSpeed enablement",
+    )
+
+
+def _validate_tau2_calibration(
+    cfg: DictConfig,
+    job_spec_path: Path,
+) -> None:
+    from pipelinerl.domains.tau2.prerun import (
+        CALIBRATION_ROLLOUTS,
+        GSPO_TOKEN_UPGRADE_TRIGGER,
+        PINNED_SOURCES,
+        POLICY_LOSS_FALLBACK,
+        POLICY_LOSS_FALLBACK_TRIGGER,
+        RUN1_POLICY_LOSS,
+        USER_SIMULATOR_ENDPOINT,
+        USER_SIMULATOR_MODEL,
+        PreRunSpec,
+        ServiceIdentity,
+        TrainerMemoryCandidate,
+    )
+    from pipelinerl.prerun_evidence import (
+        GEMMA_MODEL_ID,
+        GEMMA_MODEL_REVISION,
+        GEMMA_POLICY_IDENTITY,
+    )
+
+    prerun = cfg.tau2_prerun
+    if not prerun.enabled:
+        raise ValueError(
+            "Tau2/Gemma calibration requires evidence collection"
+        )
+    spec_path = _required_prerun_path(prerun, "spec_path")
+    spec = PreRunSpec.model_validate_json(spec_path.read_text())
+    candidates_payload = OmegaConf.to_container(
+        prerun.production_memory_candidates,
+        resolve=True,
+    )
+    candidates = [
+        TrainerMemoryCandidate.model_validate(candidate)
+        for candidate in candidates_payload
+    ]
+
+    _require_equal(
+        spec.job_spec_sha256,
+        _sha256_file(job_spec_path),
+        "calibration job digest",
+    )
+    _require_equal(spec.model_id, GEMMA_MODEL_ID, "spec model")
+    _require_equal(
+        spec.model_revision,
+        GEMMA_MODEL_REVISION,
+        "spec revision",
+    )
+    _require_equal(
+        Path(spec.model_snapshot).resolve(),
+        Path(str(prerun.model_snapshot)).resolve(),
+        "snapshot",
+    )
+    _require_equal(spec.source_pins, PINNED_SOURCES, "source pins")
+    _require_equal(
+        spec.user_simulator,
+        ServiceIdentity(
+            model=USER_SIMULATOR_MODEL,
+            endpoint=USER_SIMULATOR_ENDPOINT,
+        ),
+        "user simulator",
+    )
+    _require_equal(
+        spec.policy_model,
+        GEMMA_POLICY_IDENTITY,
+        "spec policy model",
+    )
+    _require_equal(
+        spec.policy_endpoints,
+        list(prerun.policy_endpoints),
+        "policy endpoints",
+    )
+    _require_equal(spec.expected_tp_size, 2, "spec TP size")
+    _require_equal(
+        spec.fixed_prompt_token_ids,
+        list(prerun.fixed_prompt_token_ids),
+        "prompt token IDs",
+    )
+    _require_equal(
+        spec.fixed_completion_token_ids,
+        list(prerun.fixed_completion_token_ids),
+        "completion token IDs",
+    )
+    _require_equal(
+        spec.user_separation_asserted,
+        True,
+        "user separation assertion",
+    )
+    _require_equal(spec.packing_enabled, False, "packing gate")
+    _require_equal(
+        spec.mixed_version_loss_gate_passed,
+        True,
+        "mixed-version loss gate",
+    )
+    _require_equal(
+        spec.policy_loss,
+        RUN1_POLICY_LOSS,
+        "spec policy loss",
+    )
+    _require_equal(
+        spec.policy_loss_fallback,
+        POLICY_LOSS_FALLBACK,
+        "spec fallback",
+    )
+    _require_equal(
+        spec.policy_loss_fallback_trigger,
+        POLICY_LOSS_FALLBACK_TRIGGER,
+        "spec fallback trigger",
+    )
+    _require_equal(
+        spec.gspo_token_upgrade_trigger,
+        GSPO_TOKEN_UPGRADE_TRIGGER,
+        "spec GSPO-token trigger",
+    )
+    _require_equal(
+        spec.production_memory_candidates,
+        candidates,
+        "memory candidates",
+    )
+
+    snapshot_path = Path(str(prerun.model_snapshot))
+    if not snapshot_path.is_dir():
+        raise ValueError(
+            "Tau2/Gemma calibration model snapshot does not exist: "
+            f"{snapshot_path}"
+        )
+    _require_equal(
+        int(os.environ.get("WORLD_SIZE", "1")),
+        4,
+        "calibration node count",
+    )
+    _require_equal(
+        bool(cfg.finetune.seq_packing),
+        False,
+        "calibration packing",
+    )
+    _require_equal(
+        int(cfg.finetune.seq_parallel),
+        1,
+        "calibration seq_parallel",
+    )
+    _require_equal(
+        str(cfg.deepspeed_config),
+        "deepspeed_stage3_bf16_cpu_offload",
+        "calibration optimizer profile",
+    )
+    _require_equal(
+        int(cfg.finetune.max_train_steps),
+        1,
+        "calibration max train steps",
+    )
+    _require_equal(
+        int(cfg.finetune.interrupt_train_steps),
+        1,
+        "calibration interrupt step",
+    )
+    _require_equal(
+        int(cfg.finetune.gradient_accumulation_passes),
+        CALIBRATION_ROLLOUTS,
+        "calibration samples",
+    )
+    _require_equal(
+        int(cfg.finetune.attempts),
+        16,
+        "calibration group size",
+    )
+    _require_equal(
+        int(cfg.actor.rollout_workers),
+        4,
+        "calibration rollout workers",
+    )
+    _require_equal(
+        int(cfg.actor.llm_max_rollouts),
+        4,
+        "calibration vLLM concurrency",
+    )
+    _require_equal(
+        int(cfg.world.replicas),
+        1,
+        "calibration actor replicas",
+    )
+    _require_equal(
+        int(cfg.world.actor_fraction),
+        1,
+        "calibration actor fraction",
+    )
+    _require_equal(
+        int(cfg.world.preprocessor_fraction),
+        0,
+        "calibration preprocessor fraction",
+    )
+    _require_equal(
+        int(cfg.world.finetune_fraction),
+        3,
+        "calibration trainer fraction",
+    )
+
+    context_tokens = int(prerun.calibration_context_tokens)
+    queue_entry_bytes = int(prerun.calibration_queue_entry_bytes)
+    _require_equal(
+        context_tokens,
+        262144,
+        "calibration context tokens",
+    )
+    _require_equal(
+        queue_entry_bytes,
+        128 * (1 << 20),
+        "calibration queue entry bytes",
+    )
+    _require_equal(
+        int(cfg.actor.result_queue_size),
+        2,
+        "calibration result queue size",
+    )
+    _require_equal(
+        int(cfg.preprocess.input_queue_size),
+        2,
+        "calibration preprocess input queue size",
+    )
+    _require_equal(
+        int(cfg.preprocess.output_queue_size),
+        2,
+        "calibration preprocess output queue size",
+    )
+    cfg.finetune.seq_length = context_tokens
+    cfg.vllm_config.vllm_kwargs.max_model_len = context_tokens
+    cfg.actor.shared_memory_entry_size = queue_entry_bytes
+    cfg.preprocess.shared_memory_entry_size = queue_entry_bytes
+
+
+def _validate_tau2_production(
+    cfg: DictConfig,
+    job_spec_path: Path,
+) -> None:
+    from pipelinerl.domains.tau2.prerun import (
+        CALIBRATION_CAVEAT,
+        CALIBRATION_GROUPS,
+        CALIBRATION_ROLLOUTS,
+        GSPO_TOKEN_UPGRADE_TRIGGER,
+        PINNED_SOURCES,
+        POLICY_LOSS_FALLBACK,
+        POLICY_LOSS_FALLBACK_TRIGGER,
+        RUN1_POLICY_LOSS,
+        USER_SIMULATOR_ENDPOINT,
+        USER_SIMULATOR_MODEL,
+        PreRunManifest,
+        ServiceIdentity,
+        require_ready_manifest,
+    )
+    from pipelinerl.prerun_evidence import (
+        GEMMA_MODEL_ID,
+        GEMMA_MODEL_REVISION,
+        GEMMA_POLICY_IDENTITY,
+        hash_model_snapshot,
+    )
+
+    prerun = cfg.tau2_prerun
+    if prerun.enabled:
+        raise ValueError(
+            "Tau2/Gemma production must not collect calibration evidence"
+        )
+    manifest_path = _required_prerun_path(
+        prerun,
+        "manifest_path",
+    )
+    manifest = PreRunManifest.model_validate_json(
+        manifest_path.read_text()
+    )
+    require_ready_manifest(manifest)
+    _require_equal(
+        manifest.job_spec_sha256,
+        _sha256_file(job_spec_path),
+        "manifest job digest",
+    )
+    _require_equal(
+        manifest.model.model_id,
+        GEMMA_MODEL_ID,
+        "manifest model",
+    )
+    _require_equal(
+        manifest.model.revision,
+        GEMMA_MODEL_REVISION,
+        "manifest revision",
+    )
+    snapshot_path = Path(str(prerun.model_snapshot))
+    if not snapshot_path.is_dir():
+        raise ValueError(
+            "Tau2/Gemma production model snapshot does not exist: "
+            f"{snapshot_path}"
+        )
+    model_identity = hash_model_snapshot(
+        snapshot_path,
+        GEMMA_MODEL_ID,
+        GEMMA_MODEL_REVISION,
+    )
+    _require_equal(model_identity, manifest.model, "model artifact identity")
+    _require_equal(
+        manifest.source_pins,
+        PINNED_SOURCES,
+        "manifest source pins",
+    )
+    _require_equal(
+        manifest.user_simulator,
+        ServiceIdentity(
+            model=USER_SIMULATOR_MODEL,
+            endpoint=USER_SIMULATOR_ENDPOINT,
+        ),
+        "manifest user simulator",
+    )
+    _require_equal(
+        manifest.policy_model,
+        GEMMA_POLICY_IDENTITY,
+        "manifest policy model",
+    )
+    _require_equal(
+        manifest.expected_tp_size,
+        2,
+        "manifest TP size",
+    )
+    _require_equal(
+        manifest.policy_loss,
+        RUN1_POLICY_LOSS,
+        "manifest policy loss",
+    )
+    _require_equal(
+        manifest.policy_loss_fallback,
+        POLICY_LOSS_FALLBACK,
+        "manifest fallback",
+    )
+    _require_equal(
+        manifest.policy_loss_fallback_trigger,
+        POLICY_LOSS_FALLBACK_TRIGGER,
+        "manifest fallback trigger",
+    )
+    _require_equal(
+        manifest.gspo_token_upgrade_trigger,
+        GSPO_TOKEN_UPGRADE_TRIGGER,
+        "manifest GSPO-token trigger",
+    )
+    _require_equal(
+        manifest.calibration.groups,
+        CALIBRATION_GROUPS,
+        "calibration groups",
+    )
+    _require_equal(
+        manifest.calibration.attempted_rollouts,
+        CALIBRATION_ROLLOUTS,
+        "calibration rollouts",
+    )
+    _require_equal(
+        manifest.calibration.sample_size_caveat,
+        CALIBRATION_CAVEAT,
+        "calibration caveat",
+    )
+
+    required_limits = {
+        "actor_queue_entry_bytes",
+        "training_envelope_entry_bytes",
+        "model_context_tokens",
+        "training_sequence_tokens",
+        "generation_margin_tokens",
+    }
+    missing_limits = (
+        required_limits
+        - manifest.calibration.derived_limits.keys()
+    )
+    if missing_limits:
+        raise ValueError(
+            "Tau2/Gemma manifest is missing derived limits "
+            f"{sorted(missing_limits)}"
+        )
+    for name in required_limits:
+        limit = manifest.calibration.derived_limits[name]
+        _require_equal(
+            limit.calibration_rollouts,
+            CALIBRATION_ROLLOUTS,
+            f"{name} sample count",
+        )
+        _require_equal(
+            limit.calibration_groups,
+            CALIBRATION_GROUPS,
+            f"{name} group count",
+        )
+        _require_equal(
+            limit.caveat,
+            CALIBRATION_CAVEAT,
+            f"{name} caveat",
+        )
+
+    topology = manifest.recommended_production_topology
+    if topology is None:
+        raise ValueError(
+            "Tau2/Gemma manifest has no fitting production topology"
+        )
+    if not any(
+        budget.candidate == topology and budget.fits
+        for budget in manifest.trainer_memory_budgets
+    ):
+        raise ValueError(
+            "Tau2/Gemma recommended topology has no fitting memory budget"
+        )
+    if (
+        topology.seq_parallel > 1
+        and not cfg.finetune.seq_packing
+    ):
+        raise ValueError(
+            "Tau2/Gemma gate 5 requires a packed-vs-unpacked "
+            "equivalence proof before packing with seq_parallel > 1"
+        )
+    _require_equal(
+        int(os.environ.get("WORLD_SIZE", "1")),
+        topology.node_count,
+        "production node count",
+    )
+    _require_equal(
+        int(cfg.world.replicas),
+        1,
+        "production actor replicas",
+    )
+
+    limits = manifest.calibration.derived_limits
+    cfg.actor.shared_memory_entry_size = (
+        limits["actor_queue_entry_bytes"].derived_value
+    )
+    cfg.preprocess.shared_memory_entry_size = (
+        limits["training_envelope_entry_bytes"].derived_value
+    )
+    cfg.vllm_config.vllm_kwargs.max_model_len = (
+        limits["model_context_tokens"].derived_value
+    )
+    cfg.finetune.seq_length = max(
+        limits["model_context_tokens"].derived_value,
+        limits["training_sequence_tokens"].derived_value,
+    )
+    cfg.llm.parameters.max_tokens = (
+        limits["generation_margin_tokens"].derived_value
+    )
+    cfg.test_llm.parameters.max_tokens = (
+        limits["generation_margin_tokens"].derived_value
+    )
+    cfg.finetune.seq_parallel = topology.seq_parallel
+    cfg.world.actor_fraction = topology.actor_gpus
+    cfg.world.preprocessor_fraction = 0
+    cfg.world.finetune_fraction = topology.trainer_gpus
+    cfg.deepspeed_config = (
+        "deepspeed_stage3_bf16_cpu_offload"
+        if topology.optimizer_cpu_offload
+        else "deepspeed_stage3_bf16"
+    )
+
+
+def validate_tau2_prerun(cfg: DictConfig) -> None:
+    prerun = cfg.get("tau2_prerun")
+    if not prerun:
+        return
+    from pipelinerl.prerun_evidence import (
+        require_verified_gemma_revision,
+    )
+
+    require_verified_gemma_revision()
+    _validate_tau2_recipe_identity(cfg)
+    job_spec_path = _required_prerun_path(
+        prerun,
+        "job_spec_path",
+    )
+    phase = str(prerun.get("phase", ""))
+    if phase == "calibration":
+        _validate_tau2_calibration(cfg, job_spec_path)
+    elif phase == "production":
+        _validate_tau2_production(cfg, job_spec_path)
+    else:
+        raise ValueError(
+            f"Unknown Tau2/Gemma pre-run phase {phase!r}"
+        )
+
+
 def _popen(
     cmd: list[str],
     env: dict | None = None,
@@ -51,6 +640,8 @@ def _popen(
 
 
 def validate_config(cfg: DictConfig):
+    validate_tau2_prerun(cfg)
+
     if "fp32_lm_head" in cfg:
         raise ValueError(
             "fp32_lm_head is no longer configurable; PipelineRL always uses FP32 output-head logits"
@@ -159,8 +750,27 @@ def _append_vllm_kwargs(cmd: list[str], kwargs: dict) -> None:
             cmd.append(f"--{k}" if v else f"--no-{k}")
             continue
         cmd.append(f"--{k}")
+        if isinstance(v, (list, tuple)):
+            cmd.extend(str(item) for item in v)
+            continue
         if v not in [None, ""]:
             cmd.append(str(v))
+
+
+def _add_actor_model_alias(
+    kwargs: dict,
+    actor_model_path: Path | str,
+) -> None:
+    if "served-model-name" not in kwargs:
+        return
+    served_names = kwargs["served-model-name"]
+    if not isinstance(served_names, list):
+        served_names = [served_names]
+    served_names = [str(name) for name in served_names]
+    actor_model_name = str(actor_model_path)
+    if actor_model_name not in served_names:
+        served_names.append(actor_model_name)
+    kwargs["served-model-name"] = served_names
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
@@ -246,6 +856,7 @@ def run_actor_llm(
     cmd.extend(_get_quantization_args(cfg))
 
     kwargs = _get_vllm_kwargs(cfg)
+    _add_actor_model_alias(kwargs, actor_model_path)
     if kwargs:
         _append_vllm_kwargs(cmd, kwargs)
 
@@ -652,6 +1263,8 @@ def validate_external_services(cfg: DictConfig, world_map: WorldMap) -> None:
 )
 def main(cfg: DictConfig):
     validate_config(cfg)
+    if os.environ.get("PIPELINERL_PREFLIGHT_ONLY", "0") == "1":
+        return
 
     exp_dir = Path(cfg.output_dir)
     config_dir = exp_dir / "conf"

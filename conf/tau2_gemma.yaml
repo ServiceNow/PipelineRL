@@ -1,0 +1,170 @@
+defaults:
+  - base
+  - _self_
+
+model_path: google/gemma-4-26B-A4B-it
+model_class: causal-language-modeling
+fp32_layer_prefix: lm_head
+
+actor:
+  rollout_policy: pipelinerl.domains.tau2.generate_tau2_rollout
+  rollout_workers: 4
+  llm_max_rollouts: 4
+  problem_queue_size: 12
+  result_queue_size: 2
+  shared_memory_entry_size: null
+
+preprocess:
+  n_workers: 1
+  chunk_n_groups: 1
+  raw_queue_size: 2
+  input_queue_size: 2
+  output_queue_size: 2
+  dataset_buffer_size: 192
+  ring_buffer_size: 192
+  max_ready_samples_per_lead: 192
+  shared_memory_entry_size: null
+
+finetune:
+  config_name: google/gemma-4-26B-A4B-it
+  model_revision: 01e5b3ee840d3a9e0b0b493c593e85398a30ef75
+  text_only_gemma4: true
+  seq_length: null
+  seq_packing: false
+  seq_parallel: 1
+  train_batch_size: 1
+  gradient_accumulation_passes: 192
+  attempts: 16
+  max_train_steps: 100000
+  interrupt_train_steps: -1
+  rl:
+    policy_loss: gspo
+    kl_coef: 0.0
+
+llm:
+  parameters:
+    # Tau2's prepared responses_create_params.max_output_tokens is the
+    # executed per-call cap. This field is filled from calibration only for
+    # PipelineRL length accounting.
+    max_tokens: null
+    temperature: 1.0
+
+test_llm:
+  parameters:
+    max_tokens: null
+    temperature: 1.0
+
+vllm_config:
+  vllm_kwargs:
+    dtype: bfloat16
+    gpu-memory-utilization: 0.9
+    max-num-seqs: ${actor.llm_max_rollouts}
+    max-num-batched-tokens: 8192
+    logprobs-mode: processed_logprobs
+    enable-prefix-caching: false
+    async-scheduling: false
+    enable-chunked-prefill: ""
+    return-tokens-as-token-ids: ""
+    tensor-parallel-size: 2
+    pipeline-parallel-size: 1
+    generation-config: vllm
+    max_model_len: null
+    revision: ${finetune.model_revision}
+    served-model-name:
+      - ${model_path}
+      - ${tau2_prerun.policy_model}
+
+world:
+  replicas: 1
+  actor_fraction: 1
+  preprocessor_fraction: 0
+  finetune_fraction: 3
+  env_replicas: 1
+
+dataset_loader: pipelinerl.domains.tau2.load_tau2_problems
+dataset_loader_params:
+  data_files:
+    airline: ${oc.env:TAU2_AIRLINE_JSONL,PENDING_TAU2_AIRLINE_JSONL}
+    retail: ${oc.env:TAU2_RETAIL_JSONL,PENDING_TAU2_RETAIL_JSONL}
+    telecom: ${oc.env:TAU2_TELECOM_JSONL,PENDING_TAU2_TELECOM_JSONL}
+  seed: ${seed}
+train_dataset_names:
+  - airline
+  - retail
+  - telecom
+test_dataset_names: []
+
+tau2_gym:
+  head_url: ${oc.env:TAU2_GYM_HEAD_URL,PENDING_TAU2_GYM_HEAD_URL}
+  policy_model_name: ${tau2_prerun.policy_model}
+  user_model_url: https://api.openai.com/v1
+  user_model_name: gpt-4.1-2025-04-14
+  validation_interval_s: 30.0
+  request_timeout_s: 3600.0
+  startup_timeout_s: 600.0
+
+tau2_prerun:
+  phase: production
+  enabled: false
+  manifest_path: ${oc.env:TAU2_PRERUN_MANIFEST,PENDING_TAU2_PRERUN_MANIFEST}
+  spec_path: ${oc.env:TAU2_PRERUN_SPEC,PENDING_TAU2_PRERUN_SPEC}
+  job_spec_path: ${oc.env:TAU2_JOB_SPEC_PATH,PENDING_TAU2_JOB_SPEC_PATH}
+  model_snapshot: ${oc.env:TAU2_MODEL_SNAPSHOT,PENDING_TAU2_MODEL_SNAPSHOT}
+  evidence_dir: ${output_dir}/tau2_prerun_evidence
+  policy_model: google/gemma-4-26B-A4B-it@01e5b3ee840d3a9e0b0b493c593e85398a30ef75
+  policy_endpoints: []
+  fixed_prompt_token_ids: []
+  fixed_completion_token_ids: []
+  policy_loss_fallback: dppo
+  policy_loss_fallback_trigger: bringup shows drift-attributable instability
+  gspo_token_upgrade_trigger: demonstrated need for nonuniform token credit
+
+  # Calibration only. Packing remains off, so seq_parallel stays 1; memory
+  # safety comes from optimizer CPU offload, one-G16 scheduling, and queue
+  # concurrency of two. These values are not production recommendations.
+  calibration_context_tokens: 262144
+  calibration_queue_entry_bytes: 134217728
+
+  # Ordered candidates evaluated against the measured p99 merged length.
+  # Their derived memory values remain pending until N=192 / 12 G16 groups.
+  production_memory_candidates:
+    - name: 4x8-sp1
+      node_count: 4
+      gpus_per_node: 8
+      actor_gpus: 8
+      trainer_gpus: 24
+      seq_parallel: 1
+      gpu_memory_bytes: 85899345920
+      reserve_bytes_per_gpu: 8589934592
+      optimizer_cpu_offload: false
+    - name: 6x8-sp2
+      node_count: 6
+      gpus_per_node: 8
+      actor_gpus: 8
+      trainer_gpus: 40
+      seq_parallel: 2
+      gpu_memory_bytes: 85899345920
+      reserve_bytes_per_gpu: 8589934592
+      optimizer_cpu_offload: false
+    - name: 8x8-sp8-cpu-offload
+      node_count: 8
+      gpus_per_node: 8
+      actor_gpus: 8
+      trainer_gpus: 56
+      seq_parallel: 8
+      gpu_memory_bytes: 85899345920
+      reserve_bytes_per_gpu: 8589934592
+      optimizer_cpu_offload: true
+
+use_deepspeed: true
+deepspeed_config: deepspeed_stage3_bf16_cpu_offload
+use_fsdp: false
+pop_old_data: false
+max_lag: null
+eval_every_n_versions: 0
+
+wandb:
+  tags:
+    - tau2
+    - gemma-4
+    - gspo
