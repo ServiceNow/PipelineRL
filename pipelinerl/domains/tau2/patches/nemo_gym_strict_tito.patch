@@ -1,8 +1,157 @@
+diff --git a/nemo_gym/openai_utils.py b/nemo_gym/openai_utils.py
+index d9518980..362cb495 100644
+--- a/nemo_gym/openai_utils.py
++++ b/nemo_gym/openai_utils.py
+@@ -105,12 +105,18 @@ from nemo_gym.server_utils import (
+ # Per-token routed expert indices with shape [tokens, num_moe_layers, topk].
+ RoutedExperts: TypeAlias = List[List[List[int]]]
+ 
++PIPELINERL_VERSION_START_HEADER = "X-PipelineRL-Version-Start"
++PIPELINERL_VERSION_END_HEADER = "X-PipelineRL-Version-End"
++
+ 
+ class TokenIDLogProbMixin(BaseModel):
+     prompt_token_ids: List[int]
+     generation_token_ids: List[int]
+     generation_log_probs: List[float]
+     routed_experts: Optional[RoutedExperts] = None
++    model_version_start: Optional[int] = None
++    model_version_end: Optional[int] = None
++    policy_endpoint: Optional[str] = None
+ 
+ 
+ class TokenIDLogProbTypedDictMixin(TypedDict):
+@@ -118,6 +124,9 @@ class TokenIDLogProbTypedDictMixin(TypedDict):
+     generation_token_ids: List[int]
+     generation_log_probs: List[float]
+     routed_experts: NotRequired[RoutedExperts]
++    model_version_start: NotRequired[int]
++    model_version_end: NotRequired[int]
++    policy_endpoint: NotRequired[str]
+ 
+ 
+ ########################################
+@@ -592,6 +601,10 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
+         return await get_response_json(response)
+ 
+     async def create_chat_completion(self, **kwargs):
++        completion, _ = await self.create_chat_completion_with_headers(**kwargs)
++        return completion
++
++    async def create_chat_completion_with_headers(self, **kwargs):
+         request_kwargs = dict(
+             url=f"{self.base_url}/chat/completions",
+             json=kwargs,
+@@ -599,7 +612,7 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
+         response = await self._request(method="POST", **request_kwargs)
+ 
+         await self._raise_for_status(response, request_kwargs)
+-        return await get_response_json(response)
++        return await get_response_json(response), response.headers
+ 
+     async def create_response(self, **kwargs):
+         request_kwargs = dict(
+diff --git a/nemo_gym/responses_converter.py b/nemo_gym/responses_converter.py
+index 63869017..b54b1db7 100644
+--- a/nemo_gym/responses_converter.py
++++ b/nemo_gym/responses_converter.py
+@@ -409,8 +409,14 @@ class ResponsesConverter(BaseModel):
+             last_response_output_item = response_output[-1]
+             train_cls = RESPONSES_TO_TRAIN[last_response_output_item.__class__]
+             extra_training_fields = {}
+-            if "routed_experts" in message_dict and message_dict["routed_experts"] is not None:
+-                extra_training_fields["routed_experts"] = message_dict["routed_experts"]
++            for field in (
++                "routed_experts",
++                "model_version_start",
++                "model_version_end",
++                "policy_endpoint",
++            ):
++                if field in message_dict and message_dict[field] is not None:
++                    extra_training_fields[field] = message_dict[field]
+             response_output[-1] = train_cls(
+                 **last_response_output_item.model_dump(),
+                 prompt_token_ids=message_dict["prompt_token_ids"],
+diff --git a/responses_api_agents/tau2/app.py b/responses_api_agents/tau2/app.py
+index 2f3c6d6a..44463334 100644
+--- a/responses_api_agents/tau2/app.py
++++ b/responses_api_agents/tau2/app.py
+@@ -14,6 +14,7 @@
+ # limitations under the License.
+ 
+ from collections import defaultdict
++from collections.abc import Mapping
+ from os import environ
+ from pathlib import Path
+ from time import time
+@@ -51,6 +52,45 @@ from tau2.runner.batch import run_single_task
+ from tau2.utils.llm_utils import to_litellm_messages
+ 
+ 
++_PIPELINERL_PROVENANCE_FIELDS = (
++    "model_version_start",
++    "model_version_end",
++    "policy_endpoint",
++)
++
++
++def _attach_pipelinerl_provenance(messages, output_items):
++    captures = []
++    for message in messages:
++        if message.role != "assistant" or not isinstance(message.raw_data, Mapping):
++            continue
++        choices = message.raw_data.get("choices")
++        if not isinstance(choices, list) or not choices:
++            continue
++        raw_message = choices[0].get("message")
++        if not isinstance(raw_message, Mapping) or "prompt_token_ids" not in raw_message:
++            continue
++        missing = [field for field in _PIPELINERL_PROVENANCE_FIELDS if raw_message.get(field) is None]
++        if missing:
++            raise RuntimeError(f"Tau2 policy call is missing PipelineRL provenance fields: {missing}")
++        captures.append(raw_message)
++
++    policy_items = [item for item in output_items if hasattr(item, "prompt_token_ids")]
++    if len(policy_items) != len(captures):
++        raise RuntimeError(
++            f"Tau2 converted {len(policy_items)} policy items but captured {len(captures)} raw calls"
++        )
++
++    for item, capture in zip(policy_items, captures):
++        if (
++            item.prompt_token_ids != capture["prompt_token_ids"]
++            or item.generation_token_ids != capture["generation_token_ids"]
++        ):
++            raise RuntimeError("Tau2 converted policy item does not match its raw token capture")
++        for field in _PIPELINERL_PROVENANCE_FIELDS:
++            setattr(item, field, capture[field])
++
++
+ class Tau2Config(BaseResponsesAPIAgentConfig):
+     model_server: ModelServerRef
+     user_model_server: ModelServerRef
+@@ -157,6 +197,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
+         # Tau starts trajectories with an assistant message
+         input_items_1 += output_items[:1]
+         input_items_2, output_items = split_responses_input_output_items(output_items[1:])
++        _attach_pipelinerl_provenance(result.messages, output_items)
+ 
+         prompt_usages = []
+         completion_usages = []
 diff --git a/responses_api_models/vllm_model/app.py b/responses_api_models/vllm_model/app.py
-index 2395dc3b4230471295bd7138784b34d7e9ac23df..095e5d846530de5f329ffe94fef5e4a8a700ddbe 100644
+index 2395dc3b..45d49dbd 100644
 --- a/responses_api_models/vllm_model/app.py
 +++ b/responses_api_models/vllm_model/app.py
-@@ -45,6 +45,45 @@ from nemo_gym.responses_converter import (
+@@ -29,6 +29,8 @@ from nemo_gym.base_responses_api_model import (
+     SimpleResponsesAPIModel,
+ )
+ from nemo_gym.openai_utils import (
++    PIPELINERL_VERSION_END_HEADER,
++    PIPELINERL_VERSION_START_HEADER,
+     NeMoGymAsyncOpenAI,
+     NeMoGymChatCompletion,
+     NeMoGymChatCompletionCreateParamsNonStreaming,
+@@ -45,6 +47,65 @@ from nemo_gym.responses_converter import (
  from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
  
  
@@ -45,10 +194,30 @@ index 2395dc3b4230471295bd7138784b34d7e9ac23df..095e5d846530de5f329ffe94fef5e4a8
 +    return prompt_token_ids, generation_token_ids, generation_log_probs
 +
 +
++def _validate_pipelinerl_model_versions(response_headers, policy_endpoint):
++    versions = []
++    for header in (PIPELINERL_VERSION_START_HEADER, PIPELINERL_VERSION_END_HEADER):
++        raw_version = response_headers.get(header)
++        try:
++            version = int(raw_version)
++        except (TypeError, ValueError) as exc:
++            raise RuntimeError(f"vLLM response is missing valid {header}") from exc
++        if version < 0:
++            raise RuntimeError(f"vLLM response has negative {header}: {version}")
++        versions.append(version)
++
++    version_start, version_end = versions
++    if version_end < version_start:
++        raise RuntimeError(
++            f"vLLM response model version decreased within one call: {version_start} -> {version_end}"
++        )
++    return version_start, version_end, policy_endpoint.rstrip("/")
++
++
  class VLLMModelConfig(BaseResponsesAPIModelConfig):
      base_url: Union[str, List[str]]
      api_key: str
-@@ -259,11 +298,7 @@ class VLLMModel(SimpleResponsesAPIModel):
+@@ -259,11 +320,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                  top_logprobs=0,
                  # Typically passed via OpenAI client extra_body.
                  return_tokens_as_token_ids=True,
@@ -61,7 +230,18 @@ index 2395dc3b4230471295bd7138784b34d7e9ac23df..095e5d846530de5f329ffe94fef5e4a8
              )
  
          if self.config.uses_reasoning_parser:
-@@ -457,39 +492,14 @@ class VLLMModel(SimpleResponsesAPIModel):
+@@ -397,7 +454,9 @@ class VLLMModel(SimpleResponsesAPIModel):
+                 return res
+ 
+         try:
+-            chat_completion_dict = await client.create_chat_completion(**body_dict)
++            chat_completion_dict, response_headers = await client.create_chat_completion_with_headers(
++                **body_dict
++            )
+         except ClientResponseError as e:
+             """
+             Example messages for out of context length:
+@@ -457,49 +516,29 @@ class VLLMModel(SimpleResponsesAPIModel):
                      f"had none (choice.logprobs={logprobs_block!r}). Cannot extract token ids or logprobs."
                  )
              log_probs = logprobs_block["content"]
@@ -93,6 +273,9 @@ index 2395dc3b4230471295bd7138784b34d7e9ac23df..095e5d846530de5f329ffe94fef5e4a8
 +            prompt_token_ids, generation_token_ids, generation_log_probs = (
 +                _validate_pipelinerl_token_capture(chat_completion_dict, choice_dict, log_probs)
 +            )
++            model_version_start, model_version_end, policy_endpoint = (
++                _validate_pipelinerl_model_versions(response_headers, client.base_url)
++            )
  
              message_dict = choice_dict["message"]
              message_dict.update(
@@ -104,8 +287,11 @@ index 2395dc3b4230471295bd7138784b34d7e9ac23df..095e5d846530de5f329ffe94fef5e4a8
 +                    prompt_token_ids=prompt_token_ids,
                      generation_token_ids=generation_token_ids,
                      generation_log_probs=generation_log_probs,
++                    model_version_start=model_version_start,
++                    model_version_end=model_version_end,
++                    policy_endpoint=policy_endpoint,
                  )
-@@ -497,9 +507,8 @@ class VLLMModel(SimpleResponsesAPIModel):
+             )
  
              # Clean the duplicated information
              choice_dict.pop("logprobs")

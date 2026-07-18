@@ -1,3 +1,4 @@
+import asyncio
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -5,11 +6,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 from omegaconf import OmegaConf
+from pydantic import ValidationError
 
 from pipelinerl.domains.tau2.client import Tau2RunResponse
 from pipelinerl.domains.tau2.rollouts import (
     Tau2TrajectoryError,
     build_tau2_training_text,
+    generate_tau2_rollout,
     serialized_training_text_size,
 )
 from pipelinerl.finetune.rl import RLConfig, prepare_rl_fields, rl_step
@@ -24,12 +27,26 @@ class _Tokenizer:
         return " ".join(str(token_id) for token_id in input_ids)
 
 
-def _policy_item(prompt, generation, logprobs):
+POLICY_ENDPOINT = "http://actor-0:8000/v1"
+
+
+def _policy_item(
+    prompt,
+    generation,
+    logprobs,
+    *,
+    version_start=8,
+    version_end=8,
+    endpoint=POLICY_ENDPOINT,
+):
     return {
         "type": "function_call",
         "prompt_token_ids": prompt,
         "generation_token_ids": generation,
         "generation_log_probs": logprobs,
+        "model_version_start": version_start,
+        "model_version_end": version_end,
+        "policy_endpoint": endpoint,
     }
 
 
@@ -66,6 +83,7 @@ def _build(response=None, **kwargs):
     return build_tau2_training_text(
         response or _run_response(),
         _Tokenizer(),
+        expected_policy_endpoint=kwargs.pop("expected_policy_endpoint", POLICY_ENDPOINT),
         max_sequence_length=kwargs.pop("max_sequence_length", 128),
         shared_memory_entry_size=kwargs.pop("shared_memory_entry_size", 10_000_000),
         **kwargs,
@@ -86,7 +104,99 @@ def test_builds_prefix_contiguous_all_turn_training_text():
     assert text.metadata == {
         "num_policy_calls": 2,
         "termination_reason": "user_stop",
+        "model_version": 8,
+        "model_version_min": 8,
+        "model_version_max": 8,
+        "model_version_spread": 0,
+        "model_calls": [
+            {
+                "call_index": 0,
+                "version_start": 8,
+                "version_end": 8,
+                "endpoint": POLICY_ENDPOINT,
+                "token_start": 2,
+                "token_end": 4,
+            },
+            {
+                "call_index": 1,
+                "version_start": 8,
+                "version_end": 8,
+                "endpoint": POLICY_ENDPOINT,
+                "token_start": 5,
+                "token_end": 6,
+            },
+        ],
     }
+
+
+def test_mixed_call_boundaries_preserve_ordered_provenance_and_oldest_version():
+    response = _run_response(
+        output=[
+            _policy_item(
+                [10, 11],
+                [20, 21],
+                [-0.1, -0.2],
+                version_start=8,
+                version_end=10,
+            ),
+            _policy_item(
+                [10, 11, 20, 21, 30],
+                [40],
+                [-0.3],
+                version_start=10,
+                version_end=10,
+            ),
+        ]
+    )
+
+    text = _build(response)
+
+    assert text.metadata["model_version"] == 8
+    assert text.metadata["model_version_min"] == 8
+    assert text.metadata["model_version_max"] == 10
+    assert text.metadata["model_version_spread"] == 2
+    assert text.metadata["model_calls"] == [
+        {
+            "call_index": 0,
+            "version_start": 8,
+            "version_end": 10,
+            "endpoint": POLICY_ENDPOINT,
+            "token_start": 2,
+            "token_end": 4,
+        },
+        {
+            "call_index": 1,
+            "version_start": 10,
+            "version_end": 10,
+            "endpoint": POLICY_ENDPOINT,
+            "token_start": 5,
+            "token_end": 6,
+        },
+    ]
+
+
+def test_rejects_missing_provenance_and_endpoint_affinity_drift():
+    missing = _policy_item([10], [20], [-0.1])
+    missing.pop("model_version_end")
+    response = _run_response(output=[missing], num_agent_calls=2)
+    with pytest.raises(Tau2TrajectoryError, match="incomplete capture") as exc_info:
+        _build(response)
+    assert exc_info.value.reason == "incomplete_policy_capture"
+
+    response = _run_response(
+        output=[
+            _policy_item(
+                [10],
+                [20],
+                [-0.1],
+                endpoint="http://actor-wrong:8000/v1",
+            )
+        ],
+        num_agent_calls=2,
+    )
+    with pytest.raises(Tau2TrajectoryError, match="does not match") as exc_info:
+        _build(response)
+    assert exc_info.value.reason == "policy_endpoint_mismatch"
 
 
 def test_rejects_labeled_seeded_assistant_input():
@@ -290,3 +400,146 @@ def test_masked_logprob_fillers_do_not_affect_loss_or_gradients():
 
     torch.testing.assert_close(changed_loss, base_loss, rtol=0, atol=0)
     torch.testing.assert_close(changed_gradient, base_gradient, rtol=0, atol=0)
+
+
+class _GymClient:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    async def run(self, policy_base_url, problem, session):
+        self.calls.append((policy_base_url, problem, session))
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+class _Tau2LLM:
+    def __init__(self):
+        self.tokenizer = _Tokenizer()
+
+    def get_base_url(self):
+        return "http://actor-0:8000"
+
+    def load_tokenizer(self):
+        return None
+
+
+def test_tau2_rollout_wrapper_preserves_audit_and_returns_typed_boundary_failure(monkeypatch):
+    good_response = _run_response(
+        output=[
+            _policy_item(
+                [10, 11],
+                [20],
+                [-0.1],
+                version_start=8,
+                version_end=10,
+            )
+        ],
+        num_agent_calls=2,
+        reward=0.75,
+    )
+    good_response.result.update(
+        {
+            "reward_info": {"action_checks": [{"passed": True}]},
+            "messages": [
+                {
+                    "turn_idx": 2,
+                    "tool_calls": [
+                        {
+                            "name": "lookup",
+                            "arguments": {"id": "123"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    client = _GymClient(good_response)
+    monkeypatch.setattr(
+        "pipelinerl.domains.tau2.rollouts._get_tau2_gym_client",
+        lambda cfg: client,
+    )
+    cfg = OmegaConf.create(
+        {
+            "finetune": {"seq_length": 128},
+            "actor": {"shared_memory_entry_size": 10_000_000},
+        }
+    )
+    problem = {
+        "task_id": "task-1",
+        "dataset": "telecom",
+        "domain": "tau2",
+    }
+    session = object()
+
+    result = asyncio.run(generate_tau2_rollout(cfg, _Tau2LLM(), problem, session))
+
+    assert result.model_version == 8
+    assert result.training_texts[0].metadata["model_version"] == 8
+    assert result.metrics.reward == 0.75
+    assert result.audit["reward"] == 0.75
+    assert result.audit["submitted"] is True
+    assert result.audit["verifier_result"] == {"action_checks": [{"passed": True}]}
+    assert result.audit["actions"] == [
+        {
+            "turn_idx": 2,
+            "tool_calls": [
+                {
+                    "name": "lookup",
+                    "arguments": {"id": "123"},
+                }
+            ],
+        }
+    ]
+    assert result.audit["model_calls"][0] == {
+        "call_index": 0,
+        "version_start": 8,
+        "version_end": 10,
+        "endpoint": POLICY_ENDPOINT,
+        "token_start": 2,
+        "token_end": 3,
+    }
+    assert client.calls == [(POLICY_ENDPOINT, problem, session)]
+
+    client.response = _run_response(
+        output=[_policy_item([10], [20], [-0.1])],
+        num_agent_calls=2,
+        termination_reason="context_length",
+    )
+    incomplete = asyncio.run(generate_tau2_rollout(cfg, _Tau2LLM(), problem, session))
+
+    assert incomplete.audit["submitted"] is False
+    assert incomplete.training_texts[0].finished is False
+
+    bad_item = _policy_item([10], [20], [-0.1])
+    bad_item.pop("model_version_start")
+    bad_response = _run_response(output=[bad_item], num_agent_calls=2, reward=0.75)
+    client.response = bad_response
+
+    dropped = asyncio.run(generate_tau2_rollout(cfg, _Tau2LLM(), problem, session))
+
+    assert dropped.training_texts == []
+    assert dropped.metrics.reward == 0.75
+    assert dropped.metrics.boundary_failure is True
+    assert dropped.audit["boundary_failure"]["reason"] == "incomplete_policy_capture"
+
+    with pytest.raises(ValidationError) as exc_info:
+        Tau2RunResponse.model_validate({})
+    client.response = exc_info.value
+
+    malformed = asyncio.run(generate_tau2_rollout(cfg, _Tau2LLM(), problem, session))
+
+    assert malformed.training_texts == []
+    assert malformed.metrics.reward == 0.0
+    assert malformed.metrics.boundary_failure is True
+    assert malformed.audit["reward_available"] is False
+    assert malformed.audit["submitted"] is None
+    assert malformed.audit["boundary_failure"]["reason"] == "malformed_gym_response"
+    assert malformed.audit["boundary_failure"]["validation_errors"]
+
+    client.response = RuntimeError("transport failure")
+    with pytest.raises(RuntimeError, match="transport failure"):
+        asyncio.run(generate_tau2_rollout(cfg, _Tau2LLM(), problem, session))
+
+    assert dropped.audit["entered_training"] is False

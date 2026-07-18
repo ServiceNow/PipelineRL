@@ -111,6 +111,107 @@ def make_stats_dict() -> dict:
     return defaultdict(lambda: defaultdict(list))
 
 
+def make_rollout_audit_record(result: RolloutResult) -> dict:
+    record = dict(result.audit)
+    record.setdefault("task_id", None)
+    record.setdefault("domain", result.domain)
+    record["group_id"] = result.group_id
+    record.setdefault("rollout_index", None)
+    record.setdefault("model_version", result.model_version)
+    record["dataset_name"] = result.dataset_name
+    record.setdefault("policy_endpoint", None)
+    record.setdefault("model_calls", [])
+    record.setdefault("reward", result.metrics.reward)
+    record.setdefault("submitted", None)
+    record.setdefault("terminated", None)
+    record.setdefault("stop_reason", None)
+    record.setdefault("published", bool(result.training_texts))
+    record.setdefault("entered_training", False)
+    record.setdefault("drop_reason", None)
+    record.setdefault(
+        "prompt_token_lengths",
+        [training_text.prompt_tokens for training_text in result.training_texts],
+    )
+    record.setdefault(
+        "output_token_lengths",
+        [training_text.output_tokens for training_text in result.training_texts],
+    )
+    record["n_training_texts"] = len(result.training_texts)
+    return record
+
+
+def write_rollout_audit_records(
+    audit_writer: StreamWriter,
+    rollout_results: List[RolloutResult],
+) -> None:
+    for result in rollout_results:
+        audit_writer.write(make_rollout_audit_record(result))
+
+
+def stamp_rollout_metadata(
+    rollout_result: RolloutResult,
+    scheduler_name: str,
+    group_id: int,
+    rollout_index: int,
+    admission_model_version: int,
+) -> None:
+    boundary_failure = isinstance(rollout_result.audit.get("boundary_failure"), dict)
+    if rollout_result.model_version is None and not boundary_failure:
+        rollout_result.model_version = admission_model_version
+
+    full_group_id = f"{scheduler_name}_{group_id}"
+    rollout_result.group_id = full_group_id
+    rollout_result.audit.setdefault("model_version", rollout_result.model_version)
+    rollout_result.audit["admission_model_version"] = admission_model_version
+    rollout_result.audit["group_id"] = full_group_id
+    rollout_result.audit["rollout_index"] = rollout_index
+    for step_index, sample in enumerate(rollout_result.training_texts):
+        if sample.metadata.get("model_version") is None:
+            sample.metadata["model_version"] = (
+                rollout_result.model_version
+                if rollout_result.model_version is not None
+                else admission_model_version
+            )
+        sample.metadata["rollout_index"] = rollout_index
+        sample.metadata["step_index"] = step_index
+        sample.group_id = full_group_id
+
+
+def apply_group_boundary_policy(
+    rollout_results: List[RolloutResult],
+    group_drop_counts: Dict[str, int],
+    *,
+    enters_training: bool = True,
+) -> str | None:
+    failures = []
+    for result in rollout_results:
+        failure = result.audit.get("boundary_failure")
+        if not isinstance(failure, dict):
+            continue
+        reason = failure.get("reason")
+        rollout_index = result.audit.get("rollout_index")
+        if not isinstance(reason, str) or not isinstance(rollout_index, int):
+            raise ValueError("Boundary failure audit must contain a reason and rollout_index")
+        failures.append((rollout_index, reason, result))
+
+    if not failures:
+        for result in rollout_results:
+            result.audit["published"] = bool(result.training_texts)
+            result.audit["entered_training"] = enters_training and bool(result.training_texts)
+        return None
+
+    trigger_index, reason, trigger = min(failures, key=lambda failure: failure[0])
+    group_drop_counts[reason] = group_drop_counts.get(reason, 0) + 1
+    for result in rollout_results:
+        result.audit["published"] = False
+        result.audit["entered_training"] = False
+        result.audit["drop_reason"] = reason
+        result.audit["group_drop_reason"] = reason
+        result.audit["group_drop_trigger_rollout_index"] = trigger_index
+        result.audit["group_drop_triggered_here"] = result is trigger
+    return reason
+
+
 async def schedule_rollouts(
     cfg: DictConfig,
     attempts: int,
@@ -207,16 +308,13 @@ async def schedule_rollouts(
                         continue
                     handle_rollout_exception(exc)
                     return
-            rollout_result.model_version = model_version
-            # Make a group id that will be different from groups made by another rollout maker
-            full_group_id = f"{scheduler_name}_{group_id}"
-            rollout_result.group_id = full_group_id
-            for step_index, sample in enumerate(rollout_result.training_texts):
-                # Downstream in the pipeline we'll need these fields in every sample
-                sample.metadata["model_version"] = model_version
-                sample.metadata["rollout_index"] = rollout_index
-                sample.metadata["step_index"] = step_index
-                sample.group_id = full_group_id
+            stamp_rollout_metadata(
+                rollout_result,
+                scheduler_name,
+                group_id,
+                rollout_index,
+                model_version,
+            )
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
@@ -326,12 +424,14 @@ class ActorLoop:
         llms: list[TrainableLLM],
         data_stream: StreamSpec,
         stats_stream: StreamSpec,
+        audit_stream: StreamSpec,
         trainer_state: TrainerState,
         is_training: bool = True,
     ) -> None:
         self.data_stream = data_stream
         self.trainer_state = trainer_state
         self.stats_stream = stats_stream
+        self.audit_stream = audit_stream
         self.sliding_aggregator = SlidingWindowAggregator(window_size=cfg.actor.throughput_window_size)
         self.llms = llms
         self.loop_start_time = -1
@@ -394,6 +494,7 @@ class ActorLoop:
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
         self.domain_counts = defaultdict(int)
+        self.group_drop_counts = defaultdict(int)
         self.dataset_to_domain: Dict[str, str] = {}
     
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> Dict[str, float]:
@@ -421,12 +522,12 @@ class ActorLoop:
 
     def update_stats(self, rollout_results: List[RolloutResult]):
         for result in rollout_results:
-            assert result.model_version is not None
             assert isinstance(result.metrics, BaseMetrics), "Metrics should be an instance of BaseMetrics"
             dataset_name = result.dataset_name
             group_id = result.group_id
             self.latency_list.append(result.latency)
-            self.model_versions_list.append(result.model_version)
+            if result.model_version is not None:
+                self.model_versions_list.append(result.model_version)
             domain_key: str | None = None
             if getattr(result, "domain", None):
                 domain_key = str(result.domain)
@@ -436,7 +537,8 @@ class ActorLoop:
                 domain_key = str(dataset_name)
 
             if domain_key:
-                self.domain_counts[domain_key] += len(result.training_texts)
+                if result.audit.get("published", bool(result.training_texts)):
+                    self.domain_counts[domain_key] += len(result.training_texts)
                 if dataset_name is not None:
                     self.dataset_to_domain[str(dataset_name)] = domain_key
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
@@ -449,8 +551,18 @@ class ActorLoop:
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
         
-        prompt_length_tokens = [training_text.prompt_tokens for result in rollout_results for training_text in result.training_texts]
-        output_length_tokens = [training_text.output_tokens for result in rollout_results for training_text in result.training_texts]
+        prompt_length_tokens = [
+            training_text.prompt_tokens
+            for result in rollout_results
+            if result.audit.get("published", bool(result.training_texts))
+            for training_text in result.training_texts
+        ]
+        output_length_tokens = [
+            training_text.output_tokens
+            for result in rollout_results
+            if result.audit.get("published", bool(result.training_texts))
+            for training_text in result.training_texts
+        ]
         self.sliding_aggregator.update(prompt_length_tokens, output_length_tokens)
         sliding_window_stats = self.sliding_aggregator.get_stats()
         if sliding_window_stats is not None:
@@ -537,6 +649,7 @@ class ActorLoop:
         with (
             write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
+            write_to_streams(self.audit_stream, "a") as audit_writer,
         ):
             while True:
                 # the user function must do next(...) to run each iteration
@@ -592,7 +705,17 @@ class ActorLoop:
                 assert len(rollout_results) == attempts, (
                     f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 )
-                group_samples = sum(len(r.training_texts) for r in rollout_results)
+                group_drop_reason = apply_group_boundary_policy(
+                    rollout_results,
+                    self.group_drop_counts,
+                    enters_training=self.is_training,
+                )
+                group_samples = (
+                    0
+                    if group_drop_reason is not None
+                    else sum(len(r.training_texts) for r in rollout_results)
+                )
+                write_rollout_audit_records(audit_writer, rollout_results)
 
                 # Track completions per domain for adaptive sampling
                 if domain_sampler is not None:
@@ -610,7 +733,8 @@ class ActorLoop:
                 dap_cfg = getattr(self.cfg.actor, "difficulty_aware_penalty", None)
                 max_tokens = self.cfg.llm.parameters.get("max_tokens", None)
                 if (
-                    self.is_training
+                    group_drop_reason is None
+                    and self.is_training
                     and dap_cfg
                     and dap_cfg.enabled
                     and self.cfg.rewards.buffer_tokens > 0
@@ -645,17 +769,23 @@ class ActorLoop:
 
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
-                all_text_dumps = []
-                for r in rollout_results:
-                    for text in r.training_texts:
-                        all_text_dumps.append(text.model_dump())
-                data_stream_writer.write(all_text_dumps)
                 in_progress = submitted_groups - finished_groups
-                logger.info(
-                    f"Published {group_samples} {'train' if self.is_training else 'test'} samples"
-                    f" to {self.data_stream}, total {published_samples} samples so far, {samples_in_queue} samples in the result queue,"
-                    f" {in_progress} groups in progress"
-                )
+                if group_drop_reason is None:
+                    all_text_dumps = []
+                    for r in rollout_results:
+                        for text in r.training_texts:
+                            all_text_dumps.append(text.model_dump())
+                    data_stream_writer.write(all_text_dumps)
+                    logger.info(
+                        f"Published {group_samples} {'train' if self.is_training else 'test'} samples"
+                        f" to {self.data_stream}, total {published_samples} samples so far, "
+                        f"{samples_in_queue} samples in the result queue, {in_progress} groups in progress"
+                    )
+                else:
+                    logger.warning(
+                        f"Dropped group {rollout_results[0].group_id} at the actor boundary: "
+                        f"{group_drop_reason}"
+                    )
 
                 self.update_stats(rollout_results=rollout_results)
 
@@ -753,6 +883,8 @@ class ActorLoop:
         )
 
         stats |= loop_stats
+        for reason, count in self.group_drop_counts.items():
+            stats[f"{split_name}group_drop/{reason}"] = count
 
         total_domain_samples = sum(self.domain_counts.values())
         if total_domain_samples:
@@ -799,6 +931,8 @@ def run_actor_loop(cfg: DictConfig):
     test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test")
     data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
     test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test")
+    audit_stream = SingleStreamSpec(exp_path=exp_path, topic="rollout_audit")
+    test_audit_stream = SingleStreamSpec(exp_path=exp_path, topic="rollout_audit_test")
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)
     # Get dataset loader parameters if they exist in config, otherwise use empty dict
@@ -850,7 +984,12 @@ def run_actor_loop(cfg: DictConfig):
         trainer_state.wait_for_model_version()
 
     train_loop = ActorLoop(
-        data_stream=data_stream, cfg=cfg, trainer_state=trainer_state, stats_stream=stats_stream, llms=train_llms
+        data_stream=data_stream,
+        cfg=cfg,
+        trainer_state=trainer_state,
+        stats_stream=stats_stream,
+        audit_stream=audit_stream,
+        llms=train_llms,
     )
     train_loop_run = train_loop.run(
         dataset=train_dataset,
@@ -860,6 +999,7 @@ def run_actor_loop(cfg: DictConfig):
         cfg=cfg,
         trainer_state=trainer_state,
         stats_stream=test_stats_stream,
+        audit_stream=test_audit_stream,
         llms=test_llms,
         is_training=False,
     )

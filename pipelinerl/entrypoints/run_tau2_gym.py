@@ -16,7 +16,25 @@ from pipelinerl.domains.tau2.client import (
 
 _GYM_APP_PATH = Path("responses_api_models/vllm_model/app.py")
 _GYM_APP_BASE_SHA256 = "80daf9e3c9edc6954e323eb0408e70a2af5f8c08579b171ebaa07cdcf3c15ae1"
-_GYM_APP_POST_PATCH_SHA256 = "0e0053c94051b8fcdb3cf5f4ec3e775adad8a24afff50326f5890c7bc54aa994"
+_GYM_APP_POST_PATCH_SHA256 = "ca2439870ca9902956e6b39f6967f517464a67d5c147e95125b53c9df67898a4"
+_GYM_PATCH_TARGETS = {
+    Path("nemo_gym/openai_utils.py"): (
+        "059bb8709308660559c11a9a2343bb266ca8718de42c25185c34fb9583413567",
+        "06210bba5847f52e71bdd8aba33390be3aec63bcc85ccc6210d42cc58b7f7fc6",
+    ),
+    Path("nemo_gym/responses_converter.py"): (
+        "ab3947499d2e7f58b84cd7f3dad7c6117088202a7338602a62daf0e1946a4c9e",
+        "7ebe99f9b66138cc12472bc5957617b9b7a3681c1a6e20f6fa8bdd556ccf14c3",
+    ),
+    Path("responses_api_agents/tau2/app.py"): (
+        "c7c7f8ac760c0a0de294133053a571be2e2c765f6c3064262c08bf7a8e26e4d4",
+        "145e087637755fc9d4309d834c1be68f0c221b0823d6f427569128d20159e5cc",
+    ),
+    _GYM_APP_PATH: (
+        _GYM_APP_BASE_SHA256,
+        _GYM_APP_POST_PATCH_SHA256,
+    ),
+}
 _GYM_TITO_PATCH_PATH = (
     Path(__file__).resolve().parents[1] / "domains" / "tau2" / "patches" / "nemo_gym_strict_tito.patch"
 )
@@ -148,19 +166,28 @@ def apply_gym_tito_patch(
     if _sha256(patch_path) != NEMO_GYM_TITO_PATCH_SHA:
         raise RuntimeError("NeMo Gym strict-TITO patch content does not match its pinned SHA256")
 
-    target = gym_root / _GYM_APP_PATH
-    target_sha = _sha256(target)
+    target_shas = {
+        path: _sha256(gym_root / path)
+        for path in _GYM_PATCH_TARGETS
+    }
+    expected_paths = {str(path) for path in _GYM_PATCH_TARGETS}
     status = subprocess.check_output(
         ["git", "-C", str(gym_root), "status", "--porcelain=v1", "--untracked-files=no"],
         text=True,
     )
     tracked_paths = {line[3:] for line in status.splitlines()}
-    if target_sha == _GYM_APP_POST_PATCH_SHA256:
-        if tracked_paths != {str(_GYM_APP_PATH)}:
+    if all(
+        target_shas[path] == post_sha
+        for path, (_, post_sha) in _GYM_PATCH_TARGETS.items()
+    ):
+        if tracked_paths != expected_paths:
             raise RuntimeError("Patched NeMo Gym checkout contains unexpected tracked changes")
         return
-    if target_sha != _GYM_APP_BASE_SHA256:
-        raise RuntimeError("NeMo Gym vllm_model/app.py does not match the pinned base or patched content")
+    if any(
+        target_shas[path] != base_sha
+        for path, (base_sha, _) in _GYM_PATCH_TARGETS.items()
+    ):
+        raise RuntimeError("NeMo Gym patch targets do not match their pinned base or patched content")
     if tracked_paths:
         raise RuntimeError("NeMo Gym checkout contains tracked changes before strict-TITO patching")
 
@@ -172,8 +199,15 @@ def apply_gym_tito_patch(
         ["git", "-C", str(gym_root), "apply", str(patch_path)],
         check=True,
     )
-    if _sha256(target) != _GYM_APP_POST_PATCH_SHA256:
-        raise RuntimeError("NeMo Gym strict-TITO patched content has the wrong SHA256")
+    for path, (_, post_sha) in _GYM_PATCH_TARGETS.items():
+        if _sha256(gym_root / path) != post_sha:
+            raise RuntimeError(f"Patched NeMo Gym target {path} has the wrong SHA256")
+    status = subprocess.check_output(
+        ["git", "-C", str(gym_root), "status", "--porcelain=v1", "--untracked-files=no"],
+        text=True,
+    )
+    if {line[3:] for line in status.splitlines()} != expected_paths:
+        raise RuntimeError("NeMo Gym patch changed an unexpected tracked path")
 
 
 def prepare_tau2_data(gym_root: Path, env: dict[str, str]) -> None:

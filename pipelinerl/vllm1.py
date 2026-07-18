@@ -5,6 +5,7 @@ import signal
 import time
 import torch
 import uvloop
+from fastapi import Request
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.system_utils import set_ulimit
 from vllm.entrypoints.openai.cli_args import (
@@ -46,6 +47,10 @@ handler.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+MODEL_VERSION_START_HEADER = "X-PipelineRL-Version-Start"
+MODEL_VERSION_END_HEADER = "X-PipelineRL-Version-End"
+_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 
 
 @runtime_checkable
@@ -134,12 +139,29 @@ class WorkerExtension:
             logger.info("Weight update communicator closed")
 
 
+def install_model_version_headers(app, weight_update_manager: "WeightUpdateManager") -> None:
+    @app.middleware("http")
+    async def add_model_version_headers(request: Request, call_next):
+        if request.method != "POST" or request.url.path != _CHAT_COMPLETIONS_PATH:
+            return await call_next(request)
+
+        version_start = weight_update_manager.served_version
+        response = await call_next(request)
+        if response.headers.get("content-type", "").lower().startswith("text/event-stream"):
+            return response
+
+        response.headers[MODEL_VERSION_START_HEADER] = str(version_start)
+        response.headers[MODEL_VERSION_END_HEADER] = str(weight_update_manager.served_version)
+        return response
+
+
 class WeightUpdateManager:
     def __init__(self, args, engine: AsyncLLM, engine_client: AsyncMPClient):
         self.args = args
         self.engine = engine
         self.engine_client = engine_client
         self.update_lock = asyncio.Lock()
+        self.served_version = 0
 
     async def input_process_groups(self):
         await self.engine_client.collective_rpc_async(
@@ -168,6 +190,7 @@ class WeightUpdateManager:
                 await self.engine_client.collective_rpc_async(
                     "receive_weight_update", args=(request.model_dump_json(),)
                 )
+                self.served_version = request.version
                 logger.info(
                     f"Weight update processed version={version} "
                     f"in {time.perf_counter() - update_started_at:.3f}s"
@@ -240,6 +263,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     supported_tasks = await engine.get_supported_tasks()
     logger.info(f"Supported tasks: {supported_tasks}")
     app = build_app(args, supported_tasks)
+    install_model_version_headers(app, weight_update_manager)
 
     @app.post("/receive_weight_update")
     async def _receive_weight_update(request: WeightUpdateRequest):
