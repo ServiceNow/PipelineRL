@@ -27,6 +27,13 @@ from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+from pipelinerl.prerun_evidence import (
+    ParameterTransferReceipt,
+    WorkerTransferReceipt,
+    assert_no_vision_parameters,
+    parameter_categories,
+    tensor_fingerprint,
+)
 from pipelinerl.finetune_loop import WeightUpdateRequest
 from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 from pipelinerl.torch_utils import stateless_init_process_group
@@ -116,20 +123,95 @@ class WorkerExtension:
         request = WeightUpdateRequest.model_validate_json(request_json)
         torch.cuda.synchronize(self.device)
         logger.info("Start receiving weight update")
-        expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
+        expected_dtypes = (
+            torch.bfloat16,
+            torch.float32,
+            torch.float16,
+        )
+        receipts = []
+        tied_output_head = False
+        if request.collect_evidence:
+            assert_no_vision_parameters(
+                (
+                    name
+                    for name, _ in self.model_runner.model.named_parameters()
+                ),
+                surface="vLLM model",
+            )
+            tied_output_head = bool(
+                getattr(
+                    self.model_config.hf_config,
+                    "tie_word_embeddings",
+                    False,
+                )
+            )
 
         for info in request.parameters_info:
+            if request.collect_evidence:
+                assert_no_vision_parameters(
+                    [info.name],
+                    surface="vLLM transfer request",
+                )
             target_dtype = string_to_dtype(info.dtype)
             if target_dtype not in expected_dtypes:
-                logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
-            buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
-            self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
-            loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])  # type: ignore
-            if len(loaded_params) != 1:
-                raise ValueError(f"model {info.name} not found in model state dict")
+                logger.warning(
+                    f"Unexpected dtype for {info.name}: {info.dtype}"
+                )
+            buffer = torch.empty(
+                tuple(info.shape),
+                dtype=target_dtype,
+                device=self.device,
+            )
+            self.model_update_group.broadcast(
+                buffer,
+                src=0,
+                stream=torch.cuda.current_stream(),
+            )
+            loaded_params = self.model_runner.model.load_weights(
+                weights=[(info.name, buffer)]
+            )
+            # Packed experts and K-to-V expansion can map one source tensor to
+            # multiple destinations. Gate-3 receipts now enforce exact coverage;
+            # production still requires the loader result to be non-empty.
+            loaded_names = sorted(
+                str(name) for name in loaded_params
+            )
+            if not loaded_names:
+                raise ValueError(
+                    f"model {info.name} not found in model state dict"
+                )
+            if request.collect_evidence:
+                assert_no_vision_parameters(
+                    loaded_names,
+                    surface="vLLM loaded weights",
+                )
+                categories = {
+                    category
+                    for name in [info.name, *loaded_names]
+                    for category in parameter_categories(
+                        name,
+                        tied_output_head=tied_output_head,
+                    )
+                }
+                receipts.append(
+                    ParameterTransferReceipt(
+                        source_name=info.name,
+                        loaded_names=loaded_names,
+                        categories=sorted(categories),
+                        received_fingerprint=tensor_fingerprint(
+                            buffer
+                        ),
+                    )
+                )
 
         pipelinerl.vllm_quantization.invalidate_fp32_cache()
         logger.info("Weight update received")
+        if not request.collect_evidence:
+            return None
+        return WorkerTransferReceipt(
+            rank=self.rank,
+            receipts=receipts,
+        ).model_dump(mode="json")
 
     def close_communicator(self):
         """Closes the communicator when weight synchronization is no longer needed."""
@@ -187,7 +269,7 @@ class WeightUpdateManager:
             try:
                 update_started_at = time.perf_counter()
                 logger.info(f"Starting weight update version={version}")
-                await self.engine_client.collective_rpc_async(
+                worker_receipts = await self.engine_client.collective_rpc_async(
                     "receive_weight_update", args=(request.model_dump_json(),)
                 )
                 self.served_version = request.version
@@ -203,6 +285,7 @@ class WeightUpdateManager:
                     f"Generation resumed after weight update version={version} "
                     f"in {time.perf_counter() - resume_started_at:.3f}s"
                 )
+            return worker_receipts
 
     async def close_communicator(self):
         """Closes the communicator when weight synchronization is no longer needed."""
@@ -269,8 +352,11 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     async def _receive_weight_update(request: WeightUpdateRequest):
         # Blocking: wait for weight update to complete before returning
         logger.info("Received weight update request")
-        await weight_update_manager.receive_weight_update(request)
-        return {"status": "ok"}
+        worker_receipts = await weight_update_manager.receive_weight_update(request)
+        response = {"status": "ok"}
+        if request.collect_evidence:
+            response["workers"] = worker_receipts
+        return response
 
     await init_app_state(engine, app.state, args, supported_tasks)
     shutdown_task = await serve_http(

@@ -3,6 +3,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import pickle
 import queue
 import random
 import time
@@ -22,8 +23,18 @@ import wandb
 from pipelinerl.async_llm import RetryableAbortedCompletionError
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.domains.math.rollouts import length_penalty
-from pipelinerl.finetune_loop import calculate_train_steps, samples_per_optimizer_step
+from pipelinerl.domains.tau2.prerun import (
+    CALIBRATION_GROUP_SIZE,
+    CalibrationGroupEvidence,
+    select_calibration_problems,
+)
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
+from pipelinerl.finetune_loop import calculate_train_steps, samples_per_optimizer_step
+from pipelinerl.prerun_evidence import (
+    append_evidence_record,
+    evidence_directory,
+    prerun_enabled,
+)
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import (
     BaseMetrics,
@@ -363,6 +374,119 @@ def make_training_group_envelope(
         domain=domains.pop(),
         expected_rollouts=attempts,
         entries=entries,
+    )
+
+
+def actor_result_payload_size(
+    rollout_results: List[RolloutResult],
+) -> int:
+    attempted_sizes = [
+        failure["serialized_size"]
+        for result in rollout_results
+        if isinstance(
+            (failure := result.audit.get("boundary_failure")),
+            dict,
+        )
+        and failure.get("queue_hop") == "actor_result"
+        and isinstance(failure.get("serialized_size"), int)
+    ]
+    if attempted_sizes:
+        return max(attempted_sizes)
+    return len(pickle.dumps(rollout_results))
+
+
+def make_calibration_group_evidence(
+    rollout_results: List[RolloutResult],
+    *,
+    attempts: int,
+    actor_result_bytes: int,
+    training_envelope_bytes: int | None,
+    drop_reason: str | None,
+) -> CalibrationGroupEvidence:
+    group_ids = {result.group_id for result in rollout_results}
+    datasets = {result.dataset_name for result in rollout_results}
+    task_ids = {result.audit.get("task_id") for result in rollout_results}
+    if (
+        len(group_ids) != 1
+        or None in group_ids
+        or len(datasets) != 1
+        or None in datasets
+        or len(task_ids) != 1
+        or None in task_ids
+    ):
+        raise ValueError(
+            "Calibration group identifiers are inconsistent"
+        )
+
+    model_calls = [
+        call
+        for result in rollout_results
+        for call in result.audit.get("model_calls", [])
+        if isinstance(call, dict)
+    ]
+    reasons = {
+        failure.get("reason")
+        for result in rollout_results
+        if isinstance(
+            (failure := result.audit.get("boundary_failure")),
+            dict,
+        )
+    }
+    return CalibrationGroupEvidence(
+        group_id=str(group_ids.pop()),
+        dataset=str(datasets.pop()),
+        task_id=str(task_ids.pop()),
+        attempted_rollouts=attempts,
+        published_rollouts=(
+            0
+            if drop_reason is not None
+            else sum(
+                len(result.training_texts)
+                for result in rollout_results
+            )
+        ),
+        actor_result_bytes=actor_result_bytes,
+        training_envelope_bytes=training_envelope_bytes,
+        call_prefix_tokens=[
+            int(call["token_start"])
+            for call in model_calls
+        ],
+        generation_tokens=[
+            int(call["token_end"])
+            - int(call["token_start"])
+            for call in model_calls
+        ],
+        merged_sequence_tokens=[
+            int(result.audit["sequence_tokens"])
+            for result in rollout_results
+            if isinstance(
+                result.audit.get("sequence_tokens"),
+                int,
+            )
+        ],
+        drop_reason=drop_reason,
+        endpoint_affinity_failures=sum(
+            reason
+            in {
+                "policy_endpoint_mismatch",
+                "endpoint_affinity",
+            }
+            for reason in reasons
+        ),
+        version_transport_failures=sum(
+            reason
+            in {
+                "incomplete_policy_capture",
+                "invalid_model_version_start",
+                "invalid_model_version_end",
+                "model_version_decreased",
+            }
+            for reason in reasons
+        ),
+        silent_truncations=sum(
+            bool(result.audit.get("silent_truncation"))
+            for result in rollout_results
+        ),
     )
 
 
@@ -739,19 +863,27 @@ class ActorLoop:
         self.init_stats()
 
         attempts = self.cfg.attempts if self.is_training else 1
+        calibration = self.is_training and prerun_enabled(self.cfg)
         published_samples = 0
         submitted_groups = 0
         finished_groups = 0
-        expected_rollouts = -1 if self.is_training else len(dataset)
-        if expected_rollouts > 0:
-            logger.info(f"Will stop after {expected_rollouts} rollouts")
         trainer_version_to_publish = None
 
-        # If training, we expect to sample infinitely
-        # for train sample, sample random batches infinitely
-        # for test samples, loop through the dataset once
         domain_sampler = None
-        if self.is_training:
+        if calibration:
+            if attempts != CALIBRATION_GROUP_SIZE:
+                raise ValueError("Tau2 pre-run calibration requires G16")
+            samples_per_update = samples_per_optimizer_step(self.cfg.finetune)
+            if samples_per_update != 192:
+                raise ValueError(
+                    "Tau2 pre-run calibration requires exactly "
+                    "192 samples per optimizer step"
+                )
+            selected_problems = select_calibration_problems(dataset)
+            expected_rollouts = len(selected_problems)
+            problem_iter = sequential_iter(selected_problems)
+        elif self.is_training:
+            expected_rollouts = -1
             problem_iter = random_iter(dataset)
             domain_mix_cfg = getattr(self.cfg.actor, "domain_mix", None)
             if domain_mix_cfg:
@@ -760,7 +892,10 @@ class ActorLoop:
                     raise ValueError("actor.domain_mix must be a mapping from domain to weight")
                 domain_sampler = DomainWeightedSampler(dataset, mix_weights)
         else:
+            expected_rollouts = len(dataset)
             problem_iter = sequential_iter(dataset)
+        if expected_rollouts > 0:
+            logger.info(f"Will stop after {expected_rollouts} rollouts")
         assert self.trainer_state.propagated_weight_version is not None
         dap_cfg = getattr(self.cfg.actor, "difficulty_aware_penalty", None)
         if dap_cfg and dap_cfg.enabled:
@@ -859,6 +994,11 @@ class ActorLoop:
                 assert len(rollout_results) == attempts, (
                     f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 )
+                actor_result_bytes = (
+                    actor_result_payload_size(rollout_results)
+                    if calibration
+                    else None
+                )
                 atomic_group = validate_atomic_group_admission(
                     rollout_results,
                     attempts,
@@ -930,12 +1070,15 @@ class ActorLoop:
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
                 in_progress = submitted_groups - finished_groups
+                training_envelope_bytes = None
                 if group_drop_reason is None:
                     if atomic_group:
                         group_envelope = make_training_group_envelope(
                             rollout_results,
                             attempts,
                         )
+                        if calibration:
+                            training_envelope_bytes = len(pickle.dumps(group_envelope))
                         data_stream_writer.write(group_envelope)
                     else:
                         all_text_dumps = []
@@ -952,6 +1095,20 @@ class ActorLoop:
                     logger.warning(
                         f"Dropped group {rollout_results[0].group_id} at the actor boundary: "
                         f"{group_drop_reason}"
+                    )
+
+                if calibration:
+                    assert actor_result_bytes is not None
+                    append_evidence_record(
+                        evidence_directory(self.cfg),
+                        "calibration_groups",
+                        make_calibration_group_evidence(
+                            rollout_results,
+                            attempts=attempts,
+                            actor_result_bytes=actor_result_bytes,
+                            training_envelope_bytes=training_envelope_bytes,
+                            drop_reason=group_drop_reason,
+                        ),
                     )
 
                 self.update_stats(rollout_results=rollout_results)

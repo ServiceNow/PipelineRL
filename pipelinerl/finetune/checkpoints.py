@@ -20,10 +20,19 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import _BaseAutoModelClass
 
+from pipelinerl.prerun_evidence import (
+    GEMMA_MODEL_ID,
+    GEMMA_MODEL_REVISION,
+    assert_no_vision_parameters,
+    require_verified_gemma_revision,
+)
+
 from .context import get_accelerator, logger
 from .lora import has_lora_checkpoint, lora_load, lora_save, prepare_lora_model
 from .types import ModelClass, TrainingMetrics
 from .value_model import AutoModelForCausalLMWithValueHead
+
+_GEMMA4_TEXT_KEY_MAPPING = {r"^model\.language_model\.": "model."}
 
 
 def is_deepspeed_model(model) -> bool:
@@ -122,8 +131,11 @@ def get_auto_model_class(
             raise ValueError(f"Unsupported model class: {model_class}")
 
 
-def load_tokenizer(config_name):
-    tokenizer = AutoTokenizer.from_pretrained(config_name, use_fast=True)
+def load_tokenizer(config_name, *, revision: str | None = None):
+    loading_args = {"use_fast": True}
+    if revision is not None:
+        loading_args["revision"] = revision
+    tokenizer = AutoTokenizer.from_pretrained(config_name, **loading_args)
     if not isinstance(tokenizer, transformers.PreTrainedTokenizerFast):
         raise ValueError(f"tokenizer {tokenizer} is not fast")
     if tokenizer.pad_token is None:
@@ -136,6 +148,40 @@ def load_tokenizer(config_name):
         tokenizer.add_special_tokens({"additional_special_tokens": ["<n>", "<t>"]})  # type: ignore
         tokenizer.add_tokens(new_tokens=["▁{", "{", "▁}", "}"])
     return tokenizer
+
+
+def get_model_loader(args, model_class: ModelClass):
+    """Return the configured model class and text-only Gemma load arguments."""
+    model_cls = get_auto_model_class(model_class)
+    if not getattr(args, "text_only_gemma4", False):
+        return model_cls, {}
+    if model_class != "causal-language-modeling":
+        raise ValueError("text_only_gemma4 requires causal-language-modeling")
+    revision = getattr(args, "model_revision", None)
+    if (
+        args.config_name != GEMMA_MODEL_ID
+        or revision != GEMMA_MODEL_REVISION
+    ):
+        raise ValueError(
+            "text_only_gemma4 requires the reviewed Gemma model ID and revision"
+        )
+    require_verified_gemma_revision()
+    config_args = {"trust_remote_code": args.trust_remote_code}
+    if revision is not None:
+        config_args["revision"] = revision
+    composite_config = transformers.AutoConfig.from_pretrained(
+        args.config_name,
+        **config_args,
+    )
+    if composite_config.model_type != "gemma4":
+        raise ValueError("text_only_gemma4 requires a Gemma4 composite checkpoint")
+    text_config = getattr(composite_config, "text_config", None)
+    if text_config is None or text_config.model_type != "gemma4_text":
+        raise ValueError("Gemma4 composite checkpoint has no Gemma4 text config")
+    return transformers.Gemma4ForCausalLM, {
+        "config": text_config,
+        "key_mapping": _GEMMA4_TEXT_KEY_MAPPING,
+    }
 
 
 def load_processor(config_name):
@@ -175,6 +221,9 @@ def load_model(args, model_class, current_dir):
         trust_remote_code=args.trust_remote_code,
         low_cpu_mem_usage=True,  # this is essential for quick model loading as it does not spend time on a random weights initialization. It cuts loading time of a 15B params model from 100 sec to 12 sec.
     )
+    revision = getattr(args, "model_revision", None)
+    if revision is not None:
+        loading_args["revision"] = revision
     if args.use_flash_attention:
         assert version.parse(transformers.__version__) >= version.parse("4.34.0"), (
             "flash_attention is only supported for transformers>=4.34.0. Please upgrade transformers to use it"
@@ -191,7 +240,8 @@ def load_model(args, model_class, current_dir):
         loading_args["torch_dtype"] = torch.bfloat16
     if args.auto_device_map:
         loading_args["device_map"] = "auto"
-    model_cls = get_auto_model_class(model_class)
+    model_cls, model_loader_args = get_model_loader(args, model_class)
+    loading_args.update(model_loader_args)
     if (
         os.path.exists(current_dir / "pytorch_model.bin")
         or os.path.exists(current_dir / "model.safetensors")
@@ -208,6 +258,11 @@ def load_model(args, model_class, current_dir):
     logger.info(f"Loading args: {loading_args}")
 
     model = model_cls.from_pretrained(model_to_load, **loading_args)
+    if getattr(args, "text_only_gemma4", False):
+        assert_no_vision_parameters(
+            (name for name, _ in model.named_parameters()),
+            surface="trainer model",
+        )
 
     # Always use FP32 output-head logits to match the vLLM inference path.
     layer_prefix = getattr(args, "fp32_layer_prefix", "lm_head")

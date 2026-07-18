@@ -40,6 +40,16 @@ from ring_flash_attn import substitute_hf_flash_attn, update_ring_flash_attn_par
 
 from pipelinerl.finetune.value_model import AutoModelForCausalLMWithValueHead
 from pipelinerl import torch_utils
+from pipelinerl.prerun_evidence import (
+    EndpointTransferReceipt,
+    TransferEvidence,
+    WorkerTransferReceipt,
+    append_evidence_record,
+    evidence_directory,
+    make_parity_evidence,
+    prerun_enabled,
+    tensor_fingerprint,
+)
 from pipelinerl.finetune.types import PipelineBatchEncoding
 
 from pipelinerl.finetune.checkpoints import (
@@ -159,6 +169,7 @@ class ParameterInfo(BaseModel):
 class WeightUpdateRequest(BaseModel):
     kind: Literal["weight_update_request"] = "weight_update_request"
     version: int
+    collect_evidence: bool = False
     parameters_info: list[ParameterInfo]
     timestamp: float = time.time()
 
@@ -183,31 +194,232 @@ class TrainingDone(BaseModel):
 TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | SamplesProcessed | TrainingDone
 
 
+def completion_logprobs_from_logits(
+    logits: torch.Tensor,
+    prompt_length: int,
+    completion_token_ids: list[int],
+) -> list[float]:
+    if prompt_length <= 0 or not completion_token_ids:
+        raise ValueError("Parity tokens require a non-empty prompt and completion")
+    positions = logits[
+        0,
+        prompt_length - 1 : prompt_length + len(completion_token_ids) - 1,
+    ]
+    targets = torch.tensor(completion_token_ids, device=logits.device)
+    logprobs = torch.log_softmax(positions.float(), dim=-1)
+    return (
+        logprobs.gather(-1, targets.unsqueeze(-1))
+        .squeeze(-1)
+        .cpu()
+        .tolist()
+    )
+
+
+def parse_vllm_completion_logprobs(
+    payload: dict[str, Any],
+    completion_token_ids: list[int],
+) -> list[float]:
+    entries = payload["choices"][0]["prompt_logprobs"][
+        -len(completion_token_ids) :
+    ]
+    if len(entries) != len(completion_token_ids):
+        raise ValueError(
+            "vLLM parity response has the wrong completion length"
+        )
+    result = []
+    for token_id, entry in zip(completion_token_ids, entries):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"vLLM parity response is missing token {token_id}"
+            )
+        token = entry.get(str(token_id), entry.get(token_id))
+        if not isinstance(token, dict) or "logprob" not in token:
+            raise ValueError(
+                "vLLM parity response is missing logprob for token "
+                f"{token_id}"
+            )
+        result.append(float(token["logprob"]))
+    return result
+
+
 class WeightUpdateManager:
-    def __init__(self, llm_urls: list[str], accelerated_model, update_stream, actor_update_group):
+    def __init__(self, llm_urls: list[str], accelerated_model, update_stream, actor_update_group, cfg: DictConfig | None = None):
         self.llm_urls = llm_urls
         self.accelerated_model = accelerated_model
         self.update_stream = update_stream
         self.actor_update_group = actor_update_group
         self.thread_pool = ThreadPoolExecutor(max_workers=len(llm_urls))
         self._shutdown = False
+        self.prerun_cfg = getattr(cfg, "tau2_prerun", None) if cfg is not None else None
+        self.evidence_enabled = cfg is not None and prerun_enabled(cfg)
+        self.evidence_dir = (
+            evidence_directory(cfg)
+            if cfg is not None and self.evidence_enabled
+            else None
+        )
 
-    def _request_weight_update(self, url: str, message: WeightUpdateRequest):
+    def _request_weight_update(self, url: str, message: WeightUpdateRequest) -> EndpointTransferReceipt | None:
         response = None
         try:
             response = requests.post(url + "/receive_weight_update", json=message.model_dump())
             response.raise_for_status()
+            if not self.evidence_enabled:
+                return None
+            payload = response.json()
+            workers = payload.get("workers")
+            if not isinstance(workers, list):
+                raise ValueError(
+                    f"Weight update response from {url} has no worker receipts"
+                )
+            return EndpointTransferReceipt(
+                endpoint=url,
+                workers=[
+                    WorkerTransferReceipt.model_validate(worker)
+                    for worker in workers
+                ],
+            )
         except requests.RequestException as e:
             logger.error(f"Error sending weight update request to {url}: {e}")
             # print response details
             if response is not None:
                 logger.error(f"Response: {response.status_code} - {response.text}")
+            if self.evidence_enabled:
+                raise
+            return None
 
     def request_weight_updates(self, message: WeightUpdateRequest):
         futures = []
         for url in self.llm_urls:
             futures.append(self.thread_pool.submit(self._request_weight_update, url, message))
         return futures
+
+    def _wait_for_weight_updates(
+        self,
+        futures,
+    ) -> list[EndpointTransferReceipt]:
+        receipts = []
+        logger.info("Wait for HTTP requests")
+        for future in futures:
+            receipt = future.result()
+            if receipt is not None:
+                receipts.append(receipt)
+        if (
+            self.evidence_enabled
+            and len(receipts) != len(self.llm_urls)
+        ):
+            raise ValueError(
+                "Pre-run transfer evidence is missing an actor endpoint"
+            )
+        return receipts
+
+    def _record_transfer(
+        self,
+        *,
+        phase: Literal["initial", "after_optimizer"],
+        version: int,
+        source_fingerprints,
+        endpoint_receipts: list[EndpointTransferReceipt],
+    ) -> None:
+        if not self.evidence_enabled:
+            return
+        assert self.evidence_dir is not None
+        append_evidence_record(
+            self.evidence_dir,
+            "transfer",
+            TransferEvidence(
+                phase=phase,
+                version=version,
+                source_fingerprints=source_fingerprints,
+                endpoints=endpoint_receipts,
+            ),
+        )
+
+    def _record_parity(
+        self,
+        *,
+        phase: Literal["initial", "after_optimizer"],
+        version: int,
+    ) -> None:
+        if not self.evidence_enabled:
+            return
+        assert self.prerun_cfg is not None
+        prompt_token_ids = [
+            int(token_id)
+            for token_id in self.prerun_cfg.fixed_prompt_token_ids
+        ]
+        completion_token_ids = [
+            int(token_id)
+            for token_id in self.prerun_cfg.fixed_completion_token_ids
+        ]
+        input_ids = torch.tensor(
+            [prompt_token_ids + completion_token_ids],
+            dtype=torch.long,
+            device=get_accelerator().device,
+        )
+        was_training = self.accelerated_model.training
+        self.accelerated_model.eval()
+        try:
+            with torch.no_grad():
+                output = self.accelerated_model(input_ids=input_ids)
+                trainer_logprobs = completion_logprobs_from_logits(
+                    output.logits,
+                    len(prompt_token_ids),
+                    completion_token_ids,
+                )
+        finally:
+            if was_training:
+                self.accelerated_model.train()
+
+        if not get_accelerator().is_main_process:
+            return
+        assert self.evidence_dir is not None
+        parity_phase = (
+            "before_update"
+            if phase == "initial"
+            else "after_update"
+        )
+        model_name = str(self.prerun_cfg.policy_model)
+        for url in self.llm_urls:
+            response = requests.post(
+                url + "/v1/completions",
+                json={
+                    "model": model_name,
+                    "prompt": prompt_token_ids + completion_token_ids,
+                    "temperature": 0.0,
+                    "max_tokens": 0,
+                    "logprobs": 0,
+                    "echo": True,
+                    "add_special_tokens": False,
+                    "include_stop_str_in_output": True,
+                    "skip_special_tokens": False,
+                    "n": 1,
+                    "stream": False,
+                },
+            )
+            response.raise_for_status()
+            vllm_logprobs = parse_vllm_completion_logprobs(
+                response.json(),
+                completion_token_ids,
+            )
+            evidence = make_parity_evidence(
+                phase=parity_phase,
+                version=version,
+                endpoint=url,
+                prompt_token_ids=prompt_token_ids,
+                completion_token_ids=completion_token_ids,
+                trainer_logprobs=trainer_logprobs,
+                vllm_logprobs=vllm_logprobs,
+            )
+            append_evidence_record(
+                self.evidence_dir,
+                "parity",
+                evidence,
+            )
+            if not evidence.passed:
+                raise ValueError(
+                    f"Trainer/vLLM parity failed for {url}: "
+                    f"{evidence.max_abs_error} > {evidence.tolerance}"
+                )
 
     def shutdown(self):
         if not self._shutdown:
@@ -217,7 +429,11 @@ class WeightUpdateManager:
     def send_weight_update(
         self,
         version: int,
+        *,
+        phase: Literal["initial", "after_optimizer"] = "after_optimizer",
     ):
+        source_fingerprints = {}
+        endpoint_receipts = []
         if (
             isinstance(self.accelerated_model, deepspeed.DeepSpeedEngine)
             and self.accelerated_model.zero_optimization_stage() == 3
@@ -238,21 +454,32 @@ class WeightUpdateManager:
                     ParameterInfo(name=name, shape=list(parameter.ds_shape), dtype=str(parameter.dtype))
                     for name, parameter in named_parameters.items()
                 ]
-                message = WeightUpdateRequest(version=version, parameters_info=parameters_info)
+                message = WeightUpdateRequest(
+                    version=version,
+                    parameters_info=parameters_info,
+                    collect_evidence=self.evidence_enabled,
+                )
                 futures = self.request_weight_updates(message)
                 logger.info(f"Published weight update request for version {version}")
 
             for name, parameter in named_parameters.items():
                 with deepspeed.zero.GatheredParameters([parameter]):
                     if get_accelerator().is_main_process:
+                        if self.evidence_enabled:
+                            source_fingerprints[name] = tensor_fingerprint(parameter.data)
                         # Use PyNcclCommunicator's broadcast method as torch.distributed does not work since vLLM disabled that transfer path
                         # Previously used torch.distributed.broadcast
                         self.actor_update_group.broadcast(parameter.data, src=0, stream=torch.cuda.current_stream())
             if get_accelerator().is_main_process:
-                logger.info("Wait for HTTP requests")
-                for future in futures:  # type: ignore
-                    future.result()
+                endpoint_receipts = self._wait_for_weight_updates(futures)
+                self._record_transfer(
+                    phase=phase,
+                    version=version,
+                    source_fingerprints=source_fingerprints,
+                    endpoint_receipts=endpoint_receipts,
+                )
             logger.info("Finished broadcasting weights")
+            self._record_parity(phase=phase, version=version)
 
             if get_accelerator().is_main_process:
                 assert self.update_stream is not None
@@ -285,18 +512,31 @@ class WeightUpdateManager:
                     ParameterInfo(name=name, shape=list(parameter.shape), dtype=str(parameter.dtype))
                     for name, parameter in named_parameters.items()
                 ]
-                messages = WeightUpdateRequest(version=version, parameters_info=parameters_info)
-                futures = self.request_weight_updates(messages)
+                message = WeightUpdateRequest(
+                    version=version,
+                    parameters_info=parameters_info,
+                    collect_evidence=self.evidence_enabled,
+                )
+                futures = self.request_weight_updates(message)
                 logger.info(f"Published weight update request for version {version}")
-                for _, parameter in named_parameters.items():
+                for name, parameter in named_parameters.items():
+                    if self.evidence_enabled:
+                        source_fingerprints[name] = tensor_fingerprint(parameter.data)
                     # Use PyNcclCommunicator's broadcast method as torch.distributed does not work since vLLM disabled that transfer path
                     # Previously used torch.distributed.broadcast
                     self.actor_update_group.broadcast(parameter.data, src=0, stream=torch.cuda.current_stream())
                 # No need for dist.barrier() here
 
-                for future in futures:
-                    future.result()
+                endpoint_receipts = self._wait_for_weight_updates(futures)
+                self._record_transfer(
+                    phase=phase,
+                    version=version,
+                    source_fingerprints=source_fingerprints,
+                    endpoint_receipts=endpoint_receipts,
+                )
                 logger.info("Finished broadcasting weights")
+            self._record_parity(phase=phase, version=version)
+            if get_accelerator().is_main_process:
                 with write_to_streams(self.update_stream) as writer:
                     writer.write(WeightUpdateSuccess(version=version))
             else:
@@ -390,7 +630,10 @@ def run_finetuning_loop(
     logger.info(f"Saving experiment to {output_dir}")
     dt = log_time(dt, time_stats, "finetune/startup")
 
-    tokenizer = load_tokenizer(args.config_name)
+    tokenizer = load_tokenizer(
+        args.config_name,
+        revision=getattr(args, "model_revision", None),
+    )
     logger.info("About to load model")
     model = load_model(args, args.model_class, current_dir)
     logger.info(f"Model loaded in dtype {model.dtype}")
@@ -491,6 +734,7 @@ def run_finetuning_loop(
             accelerated_model=model,
             update_stream=weight_update_stream,
             actor_update_group=actor_update_group,
+            cfg=cfg,
         )
         logger.info("Load the first version of the model into inference LLMs")
         if memory_debug is not None:
@@ -498,7 +742,10 @@ def run_finetuning_loop(
                 "before_weight_update_initial",
                 training_metrics=training_metrics,
             )
-        weight_update_manager.send_weight_update(training_metrics.samples)
+        weight_update_manager.send_weight_update(
+            training_metrics.samples,
+            phase="initial",
+        )
         if memory_debug is not None:
             memory_debug.log_snapshot(
                 "after_weight_update_initial",

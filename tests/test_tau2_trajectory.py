@@ -110,6 +110,9 @@ def test_builds_prefix_contiguous_all_turn_training_text():
     assert text.prompt_tokens == 3
     assert text.output_tokens == 3
     assert text.finished is True
+    assert text.n_predicted == 0
+    assert text.prompt_text == ""
+    assert text.output_text == text.text
     assert text.metadata == {
         "num_policy_calls": 2,
         "termination_reason": "user_stop",
@@ -530,6 +533,8 @@ def test_tau2_rollout_wrapper_preserves_audit_and_returns_typed_boundary_failure
         "token_start": 2,
         "token_end": 3,
     }
+    assert result.audit["response_tokens"] == 1
+    assert result.audit["labeled_tokens"] == 1
     assert client.calls == [(POLICY_ENDPOINT, problem, session)]
 
     client.response = _run_response(

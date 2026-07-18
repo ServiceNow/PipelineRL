@@ -232,7 +232,11 @@ def build_tau2_training_text(
     max_sequence_length: int,
     shared_memory_entry_size: int,
 ) -> TrainingText:
-    """Merge exact response-side token captures into one all-turn trajectory."""
+    """Merge exact response-side token captures into one all-turn trajectory.
+
+    n_predicted=0 makes prompt_text empty and output_text the full merged text;
+    metadata.model_calls token spans are the canonical assistant-only view.
+    """
     if max_sequence_length <= 0:
         raise ValueError("max_sequence_length must be positive")
     if shared_memory_entry_size <= 0:
@@ -513,6 +517,8 @@ async def generate_tau2_rollout(
             "model_calls": metadata["model_calls"],
             "prompt_tokens": training_text.prompt_tokens,
             "output_tokens": training_text.output_tokens,
+            "response_tokens": training_text.output_tokens,
+            "labeled_tokens": training_text.output_tokens,
             "sequence_tokens": len(training_text.input_ids),
         }
     )

@@ -224,6 +224,77 @@ def test_patched_strict_tito_and_provenance_guards_execute_and_are_used(tmp_path
 
     tau_target = checkout / "responses_api_agents/tau2/app.py"
     tau_tree = ast.parse(tau_target.read_text())
+    tau_agent = next(
+        node
+        for node in tau_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "Tau2Agent"
+    )
+    run_method = next(
+        node
+        for node in tau_agent.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "run"
+    )
+    seed_move = next(
+        node
+        for node in ast.walk(run_method)
+        if isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "input_items_1"
+    )
+    assert ast.unparse(seed_move.value) == "output_items[:1]"
+    assert any(
+        ast.unparse(argument) == "output_items[1:]"
+        for node in ast.walk(run_method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id
+        == "split_responses_input_output_items"
+        for argument in node.args
+    )
+    count_loop = next(
+        node
+        for node in ast.walk(run_method)
+        if isinstance(node, ast.For)
+        and any(
+            isinstance(child, ast.AugAssign)
+            and isinstance(child.target, ast.Name)
+            and child.target.id == "num_agent_calls"
+            for child in ast.walk(node)
+        )
+    )
+    assert ast.unparse(count_loop.iter) == "result.messages"
+    assert any(
+        isinstance(node, ast.Compare)
+        and ast.unparse(node) == "message.role == 'assistant'"
+        for node in ast.walk(count_loop)
+    )
+
+    adapter_tree = ast.parse(
+        (
+            Path(__file__).parents[1]
+            / "pipelinerl/domains/tau2/rollouts.py"
+        ).read_text()
+    )
+    extract_policy_calls = _function(
+        adapter_tree,
+        "_extract_policy_calls",
+    )
+    expected_calls = next(
+        node
+        for node in ast.walk(extract_policy_calls)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "expected_calls"
+            for target in node.targets
+        )
+    )
+    assert ast.unparse(expected_calls.value) == (
+        "max(run_response.num_agent_calls - 1, 0)"
+    )
+
     attach_helper = _function(tau_tree, "_attach_pipelinerl_provenance")
     tau_namespace = {
         "Mapping": Mapping,
