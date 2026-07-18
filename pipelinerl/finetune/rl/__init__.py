@@ -1,7 +1,7 @@
 import logging
 import os
 from functools import partial
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 import numpy as np
@@ -44,7 +44,7 @@ class RLConfig(BaseModel):
     policy_loss: str = Field(
         default="ppo",
         description="Policy Loss to use for RL",
-        choices=["ppo", "reinforce", "gspo"],
+        choices=["ppo", "reinforce", "gspo", "dppo"],
     )
     use_advantages: bool = Field(
         default=True,
@@ -52,6 +52,16 @@ class RLConfig(BaseModel):
     )
     epsilon_low: float = Field(default=0.2, description="Lower clip parameter for ratio of log probs")
     epsilon_high: float = Field(default=0.2, description="Upper clip parameter for ratio of log probs")
+    dppo_divergence_type: Literal["binary_tv"] = Field(
+        default="binary_tv",
+        description="Divergence approximation for DPPO trust-region masking",
+    )
+    dppo_divergence_threshold: float = Field(
+        default=0.1,
+        gt=0.0,
+        le=1.0,
+        description="Binary-TV threshold for DPPO trust-region masking",
+    )
     batch_size: int = Field(default=0, description="Batch size is required for normalization")
     reward_minus_kl_coef: float = Field(
         default=0.0,
@@ -131,6 +141,36 @@ def linear_decay_coef(current_step: int, max_step: int, initial_coef: float, fin
 
     """
     return initial_coef + (final_coef - initial_coef) * current_step / max_step
+
+
+def compute_binary_tv_divergence(
+    behavior_logprobs: torch.Tensor,
+    policy_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the sampled-token Bernoulli TV approximation used by DPPO."""
+    behavior_probs = torch.exp(behavior_logprobs.clamp(min=-30.0, max=0.0))
+    policy_probs = torch.exp(policy_logprobs.clamp(min=-30.0, max=0.0))
+    divergence = torch.abs(behavior_probs - policy_probs)
+    return torch.where(response_mask, divergence, torch.zeros_like(divergence))
+
+
+def compute_dppo_mask(
+    new_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    log_p_weights: torch.Tensor,
+    ratio_new_old: torch.Tensor,
+    response_mask: torch.Tensor,
+    divergence_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gate updates that are outside the trust region and moving farther away."""
+    with torch.no_grad():
+        divergence = compute_binary_tv_divergence(old_logprobs, new_logprobs, response_mask)
+        outside_region = divergence > divergence_threshold
+        bad_high = (log_p_weights > 0) & (ratio_new_old > 1.0) & outside_region
+        bad_low = (log_p_weights < 0) & (ratio_new_old < 1.0) & outside_region
+        mask = (~(bad_high | bad_low) & response_mask).to(new_logprobs.dtype)
+    return mask, divergence
 
 
 def rl_step(
@@ -294,6 +334,8 @@ def rl_step(
 
     # compute algorithm-specific losses
     policy_loss_total = None
+    dppo_mask = None
+    dppo_divergence = None
     match config.policy_loss:
         case "ppo":
             surr1 = ratio_new_old * log_p_weights
@@ -307,6 +349,19 @@ def rl_step(
             clamp_log_ratio_new_old_indicators = ratio_new_old > 1 + config.epsilon_high
             ratio_new_old = torch.clamp(ratio_new_old, 0, 1 + config.epsilon_high)
             policy_loss = new_logprobs * log_p_weights * ratio_new_old.detach()
+        case "dppo":
+            dppo_mask, dppo_divergence = compute_dppo_mask(
+                new_logprobs,
+                old_logprobs,
+                log_p_weights,
+                ratio_new_old,
+                masks_shifted,
+                config.dppo_divergence_threshold,
+            )
+            clamp_log_ratio_new_old_indicators = (~dppo_mask.bool()) & masks_shifted
+            # Keep the positive surrogate here: the common non-GSPO path below
+            # applies the final negation and the same KL/entropy terms as PPO.
+            policy_loss = dppo_mask * ratio_new_old * log_p_weights
         case "gspo":
             if segments is None:
                 raise ValueError("GSPO loss requires packed sequences with segments")
@@ -437,6 +492,18 @@ def rl_step(
         "num_output_tokens_sum": masks_shifted.sum().item(),
         "input_size": batch.input_ids.numel(), 
     }
+
+    if dppo_mask is not None:
+        assert dppo_divergence is not None
+        stats["dppo_mask_frac_kept"] = sum_sum(
+            dppo_mask / num_labels_in_seq, masks_shifted, segments
+        ).item()
+        stats["dppo_binary_tv_mean"] = sum_sum(
+            dppo_divergence / num_labels_in_seq, masks_shifted, segments
+        ).item()
+        stats["dppo_binary_tv_max"] = (
+            dppo_divergence[masks_shifted].max().item() if masks_shifted.any() else 0.0
+        )
 
     if has_value_head:
         stats["value_mean"] = sum_sum(value_predictions / num_labels_in_seq, masks_shifted, segments).item()
