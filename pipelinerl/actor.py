@@ -22,11 +22,16 @@ import wandb
 from pipelinerl.async_llm import RetryableAbortedCompletionError
 from pipelinerl.domain_sampling import DomainWeightedSampler
 from pipelinerl.domains.math.rollouts import length_penalty
-from pipelinerl.finetune_loop import calculate_train_steps
+from pipelinerl.finetune_loop import calculate_train_steps, samples_per_optimizer_step
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from pipelinerl.llm import TrainableLLM
-from pipelinerl.rollouts import BaseMetrics, RolloutResult, rollout_has_overflow
-from pipelinerl.shared_memory_array import SharedMemoryQueue
+from pipelinerl.rollouts import (
+    BaseMetrics,
+    RolloutResult,
+    TrainingGroupEnvelope,
+    rollout_has_overflow,
+)
+from pipelinerl.shared_memory_array import EntrySizeExceeded, SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.streams import (
     SingleStreamSpec,
@@ -212,6 +217,155 @@ def apply_group_boundary_policy(
     return reason
 
 
+def _set_group_boundary_failure(
+    rollout_results: List[RolloutResult],
+    reason: str,
+    detail: str,
+    **failure_fields,
+) -> None:
+    indexed_results = [
+        (result.audit.get("rollout_index"), result)
+        for result in rollout_results
+    ]
+    if not indexed_results or not all(
+        isinstance(rollout_index, int) for rollout_index, _ in indexed_results
+    ):
+        raise ValueError("Atomic group members must have integer rollout_index values")
+    _, trigger = min(indexed_results, key=lambda item: item[0])
+    trigger.audit["boundary_failure"] = {
+        "reason": reason,
+        "detail": detail,
+        **failure_fields,
+    }
+    trigger.audit["drop_reason"] = reason
+
+
+def put_rollout_group(
+    result_queue: SharedMemoryQueue,
+    rollout_results: List[RolloutResult],
+) -> None:
+    try:
+        result_queue.put(rollout_results)
+    except EntrySizeExceeded as exc:
+        if not rollout_results or not all(
+            result.atomic_group for result in rollout_results
+        ):
+            raise
+        _set_group_boundary_failure(
+            rollout_results,
+            "actor_queue_oversize",
+            "Atomic rollout group exceeds the actor result-queue entry cap",
+            queue_hop="actor_result",
+            serialized_size=exc.size,
+            max_size=exc.max_size,
+        )
+        for result in rollout_results:
+            result.audit.setdefault(
+                "prompt_token_lengths",
+                [text.prompt_tokens for text in result.training_texts],
+            )
+            result.audit.setdefault(
+                "output_token_lengths",
+                [text.output_tokens for text in result.training_texts],
+            )
+            result.audit.setdefault(
+                "n_training_texts_before_drop",
+                len(result.training_texts),
+            )
+            result.training_texts = []
+        result_queue.put(rollout_results)
+
+
+def validate_atomic_group_admission(
+    rollout_results: List[RolloutResult],
+    attempts: int,
+    samples_per_update: int,
+    ready_capacity: int,
+) -> bool:
+    atomic_values = {result.atomic_group for result in rollout_results}
+    if len(atomic_values) != 1:
+        raise ValueError("Rollout group mixes atomic and legacy members")
+    is_atomic = atomic_values.pop()
+    if not is_atomic:
+        return False
+    if any(
+        isinstance(result.audit.get("boundary_failure"), dict)
+        for result in rollout_results
+    ):
+        return True
+
+    group_ids = {result.group_id for result in rollout_results}
+    domains = {result.domain for result in rollout_results}
+    rollout_indices = [result.audit.get("rollout_index") for result in rollout_results]
+    entry_count = sum(len(result.training_texts) for result in rollout_results)
+    failures = []
+    if len(group_ids) != 1 or None in group_ids:
+        failures.append(
+            f"expected one non-null group_id, got "
+            f"{sorted(str(value) for value in group_ids)}"
+        )
+    if len(domains) != 1:
+        failures.append(
+            f"expected one domain, got {sorted(str(value) for value in domains)}"
+        )
+    if (
+        len(rollout_indices) != attempts
+        or any(not isinstance(index, int) for index in rollout_indices)
+        or len(set(rollout_indices)) != attempts
+    ):
+        failures.append(
+            f"expected {attempts} distinct rollout indices, got {rollout_indices}"
+        )
+    if any(len(result.training_texts) != 1 for result in rollout_results):
+        failures.append("each atomic rollout must contribute exactly one training sample")
+    if entry_count > samples_per_update:
+        failures.append(
+            f"{entry_count} entries exceed samples_per_optimizer_step={samples_per_update}"
+        )
+    if entry_count > ready_capacity:
+        failures.append(
+            f"{entry_count} entries exceed ring_buffer_size={ready_capacity}"
+        )
+
+    if failures:
+        _set_group_boundary_failure(
+            rollout_results,
+            "atomic_envelope_rejected",
+            "; ".join(failures),
+            samples_per_update=samples_per_update,
+            ready_capacity=ready_capacity,
+            entry_count=entry_count,
+        )
+    return True
+
+
+def make_training_group_envelope(
+    rollout_results: List[RolloutResult],
+    attempts: int,
+) -> TrainingGroupEnvelope:
+    entries = [
+        training_text.model_dump()
+        for result in rollout_results
+        for training_text in result.training_texts
+    ]
+    entries.sort(
+        key=lambda entry: (
+            entry["metadata"]["rollout_index"],
+            entry["metadata"]["step_index"],
+        )
+    )
+    group_ids = {entry["group_id"] for entry in entries}
+    domains = {result.domain for result in rollout_results}
+    assert len(group_ids) == 1
+    assert len(domains) == 1
+    return TrainingGroupEnvelope(
+        group_id=group_ids.pop(),
+        domain=domains.pop(),
+        expected_rollouts=attempts,
+        entries=entries,
+    )
+
+
 async def schedule_rollouts(
     cfg: DictConfig,
     attempts: int,
@@ -319,7 +473,7 @@ async def schedule_rollouts(
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
                 random.shuffle(group_rollouts[group_id])
-                result_queue.put(group_rollouts[group_id])
+                put_rollout_group(result_queue, group_rollouts[group_id])
                 del group_rollouts[group_id]
             finished_rollouts += 1
         except Exception as e:
@@ -705,6 +859,12 @@ class ActorLoop:
                 assert len(rollout_results) == attempts, (
                     f"Expected {attempts} rollouts, got {len(rollout_results)}"
                 )
+                atomic_group = validate_atomic_group_admission(
+                    rollout_results,
+                    attempts,
+                    samples_per_optimizer_step(self.cfg.finetune),
+                    int(self.cfg.preprocess.ring_buffer_size),
+                )
                 group_drop_reason = apply_group_boundary_policy(
                     rollout_results,
                     self.group_drop_counts,
@@ -771,11 +931,18 @@ class ActorLoop:
                 samples_in_queue = self.result_queue.qsize() * attempts
                 in_progress = submitted_groups - finished_groups
                 if group_drop_reason is None:
-                    all_text_dumps = []
-                    for r in rollout_results:
-                        for text in r.training_texts:
-                            all_text_dumps.append(text.model_dump())
-                    data_stream_writer.write(all_text_dumps)
+                    if atomic_group:
+                        group_envelope = make_training_group_envelope(
+                            rollout_results,
+                            attempts,
+                        )
+                        data_stream_writer.write(group_envelope)
+                    else:
+                        all_text_dumps = []
+                        for r in rollout_results:
+                            for text in r.training_texts:
+                                all_text_dumps.append(text.model_dump())
+                        data_stream_writer.write(all_text_dumps)
                     logger.info(
                         f"Published {group_samples} {'train' if self.is_training else 'test'} samples"
                         f" to {self.data_stream}, total {published_samples} samples so far, "
@@ -803,6 +970,9 @@ class ActorLoop:
                             "published_samples": published_samples,
                             "problem_queue_size": self.problem_queue.qsize(),
                             "result_queue_size": self.result_queue.qsize(),
+                            "result_queue_max_entry_size_bytes": (
+                                self.result_queue.max_actual_entry_size()
+                            ),
                             "finished_groups": finished_groups,
                             "trainer_model_version": trainer_version_to_publish, 
                             "time_since_start": time.time() - loop_start_time,

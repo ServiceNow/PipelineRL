@@ -335,6 +335,10 @@ def validate_packing_config(args):
         )
 
 
+def samples_per_optimizer_step(args) -> int:
+    return int(args.train_batch_size) * int(args.gradient_accumulation_passes)
+
+
 def run_finetuning_loop(
     cfg: DictConfig,
 ):
@@ -641,6 +645,7 @@ def rl_finetuning_worker(
     gradient_accumulation_passes_per_lead = args.gradient_accumulation_passes // num_lead_trainers
     samples_per_lead_per_step = gradient_accumulation_passes_per_lead * args.train_batch_size
     samples_per_step = samples_per_lead_per_step * num_lead_trainers
+    assert samples_per_step == samples_per_optimizer_step(args)
     start_samples = training_metrics.samples
     logger.info(
         f"Starting training with {start_samples} samples, "

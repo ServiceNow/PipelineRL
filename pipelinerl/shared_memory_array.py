@@ -6,6 +6,15 @@ from typing import Any
 from queue import Empty, Full
 
 
+class EntrySizeExceeded(ValueError):
+    def __init__(self, size: int, max_size: int):
+        self.size = size
+        self.max_size = max_size
+        super().__init__(
+            f"Serialized object size ({size} bytes) exceeds maximum entry size ({max_size} bytes)"
+        )
+
+
 class SharedMemoryArray:
     """
     A class that manages an array of Python objects in shared memory.
@@ -63,7 +72,7 @@ class SharedMemoryArray:
     def _set_entry_size(self, index: int, size: int) -> None:
         """Set the size information for an entry."""
         if size > self.max_entry_size:
-            raise ValueError(f"Data size ({size} bytes) exceeds maximum entry size ({self.max_entry_size} bytes)")
+            raise EntrySizeExceeded(size, self.max_entry_size)
         offset = self._get_entry_offset(index)
         struct.pack_into("I", self.shared_mem.buf, offset, size)
 
@@ -85,9 +94,7 @@ class SharedMemoryArray:
         size = len(data)
 
         if size > self.max_entry_size:
-            raise ValueError(
-                f"Serialized object size ({size} bytes) exceeds maximum entry size ({self.max_entry_size} bytes)"
-            )
+            raise EntrySizeExceeded(size, self.max_entry_size)
 
         # Write the data
         offset = self._get_entry_offset(index) + 4  # Skip size field
@@ -151,8 +158,11 @@ class SharedMemoryQueue:
         except Empty:
             raise Full()
         
-        # Store the item in the shared array
-        self.shared_array[slot_index] = item
+        try:
+            self.shared_array[slot_index] = item
+        except Exception:
+            self.free_slots.put(slot_index)
+            raise
         
         # Add slot to filled slots queue
         self.content_slots.put(slot_index)

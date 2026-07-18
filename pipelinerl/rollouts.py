@@ -1,7 +1,25 @@
 from dataclasses import dataclass
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Sequence
+from typing import Any, List, Optional, Dict, Sequence, Literal
 import numpy as np
+
+_TOKENIZER_TOKEN_IDS_BY_ID: dict[
+    int,
+    tuple[Any, frozenset[int]],
+] = {}
+
+
+def cached_tokenizer_token_ids(tokenizer: Any) -> frozenset[int]:
+    tokenizer_id = id(tokenizer)
+    cached = _TOKENIZER_TOKEN_IDS_BY_ID.get(tokenizer_id)
+    if cached is None or cached[0] is not tokenizer:
+        cached = (
+            tokenizer,
+            frozenset(tokenizer.get_vocab().values()),
+        )
+        _TOKENIZER_TOKEN_IDS_BY_ID[tokenizer_id] = cached
+    return cached[1]
+
 
 class BaseMetrics(BaseModel):
     reward: float
@@ -57,6 +75,14 @@ class TrainingText(BaseModel):
         return self.text[-self.n_predicted :]
 
 
+class TrainingGroupEnvelope(BaseModel):
+    kind: Literal["atomic_training_group"] = "atomic_training_group"
+    group_id: str
+    domain: str | None = None
+    expected_rollouts: int
+    entries: list[dict]
+
+
 class RolloutResult(BaseModel):
     training_texts: list[TrainingText]
     metrics: BaseMetrics
@@ -67,6 +93,7 @@ class RolloutResult(BaseModel):
     group_id: str | None = None
     domain: str | None = None
     audit: dict = Field(default_factory=dict)
+    atomic_group: bool = False
 
 
 @dataclass(frozen=True)

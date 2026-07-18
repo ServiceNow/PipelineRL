@@ -17,7 +17,12 @@ from pipelinerl.domains.tau2.client import (
     normalize_openai_base_url,
 )
 from pipelinerl.llm import TrainableLLM
-from pipelinerl.rollouts import BaseMetrics, RolloutResult, TrainingText
+from pipelinerl.rollouts import (
+    BaseMetrics,
+    RolloutResult,
+    TrainingText,
+    cached_tokenizer_token_ids,
+)
 
 
 MASKED_TOKEN_ID = -100
@@ -283,6 +288,14 @@ def build_tau2_training_text(
     if not (len(input_ids) == len(labels) == len(old_logprobs)):
         raise AssertionError("Tau2 trajectory token fields are not aligned")
 
+    valid_token_ids = cached_tokenizer_token_ids(tokenizer)
+    invalid_token_ids = sorted(set(input_ids) - valid_token_ids)
+    if invalid_token_ids:
+        raise Tau2TrajectoryError(
+            "oov_token_ids",
+            f"Tau2 trajectory contains out-of-vocabulary token IDs: {invalid_token_ids}",
+        )
+
     termination_reason = run_response.result.get("termination_reason")
     output_tokens = sum(label != MASKED_TOKEN_ID for label in labels)
     boundary_versions = [
@@ -447,6 +460,7 @@ async def generate_tau2_rollout(
             dataset_name=problem.get("dataset"),
             domain=problem.get("domain", "tau2"),
             audit=audit,
+            atomic_group=True,
         )
     latency = time.perf_counter() - start_time
     audit = _base_tau2_audit(
@@ -486,6 +500,7 @@ async def generate_tau2_rollout(
             dataset_name=problem.get("dataset"),
             domain=problem.get("domain", "tau2"),
             audit=audit,
+            atomic_group=True,
         )
 
     metadata = training_text.metadata
@@ -509,4 +524,5 @@ async def generate_tau2_rollout(
         dataset_name=problem.get("dataset"),
         domain=problem.get("domain", "tau2"),
         audit=audit,
+        atomic_group=True,
     )

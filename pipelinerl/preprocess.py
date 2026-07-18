@@ -7,6 +7,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from functools import partial
 from multiprocessing import Process, Queue
 from multiprocessing.managers import SharedMemoryManager
@@ -19,8 +20,8 @@ import transformers
 from litellm import BaseModel, Field
 
 from pipelinerl.finetune.logging_ import flatten_dict_config
-from pipelinerl.finetune_loop import calculate_train_steps
-from pipelinerl.shared_memory_array import SharedMemoryQueue
+from pipelinerl.finetune_loop import calculate_train_steps, samples_per_optimizer_step
+from pipelinerl.shared_memory_array import EntrySizeExceeded, SharedMemoryQueue
 from pipelinerl.state import TrainerState
 from pipelinerl.utils import init_wandb, setup_logging, wait_for_inference_servers
 from pipelinerl.world import WorldMap
@@ -36,8 +37,12 @@ from pipelinerl.finetune.checkpoints import (
 from pipelinerl.finetune.data import collate, collate_packed, preprocess_fn
 from pipelinerl.finetune.rl import RLConfig, populate_rl_data
 from pipelinerl.finetune.types import PipelineBatchEncoding
-from pipelinerl.finetune.utils import create_sentinel_batch
+from pipelinerl.finetune.utils import create_sentinel_batch, create_sentinel_example
 from pipelinerl.llm import TrainableLLM
+from pipelinerl.rollouts import (
+    TrainingGroupEnvelope,
+    cached_tokenizer_token_ids,
+)
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamRangeSpec,
@@ -48,6 +53,126 @@ from pipelinerl.streams import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AtomicUpdate:
+    entries: list[dict]
+    n_groups: int
+    padding: int
+
+
+class AtomicGroupBuffer:
+    """Bound complete training-group envelopes and stage one protected update."""
+
+    def __init__(self, capacity: int, samples_per_step: int):
+        if capacity <= 0 or samples_per_step <= 0:
+            raise ValueError("Atomic queue capacity and samples_per_step must be positive")
+        self.capacity = capacity
+        self.samples_per_step = samples_per_step
+        self.ready_groups = deque()
+        self.ready_entries = 0
+        self.staged_groups = []
+        self.staged_entries = 0
+        self.evicted_groups = 0
+        self.evicted_entries = 0
+        self.rejected_groups = 0
+        self.rejected_entries = 0
+        self.updates = 0
+        self.padding = 0
+
+    def enqueue(self, envelope: TrainingGroupEnvelope, pop_old_data: bool) -> bool:
+        """Queue one envelope; return False only when backpressure must retain it."""
+        group_size = len(envelope.entries)
+        if group_size > self.samples_per_step or group_size > self.capacity:
+            self.rejected_groups += 1
+            self.rejected_entries += group_size
+            logger.warning(
+                "Rejecting atomic envelope %s with %d entries: update capacity=%d, ready capacity=%d",
+                envelope.group_id,
+                group_size,
+                self.samples_per_step,
+                self.capacity,
+            )
+            return True
+        if not pop_old_data and self.ready_entries + group_size > self.capacity:
+            return False
+        while self.ready_groups and self.ready_entries + group_size > self.capacity:
+            evicted = self.ready_groups.popleft()
+            self.ready_entries -= len(evicted.entries)
+            self.evicted_groups += 1
+            self.evicted_entries += len(evicted.entries)
+        self.ready_groups.append(envelope)
+        self.ready_entries += group_size
+        return True
+
+    def compose_update(self) -> AtomicUpdate | None:
+        """Move whole envelopes into the protected accumulator until an update closes."""
+        while self.ready_groups:
+            envelope = self.ready_groups[0]
+            group_size = len(envelope.entries)
+            if self.staged_entries + group_size > self.samples_per_step:
+                return self._finish_update()
+            self.ready_groups.popleft()
+            self.ready_entries -= group_size
+            self.staged_groups.append(envelope)
+            self.staged_entries += group_size
+            if self.staged_entries == self.samples_per_step:
+                return self._finish_update()
+        return None
+
+    def _finish_update(self) -> AtomicUpdate:
+        assert self.staged_groups and 0 < self.staged_entries <= self.samples_per_step
+        entries = [
+            entry
+            for envelope in self.staged_groups
+            for entry in envelope.entries
+        ]
+        update = AtomicUpdate(
+            entries=entries,
+            n_groups=len(self.staged_groups),
+            padding=self.samples_per_step - self.staged_entries,
+        )
+        self.staged_groups = []
+        self.staged_entries = 0
+        self.updates += 1
+        self.padding += update.padding
+        return update
+
+
+def materialize_atomic_update(
+    update: AtomicUpdate,
+    tokenizer: transformers.PreTrainedTokenizerBase,
+) -> tuple[list[dict], int]:
+    newest_model_version = max(entry["model_version"] for entry in update.entries)
+    entries = list(update.entries)
+    template = update.entries[0]
+    for _ in range(update.padding):
+        sentinel = create_sentinel_example(
+            8,
+            tokenizer=tokenizer,
+            model_version=newest_model_version,
+        )
+        for key, value in template.items():
+            if key in sentinel:
+                continue
+            if isinstance(value, list):
+                fill_value = (
+                    0.0
+                    if value and isinstance(value[0], float)
+                    else 0
+                )
+                sentinel[key] = [fill_value] * 8
+            elif isinstance(value, str):
+                sentinel[key] = ""
+            elif isinstance(value, dict):
+                sentinel[key] = {}
+            elif value is None:
+                sentinel[key] = None
+            else:
+                sentinel[key] = type(value)()
+        entries.append(sentinel)
+    return entries, newest_model_version
 
 
 def _needs_reference_logprobs(rl_config: RLConfig) -> bool:
@@ -169,10 +294,12 @@ def preprocess_dataset(
     tokenizer: transformers.PreTrainedTokenizerBase,
     seq_length: int,
     rl_config: RLConfig,
+    rewrite_oov_tokens: bool = True,
 ) -> list[dict]:
     preprocess = partial(preprocess_fn, seq_length=seq_length, tokenizer=tokenizer, is_rl=True)
 
-    data = replace_oov_tokens_with_the(data, tokenizer)
+    if rewrite_oov_tokens:
+        data = replace_oov_tokens_with_the(data, tokenizer)
 
     # inplace update of the traces with ref logprobs
     if llm is not None:
@@ -210,6 +337,112 @@ def preprocess_dataset(
     return dataset
 
 
+def atomic_envelope_oov_token_ids(
+    envelope: TrainingGroupEnvelope,
+    tokenizer: transformers.PreTrainedTokenizerBase,
+) -> list[int]:
+    valid_token_ids = cached_tokenizer_token_ids(tokenizer)
+    return sorted(
+        {
+            token_id
+            for entry in envelope.entries
+            for token_id in entry["input_ids"]
+            if token_id not in valid_token_ids
+        }
+    )
+
+
+def atomic_group_rejection(
+    envelope: TrainingGroupEnvelope,
+    reason: str,
+    queue_hop: str,
+    **details,
+) -> dict:
+    return {
+        "kind": "atomic_group_rejection",
+        "group_id": envelope.group_id,
+        "reason": reason,
+        "queue_hop": queue_hop,
+        **details,
+    }
+
+
+def put_atomic_input_queue(
+    input_queue: SharedMemoryQueue,
+    envelope: TrainingGroupEnvelope,
+    rejection_counts: dict[str, int],
+) -> bool:
+    try:
+        input_queue.put(envelope)
+    except EntrySizeExceeded as exc:
+        rejection_counts["preprocess_input/queue_oversize"] += 1
+        logger.warning(
+            "Dropping atomic group %s at preprocess input: %d > %d bytes",
+            envelope.group_id,
+            exc.size,
+            exc.max_size,
+        )
+        return False
+    return True
+
+
+def put_atomic_output_queue(
+    output_queue: SharedMemoryQueue,
+    processed: TrainingGroupEnvelope | dict,
+    source_envelope: TrainingGroupEnvelope,
+) -> None:
+    try:
+        output_queue.put(processed)
+    except EntrySizeExceeded as exc:
+        if not isinstance(processed, TrainingGroupEnvelope):
+            raise
+        output_queue.put(
+            atomic_group_rejection(
+                source_envelope,
+                "queue_oversize",
+                "preprocess_output",
+                serialized_size=exc.size,
+                max_size=exc.max_size,
+            )
+        )
+
+
+def count_atomic_group_rejection(
+    rejection: dict,
+    rejection_counts: dict[str, int],
+) -> str:
+    counter_key = f"{rejection['queue_hop']}/{rejection['reason']}"
+    rejection_counts[counter_key] += 1
+    return counter_key
+
+
+def preprocess_atomic_envelope(
+    llm: TrainableLLM | None,
+    envelope: TrainingGroupEnvelope,
+    tokenizer: transformers.PreTrainedTokenizerBase,
+    seq_length: int,
+    rl_config: RLConfig,
+) -> TrainingGroupEnvelope | dict:
+    invalid_token_ids = atomic_envelope_oov_token_ids(envelope, tokenizer)
+    if invalid_token_ids:
+        return atomic_group_rejection(
+            envelope,
+            "oov_token_ids",
+            "preprocess_validation",
+            invalid_token_ids=invalid_token_ids,
+        )
+    dataset = preprocess_dataset(
+        llm=llm,
+        data=envelope.entries,
+        tokenizer=tokenizer,
+        seq_length=seq_length,
+        rl_config=rl_config,
+        rewrite_oov_tokens=False,
+    )
+    return envelope.model_copy(update={"entries": dataset})
+
+
+
 def run_dataset_loader(
     raw_chunk_queue: Queue,
     data_stream: SingleStreamSpec,
@@ -224,11 +457,53 @@ def run_dataset_loader(
             try:
                 buffer = []
                 n_groups = 0
+                atomic_envelope = None
                 for group in reader.read():
+                    if (
+                        isinstance(group, dict)
+                        and group.get("kind") == "atomic_training_group"
+                    ):
+                        if n_groups > 0:
+                            raise ValueError(
+                                "stream mixes atomic envelopes and legacy groups"
+                            )
+                        atomic_envelope = TrainingGroupEnvelope.model_validate(group)
+                        if (
+                            atomic_envelope.expected_rollouts != check_group_size
+                            or not atomic_envelope.entries
+                            or any(
+                                entry["group_id"] != atomic_envelope.group_id
+                                for entry in atomic_envelope.entries
+                            )
+                            or not _check_group_sizes(
+                                atomic_envelope.entries,
+                                atomic_envelope.expected_rollouts,
+                            )
+                        ):
+                            raise ValueError("Invalid atomic group envelope")
+                        try:
+                            raw_chunk_queue.put_nowait(atomic_envelope)
+                        except queue.Full:
+                            if pop_old_data:
+                                try:
+                                    raw_chunk_queue.get_nowait()
+                                    old_and_dropped += 1
+                                    if old_and_dropped // 100 != last_time_notice:
+                                        logger.info(
+                                            f"So far removed {old_and_dropped} old elements "
+                                            "from preprocessor queue"
+                                        )
+                                        last_time_notice = old_and_dropped // 100
+                                except Empty:
+                                    pass
+                            raw_chunk_queue.put(atomic_envelope)
+                        break
                     buffer.extend(group)
                     n_groups += 1
                     if n_groups == chunk_n_groups:
                         break
+                if atomic_envelope is not None:
+                    continue
                 if not _check_group_sizes(buffer, check_group_size):
                     raise ValueError("Invalid group sizes in data")
                 try:
@@ -314,20 +589,31 @@ def process_chunk(
         worker_ref_source = llm.base_url if llm is not None else "rollout logprobs fallback"
         logger.info(f"Preprocessor worker started with reference source: {worker_ref_source}")
         while True:
+            chunk = None
             try:
                 chunk = input_queue.get()
-                dataset = preprocess_dataset(
-                    llm=llm,
-                    data=chunk,
-                    tokenizer=tokenizer,
-                    seq_length=seq_length,
-                    rl_config=rl_config,
-                )
-                output_queue.put(dataset)
+                if isinstance(chunk, TrainingGroupEnvelope):
+                    processed = preprocess_atomic_envelope(
+                        llm=llm,
+                        envelope=chunk,
+                        tokenizer=tokenizer,
+                        seq_length=seq_length,
+                        rl_config=rl_config,
+                    )
+                    put_atomic_output_queue(output_queue, processed, chunk)
+                else:
+                    dataset = preprocess_dataset(
+                        llm=llm,
+                        data=chunk,
+                        tokenizer=tokenizer,
+                        seq_length=seq_length,
+                        rl_config=rl_config,
+                    )
+                    output_queue.put(dataset)
             except Exception as e:
                 error_info = {
                     "error": str(e),
-                    "traceback": traceback.format_exc()
+                    "traceback": traceback.format_exc(),
                 }
                 output_queue.put(error_info)
     except KeyboardInterrupt:
@@ -485,7 +771,15 @@ def run_preprocessing_loop(
     gradient_accumulation_passes_per_lead = cfg.finetune.gradient_accumulation_passes // num_lead_trainers
     samples_per_lead_per_step = cfg.finetune.train_batch_size * gradient_accumulation_passes_per_lead
     train_batch_size = samples_per_lead_per_step * num_lead_trainers
+    samples_per_step = samples_per_optimizer_step(cfg.finetune)
+    assert train_batch_size == samples_per_step
     processed_entries_queue = deque(maxlen=cfg.preprocess.ring_buffer_size)
+    atomic_pending_envelopes = deque()
+    atomic_group_buffer = AtomicGroupBuffer(
+        int(cfg.preprocess.ring_buffer_size),
+        samples_per_step,
+    )
+    atomic_mode = None
     published_samples = trainer_state.wait_for_processed_samples()
     last_published_samples = published_samples
     assert published_samples % num_lead_trainers == 0
@@ -503,6 +797,39 @@ def run_preprocessing_loop(
     
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
+
+    atomic_rejection_counts = defaultdict(int)
+    last_atomic_update_groups = 0
+    last_atomic_update_real_entries = 0
+    last_atomic_update_padding = 0
+
+    def prepare_atomic_update() -> None:
+        nonlocal max_model_version
+        nonlocal last_atomic_update_groups
+        nonlocal last_atomic_update_real_entries
+        nonlocal last_atomic_update_padding
+        if atomic_mode is not True or processed_entries_queue or current_batch:
+            return
+        update = atomic_group_buffer.compose_update()
+        if update is None:
+            return
+        update_entries, update_model_version = materialize_atomic_update(
+            update,
+            tokenizer,
+        )
+        processed_entries_queue.extend(update_entries)
+        assert len(processed_entries_queue) == samples_per_step
+        max_model_version = update_model_version
+        last_atomic_update_groups = update.n_groups
+        last_atomic_update_real_entries = len(update.entries)
+        last_atomic_update_padding = update.padding
+        stats_aggregator.update([len(entry["input_ids"]) for entry in update.entries])
+        logger.info(
+            "Composed atomic update with %d groups, %d real entries, and %d sentinel slots",
+            update.n_groups,
+            len(update.entries),
+            update.padding,
+        )
 
     with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
         with SharedMemoryManager() as smm:
@@ -552,21 +879,67 @@ def run_preprocessing_loop(
                             raw_chunk = raw_chunk_queue.get(timeout=0.001)
                             if isinstance(raw_chunk, Exception):
                                 raise raw_chunk
-                            
-                            # Put chunk in the input queue for workers
-                            input_queue.put(raw_chunk)
-                            submitted_chunks += 1
+                            raw_is_atomic = isinstance(raw_chunk, TrainingGroupEnvelope)
+                            if atomic_mode is None:
+                                atomic_mode = raw_is_atomic
+                                if atomic_mode:
+                                    processed_entries_queue = deque()
+                            elif atomic_mode != raw_is_atomic:
+                                raise ValueError(
+                                    "Cannot mix atomic envelopes and legacy chunks in one preprocessor"
+                                )
+                            if raw_is_atomic:
+                                if put_atomic_input_queue(
+                                    input_queue,
+                                    raw_chunk,
+                                    atomic_rejection_counts,
+                                ):
+                                    submitted_chunks += 1
+                            else:
+                                input_queue.put(raw_chunk)
+                                submitted_chunks += 1
                         except Empty:
                             pass
 
                     dataset = None
                     try:
-                        # Try to write the next dataset to the output stream, if it is ready
                         start_fetching = time.time()
                         dataset = output_queue.get(timeout=0.001)
                         if isinstance(dataset, Exception):
                             raise dataset
-                        if rl_config.filter_zero_advantage_groups:
+                        if (
+                            isinstance(dataset, dict)
+                            and dataset.get("kind") == "atomic_group_rejection"
+                        ):
+                            count_atomic_group_rejection(
+                                dataset,
+                                atomic_rejection_counts,
+                            )
+                            logger.warning(
+                                "Dropping atomic group %s at %s: %s (%s)",
+                                dataset["group_id"],
+                                dataset["queue_hop"],
+                                dataset["reason"],
+                                dataset,
+                            )
+                            dataset = None
+                        elif isinstance(dataset, TrainingGroupEnvelope):
+                            if rl_config.filter_zero_advantage_groups:
+                                entries, num_filtered_out = filter_zero_advantage_groups(
+                                    dataset.entries
+                                )
+                                total_filtered_out += num_filtered_out
+                                dataset = (
+                                    dataset.model_copy(update={"entries": entries})
+                                    if entries
+                                    else None
+                                )
+                                if num_filtered_out > 0:
+                                    logger.info(
+                                        f"Filtered out {num_filtered_out} samples from "
+                                        "groups with zero advantage."
+                                    )
+                        elif rl_config.filter_zero_advantage_groups:
                             dataset, num_filtered_out = filter_zero_advantage_groups(dataset)
                             total_filtered_out += num_filtered_out
                             if num_filtered_out > 0:
@@ -580,30 +953,51 @@ def run_preprocessing_loop(
                             logger.error(f"Got exception from the result queue: {dataset['error']}")
                             logger.error(f"Traceback: {dataset['traceback']}")
                             raise Exception(dataset['error'])
-                        for entry in dataset:
-                            buffer.append(entry)
+                        if isinstance(dataset, TrainingGroupEnvelope):
+                            atomic_pending_envelopes.append(dataset)
+                        else:
+                            for entry in dataset:
+                                buffer.append(entry)
                         processed_chunks += 1
 
-                    if len(buffer) < cfg.preprocess.dataset_buffer_size:
+                    buffered_samples = (
+                        sum(
+                            len(envelope.entries)
+                            for envelope in atomic_pending_envelopes
+                        )
+                        if atomic_mode
+                        else len(buffer)
+                    )
+                    if buffered_samples < cfg.preprocess.dataset_buffer_size:
                         continue
                     if cfg.preprocess.dataset_buffer_size:
-                        # If buffer size is not set, no point in logging
-                        logger.info(f"Buffer is full with {len(buffer)} samples, start writing")
+                        logger.info(
+                            f"Buffer is full with {buffered_samples} samples, start writing"
+                        )
 
-                    while len(buffer) > 0:
-                        if len(processed_entries_queue) == processed_entries_queue.maxlen:
-                            if not pop_old_data:
-                                break 
-                            else:
-                                processed_entries_queue_popped_data += 1
-                                if processed_entries_queue_popped_data % 100 == 0 and last_time_notice != processed_entries_queue_popped_data // 100:
-                                    logger.warning(f"Popped {processed_entries_queue_popped_data} old entries from processed entries queue")
-                                    last_time_notice = processed_entries_queue_popped_data // 100
-                        entry = buffer.popleft()
-                        processed_entries_queue.append(entry) # drop from the left if full
+                    if atomic_mode:
+                        prepare_atomic_update()
+                        while atomic_pending_envelopes:
+                            envelope = atomic_pending_envelopes[0]
+                            if not atomic_group_buffer.enqueue(envelope, pop_old_data):
+                                break
+                            atomic_pending_envelopes.popleft()
+                        prepare_atomic_update()
+                    else:
+                        while len(buffer) > 0:
+                            if len(processed_entries_queue) == processed_entries_queue.maxlen:
+                                if not pop_old_data:
+                                    break
+                                else:
+                                    processed_entries_queue_popped_data += 1
+                                    if processed_entries_queue_popped_data % 100 == 0 and last_time_notice != processed_entries_queue_popped_data // 100:
+                                        logger.warning(f"Popped {processed_entries_queue_popped_data} old entries from processed entries queue")
+                                        last_time_notice = processed_entries_queue_popped_data // 100
+                            entry = buffer.popleft()
+                            processed_entries_queue.append(entry) # drop from the left if full
 
-                        stats_aggregator.update([len(entry["input_ids"]) for entry in processed_entries_queue])
-                        max_model_version = max([entry["model_version"] for entry in processed_entries_queue]) if processed_entries_queue else 0
+                            stats_aggregator.update([len(entry["input_ids"]) for entry in processed_entries_queue])
+                            max_model_version = max([entry["model_version"] for entry in processed_entries_queue]) if processed_entries_queue else 0
                     
                     max_unconsumed_samples = cfg.preprocess.max_ready_samples_per_lead * num_trainers
 
@@ -687,17 +1081,81 @@ def run_preprocessing_loop(
                         published_samples > last_published_samples 
                         and (cfg.debug.mode or batch_done or (published_samples - last_published_samples > cfg.preprocess.log_every_n_samples))
                     ):
-                        samples_in_output_queue = output_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts
+                        queued_entry_samples = (
+                            cfg.attempts
+                            if atomic_mode
+                            else cfg.preprocess.chunk_n_groups * cfg.attempts
+                        )
+                        samples_in_output_queue = (
+                            output_queue.qsize() * queued_entry_samples
+                        )
                         stats = {
                             "preprocessor/published_samples": published_samples,
                             "preprocessor/published_model_version": max_model_version,
-                            "preprocessor/queue/raw_samples": raw_chunk_queue.qsize() * cfg.preprocess.chunk_n_groups * cfg.attempts,
+                            "preprocessor/queue/raw_samples": (
+                                raw_chunk_queue.qsize() * queued_entry_samples
+                            ),
                             "preprocessor/queue/raw": raw_chunk_queue.qsize(),
                             "preprocessor/queue/output_samples": samples_in_output_queue,
                             "preprocessor/queue/output": output_queue.qsize(),
                             "preprocessor/filtered_out_samples": num_filtered_out,
                             "preprocessor/total_filtered_out_samples": total_filtered_out,
                         }
+                        if atomic_mode:
+                            stats.update(
+                                {
+                                    "preprocessor/atomic/ready_groups": len(
+                                        atomic_group_buffer.ready_groups
+                                    ),
+                                    "preprocessor/atomic/ready_entries": (
+                                        atomic_group_buffer.ready_entries
+                                    ),
+                                    "preprocessor/atomic/staged_groups": len(
+                                        atomic_group_buffer.staged_groups
+                                    ),
+                                    "preprocessor/atomic/staged_entries": (
+                                        atomic_group_buffer.staged_entries
+                                    ),
+                                    "preprocessor/atomic/pending_groups": len(
+                                        atomic_pending_envelopes
+                                    ),
+                                    "preprocessor/atomic/pending_entries": sum(
+                                        len(envelope.entries)
+                                        for envelope in atomic_pending_envelopes
+                                    ),
+                                    "preprocessor/atomic/evicted_groups": (
+                                        atomic_group_buffer.evicted_groups
+                                    ),
+                                    "preprocessor/atomic/evicted_entries": (
+                                        atomic_group_buffer.evicted_entries
+                                    ),
+                                    "preprocessor/atomic/rejected_groups": (
+                                        atomic_group_buffer.rejected_groups
+                                    ),
+                                    "preprocessor/atomic/rejected_entries": (
+                                        atomic_group_buffer.rejected_entries
+                                    ),
+                                    "preprocessor/atomic/updates": (
+                                        atomic_group_buffer.updates
+                                    ),
+                                    "preprocessor/atomic/padding": (
+                                        atomic_group_buffer.padding
+                                    ),
+                                    "preprocessor/atomic/last_update_groups": (
+                                        last_atomic_update_groups
+                                    ),
+                                    "preprocessor/atomic/last_update_real_entries": (
+                                        last_atomic_update_real_entries
+                                    ),
+                                    "preprocessor/atomic/last_update_padding": (
+                                        last_atomic_update_padding
+                                    ),
+                                }
+                            )
+                            for reason, count in atomic_rejection_counts.items():
+                                stats[
+                                    f"preprocessor/atomic_group_drop/{reason}"
+                                ] = count
                         if stats_aggregator.has_enough_data():
                             stats.update({"preprocessor/" + k: v for k, v in stats_aggregator.get_stats().items()})
                         if wandb_run is not None:

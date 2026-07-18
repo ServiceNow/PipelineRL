@@ -1,13 +1,18 @@
+from multiprocessing.managers import SharedMemoryManager
 from types import SimpleNamespace
 
 from pipelinerl.actor import (
     apply_group_boundary_policy,
     make_rollout_audit_record,
+    make_training_group_envelope,
+    put_rollout_group,
     stamp_rollout_metadata,
+    validate_atomic_group_admission,
     write_rollout_audit_records,
 )
 from pipelinerl.finetune.data import collate
 from pipelinerl.rollouts import BaseMetrics, RolloutResult, TrainingText
+from pipelinerl.shared_memory_array import SharedMemoryQueue
 
 
 class _Writer:
@@ -33,6 +38,8 @@ def _result(
     reward: float,
     model_version: int | None = 8,
     boundary_reason: str | None = None,
+    atomic_group: bool = False,
+    token_count: int = 1,
 ) -> RolloutResult:
     audit = {
         "rollout_index": rollout_index,
@@ -58,14 +65,18 @@ def _result(
         if boundary_reason is not None
         else [
             TrainingText(
-                text="sample",
-                n_predicted=1,
+                text="x" * token_count,
+                n_predicted=token_count,
                 reward=reward,
-                input_ids=[1],
-                labels=[1],
+                input_ids=[1] * token_count,
+                labels=[1] * token_count,
                 prompt_tokens=0,
-                output_tokens=1,
-                metadata={"model_version": model_version},
+                output_tokens=token_count,
+                metadata={
+                    "model_version": model_version,
+                    "rollout_index": rollout_index,
+                    "step_index": 0,
+                },
             )
         ]
     )
@@ -78,6 +89,7 @@ def _result(
         group_id="group-1",
         domain="tau2",
         audit=audit,
+        atomic_group=atomic_group,
     )
 
 
@@ -211,3 +223,117 @@ def test_existing_collate_uses_oldest_training_text_model_version():
     )
 
     assert batch.model_version == 8
+
+
+def test_atomic_actor_queue_oversize_drops_whole_group_and_retains_audits():
+    results = [
+        _result(
+            1,
+            reward=0.25,
+            atomic_group=True,
+            token_count=10_000,
+        ),
+        _result(
+            0,
+            reward=0.75,
+            atomic_group=True,
+            token_count=10_000,
+        ),
+    ]
+
+    with SharedMemoryManager() as smm:
+        queue = SharedMemoryQueue(smm, max_size=1, max_entry_size=5_000)
+        put_rollout_group(queue, results)
+        compact_results = queue.get()
+
+    assert [result.metrics.reward for result in compact_results] == [0.25, 0.75]
+    assert all(result.training_texts == [] for result in compact_results)
+    assert all(result.audit["model_calls"] for result in compact_results)
+    assert all(result.audit["n_training_texts_before_drop"] == 1 for result in compact_results)
+    trigger = next(
+        result
+        for result in compact_results
+        if "boundary_failure" in result.audit
+    )
+    failure = trigger.audit["boundary_failure"]
+    assert trigger.audit["rollout_index"] == 0
+    assert failure["reason"] == "actor_queue_oversize"
+    assert failure["queue_hop"] == "actor_result"
+    assert failure["serialized_size"] > failure["max_size"] == 5_000
+
+    counters = {}
+    reason = apply_group_boundary_policy(compact_results, counters)
+
+    assert reason == "actor_queue_oversize"
+    assert counters == {"actor_queue_oversize": 1}
+    assert all(result.audit["entered_training"] is False for result in compact_results)
+
+
+def test_atomic_envelope_admission_rejection_fires_group_counter():
+    results = [
+        _result(1, reward=0.25, atomic_group=True),
+        _result(0, reward=0.75, atomic_group=True),
+    ]
+
+    assert validate_atomic_group_admission(
+        results,
+        attempts=2,
+        samples_per_update=1,
+        ready_capacity=2,
+    )
+
+    counters = {}
+    reason = apply_group_boundary_policy(results, counters)
+
+    assert reason == "atomic_envelope_rejected"
+    assert counters == {"atomic_envelope_rejected": 1}
+    trigger = next(
+        result
+        for result in results
+        if "boundary_failure" in result.audit
+    )
+    assert trigger.audit["rollout_index"] == 0
+    assert trigger.audit["boundary_failure"]["entry_count"] == 2
+
+
+def test_atomic_envelope_is_complete_and_deterministically_ordered():
+    higher = _result(1, reward=0.25, atomic_group=True)
+    lower = _result(0, reward=0.75, atomic_group=True)
+    stamp_rollout_metadata(higher, "actor", 7, 1, 10)
+    stamp_rollout_metadata(lower, "actor", 7, 0, 10)
+
+    assert validate_atomic_group_admission(
+        [higher, lower],
+        attempts=2,
+        samples_per_update=4,
+        ready_capacity=4,
+    )
+    envelope = make_training_group_envelope([higher, lower], attempts=2)
+
+    assert envelope.kind == "atomic_training_group"
+    assert envelope.group_id == "actor_7"
+    assert envelope.domain == "tau2"
+    assert envelope.expected_rollouts == 2
+    assert [
+        (
+            entry["metadata"]["rollout_index"],
+            entry["metadata"]["step_index"],
+        )
+        for entry in envelope.entries
+    ] == [(0, 0), (1, 0)]
+
+
+def test_legacy_group_admission_is_an_exact_noop():
+    results = [
+        _result(0, reward=0.25),
+        _result(1, reward=0.75),
+    ]
+    before = [result.model_dump() for result in results]
+
+    assert not validate_atomic_group_admission(
+        results,
+        attempts=2,
+        samples_per_update=1,
+        ready_capacity=1,
+    )
+    assert [result.model_dump() for result in results] == before

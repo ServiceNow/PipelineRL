@@ -8,6 +8,7 @@ import torch
 from omegaconf import OmegaConf
 from pydantic import ValidationError
 
+from pipelinerl.actor import apply_group_boundary_policy, stamp_rollout_metadata
 from pipelinerl.domains.tau2.client import Tau2RunResponse
 from pipelinerl.domains.tau2.rollouts import (
     Tau2TrajectoryError,
@@ -21,10 +22,18 @@ from pipelinerl.preprocess import batch_annotate_traces_with_ref_logprobs
 from pipelinerl.rollouts import BaseMetrics, RolloutResult
 
 
+class _Vocabulary:
+    def values(self):
+        return range(65_536)
+
+
 class _Tokenizer:
     def decode(self, input_ids, *, skip_special_tokens):
         assert skip_special_tokens is False
         return " ".join(str(token_id) for token_id in input_ids)
+
+    def get_vocab(self):
+        return _Vocabulary()
 
 
 POLICY_ENDPOINT = "http://actor-0:8000/v1"
@@ -231,6 +240,18 @@ def test_rejects_non_prefix_turn_and_context_overflow():
         _build(max_sequence_length=5)
 
 
+def test_rejects_out_of_vocabulary_token_ids_before_decode():
+    response = _run_response(
+        output=[_policy_item([10], [70_000], [-0.1])],
+        num_agent_calls=2,
+    )
+
+    with pytest.raises(Tau2TrajectoryError, match="out-of-vocabulary") as exc_info:
+        _build(response)
+
+    assert exc_info.value.reason == "oov_token_ids"
+
+
 def test_max_steps_is_recorded_as_incomplete():
     text = _build(_run_response(termination_reason="max_steps"))
     assert text.finished is False
@@ -269,8 +290,16 @@ def test_real_length_serialization_fits_default_actor_cap_and_rejects_oversize()
         latency=1.0,
     )
     result_entry_size = len(pickle.dumps([rollout_result]))
+    serialized_result = pickle.dumps(rollout_result)
+    group_entry_size = len(
+        pickle.dumps(
+            [pickle.loads(serialized_result) for _ in range(16)]
+        )
+    )
     assert serialized_size < actor_entry_cap
-    assert result_entry_size < actor_entry_cap < result_entry_size * 16
+    assert result_entry_size < actor_entry_cap < group_entry_size
+    assert group_entry_size > result_entry_size * 15
+    assert 32_000_000 < group_entry_size < 34_000_000
     with pytest.raises(Tau2TrajectoryError, match="serialized size"):
         _build(
             response,
@@ -476,6 +505,7 @@ def test_tau2_rollout_wrapper_preserves_audit_and_returns_typed_boundary_failure
     result = asyncio.run(generate_tau2_rollout(cfg, _Tau2LLM(), problem, session))
 
     assert result.model_version == 8
+    assert result.atomic_group is True
     assert result.training_texts[0].metadata["model_version"] == 8
     assert result.metrics.reward == 0.75
     assert result.audit["reward"] == 0.75
@@ -523,6 +553,33 @@ def test_tau2_rollout_wrapper_preserves_audit_and_returns_typed_boundary_failure
     assert dropped.metrics.reward == 0.75
     assert dropped.metrics.boundary_failure is True
     assert dropped.audit["boundary_failure"]["reason"] == "incomplete_policy_capture"
+
+    oov_response = _run_response(
+        output=[_policy_item([10], [70_000], [-0.1])],
+        num_agent_calls=2,
+        reward=0.75,
+    )
+    oov_response.result.update(good_response.result)
+    client.response = oov_response
+
+    oov = asyncio.run(generate_tau2_rollout(cfg, _Tau2LLM(), problem, session))
+
+    assert oov.training_texts == []
+    assert oov.metrics.reward == 0.75
+    assert oov.audit["reward"] == 0.75
+    assert oov.audit["verifier_result"] == {"action_checks": [{"passed": True}]}
+    assert oov.audit["actions"] == result.audit["actions"]
+    assert oov.audit["boundary_failure"]["reason"] == "oov_token_ids"
+
+    stamp_rollout_metadata(result, "actor", 9, 0, 10)
+    stamp_rollout_metadata(oov, "actor", 9, 1, 10)
+    oov_counters = {}
+    assert apply_group_boundary_policy([oov, result], oov_counters) == "oov_token_ids"
+    assert oov_counters == {"oov_token_ids": 1}
+    assert all(
+        rollout.audit["entered_training"] is False
+        for rollout in [oov, result]
+    )
 
     with pytest.raises(ValidationError) as exc_info:
         Tau2RunResponse.model_validate({})
