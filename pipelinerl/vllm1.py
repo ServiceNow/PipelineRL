@@ -3,8 +3,12 @@ import logging
 import os
 import signal
 import time
+from contextlib import asynccontextmanager
+from typing import Any, Protocol, runtime_checkable
+
 import torch
 import uvloop
+from fastapi import BackgroundTasks
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.system_utils import set_ulimit
 from vllm.entrypoints.openai.cli_args import (
@@ -25,12 +29,11 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-
-from pipelinerl.finetune_loop import WeightUpdateRequest
-from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
-from pipelinerl.torch_utils import stateless_init_process_group
-from typing import Any, Protocol, runtime_checkable
 import pipelinerl.vllm_quantization  # Register bf16_last_layer_fp32 quantization config
+from pipelinerl.finetune_loop import WeightUpdateRequest
+from pipelinerl.state import read_fast_llm_events
+from pipelinerl.torch_utils import stateless_init_process_group
+from pipelinerl.vllm_quantization import string_to_dtype  # reuse mapping
 
 try:
     from vllm.entrypoints.openai.tool_parsers import ToolParserManager
@@ -38,14 +41,15 @@ except ModuleNotFoundError:
     from vllm.tool_parsers import ToolParserManager
 
 logger = logging.getLogger(__name__)
-# configure this logger individually, in order to avoid messign
-# with the default vllm logger configuration
+# Configure this logger with its own handler to avoid interfering with vLLM's logger configuration.
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+formatter = logging.Formatter("[%(asctime)s] [VLLM-%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+# Prevent propagation to vLLM's loggers to avoid double logging
+logger.propagate = False
 
 
 @runtime_checkable
@@ -60,13 +64,13 @@ class LikeWorker(Protocol):
 
 
 class WorkerExtension:
-
     def init_actor_update_group(
         self: LikeWorker,
         actor_idx: int,
         actor_ngpus: int,
         weight_update_group_init_method: str,
         weight_update_group_world_size: int,
+        weight_update_mode: str = "http",
     ):
         self.pg_rank = 1 + actor_idx * actor_ngpus + self.rank
         # log all you know
@@ -77,7 +81,7 @@ class WorkerExtension:
         )
         logger.info(
             prefix
-            + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}"
+            + f"Weight update group init method: {weight_update_group_init_method}, world size: {weight_update_group_world_size}, mode: {weight_update_mode}"
         )
 
         batch_invariant_env = os.getenv("VLLM_BATCH_INVARIANT", "0")
@@ -98,66 +102,193 @@ class WorkerExtension:
             ):
                 os.environ.pop(_k, None)
 
-        # Use vLLM's StatelessProcessGroup instead of torch.distributed
-        self.model_update_group = stateless_init_process_group(
-            init_method=weight_update_group_init_method,
-            rank=self.pg_rank,
-            world_size=weight_update_group_world_size,
-            device=self.device,
-        )
+        if weight_update_mode == "http":
+            # HTTP mode uses vLLM's StatelessProcessGroup to match the trainer,
+            # which in pipelinerl/finetune_loop.py uses torch_utils.stateless_init_process_group.
+            self.model_update_group = stateless_init_process_group(
+                init_method=weight_update_group_init_method,
+                rank=self.pg_rank,
+                world_size=weight_update_group_world_size,
+                device=self.device,
+            )
+        else:
+            from fast_llm.engine.distributed.config import DistributedBackend
+            from fast_llm.engine.distributed.distributed import ProcessGroupPool
+
+            self.model_update_group = ProcessGroupPool(
+                rank=self.pg_rank,
+                world_size=weight_update_group_world_size,
+                local_world_size=1,
+                init_method=weight_update_group_init_method,
+                backend=DistributedBackend.nccl,
+            ).get_process_group(range(weight_update_group_world_size), self.pg_rank)
+        self._process_group_destroyed = False
         logger.info(prefix + "Actor update process group initialized")
+
+    def destroy_actor_update_group(self: LikeWorker):
+        self._process_group_destroyed = True
+        if isinstance(self.model_update_group, torch.distributed.ProcessGroup):
+            torch.distributed.destroy_process_group(self.model_update_group)
+        elif hasattr(self.model_update_group, "shutdown"):
+            self.model_update_group.shutdown()
+        # StatelessProcessGroup has no shutdown method; rely on GC.
+
+    def is_actor_update_group_destroyed(self: LikeWorker) -> bool:
+        return self._process_group_destroyed
 
     def receive_weight_update(self: LikeWorker, request_json: str):
         request = WeightUpdateRequest.model_validate_json(request_json)
         torch.cuda.synchronize(self.device)
-        logger.info("Start receiving weight update")
+        logger.info(
+            f"Start receiving weight update: {len(request.parameters_info)} parameters"
+        )
         expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
 
-        for info in request.parameters_info:
+        for i, info in enumerate(request.parameters_info):
             target_dtype = string_to_dtype(info.dtype)
             if target_dtype not in expected_dtypes:
                 logger.warning(f"Unexpected dtype for {info.name}: {info.dtype}")
-            buffer = torch.empty(tuple(info.shape), dtype=target_dtype, device=self.device)
-            self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
+
+            buffer = torch.empty(
+                tuple(info.shape), dtype=target_dtype, device=self.device
+            )
+
+            # StatelessProcessGroup exposes .broadcast(); torch.distributed.ProcessGroup
+            # (fast-llm path) uses the functional torch.distributed.broadcast.
+            if isinstance(self.model_update_group, torch.distributed.ProcessGroup):
+                torch.distributed.broadcast(buffer, src=0, group=self.model_update_group)
+            else:
+                self.model_update_group.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
+
             loaded_params = self.model_runner.model.load_weights(weights=[(info.name, buffer)])  # type: ignore
-            if len(loaded_params) != 1:
-                raise ValueError(f"model {info.name} not found in model state dict")
+            if len(loaded_params) == 0:
+                raise ValueError(
+                    f"Parameter {info.name} not found in vLLM model state dict"
+                )
+            elif len(loaded_params) > 1:
+                raise ValueError(
+                    f"Unexpected number of parameters loaded for {info.name}"
+                )
+
+            if (i + 1) % 10 == 0:
+                logger.info(f"Received {i + 1}/{len(request.parameters_info)} parameters")
 
         pipelinerl.vllm_quantization.invalidate_fp32_cache()
-        logger.info("Weight update received")
+        logger.info("Weight update received - all parameters processed")
 
-    def close_communicator(self):
-        """Closes the communicator when weight synchronization is no longer needed."""
-        if hasattr(self, "model_update_group") and self.model_update_group is not None:
-            del self.model_update_group
-            self.model_update_group = None
-            logger.info("Weight update communicator closed")
+    def receive_weight_update_fast_llm(self: LikeWorker):
+        """Receive weight update via Fast-LLM broadcast protocol.
+
+        Called via collective_rpc_async from the main-process monitoring thread,
+        so it runs in each worker's main thread — serialized with inference,
+        identical concurrency model to receive_weight_update (HTTP path).
+
+        Protocol:
+        1. Loop: receive metadata via broadcast_object
+        2. Receive tensor via broadcast
+        3. Call model.load_weights() for each parameter
+        4. Exit when metadata is None (end signal)
+        """
+        torch.cuda.synchronize(self.device)
+        logger.info(f"[Worker rank={self.rank}] Start receiving Fast-LLM weight update")
+
+        expected_dtypes = (torch.bfloat16, torch.float32, torch.float16)
+        param_count = 0
+
+        from fast_llm.core.distributed import broadcast as _broadcast, broadcast_object as _broadcast_object
+
+        while True:
+            meta = _broadcast_object(None, self.model_update_group, src=0)
+
+            if meta is None:
+                logger.info(
+                    f"[Worker rank={self.rank}] Received end signal, finished receiving {param_count} parameters"
+                )
+                break
+
+            # Parse metadata: (shard_name, param_name, shape, dtype)
+            # shard_name is a category label ("weights", "grads", etc.), not part of the HF param name
+            shard_name, param_name, shape, dtype = meta
+
+            target_dtype = string_to_dtype(str(dtype))
+
+            # Allocate buffer and receive tensor (must happen for every broadcast to stay in sync)
+            buffer = torch.empty(tuple(shape), dtype=target_dtype, device=self.device)
+            _broadcast(buffer, 0, self.model_update_group)
+
+            # Only load weight shards (skip grads, optimizer state, etc.)
+            if shard_name != "weights":
+                continue
+
+            param_count += 1
+            if target_dtype not in expected_dtypes:
+                logger.warning(f"Unexpected dtype for {param_name}: {dtype}")
+
+            # Load weights
+            loaded_params = self.model_runner.model.load_weights(
+                weights=[(param_name, buffer)]
+            )
+            if len(loaded_params) == 0:
+                raise ValueError(
+                    f"Parameter {param_name} not found in vLLM model state dict"
+                )
+            elif len(loaded_params) > 1:
+                raise ValueError(
+                    f"Unexpected number of parameters loaded for {param_name}"
+                )
+
+            if param_count % 10 == 0:
+                logger.info(f"[Worker rank={self.rank}] Received {param_count} parameters")
+
+        pipelinerl.vllm_quantization.invalidate_fp32_cache()
+        logger.info(
+            f"[Worker rank={self.rank}] Fast-LLM weight update complete - {param_count} parameters processed"
+        )
 
 
-class WeightUpdateManager:
-    def __init__(self, args, engine: AsyncLLM, engine_client: AsyncMPClient):
+async def _pause_generation(engine: AsyncLLM) -> None:
+    """Pause generation, keeping in-flight requests, for an in-place weight update."""
+    await engine.pause_generation(mode="keep", clear_cache=False)
+
+
+class EngineManager:
+    def __init__(self, args, engine: AsyncLLM, engine_config: Any):
         self.args = args
         self.engine = engine
-        self.engine_client = engine_client
+        self.engine_config = engine_config
         self.update_lock = asyncio.Lock()
 
-    async def input_process_groups(self):
-        await self.engine_client.collective_rpc_async(
+    async def init_actor_update_group(self):
+        await self.engine.engine_core.collective_rpc_async(
             "init_actor_update_group",
             args=(
                 self.args.actor_llm_idx,
                 torch.cuda.device_count(),
                 self.args.weight_update_group_init_method,
                 self.args.weight_update_group_world_size,
+                getattr(self.args, "weight_update_mode", "http"),
             ),
         )
+
+    async def destroy_actor_update_group(self):
+        await self.engine.engine_core.collective_rpc_async(
+            "destroy_actor_update_group",
+            args=(),
+        )
+
+    async def is_actor_update_group_destroyed(self) -> bool:
+        results = await self.engine.engine_core.collective_rpc_async(
+            "is_actor_update_group_destroyed",
+            args=(),
+        )
+        return all(results)
 
     async def receive_weight_update(self, request: WeightUpdateRequest):
         async with self.update_lock:
             version = getattr(request, "version", "unknown")
             pause_started_at = time.perf_counter()
             logger.info(f"Pausing generation for weight update version={version}")
-            await self.engine.pause_generation(mode="keep", clear_cache=False)
+            await _pause_generation(self.engine)
             logger.info(
                 f"Generation paused for weight update version={version} "
                 f"in {time.perf_counter() - pause_started_at:.3f}s"
@@ -165,7 +296,7 @@ class WeightUpdateManager:
             try:
                 update_started_at = time.perf_counter()
                 logger.info(f"Starting weight update version={version}")
-                await self.engine_client.collective_rpc_async(
+                await self.engine.engine_core.collective_rpc_async(
                     "receive_weight_update", args=(request.model_dump_json(),)
                 )
                 logger.info(
@@ -181,9 +312,189 @@ class WeightUpdateManager:
                     f"in {time.perf_counter() - resume_started_at:.3f}s"
                 )
 
-    async def close_communicator(self):
-        """Closes the communicator when weight synchronization is no longer needed."""
-        await self.engine_client.collective_rpc_async("close_communicator")
+    async def init_fast_llm_receiver(self):
+        """Store Redis connection info for the main-process monitoring thread."""
+        self._redis_host = self.args.redis_host
+        self._redis_port = self.args.redis_port
+        logger.info(
+            f"Fast-LLM receiver initialized (Redis {self._redis_host}:{self._redis_port})"
+        )
+
+    async def receive_weight_update_fast_llm(self, version: int | None = None):
+        """Run a fast-llm broadcast weight update paused-for-the-duration.
+
+        Pause/resume wraps the collective RPC symmetrically with the HTTP path
+        so that in-flight generation cannot interleave with a mid-broadcast
+        parameter swap (the source of logprob drift PR #137 closed).
+
+        NOTE: this must NOT be used for the very first weights_ready event
+        after process startup, because at that point the actor has not yet
+        begun issuing rollouts (it's blocked in wait_for_model_version) and
+        pause_generation will deadlock waiting for an in-flight-decode state
+        that never arrives. The monitor thread gates this accordingly.
+        """
+        async with self.update_lock:
+            pause_started_at = time.perf_counter()
+            logger.info("Pausing generation for fast-llm weight update")
+            await _pause_generation(self.engine)
+            logger.info(
+                f"Generation paused for fast-llm weight update "
+                f"in {time.perf_counter() - pause_started_at:.3f}s"
+            )
+            try:
+                update_started_at = time.perf_counter()
+                await self.engine.engine_core.collective_rpc_async(
+                    "receive_weight_update_fast_llm", args=()
+                )
+                logger.info(
+                    f"Fast-llm weight update processed version={version} "
+                    f"in {time.perf_counter() - update_started_at:.3f}s"
+                )
+            finally:
+                resume_started_at = time.perf_counter()
+                logger.info("Resuming generation after fast-llm weight update")
+                await self.engine.resume_generation()
+                logger.info(
+                    f"Generation resumed after fast-llm weight update "
+                    f"in {time.perf_counter() - resume_started_at:.3f}s"
+                )
+
+    async def start_fast_llm_monitoring(self):
+        """Start a single Redis monitoring thread in the main process.
+
+        When weights_ready arrives the thread calls
+        collective_rpc_async("receive_weight_update_fast_llm") which runs in
+        each worker's main thread — blocking inference during the update,
+        identical concurrency to the HTTP path.  training_finished is handled
+        the same way via destroy_actor_update_group().
+        """
+        import threading
+
+        self._fast_llm_stop_event = threading.Event()
+        loop = asyncio.get_event_loop()
+
+        def monitor_redis_stream():
+            import redis
+
+            redis_client = redis.Redis(host=self._redis_host, port=self._redis_port)
+            # First weights_ready event since this vLLM process started is the
+            # initial broadcast (step can be 0 on fresh start or k>0 on resume).
+            # Actor is still blocked in wait_for_model_version at this point, so
+            # vLLM has zero in-flight requests — pause_generation would deadlock.
+            # Take the raw RPC path for the first event; wrap with pause/resume
+            # thereafter, matching PR #137's guard against mid-rollout weight swaps.
+            first_weights_ready_seen = False
+
+            logger.info("[FastLLM] Main-process Redis monitoring started")
+
+            try:
+                for event_type, version, step, documents_seen in read_fast_llm_events(
+                    redis_client, self._fast_llm_stop_event
+                ):
+                    if event_type == "weights_ready":
+                        if not first_weights_ready_seen:
+                            logger.info(
+                                f"[FastLLM] weights_ready step={step} documents_seen={documents_seen} "
+                                f"(initial broadcast — no pause wrap)"
+                            )
+                            coro = self.engine.engine_core.collective_rpc_async(
+                                "receive_weight_update_fast_llm", args=()
+                            )
+                            first_weights_ready_seen = True
+                        else:
+                            logger.info(
+                                f"[FastLLM] weights_ready step={step} documents_seen={documents_seen}, "
+                                f"dispatching to workers"
+                            )
+                            coro = self.receive_weight_update_fast_llm(version)
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(coro, loop)
+                            future.result()
+                            logger.info(f"[FastLLM] Weight update complete: step={step}")
+                        except Exception as e:
+                            logger.error(f"[FastLLM] Error receiving weight update: {e}")
+
+                    elif event_type == "training_finished":
+                        logger.info(
+                            "[FastLLM] training_finished received, destroying process group"
+                        )
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(
+                                self.destroy_actor_update_group(), loop
+                            )
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"[FastLLM] Error destroying process group: {e}")
+                        self._fast_llm_stop_event.set()
+            finally:
+                logger.info("[FastLLM] Main-process Redis monitoring stopped")
+                redis_client.close()
+
+        self._fast_llm_monitor_thread = threading.Thread(
+            target=monitor_redis_stream,
+            daemon=True,
+            name="FastLLMMonitor",
+        )
+        self._fast_llm_monitor_thread.start()
+        logger.info("[FastLLM] Main-process monitoring thread started")
+
+    async def stop_fast_llm_monitoring(self):
+        """Stop the main-process Fast-LLM monitoring thread."""
+        if not hasattr(self, "_fast_llm_stop_event"):
+            return
+        if not self._fast_llm_stop_event.is_set():
+            logger.warning("[FastLLM] training_finished was not received; forcing stop")
+            self._fast_llm_stop_event.set()
+        if hasattr(self, "_fast_llm_monitor_thread"):
+            self._fast_llm_monitor_thread.join(timeout=5)
+            logger.info("[FastLLM] Main-process monitoring thread stopped")
+
+    @staticmethod
+    @asynccontextmanager
+    async def create_engine(args: Any):
+        """Create a vLLM AsyncLLM engine wrapped in an EngineManager.
+
+        Async context manager yielding an ``EngineManager`` whose ``.engine`` and
+        ``.engine_config`` hold the ``AsyncLLM`` and its ``VllmConfig``. The engine is
+        left running on exit (server usage runs indefinitely).
+        """
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        engine_args.worker_extension_cls = "pipelinerl.vllm1.WorkerExtension"
+        engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
+
+        logger.info(f"Creating vLLM engine with model={args.model}")
+        engine = AsyncLLM.from_vllm_config(
+            vllm_config=engine_config,
+            usage_context=UsageContext.OPENAI_API_SERVER,
+            disable_log_stats=engine_args.disable_log_stats,
+            enable_log_requests=engine_args.enable_log_requests,
+        )
+
+        logger.info("vLLM engine created successfully")
+
+        assert isinstance(engine.engine_core, AsyncMPClient)
+        manager = EngineManager(args, engine, engine_config)
+        weight_update_mode = getattr(args, "weight_update_mode", "http")
+        try:
+            if not args.disable_weight_updates:
+                await manager.init_actor_update_group()
+
+                if weight_update_mode == "fast-llm":
+                    await manager.init_fast_llm_receiver()
+                    await manager.start_fast_llm_monitoring()
+                    logger.info("Fast-LLM weight update mode enabled")
+
+            yield manager
+        finally:
+            if not args.disable_weight_updates:
+                if weight_update_mode == "fast-llm":
+                    await manager.stop_fast_llm_monitoring()
+
+                if not await manager.is_actor_update_group_destroyed():
+                    logger.warning(
+                        "training_finished was not called before shutdown; "
+                        "NCCL process group was not destroyed — potential resource leak"
+                    )
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
@@ -219,65 +530,76 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
-    engine_args = AsyncEngineArgs.from_cli_args(args)
-    engine_args.worker_extension_cls = "pipelinerl.vllm1.WorkerExtension"
-    engine_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
-    engine = AsyncLLM.from_vllm_config(
-        vllm_config=engine_config,
-        usage_context=UsageContext.OPENAI_API_SERVER,
-        disable_log_stats=engine_args.disable_log_stats,
-        enable_log_requests=engine_args.enable_log_requests,
-    )
-    assert isinstance(engine.engine_core, AsyncMPClient)
+    async with EngineManager.create_engine(args) as manager:
+        # Run HTTP server
+        sock_addr = (args.host or "", args.port)
+        sock = create_server_socket(sock_addr)
+        # vLLM 0.18.1+ requires supported_tasks to build the app and app state;
+        # older vllm (e.g. 0.14.x) has 1-arg build_app / 3-arg init_app_state.
+        import inspect
+        _build_app_params = inspect.signature(build_app).parameters
+        if "supported_tasks" in _build_app_params and hasattr(manager.engine, "get_supported_tasks"):
+            supported_tasks = await manager.engine.get_supported_tasks()
+            logger.info(f"Supported tasks: {supported_tasks}")
+            app = build_app(args, supported_tasks)
+        else:
+            supported_tasks = None
+            app = build_app(args)
 
-    weight_update_manager = WeightUpdateManager(args, engine, engine.engine_core)
-    if not args.disable_weight_updates:
-        await weight_update_manager.input_process_groups()
+        # Register HTTP endpoint only if using HTTP mode
+        if getattr(args, "weight_update_mode", "http") == "http":
+            @app.post("/receive_weight_update")
+            async def _receive_weight_update(request: WeightUpdateRequest):
+                await manager.receive_weight_update(request)
+                return {"status": "ok"}
 
-    # Run HTTP server
-    sock_addr = (args.host or "", args.port)
-    sock = create_server_socket(sock_addr)
-    supported_tasks = await engine.get_supported_tasks()
-    logger.info(f"Supported tasks: {supported_tasks}")
-    app = build_app(args, supported_tasks)
+            @app.post("/training_finished")
+            async def _training_finished(background_tasks: BackgroundTasks):
+                logger.info("Received /training_finished, scheduling NCCL process group teardown")
+                background_tasks.add_task(manager.destroy_actor_update_group)
+                return {"status": "ok"}
 
-    @app.post("/receive_weight_update")
-    async def _receive_weight_update(request: WeightUpdateRequest):
-        # Blocking: wait for weight update to complete before returning
-        logger.info("Received weight update request")
-        await weight_update_manager.receive_weight_update(request)
-        return {"status": "ok"}
+            logger.info("HTTP weight update endpoint registered")
+        else:
+            logger.info("Fast-LLM mode: using Redis stream (no HTTP endpoint registered)")
 
-    await init_app_state(engine, app.state, args, supported_tasks)
-    shutdown_task = await serve_http(
-        app,
-        sock,
-        host=args.host,
-        port=args.port,
-        log_level=args.uvicorn_log_level,
-        # increase timeout
-        timeout_keep_alive=60,
-        ssl_keyfile=args.ssl_keyfile,
-        ssl_certfile=args.ssl_certfile,
-        ssl_ca_certs=args.ssl_ca_certs,
-        ssl_cert_reqs=args.ssl_cert_reqs,
-        **uvicorn_kwargs,
-    )
+        if "supported_tasks" in inspect.signature(init_app_state).parameters:
+            await init_app_state(manager.engine, app.state, args, supported_tasks)
+        else:
+            await init_app_state(manager.engine, app.state, args)
+        shutdown_task = await serve_http(
+            app,
+            sock,
+            host=args.host,
+            port=args.port,
+            log_level=args.uvicorn_log_level,
+            # increase timeout
+            timeout_keep_alive=60,
+            ssl_keyfile=args.ssl_keyfile,
+            ssl_certfile=args.ssl_certfile,
+            ssl_ca_certs=args.ssl_ca_certs,
+            ssl_cert_reqs=args.ssl_cert_reqs,
+            **uvicorn_kwargs,
+        )
 
-    # NB: Await server shutdown only after the backend context is exited
-    await shutdown_task
+        # NB: Await server shutdown only after the backend context is exited
+        await shutdown_task
 
-    # Cleanup
-    if not args.disable_weight_updates:
-        await weight_update_manager.close_communicator()
-    sock.close()
+        sock.close()
+
+        # NOTE: weight-broadcast process group teardown must be coordinated with the trainer —
+        # the trainer sends training_finished, then the engine manager destroys its side here.
 
 
 def run_llm():
-    parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
+    parser = FlexibleArgumentParser(
+        description="vLLM OpenAI-Compatible RESTful API server."
+    )
     parser = make_arg_parser(parser)
     parser.add_argument(
-        "--disable-weight-updates", action="store_true", help="Whether to receive weight updates from the trainer"
+        "--disable-weight-updates",
+        action="store_true",
+        help="Whether to receive weight updates from the trainer",
     )
     parser.add_argument(
         "--actor-llm-idx",
@@ -290,6 +612,25 @@ def run_llm():
     parser.add_argument(
         "--weight-update-group-world-size",
         type=int,
+    )
+    parser.add_argument(
+        "--weight-update-mode",
+        type=str,
+        choices=["http", "fast-llm"],
+        default="http",
+        help="Weight update protocol: 'http' (HTTP POST) or 'fast-llm' (Redis+broadcast)",
+    )
+    parser.add_argument(
+        "--redis-host",
+        type=str,
+        default="localhost",
+        help="Redis host for Fast-LLM mode",
+    )
+    parser.add_argument(
+        "--redis-port",
+        type=int,
+        default=6379,
+        help="Redis port for Fast-LLM mode",
     )
     args = parser.parse_args()
     validate_parsed_serve_args(args)

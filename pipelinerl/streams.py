@@ -192,6 +192,35 @@ class RedisStreamReader(StreamReader):
                 yield pickle.loads(entry[b"data"])
 
 
+_REDIS_STREAM_MAXLEN = 1_000_000
+
+
+class RedisSharedStreamWriter(StreamWriter):
+    """Redis writer that supports multiple producers appending to a single stream."""
+
+    def __init__(
+        self,
+        stream: SingleStreamSpec,
+        *,
+        stream_name_override: str | None = None,
+    ):
+        self.stream = stream
+        assert isinstance(_backend, RedisConfig)
+        self._redis = connect_to_redis(_backend)
+        self._stream_name = stream_name_override if stream_name_override is not None else str(self.stream)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._redis.close()
+
+    def write(self, data, partition: int | None = None):
+        # partition is ignored: all producers fan in to one stream and Fast-LLM shards downstream.
+        serialized = _serialize_with_orjson(data)
+        self._redis.xadd(self._stream_name, {"data": serialized}, maxlen=_REDIS_STREAM_MAXLEN, approximate=True)
+
+
 class RoundRobinRedisStreamWriter(StreamWriter):
     # TODO: share the connection across writers
 
@@ -246,6 +275,32 @@ def stream_file(stream_dir: Path, shard_id: int) -> Path:
 StreamSpec = SingleStreamSpec | StreamRangeSpec
 
 
+def _to_json_ready(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+
+    if isinstance(value, numpy.ndarray):
+        return value
+
+    if isinstance(value, numpy.generic):
+        return value.item()
+
+    if isinstance(value, dict):
+        return {key: _to_json_ready(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_to_json_ready(item) for item in value]
+
+    return value
+
+
+def _serialize_with_orjson(data: Any) -> bytes:
+    return orjson.dumps(_to_json_ready(data), option=orjson.OPT_SERIALIZE_NUMPY)
+
+
 class FileStreamWriter(StreamWriter):
     def __init__(self, stream: SingleStreamSpec, mode: Literal["w", "a"] = "a"):
         self.stream = stream
@@ -266,13 +321,8 @@ class FileStreamWriter(StreamWriter):
         if partition is not None:
             raise ValueError()
         # Textual streams are so useful, that we try hard to jsonify the given object.
-        if isinstance(data, BaseModel):
-            data_dict = data.model_dump()
-            for key, value in data_dict.items():
-                if isinstance(value, torch.Tensor):
-                    data_dict[key] = value.numpy()
-            data = data_dict
-        self._file.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY).decode("utf-8"))
+        payload = _serialize_with_orjson(data)
+        self._file.write(payload.decode("utf-8"))
         self._file.write("\n")
         self._file.flush()
 
@@ -400,19 +450,38 @@ def read_stream(stream: SingleStreamSpec) -> StreamReader:
         assert False
 
 
-def write_to_streams(streams: StreamSpec, mode: Literal["w", "a"] = "a") -> StreamWriter:
-    """Append to the end of the stream."""
+def write_to_streams(
+    streams: StreamSpec,
+    mode: Literal["w", "a"] = "a",
+    *,
+    shared: bool = False,
+    stream_name_override: str | None = None,
+) -> StreamWriter:
+    """Append to the end of the stream.
+
+    Set ``shared`` to True when multiple producers must append to the same Redis
+    stream and Fast-LLM will perform downstream sharding.
+
+    ``stream_name_override`` bypasses the stream spec naming and writes directly
+    to the given Redis key. Only supported for shared Redis streams.
+    """
     raise_if_backend_not_set()
     if not isinstance(streams, (SingleStreamSpec, StreamRangeSpec)):
         raise ValueError(f"Invalid stream spec: {streams}")
     if isinstance(_backend, RedisConfig):
         if isinstance(streams, SingleStreamSpec):
+            if shared:
+                return RedisSharedStreamWriter(streams, stream_name_override=stream_name_override)
             return RedisStreamWriter(streams, mode)
         elif isinstance(streams, StreamRangeSpec):
+            if shared:
+                raise ValueError("Shared Redis streams only support SingleStreamSpec inputs")
             return RoundRobinRedisStreamWriter(streams, mode)
         else:
             assert False
     elif _backend == "files":
+        if shared:
+            raise ValueError("Shared stream mode is only supported with the Redis backend")
         if isinstance(streams, SingleStreamSpec):
             return FileStreamWriter(streams, mode)
         elif isinstance(streams, StreamRangeSpec):

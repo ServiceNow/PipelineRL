@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -84,9 +85,15 @@ def validate_config(cfg: DictConfig):
             raise ValueError("value_loss_coef must be greater than 0 when using causal-language-modeling-with-value-head")
 
     # Check that model being tuned to the max length accepted by inference
-    if cfg.finetune.seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
+    if cfg.use_fast_llm:
+        max_seq_length = cfg.fast_llm.data.micro_batch_size
+        seq_length_label = "fast_llm.data.micro_batch_size"
+    else:
+        max_seq_length = cfg.finetune.seq_length
+        seq_length_label = "finetune.seq_length"
+    if max_seq_length < cfg.vllm_config.vllm_kwargs.max_model_len:
         raise ValueError(
-            f"seq_length {cfg.finetune.seq_length} must be greater than or equal to "
+            f"{seq_length_label} {max_seq_length} must be greater than or equal to "
             f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
         )
 
@@ -238,8 +245,19 @@ def run_actor_llm(
     if kwargs:
         _append_vllm_kwargs(cmd, kwargs)
 
-    if cfg.debug.mode:
+    if cfg.debug.mode or not cfg.weight_broadcast:
         cmd.append("--disable-weight-updates")
+
+    # Always tell the vLLM actor server which weight-update protocol to use,
+    # so its conditional init takes the right branch (HTTP vs fast-llm broadcast).
+    if cfg.use_fast_llm:
+        cmd += [
+            "--weight-update-mode", "fast-llm",
+            "--redis-host", cfg.streams.host,
+            "--redis-port", str(cfg.streams.port),
+        ]
+    else:
+        cmd += ["--weight-update-mode", "http"]
 
     gpu_str = ",".join([str(gpu) for gpu in gpus])
     logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
@@ -317,6 +335,20 @@ def run_environment(cfg: DictConfig, job: Job):
 
 
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
+    if cfg.use_fast_llm:
+        yield from _run_finetune_fast_llm(cfg, world_map, gpus, exp_dir)
+    else:
+        yield from _run_finetune_deepspeed(cfg, world_map, gpus, exp_dir)
+
+
+def _node_suffix(world_map: WorldMap) -> str:
+    """Per-node filename suffix, empty unless finetuning spans multiple nodes."""
+    finetune_nodes = world_map.nodes_with_finetuning()
+    finetune_rank = world_map.my_finetuning_rank()
+    return f"_node{finetune_rank}" if len(finetune_nodes) > 1 else ""
+
+
+def _run_finetune_deepspeed(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
     if cfg.use_fsdp and cfg.use_deepspeed:
         raise ValueError("Cannot use both FSDP and DeepSpeed")
     cmd = [
@@ -325,10 +357,10 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         "accelerate.commands.launch",
     ]
     if world_map.world_size > 1:
-        # DeepSpeed multi-node args
         assert cfg.use_deepspeed
-        assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-        hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+        # Use original DNS names (pod IP exchange may have replaced address_map with IPs).
+        dns_map = world_map.dns_address_map
+        hosts = [dns_map[i] for i in range(world_map.world_size)]
         filter_parts = []
         for rank, job_list in world_map.job_map.items():
             for job in job_list:
@@ -336,34 +368,23 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
                     filter_parts.append(f"{hosts[rank]}:{','.join(map(str, job.gpus))}")
         deepspeed_include_filter = "@".join(filter_parts)
         logger.info(f"Deepspeed include filter: {deepspeed_include_filter}")
-        # Orchestrator rank must have already created hostfile.txt
         hostfile_path = str(exp_dir / "hostfile.txt")
         cmd += [
-            "--num_machines",
-            str(len(world_map.nodes_with_finetuning())),
-            "--machine_rank",
-            str(world_map.my_finetuning_rank()),
-            "--main_process_ip",
-            str(os.environ.get("MASTER_ADDR")),
-            "--main_process_port",
-            str(os.environ.get("MASTER_PORT")),
-            "--deepspeed_hostfile",
-            hostfile_path,
-            "--deepspeed_inclusion_filter",
-            deepspeed_include_filter,
-            "--deepspeed_multinode_launcher",
-            "nossh"
+            "--num_machines", str(len(world_map.nodes_with_finetuning())),
+            "--machine_rank", str(world_map.my_finetuning_rank()),
+            "--main_process_ip", str(os.environ.get("MASTER_ADDR")),
+            "--main_process_port", str(os.environ.get("MASTER_PORT")),
+            "--deepspeed_hostfile", hostfile_path,
+            "--deepspeed_inclusion_filter", deepspeed_include_filter,
+            "--deepspeed_multinode_launcher", "nossh",
         ]
-    # get path to this file
     this_file_path = Path(os.path.dirname(os.path.abspath(__file__)))
     if cfg.use_deepspeed:
-        # DeepSpeed single-node args
         cmd += [
             "--use_deepspeed",
             "--deepspeed_config_file",
             str(this_file_path / f"../conf/deepspeed/{cfg.deepspeed_config}.json"),
         ]
-    # DeepSpeed and non-DeepSpeed args
     accelerate_config = cfg.accelerate_config
     if accelerate_config is None:
         if cfg.use_deepspeed:
@@ -375,27 +396,18 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     cmd += [
         "--config_file",
         str(this_file_path / f"../conf/accelerate/{accelerate_config}.yaml"),
-        "--rdzv_backend",
-        "c10d",
+        "--rdzv_backend", "c10d",
     ]
     if gpus:
         gpus_str = str(",".join([str(gpu) for gpu in gpus])) if len(gpus) < world_map.node_size else "all"
-        cmd += [
-            "--gpu-ids",
-            gpus_str,
-        ]
+        cmd += ["--gpu-ids", gpus_str]
     cmd += [
-        "--num_processes",
-        str(world_map.total_finetune_gpus),
-        "pipelinerl/entrypoints/run_finetune.py",
-        "--config-dir",
-        f"{exp_dir}/conf",
-        "--config-name",
-        "exp_config",
+        "--num_processes", str(world_map.total_finetune_gpus),
+        str(this_file_path / "entrypoints/run_finetune.py"),
+        "--config-dir", f"{exp_dir}/conf",
+        "--config-name", "exp_config",
         f"output_dir={exp_dir}",
         f"hydra.run.dir={exp_dir}/finetune",
-        # TODO: figure out why we can't build WorldMap in run_finetune.py
-        # Current workaround: pass the essential information as follows:
         f"+me.weight_update_group_init_method=tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
         f"+me.weight_update_group_world_size={world_map.weight_update_group_size}",
         f"+me.llm_urls={'+'.join(world_map.get_actor_urls())}",
@@ -403,11 +415,111 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     if cfg.debug.mode in ["finetune", "open_loop", "finetune+preprocessor"]:
         cmd.append("finetune.send_weight_updates=False")
 
-    logger.info(f"Running finetune with command: {' '.join(cmd)}")
-    save_command(exp_dir / "finetune", cmd)
+    node_suffix = _node_suffix(world_map)
+
+    logger.info(f"Running DeepSpeed finetune with command: {' '.join(cmd)}")
+    save_command(exp_dir / "finetune", cmd, suffix=node_suffix)
     env = dict(os.environ)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
     proc = _popen(cmd, env=env)
+    if proc is not None:
+        yield LaunchedProcess(kind="finetune", handle=proc)
+
+
+def _run_finetune_fast_llm(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
+    save_dir = exp_dir / "finetune"
+    os.makedirs(save_dir, exist_ok=True)
+
+    if not os.path.isdir(cfg.model_path):
+        raise ValueError(
+            f"fast-llm requires a local model path but got: {cfg.model_path!r}. "
+            "Download the model first and set model_path to its local directory."
+        )
+
+    # Callbacks (weight-broadcast streaming) are only meaningful when broadcasting outside debug mode.
+    include_callbacks = cfg.weight_broadcast and not bool(cfg.debug.mode)
+
+    # Build fast-llm config, stripping callbacks when they aren't used.
+    fast_llm_cfg = OmegaConf.to_container(cfg.fast_llm, resolve=True, throw_on_missing=False)
+    if not include_callbacks:
+        fast_llm_cfg.pop("callbacks", None)
+
+    # Derive experiment name for wandb: use the explicit run name (so the finetune run groups with
+    # the actor/preprocess runs, which init_wandb names `{wandb_name}/{component}`), falling back to
+    # the save_dir path relative to workspace root when no run name is set.
+    root = cfg.wandb.wandb_workspace_root
+    save_dir_str = str(save_dir)
+    if cfg.wandb.wandb_name:
+        experiment_name = f"{cfg.wandb.wandb_name}/finetune"
+    else:
+        experiment_name = save_dir_str[len(root) + 1:] if root and save_dir_str.startswith(root + "/") else save_dir.name
+
+    # Fill in all dynamic values so the saved config is fully functional.
+    fast_llm_cfg["pretrained"]["path"] = cfg.model_path
+    fast_llm_cfg["run"]["experiment_dir"] = str(save_dir)
+    fast_llm_cfg["run"]["experiment_name"] = experiment_name
+    fast_llm_cfg["data"]["datasets"]["training"]["host"] = cfg.streams.host
+    fast_llm_cfg["data"]["datasets"]["training"]["port"] = cfg.streams.port
+    fast_llm_cfg["training"]["wandb"]["entity_name"] = cfg.wandb.wandb_entity_name
+    fast_llm_cfg["training"]["wandb"]["project_name"] = cfg.wandb.wandb_project_name
+    fast_llm_cfg["training"]["wandb"]["group_name"] = cfg.wandb.wandb_group
+    if include_callbacks:
+        fast_llm_cfg["callbacks"]["streaming"]["host"] = cfg.streams.host
+        fast_llm_cfg["callbacks"]["streaming"]["port"] = cfg.streams.port
+        # fast-llm runs on node 0 (same node as the TCPStore server); use localhost
+        # to avoid DNS self-resolution issues.  vLLM (on node 1) uses master_addr.
+        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["host"] = "localhost"
+        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["port"] = cfg.world.actor_group_port
+        fast_llm_cfg["callbacks"]["streaming"]["broadcast"]["external_world_size"] = world_map.weight_update_group_size - 1
+
+    # Use per-node suffixes for all output files to avoid NFS write races when multiple
+    # finetune nodes share the same experiment directory.
+    model_type = cfg.fast_llm_finetune.model_type
+    torchrun_port = cfg.fast_llm_finetune.torchrun_port
+    finetune_nodes = world_map.nodes_with_finetuning()
+    node_suffix = _node_suffix(world_map)
+
+    config_path = save_dir / f"fast_llm_config{node_suffix}.yaml"
+    OmegaConf.save(OmegaConf.create(fast_llm_cfg), config_path)
+
+    if len(finetune_nodes) > 1:
+        finetune_master = world_map.address_map[finetune_nodes[0]]
+        finetune_rank = world_map.my_finetuning_rank()
+        torchrun_args = [
+            f"--nproc_per_node={len(gpus)}",
+            f"--nnodes={len(finetune_nodes)}",
+            f"--node_rank={finetune_rank}",
+            "--rdzv_backend=static",
+            "--rdzv_id=0",
+            f"--rdzv_endpoint={finetune_master}:{torchrun_port}",
+            "--rdzv_conf=timeout=3600",
+            "--max_restarts=0",
+        ]
+    else:
+        torchrun_args = [
+            f"--nproc_per_node={len(gpus)}",
+            f"--master_port={torchrun_port}",
+        ]
+    cmd = [
+        "torchrun",
+        *torchrun_args,
+        "--no_python",
+        str(Path(sys.executable).parent / "fast-llm"),
+        "train",
+        model_type,
+        "--config",
+        str(config_path),
+    ]
+
+    logger.info(f"Running finetune with command: {' '.join(cmd)}")
+    save_command(save_dir, cmd, suffix=node_suffix)
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = "42"
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
+    log_file_path = save_dir / f"stdout{node_suffix}.log"
+    err_file_path = save_dir / f"stderr{node_suffix}.log"
+    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
+        proc = _popen(cmd, env=env, stdout=log_file, stderr=err_file)
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
 
@@ -468,9 +580,9 @@ def run_redis(cfg: DictConfig):
         yield LaunchedProcess(kind="redis", handle=proc)
 
 
-def save_command(script_dir: Path, cmd):
+def save_command(script_dir: Path, cmd, suffix: str = ""):
     os.makedirs(script_dir, exist_ok=True)
-    script_path = script_dir / "start.sh"
+    script_path = script_dir / f"start{suffix}.sh"
     with open(script_path, "w") as f:
         f.write("#!/bin/bash\n")
         # Properly quote arguments for the shell script
@@ -489,7 +601,6 @@ def clean_up(exp_dir, force_restart):
             os.remove(f"{exp_dir}/streams")
     if os.path.exists(f"{exp_dir}/dump.rdb"):
         os.remove(f"{exp_dir}/dump.rdb")
-
     if force_restart:
         if os.path.exists(f"{exp_dir}/finetune"):
             logger.info("Cleaning up finetune directory")
@@ -507,9 +618,13 @@ def is_inference_process(proc: LaunchedProcess) -> bool:
     return proc.kind in {"actor_llm", "preprocessor_llm"}
 
 
-def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False):
+def is_finetune_process(proc: LaunchedProcess) -> bool:
+    return proc.kind == "finetune"
+
+
+def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False, use_fast_llm: bool = False, weight_broadcast: bool = True):
     if not debug_mode:
-        trainer_state = TrainerState(exp_path)
+        trainer_state = TrainerState(exp_path, use_fast_llm=use_fast_llm, weight_broadcast=weight_broadcast)
         trainer_state.start_listening()
     else:
         trainer_state = None
@@ -521,6 +636,23 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
         for proc in processes:
             logger.info(f"Terminating {proc.handle.args}")
             terminate_with_children(proc.handle.pid)
+
+    def stop_alive_processes(alive: List[LaunchedProcess], reason: str):
+        logger.info(f"{reason}; stopping remaining {len(alive)} process(es): {[proc.kind for proc in alive]}")
+        for proc in list(alive):
+            logger.info(f"Terminating {proc.kind} process {proc.handle.args}")
+            terminate_with_children(proc.handle.pid)
+        for proc in list(alive):
+            proc.handle.wait()
+            logger.info(f"{proc.kind} process {proc.handle.args} stopped")
+            alive.remove(proc)
+
+    def wait_for_training_done_signal():
+        logger.info(
+            "Waiting for training completion signal "
+            f"(training_done={trainer_state.training_done})"
+        )
+        trainer_state.wait_for_training_done(timeout=5.0)
 
     logger.info("I have launched everyone, waiting for them to finish...")
 
@@ -543,21 +675,14 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                     sys.exit(1)
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
-            if alive and all(is_inference_process(proc) for proc in alive):
-                # shut down inference servers after training is complete
-                if trainer_state is not None and not trainer_state.training_done:
-                    # check if training is completed
-                    logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
-                    trainer_state.wait_for_training_done(timeout=5.0)
+            if alive and trainer_state is not None and not any(is_finetune_process(proc) for proc in alive):
+                if not trainer_state.training_done:
+                    wait_for_training_done_signal()
                     continue
-                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} inference server(s)")
-                for proc in list(alive):
-                    logger.info(f"Terminating inference server {proc.handle.args}")
-                    terminate_with_children(proc.handle.pid)
-                for proc in list(alive):
-                    proc.handle.wait()
-                    logger.info(f"Inference server {proc.handle.args} stopped")
-                    alive.remove(proc)
+                stop_alive_processes(alive, "Trainer completion detected")
+            elif alive and all(is_inference_process(proc) for proc in alive):
+                # shut down inference servers after training is complete
+                stop_alive_processes(alive, "Trainer completion detected")
             # TODO: make the watcdog code below more stable
             # if (trainer_state is not None
             #     and (version := trainer_state.propagated_weight_version is not None)
@@ -626,6 +751,80 @@ def setup_logging(log_file: Path):
     logger.info("Logging setup complete")
 
 
+def _get_pod_ip() -> str:
+    """Return this pod's primary IP (bypasses Kubernetes Service kube-proxy)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+def _exchange_pod_ips(world_map: WorldMap, exp_dir: Path, run_id: str) -> None:
+    """Exchange pod IPs across replicas via the shared NFS mount.
+
+    Kubernetes Services only expose the declared master port; all other ports
+    (Redis, vLLM HTTP, TCPStore) are silently dropped for Service ClusterIPs.
+    Using pod IPs bypasses kube-proxy and gives full port access.
+
+    After the exchange, all Job.url and Job.hostname fields are updated to use
+    pod IPs so every cross-node HTTP/TCP connection bypasses the Service.
+    """
+    # Save DNS names before overwriting so DeepSpeed hostfile can use them.
+    world_map.dns_address_map = dict(world_map.address_map)
+
+    ip_dir = exp_dir / ".pod_ips" / run_id
+    my_ip = _get_pod_ip()
+
+    if world_map.my_rank == 0:
+        if ip_dir.exists():
+            raise RuntimeError(
+                f"Pod IP exchange directory already exists for run_id={run_id!r}. "
+                "world.run_id must be unique per job run."
+            )
+        ip_dir.mkdir(parents=True)
+    else:
+        waited = 0
+        while not ip_dir.exists():
+            time.sleep(0.5)
+            waited += 0.5
+            if waited % 10 == 0:
+                logger.info(f"Waiting for rank 0 to create pod IP dir ({waited:.0f}s)...")
+
+    ip_file = ip_dir / f"rank_{world_map.my_rank}.txt"
+    ip_file.write_text(my_ip)
+    logger.info(f"Pod IP exchange: rank {world_map.my_rank} pod IP = {my_ip}")
+
+    pod_ips = {}
+    for rank in range(world_map.world_size):
+        peer_file = ip_dir / f"rank_{rank}.txt"
+        waited = 0
+        while not peer_file.exists():
+            time.sleep(0.5)
+            waited += 0.5
+            if waited % 10 == 0:
+                logger.info(f"Waiting for pod IP from rank {rank} ({waited:.0f}s)...")
+        pod_ip = peer_file.read_text().strip()
+        pod_ips[rank] = pod_ip
+        world_map.address_map[rank] = pod_ip
+        logger.info(f"Pod IP exchange: rank {rank} → {pod_ip}")
+
+    world_map.master_addr = pod_ips[0]
+    logger.info(f"Updated master_addr to pod IP: {world_map.master_addr}")
+
+    # Update all Job URLs and hostnames to pod IPs so cross-node connections
+    # bypass the Kubernetes Service (which only exposes declared ports).
+    for node, jobs in world_map.job_map.items():
+        pod_ip = pod_ips[node]
+        dns_name = world_map.dns_address_map[node]
+        for job in jobs:
+            job.hostname = pod_ip
+            if job.url:
+                job.url = job.url.replace(dns_name, pod_ip)
+    logger.info("Updated all job URLs to pod IPs for direct pod-to-pod connectivity.")
+
+
 @hydra.main(
     config_path="../conf/",
     config_name="base",
@@ -641,6 +840,18 @@ def main(cfg: DictConfig):
     log_file = exp_dir / "launcher" / f"launcher_{os.environ.get('RANK', 0)}.log"
     setup_logging(log_file)
     world_map = WorldMap(cfg, verbose=True)
+
+    # In multi-node EAI jobs the `dns-<uuid>-<rank>` names are Kubernetes Services
+    # that expose only the declared master port.  Connecting to those Service IPs
+    # on any other port (Redis, vLLM HTTP, TCPStore) gets SYN-dropped by kube-proxy.
+    # Pod IPs bypass kube-proxy and have all ports open, so we exchange pod IPs via
+    # a shared NFS file and update address_map before any TCP connections are made.
+    if world_map.world_size > 1:
+        run_id = cfg.world.get("run_id")
+        if not run_id:
+            raise ValueError("world.run_id must be set for multi-node jobs (use a unique value per job run)")
+        _exchange_pod_ips(world_map, exp_dir, run_id)
+
     cfg.jobs = [job.model_dump() for job in world_map.get_all_jobs()]
 
     group = str(exp_dir)
@@ -660,7 +871,15 @@ def main(cfg: DictConfig):
             )
             cfg.finetune.gradient_accumulation_passes = new_accum_passes
     if cfg.streams.backend == "redis":
-        cfg.streams.host = world_map.master_addr
+        if world_map.world_size > 1:
+            # Multi-node: use the pod IP of rank 0 (world_map.master_addr after pod IP
+            # exchange).  Pod-to-pod connections are unrestricted on all ports, so rank 0
+            # can reach its own Redis via its pod IP, and rank 1 via the cross-node pod IP.
+            # Using the pod IP (not localhost or a DNS name) also ensures the saved
+            # exp_config.yaml has a reachable address for DeepSpeed workers on node 1.
+            cfg.streams.host = world_map.master_addr
+        else:
+            cfg.streams.host = "localhost"
     set_streams_backend(**cfg.streams)
 
     processes = []
@@ -678,8 +897,9 @@ def main(cfg: DictConfig):
             redis.flushall()
 
         if world_map.world_size > 1:
-            assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
-            hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
+            # Use original DNS names (pod IP exchange may have replaced address_map with IPs).
+            dns_map = world_map.dns_address_map
+            hosts = [dns_map[i] for i in range(world_map.world_size)]
             hostfile_lines = [f"{host} slots=8" for host in hosts]
             deepspeed_hostfile_content = "\n".join(hostfile_lines)
             hostfile_path = str(exp_dir / "hostfile.txt")
@@ -702,6 +922,30 @@ def main(cfg: DictConfig):
                 raise ValueError(f"Expected {init_msg}, got {msg}")
         logger.info(f"Orchestrator {world_map.my_rank} heard that the exp folder is ready.")
 
+    # Pre-create the broadcast rendezvous TCPStore on actor_group_port so that
+    # fast-llm (launched via torchrun) can connect as a client.  Torchrun sets
+    # TORCHELASTIC_USE_AGENT_STORE=True which makes PyTorch treat ALL ranks as
+    # clients in _create_c10d_store; without a pre-existing server the port is
+    # never opened and both fast-llm and vLLM hang forever.  Only the master
+    # node (my_rank == 0) hosts the server; vLLM workers connect via master_addr.
+    # Keep this handle bound for the lifetime of main(): dropping it would
+    # garbage-collect the TCPStore and close the server socket.
+    broadcast_store = None
+    if cfg.use_fast_llm and cfg.weight_broadcast and world_map.my_rank == 0:
+        from torch.distributed import TCPStore
+        broadcast_store = TCPStore(
+            host_name="0.0.0.0",
+            port=cfg.world.actor_group_port,
+            world_size=world_map.weight_update_group_size,
+            is_master=True,
+            wait_for_workers=False,
+        )
+        logger.info(
+            f"Broadcast TCPStore server started on "
+            f"{world_map.master_addr}:{cfg.world.actor_group_port} "
+            f"(world_size={world_map.weight_update_group_size})"
+        )
+
     if cfg.debug.mode == "finetune":
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
     elif cfg.debug.mode == "actor":
@@ -720,7 +964,7 @@ def main(cfg: DictConfig):
     if os.environ.get("DRY_RUN", "0") == "1":
         assert not processes
         return
-    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode))
+    watch_processes_running(exp_dir, processes, bool(cfg.debug.mode), cfg.use_fast_llm, cfg.weight_broadcast)
 
 
 if __name__ == "__main__":

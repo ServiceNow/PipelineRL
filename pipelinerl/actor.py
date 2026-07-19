@@ -155,10 +155,7 @@ async def schedule_rollouts(
     retry_max_delay_s = float(getattr(cfg.actor, "rollout_retry_max_delay_s", 30.0))
 
     def is_trainer_finished() -> bool:
-        return (
-            trainer_state.samples_processed is not None
-            and trainer_state.samples_processed >= samples_target
-        )
+        return trainer_state.is_finished(samples_target)
 
     def handle_rollout_exception(exc: Exception):
         if isinstance(exc, retryable_rollout_exceptions) and is_trainer_finished():
@@ -318,7 +315,7 @@ def rollout_maker_entrypoint(
     llms: list[TrainableLLM],
     scheduler_name: str,
 ):
-    trainer_state = TrainerState(Path(cfg.output_dir))
+    trainer_state = TrainerState(Path(cfg.output_dir), use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode:
         trainer_state.propagated_weight_version = 0
     else:
@@ -558,6 +555,8 @@ class ActorLoop:
             can_submit_before_update = math.inf
 
         logger.info(f"Start {'train' if self.is_training else 'test'} actor loop")
+        final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
+        samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
         with (
             write_to_streams(self.data_stream, "a") as data_stream_writer,
             write_to_streams(self.stats_stream, "a") as stats_writer,
@@ -566,9 +565,7 @@ class ActorLoop:
                 # the user function must do next(...) to run each iteration
                 yield
 
-                final_steps = calculate_train_steps(self.cfg.finetune, self.cfg.finetune.interrupt_train_steps)
-                samples_target = final_steps * self.cfg.finetune.train_batch_size * self.cfg.finetune.gradient_accumulation_passes
-                if self.trainer_state.samples_processed is not None and self.trainer_state.samples_processed >= samples_target:
+                if self.trainer_state.is_finished(samples_target):
                     logger.info("Trainer signalled completion; stopping actor loop")
                     break
 
@@ -687,7 +684,7 @@ class ActorLoop:
                 time_to_publish_train_stats = (
                     self.is_training
                     and trainer_version_to_publish is not None
-                ) or self.debug_mode 
+                ) or self.debug_mode
                 time_to_publish_test_stats = finished_groups == expected_rollouts
 
                 # Publish stats at every new model version or if all tapes are finished
@@ -698,20 +695,19 @@ class ActorLoop:
                             "problem_queue_size": self.problem_queue.qsize(),
                             "result_queue_size": self.result_queue.qsize(),
                             "finished_groups": finished_groups,
-                            "trainer_model_version": trainer_version_to_publish, 
+                            "trainer_model_version": trainer_version_to_publish,
                             "time_since_start": time.time() - loop_start_time,
                         }
                         trainer_version_to_publish = None
                     else:
                         loop_stats = {
-                            "trainer_model_version": last_trainer_version
+                            "trainer_model_version": last_trainer_version,
                             }
 
                     self.publish_stats(
                         stats_writer=stats_writer,
                         loop_stats=loop_stats,
                     )
-
 
                 if finished_groups == expected_rollouts:
                     logger.info(f"Finished {expected_rollouts} rollouts, stopping actor loop")
@@ -866,7 +862,7 @@ def run_actor_loop(cfg: DictConfig):
 
     wait_for_inference_servers(llm_urls)
     wait_for_environments(cfg)
-    trainer_state = TrainerState(exp_path)
+    trainer_state = TrainerState(exp_path, use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode:
         trainer_state.debug_mode_init()
     else:

@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+import typing
 from pathlib import Path
 
 from pydantic import TypeAdapter
@@ -14,14 +15,73 @@ from pipelinerl.finetune_loop import (
 )
 from pipelinerl.streams import SingleStreamSpec, read_stream
 
+if typing.TYPE_CHECKING:
+    import redis
+
 logger = logging.getLogger(__name__)
+
+# Fast-LLM event stream name (must match fast-llm config events.redis.stream_key)
+FAST_LLM_EVENTS_STREAM = "fast_llm_events"
+# Redis field holding the serialized event payload.
+FAST_LLM_EVENT_PAYLOAD_KEY = b"event"
+
+
+def fast_llm_event_version(event: dict) -> int | None:
+    """Model version carried by a Fast-LLM event: the cumulative document count
+    (``documents_seen``) when present, to align staleness with the trainer's document
+    clock, else the raw optimizer ``step`` (older trainers that only send the step)."""
+    documents_seen = event.get("documents_seen")
+    return documents_seen if documents_seen is not None else event.get("step")
+
+
+def read_fast_llm_events(
+    redis_client: "redis.Redis", stop_event: threading.Event | None = None
+) -> typing.Iterator[tuple[str | None, int | None, int | None, int | None]]:
+    """Yield ``(event_type, version, step, documents_seen)`` for each event on the
+    Fast-LLM Redis stream, until ``stop_event`` is set (indefinitely if it is ``None``).
+    Transient read failures are retried; malformed messages are skipped."""
+    import orjson
+
+    last_id = "0-0"
+    while stop_event is None or not stop_event.is_set():
+        try:
+            result = redis_client.xread({FAST_LLM_EVENTS_STREAM: last_id}, count=1, block=1000)
+        except Exception as e:
+            logger.error(f"Failed to read Fast-LLM events: {e}")
+            if stop_event is not None and stop_event.is_set():
+                break
+            time.sleep(1)
+            continue
+        if not result:
+            continue
+        for _stream_name, messages in result:
+            for message_id, message_data in messages:
+                last_id = message_id
+                if FAST_LLM_EVENT_PAYLOAD_KEY not in message_data:
+                    logger.warning(
+                        f"Fast-LLM event missing '{FAST_LLM_EVENT_PAYLOAD_KEY.decode()}' field: {message_data}"
+                    )
+                    continue
+                try:
+                    event = orjson.loads(message_data[FAST_LLM_EVENT_PAYLOAD_KEY])
+                except Exception as e:
+                    logger.error(f"Failed to parse Fast-LLM event: {e}")
+                    continue
+                yield (
+                    event.get("type"),
+                    fast_llm_event_version(event),
+                    event.get("step"),
+                    event.get("documents_seen"),
+                )
 
 
 class TrainerState:
-    def __init__(self, exp_path: Path):
+    def __init__(self, exp_path: Path, use_fast_llm: bool = False, weight_broadcast: bool = True):
         self.exp_path = exp_path
-        self.propagated_weight_version: int | None = None
-        self.samples_processed: int | None = None
+        self.use_fast_llm = use_fast_llm
+        self.weight_broadcast = weight_broadcast
+        self.propagated_weight_version: int | None = None if weight_broadcast else 0
+        self.samples_processed: int | None = None if weight_broadcast else 0
         self.training_done: bool = False
         self._training_done_event = threading.Event()
 
@@ -32,6 +92,13 @@ class TrainerState:
         self._training_done_event.set()
 
     def start_listening(self):
+        if self.use_fast_llm:
+            self._start_listening_fast_llm()
+        else:
+            self._start_listening_legacy()
+
+    def _start_listening_legacy(self):
+        """Listen to legacy PipelineRL trainer messages."""
         stream = SingleStreamSpec(exp_path=self.exp_path, topic=TRAINER_TOPIC)
 
         def listen():
@@ -49,6 +116,65 @@ class TrainerState:
         self._thread = threading.Thread(target=listen, daemon=True)
         self._thread.start()
 
+    def _start_listening_fast_llm(self):
+        """Listen to Fast-LLM trainer events directly from Redis."""
+        from pipelinerl.streams import RedisConfig, _backend, connect_to_redis
+
+        from fast_llm.data.dataset.config import REDIS_DATA_STREAM, REDIS_GROUP_NAME
+
+        # Initialize to 0 so wait_for_processed_samples() doesn't block at startup.
+        # The lag thread below will update this once the data stream/consumer group exists.
+        self.samples_processed = 0
+
+        def listen_events():
+            assert isinstance(_backend, RedisConfig)
+            redis_client = connect_to_redis(_backend)
+            logger.info(f"Listening for Fast-LLM events on Redis stream '{FAST_LLM_EVENTS_STREAM}'")
+            for event_type, version, step, documents_seen in read_fast_llm_events(redis_client):
+                if event_type == "weights_ready":
+                    logger.info(f"Received weights_ready event: step={step}, documents_seen={documents_seen}")
+                    self.propagated_weight_version = version
+                elif event_type == "training_finished":
+                    logger.info("Received training_finished event")
+                    self.training_done = True
+                    self._training_done_event.set()
+                else:
+                    logger.warning(f"Unknown Fast-LLM event type: {event_type}")
+
+        def poll_lag():
+            assert isinstance(_backend, RedisConfig)
+            redis_client = connect_to_redis(_backend)
+            lag_check_interval = 0.5  # seconds
+
+            while True:
+                try:
+                    stream_info = redis_client.xinfo_stream(REDIS_DATA_STREAM)
+                    total_len = stream_info.get("length", 0)
+                    groups = redis_client.xinfo_groups(REDIS_DATA_STREAM)
+                    for group in groups:
+                        group_name = group.get("name", "")
+                        if isinstance(group_name, bytes):
+                            group_name = group_name.decode()
+                        if group_name == REDIS_GROUP_NAME:
+                            entries_read = group.get("entries-read")
+                            if entries_read is None:
+                                lag = group.get("lag", 0) or 0
+                                entries_read = total_len - lag
+                            self.samples_processed = int(entries_read)
+                            logger.debug(
+                                f"Fast-LLM lag check: stream_len={total_len} entries_read={entries_read} "
+                                f"samples_processed={self.samples_processed}"
+                            )
+                            break
+                except Exception as e:
+                    logger.debug(f"Fast-LLM lag check failed (stream/group not yet created?): {e}")
+                time.sleep(lag_check_interval)
+
+        self._event_thread = threading.Thread(target=listen_events, daemon=True)
+        self._lag_thread = threading.Thread(target=poll_lag, daemon=True)
+        self._event_thread.start()
+        self._lag_thread.start()
+
     def wait_for_training_done(self, timeout: float | None = None) -> bool:
         return self._training_done_event.wait(timeout=timeout)
 
@@ -63,3 +189,11 @@ class TrainerState:
             logger.info("Waiting for the trainer to declare the initial weight version")
             time.sleep(1)
         return self.propagated_weight_version
+
+    def is_finished(self, samples_target: int) -> bool:
+        # Fast-LLM ignores `gradient_accumulation_passes` and overshoots `docs_per_step`
+        # by a few docs per step, so the sample-counting formula fires several optimizer
+        # steps early. Use the explicit `training_finished` event instead.
+        if self.use_fast_llm:
+            return self.training_done
+        return self.samples_processed is not None and self.samples_processed >= samples_target
