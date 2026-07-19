@@ -15,14 +15,14 @@ from pydantic import BaseModel
 
 
 GEMMA_MODEL_ID = "google/gemma-4-26B-A4B-it"
-# UNVERIFIED PLACEHOLDER: Claude/Rafa must verify this immutable revision on
-# Hugging Face before any evidence run. Keeping the status separate from the
-# value makes every executed path fail closed until that root of trust exists.
+# VERIFIED 2026-07-19 by Claude with Rafa in the loop: Hugging Face main resolves
+# to this immutable revision, and the local snapshot matches its repository tree.
 GEMMA_MODEL_REVISION = "01e5b3ee840d3a9e0b0b493c593e85398a30ef75"
-GEMMA_MODEL_REVISION_VERIFIED = False
+GEMMA_MODEL_REVISION_VERIFIED = True
 GEMMA_MODEL_REVISION_PROVENANCE = (
-    "UNVERIFIED PLACEHOLDER carried into Wave 7; Claude/Rafa must verify it "
-    "against the official Hugging Face repository before any evidence run."
+    "Verified 2026-07-19 by Claude with Rafa in the loop: the Hugging Face "
+    "refs API reports google/gemma-4-26B-A4B-it main == "
+    "01e5b3ee840d3a9e0b0b493c593e85398a30ef75."
 )
 GEMMA_POLICY_IDENTITY = f"{GEMMA_MODEL_ID}@{GEMMA_MODEL_REVISION}"
 GEMMA_EXPECTED_TEXT_TOPOLOGY = (
@@ -35,9 +35,16 @@ GEMMA_EXPECTED_TEXT_TOPOLOGY = (
     262144,
 )
 GEMMA_TOPOLOGY_PROVENANCE = (
-    "Fetched 2026-07-18 from https://huggingface.co/google/"
-    "gemma-4-26B-A4B-it/blob/main/config.json and verified every expected "
-    "field; reverify at the eventual immutable revision before an evidence run."
+    "Verified 2026-07-19 by Claude at revision "
+    "01e5b3ee840d3a9e0b0b493c593e85398a30ef75: local snapshot "
+    "/mnt/llmd/base_models/gemma-4-26B-A4B-it matched Hugging Face tree LFS "
+    "SHA256 OIDs for model-00001-of-00002.safetensors="
+    "1127684971bbca40465435a5cad69d67ad603bf5e61c6dfd5561fae4a3bcfdb3, "
+    "model-00002-of-00002.safetensors="
+    "aab47033e1e8a492ef8e581efae1cf36478d0433567e7729b3c1728bc8970db7, "
+    "and tokenizer.json="
+    "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f; "
+    "non-LFS files and config topology also matched."
 )
 PARITY_MAX_ABS_TOLERANCE = 0.05
 PARITY_TOLERANCE_BASIS = (

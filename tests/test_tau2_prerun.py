@@ -414,13 +414,7 @@ def test_tensor_fingerprint_covers_all_values_and_finiteness():
 
 def test_finalizer_requires_all_nine_gates_and_records_evidence(
     tmp_path: Path,
-    monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     evidence_dir = tmp_path / "evidence"
     append_evidence_record(
         evidence_dir,
@@ -482,8 +476,16 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
     assert manifest.recommended_production_topology is not None
     assert manifest.recommended_production_topology.name == "4x8-sp1"
     assert "n_predicted=0" in manifest.tau2_text_views
-    assert "UNVERIFIED PLACEHOLDER" in manifest.model_revision_provenance
-    assert "blob/main/config.json" in manifest.topology_provenance
+    assert "Verified 2026-07-19 by Claude" in (
+        manifest.model_revision_provenance
+    )
+    assert "refs API reports" in manifest.model_revision_provenance
+    assert "/mnt/llmd/base_models/gemma-4-26B-A4B-it" in (
+        manifest.topology_provenance
+    )
+    assert "1127684971bbca40465435a5cad69d67" in (
+        manifest.topology_provenance
+    )
     assert "developers.openai.com" in manifest.user_simulator_provenance
 
 

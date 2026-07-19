@@ -33,11 +33,7 @@ def test_gemma4_is_registered_for_pipelinerl_model_classes():
 def test_gemma4_text_loader_pins_revision_and_excludes_vision(
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
+    assert prerun_evidence.GEMMA_MODEL_REVISION_VERIFIED is True
     calls = []
     text_config = SimpleNamespace(model_type="gemma4_text")
     composite_config = SimpleNamespace(
@@ -94,7 +90,12 @@ def test_gemma4_text_loader_rejects_unreviewed_revision():
         get_model_loader(args, "causal-language-modeling")
 
 
-def test_gemma4_text_loader_rejects_unverified_placeholder():
+def test_gemma4_text_loader_rejects_unverified_placeholder(monkeypatch):
+    monkeypatch.setattr(
+        prerun_evidence,
+        "GEMMA_MODEL_REVISION_VERIFIED",
+        False,
+    )
     args = SimpleNamespace(
         text_only_gemma4=True,
         model_revision=GEMMA_MODEL_REVISION,

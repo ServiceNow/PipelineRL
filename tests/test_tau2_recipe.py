@@ -452,6 +452,11 @@ def test_unverified_revision_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        prerun_evidence,
+        "GEMMA_MODEL_REVISION_VERIFIED",
+        False,
+    )
     manifest = _ready_manifest(_sha256(CALIBRATION_JOB))
     cfg = _production_cfg(tmp_path, manifest)
     _assert_main_fails_before_process(
