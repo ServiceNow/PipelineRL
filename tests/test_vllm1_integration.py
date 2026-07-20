@@ -2,7 +2,6 @@
 
 import asyncio
 import pytest
-import tempfile
 from pathlib import Path
 import time
 import os
@@ -328,6 +327,8 @@ async def _run_server_weight_update_test(
             if trainer_proc.poll() is not None:
                 break
             await asyncio.sleep(1)
+
+        assert trainer_proc.returncode in (0, None), f"Trainer exited with code {trainer_proc.returncode}"
 
         if len(server_urls) == 1:
             analyze_and_verify_pattern(generations)
@@ -916,6 +917,8 @@ class TestWeightUpdateDistributed:
                 if trainer_proc.poll() is not None:
                     break
                 await asyncio.sleep(1)
+
+            assert trainer_proc.returncode in (0, None), f"Trainer exited with code {trainer_proc.returncode}"
 
             analyze_and_verify_transitions(generations, n_cycles=6)
             print("\n✓ Transition-capture test PASSED")

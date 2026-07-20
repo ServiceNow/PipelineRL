@@ -153,11 +153,12 @@ def rapid_broadcast_cycles_fast_llm(
          overall A→B→A→B pattern remains detectable
     """
     import time
-    import redis as redis_lib
+    import redis
     import orjson
 
     from fast_llm.engine.distributed.config import DistributedBackend
     from fast_llm.engine.distributed.distributed import ProcessGroupPool
+    from fast_llm.core.distributed import broadcast as _broadcast, broadcast_object as _broadcast_object
 
     print(f"[Trainer] Initializing process group as rank 0 (world_size={world_size})")
     process_group = ProcessGroupPool(
@@ -169,7 +170,7 @@ def rapid_broadcast_cycles_fast_llm(
     ).get_process_group(range(world_size), 0)
     print("[Trainer] Process group initialized")
 
-    r = redis_lib.Redis(host=redis_host, port=redis_port)
+    r = redis.Redis(host=redis_host, port=redis_port)
     stream_key = "fast_llm_events"
     payload_key = "event"
 
@@ -187,8 +188,6 @@ def rapid_broadcast_cycles_fast_llm(
         r.xadd(stream_key, {payload_key: orjson.dumps(event)})
         print(f"[Trainer] Sent weights_ready step={step} ({label})")
         step += 1
-
-        from fast_llm.core.distributed import broadcast as _broadcast, broadcast_object as _broadcast_object
 
         for name, tensor in state_dict.items():
             if tensor.device.type != "cuda":

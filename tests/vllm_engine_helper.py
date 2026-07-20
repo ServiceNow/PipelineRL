@@ -23,12 +23,11 @@ async def init_engine_and_process_group(
     on context manager exit.
     """
     from pipelinerl.vllm1 import EngineManager
-    import argparse as ap
 
     print("[vLLM Engine] Starting engine initialization")
 
     # Create args for engine with process group params
-    args = ap.Namespace(
+    args = argparse.Namespace(
         model=model_name,
         tensor_parallel_size=1,
         disable_log_stats=True,
@@ -80,7 +79,6 @@ async def test_weight_update(
     from pipelinerl.vllm1 import EngineManager
     from vllm import SamplingParams
     from pathlib import Path
-    import argparse as ap
     # Import sync helper from same directory
     sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint
@@ -96,7 +94,7 @@ async def test_weight_update(
     broadcast_done = SyncPoint(sync_path, "broadcast_done")
 
     # Create args for engine with process group params
-    args = ap.Namespace(
+    args = argparse.Namespace(
         model=model_name,
         tensor_parallel_size=1,
         disable_log_stats=True,
@@ -214,7 +212,6 @@ async def test_cross_validation(
     from pipelinerl.vllm1 import EngineManager
     from vllm import SamplingParams
     from pathlib import Path
-    import argparse as ap
     sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint, read_weight_update_request
 
@@ -240,7 +237,7 @@ async def test_cross_validation(
     )
 
     # Step 1: Generate with original model
-    args = ap.Namespace(
+    args = argparse.Namespace(
         model=model_name,
         tensor_parallel_size=1,
         disable_log_stats=True,
@@ -306,7 +303,7 @@ async def test_cross_validation(
     perturbed_model_path = (sync_path / "perturbed_model_path.txt").read_text().strip()
     print(f"[vLLM Engine] Step 3: Recreating engine with perturbed model from: {perturbed_model_path}")
 
-    args_perturbed = ap.Namespace(
+    args_perturbed = argparse.Namespace(
         model=perturbed_model_path,
         tensor_parallel_size=1,
         disable_log_stats=True,
@@ -408,7 +405,6 @@ async def test_back_and_forth(
     from pipelinerl.vllm1 import EngineManager
     from vllm import SamplingParams
     from pathlib import Path
-    import argparse as ap
     sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint, read_weight_update_request
 
@@ -434,7 +430,7 @@ async def test_back_and_forth(
     )
 
     # Create engine args
-    args = ap.Namespace(
+    args = argparse.Namespace(
         model=model_name,
         tensor_parallel_size=tensor_parallel_size,
         disable_log_stats=True,
@@ -448,7 +444,7 @@ async def test_back_and_forth(
     print(f"[vLLM Engine] Creating engine with model: {model_name}")
     async with EngineManager.create_engine(args) as manager:
         # Step 1: Generate with original weights
-        print(f"[vLLM Engine] Step 1: Generating res_or_1")
+        print("[vLLM Engine] Step 1: Generating res_or_1")
         async for output in manager.engine.generate(
             prompt, sampling_params=sampling_params, request_id="res_or_1"
         ):
@@ -461,11 +457,11 @@ async def test_back_and_forth(
         import time
         time.sleep(0.5)
         request = read_weight_update_request(sync_path)
-        print(f"[vLLM Engine] Step 2: Receiving perturbed weights (1st time)")
+        print("[vLLM Engine] Step 2: Receiving perturbed weights (1st time)")
         await manager.receive_weight_update(request)
         perturbed1_done.wait(timeout=900)
 
-        print(f"[vLLM Engine] Generating res_mod_1")
+        print("[vLLM Engine] Generating res_mod_1")
         async for output in manager.engine.generate(
             prompt, sampling_params=sampling_params, request_id="res_mod_1"
         ):
@@ -476,11 +472,11 @@ async def test_back_and_forth(
         ready_for_original.signal()
         time.sleep(0.5)
         request = read_weight_update_request(sync_path)
-        print(f"[vLLM Engine] Step 3: Receiving original weights")
+        print("[vLLM Engine] Step 3: Receiving original weights")
         await manager.receive_weight_update(request)
         original_done.wait(timeout=900)
 
-        print(f"[vLLM Engine] Generating res_or_2")
+        print("[vLLM Engine] Generating res_or_2")
         async for output in manager.engine.generate(
             prompt, sampling_params=sampling_params, request_id="res_or_2"
         ):
@@ -491,11 +487,11 @@ async def test_back_and_forth(
         ready_for_perturbed2.signal()
         time.sleep(0.5)
         request = read_weight_update_request(sync_path)
-        print(f"[vLLM Engine] Step 4: Receiving perturbed weights (2nd time)")
+        print("[vLLM Engine] Step 4: Receiving perturbed weights (2nd time)")
         await manager.receive_weight_update(request)
         perturbed2_done.wait(timeout=900)
 
-        print(f"[vLLM Engine] Generating res_mod_2")
+        print("[vLLM Engine] Generating res_mod_2")
         async for output in manager.engine.generate(
             prompt, sampling_params=sampling_params, request_id="res_mod_2"
         ):

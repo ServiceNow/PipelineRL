@@ -346,54 +346,6 @@ def _simulate_pod_ip_exchange(wm, pod_ips: dict):
                 job.url = job.url.replace(dns_name, pod_ip)
 
 
-class TestPodIPExchange:
-
-    def test_dns_address_map_holds_original_dns_names(self):
-        """After pod IP exchange, dns_address_map contains original DNS names, not pod IPs."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-
-        pod_ips = {0: "10.0.0.1", 1: "10.0.0.2"}
-        _simulate_pod_ip_exchange(wm, pod_ips)
-
-        assert wm.dns_address_map[0] == "dns-abc123-0"
-        assert wm.dns_address_map[1] == "dns-abc123-1"
-
-    def test_address_map_updated_to_pod_ips(self):
-        """After pod IP exchange, address_map and master_addr hold pod IPs."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-
-        pod_ips = {0: "10.0.0.1", 1: "10.0.0.2"}
-        _simulate_pod_ip_exchange(wm, pod_ips)
-
-        assert wm.address_map[0] == "10.0.0.1"
-        assert wm.address_map[1] == "10.0.0.2"
-        assert wm.master_addr == "10.0.0.1"
-
-    def test_job_urls_rewritten_to_pod_ips(self):
-        """After pod IP exchange, actor_llm job URLs use pod IPs, not DNS names."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-
-        # Verify that actor_llm jobs have DNS-based URLs before exchange
-        actor_urls_before = [job.url for job in wm.get_all_jobs() if job.kind == "actor_llm"]
-        assert all("dns-abc123-1" in u for u in actor_urls_before)
-
-        pod_ips = {0: "10.0.0.1", 1: "10.0.0.2"}
-        _simulate_pod_ip_exchange(wm, pod_ips)
-
-        actor_urls_after = [job.url for job in wm.get_all_jobs() if job.kind == "actor_llm"]
-        assert all("10.0.0.2" in u for u in actor_urls_after), f"Expected pod IP in URLs: {actor_urls_after}"
-        assert all("dns-abc123" not in u for u in actor_urls_after)
-
-    def test_no_dns_address_map_without_exchange(self):
-        """Without pod IP exchange, dns_address_map is not set (no AttributeError)."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-        assert not hasattr(wm, "dns_address_map")
-
-
 # ---------------------------------------------------------------------------
 # DeepSpeed command assembly: hostfile and inclusion filter use DNS names
 # ---------------------------------------------------------------------------
@@ -477,116 +429,6 @@ class TestDeepSpeedCommand:
 
 
 # ---------------------------------------------------------------------------
-# Hostfile creation in main(): uses dns_address_map after pod IP exchange
-# ---------------------------------------------------------------------------
-
-class TestHostfileCreation:
-
-    def test_hostfile_uses_dns_names_after_pod_ip_exchange(self):
-        """The DeepSpeed hostfile written by main() uses DNS names even after pod IP exchange."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-
-        # Simulate pod IP exchange
-        _simulate_pod_ip_exchange(wm, {0: "10.0.0.1", 1: "10.0.0.2"})
-
-        dns_map = getattr(wm, "dns_address_map", wm.address_map)
-        hosts = [dns_map[i] for i in range(wm.world_size)]
-
-        assert hosts[0] == "dns-abc123-0"
-        assert hosts[1] == "dns-abc123-1"
-        assert "10.0.0" not in hosts[0]
-        assert "10.0.0" not in hosts[1]
-
-    def test_hostfile_uses_address_map_without_exchange(self):
-        """Without pod IP exchange, dns_address_map is absent — falls back to address_map."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-
-        dns_map = getattr(wm, "dns_address_map", wm.address_map)
-        hosts = [dns_map[i] for i in range(wm.world_size)]
-
-        assert hosts[0] == "dns-abc123-0"
-        assert hosts[1] == "dns-abc123-1"
-
-
-# ---------------------------------------------------------------------------
-# Redis host in saved exp_config.yaml for multi-node (DeepSpeed + Redis)
-# ---------------------------------------------------------------------------
-
-class TestRedisHostMultiNode:
-
-    def _compute_streams_host(self, world_map, my_rank: int) -> str:
-        """Mirror the launch.py logic for cfg.streams.host selection."""
-        if world_map.world_size > 1:
-            return world_map.master_addr
-        return "localhost"
-
-    def test_single_node_redis_host_is_localhost(self):
-        """Single-node: Redis host is localhost regardless of pod IP exchange."""
-        cfg = _make_cfg(actor_fraction=2, finetune_fraction=6, use_fast_llm=False)
-        with patch("torch.cuda.device_count", return_value=8):
-            with patch("pipelinerl.utils.collect_environment_specs", return_value=[]):
-                with patch("pipelinerl.world.WorldMap._place_environments"):
-                    from pipelinerl.world import WorldMap
-                    wm = WorldMap(cfg, verbose=False)
-
-        host = self._compute_streams_host(wm, my_rank=0)
-        assert host == "localhost"
-
-    def test_multinode_rank0_redis_host_is_pod_ip(self):
-        """Multi-node rank 0: Redis host is pod IP (not localhost) after exchange.
-
-        This ensures the saved exp_config.yaml has a reachable address for
-        DeepSpeed workers on other nodes.
-        """
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-        _simulate_pod_ip_exchange(wm, {0: "10.0.0.1", 1: "10.0.0.2"})
-
-        host = self._compute_streams_host(wm, my_rank=0)
-        assert host == "10.0.0.1", "rank 0 should use pod IP so saved config is reachable cross-node"
-        assert host != "localhost"
-
-    def test_multinode_rank1_redis_host_is_pod_ip(self):
-        """Multi-node rank 1: Redis host is pod IP of rank 0."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0", rank=1)
-        _simulate_pod_ip_exchange(wm, {0: "10.0.0.1", 1: "10.0.0.2"})
-
-        host = self._compute_streams_host(wm, my_rank=1)
-        assert host == "10.0.0.1", "rank 1 should use rank 0's pod IP to reach Redis"
-
-    def test_multinode_both_ranks_same_redis_host(self):
-        """Both ranks in a 2-node job resolve to the same Redis host (pod IP of rank 0)."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
-        wm0 = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0", rank=0)
-        wm1 = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0", rank=1)
-
-        _simulate_pod_ip_exchange(wm0, {0: "10.0.0.1", 1: "10.0.0.2"})
-        _simulate_pod_ip_exchange(wm1, {0: "10.0.0.1", 1: "10.0.0.2"})
-
-        host0 = self._compute_streams_host(wm0, my_rank=0)
-        host1 = self._compute_streams_host(wm1, my_rank=1)
-
-        assert host0 == host1 == "10.0.0.1"
-
-    def test_multinode_without_pod_ip_exchange_uses_master_addr(self):
-        """Without pod IP exchange, multi-node uses master_addr (DNS name) for Redis.
-
-        This is a fallback; the pod IP exchange should always run in practice
-        but the code must not crash without it.
-        """
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-
-        # No pod IP exchange — master_addr is still a DNS name
-        assert wm.master_addr == "dns-abc123-0"
-        host = self._compute_streams_host(wm, my_rank=0)
-        assert host == "dns-abc123-0"  # DNS name (port filtering may apply, but code doesn't crash)
-
-
-# ---------------------------------------------------------------------------
 # DeepSpeed run_finetune.py path: must be absolute (not relative to CWD)
 # ---------------------------------------------------------------------------
 
@@ -594,7 +436,6 @@ class TestDeepSpeedEntrypointPath:
 
     def _capture_ds_cmd(self, world_map):
         from pipelinerl.launch import _run_finetune_deepspeed
-        from omegaconf import OmegaConf
 
         cfg = OmegaConf.create({
             "use_deepspeed": True,

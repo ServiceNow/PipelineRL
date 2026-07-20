@@ -75,12 +75,12 @@ def redis_server():
     )
 
     # Start streaming Redis output
-    redis_stdout_thread, redis_stderr_thread = stream_process_output(redis_proc, "Redis")
+    stream_process_output(redis_proc, "Redis")
 
     # Wait for Redis to be ready
     import redis
     r = redis.Redis(host=redis_host, port=redis_port)
-    for i in range(30):
+    for _ in range(30):
         try:
             r.ping()
             print(f"[Redis] Server ready on {redis_host}:{redis_port}")
@@ -204,6 +204,8 @@ async def _run_fast_llm_server_test(
             if trainer_proc.poll() is not None:
                 break
             await asyncio.sleep(1)
+
+        assert trainer_proc.returncode in (0, None), f"Trainer exited with code {trainer_proc.returncode}"
 
         if len(server_urls) == 1:
             analyze_and_verify_pattern(generations)
@@ -348,6 +350,8 @@ class TestFastLLMServerIntegration:
                 if trainer_proc.poll() is not None:
                     break
                 await asyncio.sleep(1)
+
+            assert trainer_proc.returncode in (0, None), f"Trainer exited with code {trainer_proc.returncode}"
 
             analyze_and_verify_transitions(generations, n_cycles=6)
             print("\n✓ Fast-LLM transition-capture test PASSED")
