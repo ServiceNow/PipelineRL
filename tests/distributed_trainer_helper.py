@@ -173,10 +173,9 @@ def save_model_to_dir(state_dict: dict, output_dir: str, model_name: str):
 
 
 def broadcast_weights(
-    init_method: str, model_name: str, perturb: bool = False, sync_dir: str = None
+    init_method: str, model_name: str, perturb: bool = False, sync_dir: str | None = None
 ):
     """Load model and broadcast weights to vLLM worker."""
-    import torch
     import torch.distributed as dist
     from pathlib import Path
 
@@ -239,17 +238,9 @@ def broadcast_weights(
     # Broadcast each weight with detailed logging
     logger.info(f"Starting broadcast of {len(params_to_broadcast)} parameters")
     for i, (name, tensor) in enumerate(params_to_broadcast.items()):
-        logger.debug(f"[{i+1}/{len(state_dict)}] Preparing to broadcast: {name}")
-        logger.debug(
-            f"  - shape: {tensor.shape}, dtype: {tensor.dtype}, device: {tensor.device}"
-        )
         if tensor.device.type != "cuda":
-            logger.debug(f"  - Moving {name} to CUDA")
             tensor = tensor.cuda(0)
-            logger.debug(f"  - {name} now on device: {tensor.device}")
-        logger.debug(f"  - Calling dist.broadcast for {name}...")
         dist.broadcast(tensor, src=0, group=process_group)
-        logger.debug(f"  - Broadcast complete for {name}")
         if (i + 1) % 10 == 0:
             logger.info(f"Broadcasted {i+1}/{len(params_to_broadcast)} parameters")
 

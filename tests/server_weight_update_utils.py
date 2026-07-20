@@ -7,6 +7,91 @@ from pathlib import Path
 import subprocess
 import sys
 import os
+import signal
+
+try:
+    import psutil
+
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    print("WARNING: psutil not available, process tree cleanup will be limited")
+
+
+def stream_process_output(proc, name):
+    """Start background threads to continuously stream process stdout/stderr.
+
+    Args:
+        proc: subprocess.Popen object
+        name: Name for logging prefix (e.g., "vLLM Server", "Trainer")
+
+    Returns:
+        Tuple of (stdout_thread, stderr_thread)
+    """
+    import threading
+
+    def read_stream(stream, prefix):
+        """Read from stream and print with prefix."""
+        try:
+            for line in iter(stream.readline, ""):
+                if line:
+                    print(f"{prefix} {line.rstrip()}", flush=True)
+        except Exception as e:
+            print(f"{prefix} [Stream read error: {e}]", flush=True)
+
+    stdout_thread = threading.Thread(
+        target=read_stream,
+        args=(proc.stdout, f"[{name} OUT]"),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=read_stream,
+        args=(proc.stderr, f"[{name} ERR]"),
+        daemon=True,
+    )
+
+    stdout_thread.start()
+    stderr_thread.start()
+
+    return stdout_thread, stderr_thread
+
+
+def kill_process_tree(pid, sig=signal.SIGKILL):
+    """Kill a process and all its children/grandchildren.
+
+    Args:
+        pid: Process ID to kill
+        sig: Signal to send (default SIGKILL)
+    """
+    if not HAS_PSUTIL:
+        # Fallback: just kill the main process
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        return
+
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    # Get all children recursively
+    children = parent.children(recursive=True)
+
+    # Kill children first
+    for child in children:
+        try:
+            print(f"[Kill] Killing child process {child.pid}")
+            child.send_signal(sig)
+        except psutil.NoSuchProcess:
+            pass
+
+    # Kill parent
+    try:
+        parent.send_signal(sig)
+    except psutil.NoSuchProcess:
+        pass
 
 
 async def wait_for_server_ready(server_url: str, server_proc, trainer_proc, timeout_seconds: int = 300):
@@ -142,34 +227,6 @@ def _find_abab_pattern(phases, min_stable_gens=5):
         return None
 
     return phases[first_a], phases[first_b], phases[second_a], phases[second_b]
-
-
-def check_pattern_detected(generations):
-    """Check whether the full A→B→A→B pattern is present in the generation history.
-
-    This is a **post-hoc analysis helper** (e.g. for assertions after the
-    generation loop ends).  It is intentionally *not* used as an early-stop
-    signal inside the generation loops.
-
-    Why not early-stop? Any transition artifact text T that happens to appear
-    with several consecutive identical generations (possible when NCCL broadcasts
-    are slow) is indistinguishable from the real perturbed text B at generation
-    time.  False positives would cut the loop short before the final stable B
-    phase accumulates.  The generation loops instead rely on the trainer process
-    exiting (``trainer_proc.poll() is not None``) as their sole reliable
-    termination signal — the trainer exits within milliseconds of completing its
-    last broadcast, so no significant extra generation happens.
-
-    Args:
-        generations: List of (timestamp, text) tuples
-
-    Returns:
-        True if the A→B→A→B pattern is present
-    """
-    if len(generations) < 4:
-        return False
-    phases = _build_phases(generations)
-    return _find_abab_pattern(phases) is not None
 
 
 async def run_generation_loop(
@@ -423,8 +480,7 @@ def start_vllm_server(
     model_name: str,
     server_port: int,
     distributed_init_method: str,
-    stream_process_output_fn,
-    extra_args: list = None,
+    extra_args: list | None = None,
     gpu_ids: str = "0",
     actor_llm_idx: int = 0,
     world_size: int = 2,
@@ -436,7 +492,6 @@ def start_vllm_server(
         model_name: Model to load
         server_port: Port to bind to
         distributed_init_method: Distributed initialization method
-        stream_process_output_fn: Function to stream process output
         extra_args: Additional CLI arguments (e.g., ["--weight-update-mode", "fast-llm"])
         gpu_ids: CUDA_VISIBLE_DEVICES value (e.g., "0" or "0,1")
         actor_llm_idx: Actor index for this vLLM instance
@@ -477,7 +532,7 @@ def start_vllm_server(
     )
 
     print("[Main] Starting server output streaming...")
-    stdout_thread, stderr_thread = stream_process_output_fn(server_proc, f"vLLM Server (actor {actor_llm_idx})")
+    stdout_thread, stderr_thread = stream_process_output(server_proc, f"vLLM Server (actor {actor_llm_idx})")
 
     return server_proc, stdout_thread, stderr_thread
 
@@ -503,7 +558,7 @@ async def wait_for_all_servers_ready(
         RuntimeError: If any process terminates unexpectedly
         TimeoutError: If any server doesn't become ready within timeout
     """
-    for url, proc in zip(server_urls, server_procs):
+    for url, proc in zip(server_urls, server_procs, strict=True):
         await wait_for_server_ready(url, proc, trainer_proc, timeout_seconds)
     return True
 
@@ -584,8 +639,7 @@ def start_trainer_process(
     distributed_init_method: str,
     model_name: str,
     server_urls: list,
-    stream_process_output_fn,
-    extra_args: list = None,
+    extra_args: list | None = None,
     gpu_id: str = "1",
     world_size: int = 2,
     command: str = "timed_broadcast_server_test",
@@ -597,7 +651,6 @@ def start_trainer_process(
         distributed_init_method: Distributed initialization method
         model_name: Model name
         server_urls: List of server URLs (one per actor)
-        stream_process_output_fn: Function to stream process output
         extra_args: Additional CLI arguments (e.g., ["--n-cycles", "6"])
         gpu_id: CUDA_VISIBLE_DEVICES value for the trainer GPU
         world_size: Total distributed world size
@@ -648,6 +701,6 @@ def start_trainer_process(
     )
 
     print("[Main] Starting trainer output streaming...")
-    stdout_thread, stderr_thread = stream_process_output_fn(trainer_proc, "Trainer")
+    stdout_thread, stderr_thread = stream_process_output(trainer_proc, "Trainer")
 
     return trainer_proc, stdout_thread, stderr_thread

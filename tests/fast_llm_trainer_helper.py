@@ -35,8 +35,6 @@ def timed_broadcast_fast_llm(
         redis_port: Redis port number
         world_size: Total NCCL world size (trainer rank 0 + all vLLM workers)
     """
-    import torch
-    import torch.distributed as dist
     import time
     import redis
     import orjson
@@ -99,7 +97,7 @@ def timed_broadcast_fast_llm(
 
         # Send end signal
         _broadcast_object(None, process_group, src=0)
-        print(f"[Trainer] Sent end signal, broadcast complete")
+        print("[Trainer] Sent end signal, broadcast complete")
 
     # Broadcast 1: Perturbed weights
     print(f"[Trainer] Broadcasting {len(perturbed_state_dict)} perturbed parameters")
@@ -154,7 +152,6 @@ def rapid_broadcast_cycles_fast_llm(
       4. Slow broadcast: perturbed  (5 s wait after) — end on text_B so the
          overall A→B→A→B pattern remains detectable
     """
-    import torch.distributed as dist
     import time
     import redis as redis_lib
     import orjson
@@ -186,7 +183,6 @@ def rapid_broadcast_cycles_fast_llm(
 
     def broadcast_weights(state_dict, label):
         nonlocal step
-        import torch
         event = {"type": "weights_ready", "step": step}
         r.xadd(stream_key, {payload_key: orjson.dumps(event)})
         print(f"[Trainer] Sent weights_ready step={step} ({label})")

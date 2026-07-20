@@ -1,14 +1,8 @@
 """Pytest configuration and fixtures for vllm1 tests."""
 
-import os
 import pytest
-import torch
 import tempfile
 from pathlib import Path
-import subprocess
-import sys
-
-from pipelinerl.vllm1 import EngineManager
 
 
 @pytest.fixture(scope="session")
@@ -18,39 +12,9 @@ def model_name():
 
 
 @pytest.fixture(scope="session")
-def sample_prompts():
-    """Sample prompts for generation testing."""
-    return [
-        "Write a haiku about coding:",
-        "The capital of France is",
-        "In a galaxy far away,",
-    ]
-
-
-@pytest.fixture(scope="session")
 def simple_prompt():
     """Single simple prompt for deterministic testing."""
     return "The capital of France is"
-
-
-@pytest.fixture(scope="session")
-def num_gpus():
-    """Number of GPUs available."""
-    return torch.cuda.device_count()
-
-
-@pytest.fixture(scope="session")
-def require_2_gpus(num_gpus):
-    """Skip test if less than 2 GPUs available."""
-    if num_gpus < 2:
-        pytest.skip("Test requires at least 2 GPUs")
-
-
-@pytest.fixture(scope="session")
-def require_gpu():
-    """Skip test if no GPU available."""
-    if not torch.cuda.is_available():
-        pytest.skip("Test requires GPU")
 
 
 @pytest.fixture
@@ -82,21 +46,6 @@ def shared_distributed_init_method(shared_test_dir):
     return f"file://{shared_test_dir}/dist_init"
 
 
-@pytest.fixture(scope="session")
-def cache_dir():
-    """Directory for caching downloaded models."""
-    cache_path = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    cache_path.mkdir(parents=True, exist_ok=True)
-    return cache_path
-
-
-@pytest.fixture
-def vllm_server_port():
-    """Port for vLLM server in tests."""
-    # Use a high port to avoid conflicts
-    return 8765
-
-
 @pytest.fixture
 def generation_config():
     """Configuration for deterministic generation."""
@@ -106,33 +55,6 @@ def generation_config():
         "max_tokens": 50,
         "seed": 42,
     }
-
-
-@pytest.fixture
-def vllm_engine_factory_2gpu(model_name):
-    """Factory fixture that defaults to 2 GPUs.
-
-    Usage:
-        async with vllm_engine_factory_2gpu() as manager:
-            # Uses 2 GPUs by default
-            # Access engine via manager.engine
-            ...
-    """
-    def _factory(tensor_parallel_size: int = 2, **kwargs):
-        """Create engine with 2 GPUs by default."""
-        import argparse
-
-        args = argparse.Namespace(
-            model=model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            disable_log_stats=True,
-            enable_log_requests=False,
-            **kwargs
-        )
-
-        return EngineManager.create_engine(args)
-
-    return _factory
 
 
 @pytest.fixture
@@ -149,11 +71,6 @@ def vllm_engine_factory(model_name):
         async with vllm_engine_factory(tensor_parallel_size=2) as manager:
             # use manager.engine with 2 GPUs
             ...
-
-    Or if you need engine_config:
-        async with vllm_engine_factory() as manager:
-            # access manager.engine, manager.engine_config, manager.args
-            ...
     """
     def _factory(tensor_parallel_size: int = 1, **kwargs):
         """Create engine context manager with test defaults.
@@ -167,6 +84,8 @@ def vllm_engine_factory(model_name):
         """
         import argparse
 
+        from pipelinerl.vllm1 import EngineManager
+
         # Create minimal args object with required attributes for AsyncEngineArgs.from_cli_args()
         args = argparse.Namespace(
             model=model_name,
@@ -176,8 +95,6 @@ def vllm_engine_factory(model_name):
             # Apply any additional kwargs
             **kwargs
         )
-
-        print("args: ", args)
 
         return EngineManager.create_engine(args)
 

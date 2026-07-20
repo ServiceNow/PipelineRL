@@ -1,10 +1,9 @@
 """Tests for multi-node WorldMap topology and fast-llm torchrun command assembly."""
 
 import os
-import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 from omegaconf import OmegaConf
@@ -331,7 +330,6 @@ def _simulate_pod_ip_exchange(wm, pod_ips: dict):
     Sets dns_address_map to original DNS names, updates address_map and job
     URLs/hostnames to pod IPs — mirrors the real function's side-effects.
     """
-    from pipelinerl.launch import _exchange_pod_ips as real_fn  # noqa: F401 (not called)
     # Save DNS names first (matches the real implementation order)
     wm.dns_address_map = dict(wm.address_map)
     # Overwrite address_map with pod IPs
@@ -691,8 +689,6 @@ class TestPerNodeFileNaming:
 
         written_files = {}
 
-        real_open = open
-
         def mock_popen(cmd, **kwargs):
             written_files["stdout"] = str(kwargs.get("stdout", {}).name if hasattr(kwargs.get("stdout"), "name") else "")
             written_files["stderr"] = str(kwargs.get("stderr", {}).name if hasattr(kwargs.get("stderr"), "name") else "")
@@ -705,8 +701,6 @@ class TestPerNodeFileNaming:
             captured_save["dir"] = str(script_dir)
 
         captured_config = {}
-
-        real_omegaconf_save = None
 
         with tempfile.TemporaryDirectory() as tmp:
             exp_dir = Path(tmp)

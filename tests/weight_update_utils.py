@@ -1,6 +1,5 @@
 """Utility functions for weight update testing."""
 
-from typing import Dict
 import torch
 from pipelinerl.finetune_loop import WeightUpdateRequest, ParameterInfo
 
@@ -19,7 +18,7 @@ def dtype_to_string(dtype: torch.dtype) -> str:
 
 
 def create_weight_update_request_from_state_dict(
-    state_dict: Dict[str, torch.Tensor],
+    state_dict: dict[str, torch.Tensor],
     version: int = 0,
 ) -> WeightUpdateRequest:
     """Create a WeightUpdateRequest from a model state dict.
