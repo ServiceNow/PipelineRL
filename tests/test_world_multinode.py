@@ -53,7 +53,11 @@ def _make_world_map(cfg, world_size, rank=0, master_addr="dns-test-0"):
         # patch it out to avoid AttributeError.
         with patch("pipelinerl.world.WorldMap._place_environments"):
             with patch("pipelinerl.utils.collect_environment_specs", return_value=[]):
-                return WorldMap(cfg, verbose=False)
+                world_map = WorldMap(cfg, verbose=False)
+    # Multi-node finetune always runs after _exchange_pod_ips, which populates dns_address_map; mirror that.
+    if world_size > 1:
+        world_map.dns_address_map = dict(world_map.address_map)
+    return world_map
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +195,7 @@ class TestTorchrunCommand:
                 "wandb_entity_name": "test",
                 "wandb_project_name": "test",
                 "wandb_group": "test",
+                "wandb_name": None,
             },
             "fast_llm": {
                 "training": {
@@ -386,16 +391,6 @@ class TestDeepSpeedCommand:
 
         return captured_cmd
 
-    def test_deepspeed_multinode_uses_dns_names_without_exchange(self):
-        """DeepSpeed 2-node without pod IP exchange: inclusion filter uses DNS names."""
-        cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
-        wm = _make_world_map(cfg, world_size=2, master_addr="dns-abc123-0")
-
-        cmd = self._capture_ds_cmd(wm)
-        # The deepspeed_inclusion_filter should contain the DNS hostname for the finetune node
-        filter_arg = next((c for c in cmd if "dns-abc123" in c), None)
-        assert filter_arg is not None, f"Expected DNS name in cmd, got: {cmd}"
-
     def test_deepspeed_multinode_after_pod_ip_exchange_uses_dns_names(self):
         """After pod IP exchange, DeepSpeed inclusion filter still uses DNS names (not pod IPs)."""
         cfg = _make_cfg(actor_fraction=1, finetune_fraction=1, use_fast_llm=False)
@@ -510,6 +505,7 @@ class TestPerNodeFileNaming:
                 "wandb_entity_name": "test",
                 "wandb_project_name": "test",
                 "wandb_group": "test",
+                "wandb_name": None,
             },
             "fast_llm": {
                 "training": {
