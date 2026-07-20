@@ -13,8 +13,7 @@ def dtype_to_string(dtype: torch.dtype) -> str:
     Returns:
         String representation (e.g., 'bfloat16', 'float32')
     """
-    dtype_str = str(dtype).replace("torch.", "")
-    return dtype_str
+    return str(dtype).replace("torch.", "")
 
 
 def create_weight_update_request_from_state_dict(

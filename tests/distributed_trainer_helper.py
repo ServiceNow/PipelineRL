@@ -34,8 +34,6 @@ def _wait_all_actors(sync_path, name: str, num_actors: int, timeout: float = 120
 
     Each actor signals ``{name}_actor_{i}`` for i in range(num_actors).
     """
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint
 
     for i in range(num_actors):
@@ -134,7 +132,6 @@ def save_model_to_dir(state_dict: dict, output_dir: str, model_name: str):
         output_dir: Directory to save model
         model_name: Original model name to copy config from
     """
-    from pathlib import Path
     from safetensors.torch import save_file
     import shutil
 
@@ -177,11 +174,9 @@ def broadcast_weights(
 ):
     """Load model and broadcast weights to vLLM worker."""
     import torch.distributed as dist
-    from pathlib import Path
 
     # Setup sync points if provided
     if sync_dir:
-        sys.path.insert(0, str(Path(__file__).parent))
         from sync_helper import SyncPoint, write_weight_update_request
 
         sync_path = Path(sync_dir)
@@ -263,9 +258,7 @@ def broadcast_cross_validation(
     Also saves perturbed model to disk for vLLM to load.
     """
     import torch.distributed as dist
-    from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint, write_weight_update_request
     from weight_update_utils import create_weight_update_request_from_state_dict
 
@@ -361,9 +354,7 @@ def broadcast_back_and_forth(
     each broadcast, then sends a single shared completion signal.
     """
     import torch.distributed as dist
-    from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent))
     from sync_helper import SyncPoint, write_weight_update_request
     from weight_update_utils import create_weight_update_request_from_state_dict
 
