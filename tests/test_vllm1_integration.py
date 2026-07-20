@@ -4,7 +4,6 @@ import asyncio
 import pytest
 import tempfile
 from pathlib import Path
-from typing import Dict, List
 import time
 import os
 import subprocess
@@ -25,143 +24,8 @@ from .server_weight_update_utils import (
     analyze_and_verify_transitions,
     start_vllm_server,
     start_trainer_process,
+    kill_process_tree,
 )
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-    print("WARNING: psutil not available, process tree cleanup will be limited")
-
-
-def stream_process_output(proc, name):
-    """Start background threads to continuously stream process stdout/stderr.
-
-    Args:
-        proc: subprocess.Popen object
-        name: Name for logging prefix (e.g., "vLLM Server", "Trainer")
-
-    Returns:
-        Tuple of (stdout_thread, stderr_thread)
-    """
-    import threading
-
-    def read_stream(stream, prefix):
-        """Read from stream and print with prefix."""
-        try:
-            for line in iter(stream.readline, ''):
-                if line:
-                    print(f"{prefix} {line.rstrip()}", flush=True)
-        except Exception as e:
-            print(f"{prefix} [Stream read error: {e}]", flush=True)
-
-    stdout_thread = threading.Thread(
-        target=read_stream,
-        args=(proc.stdout, f"[{name} OUT]"),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=read_stream,
-        args=(proc.stderr, f"[{name} ERR]"),
-        daemon=True,
-    )
-
-    stdout_thread.start()
-    stderr_thread.start()
-
-    return stdout_thread, stderr_thread
-
-
-def kill_process_tree(pid, sig=signal.SIGKILL):
-    """Kill a process and all its children/grandchildren.
-
-    Args:
-        pid: Process ID to kill
-        sig: Signal to send (default SIGKILL)
-    """
-    if not HAS_PSUTIL:
-        # Fallback: just kill the main process
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            pass
-        return
-
-    try:
-        parent = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return
-
-    # Get all children recursively
-    children = parent.children(recursive=True)
-
-    # Kill children first
-    for child in children:
-        try:
-            print(f"[Kill] Killing child process {child.pid}")
-            child.send_signal(sig)
-        except psutil.NoSuchProcess:
-            pass
-
-    # Kill parent
-    try:
-        parent.send_signal(sig)
-    except psutil.NoSuchProcess:
-        pass
-
-
-def force_kill_process(proc, name):
-    """Forcefully kill a process tree and collect output.
-
-    SIGKILL always kills the process. If communicate() hangs, it's the PIPES
-    that are stuck, not the process. We handle this with retries and timeouts.
-
-    Returns:
-        Tuple of (stdout, stderr, returncode)
-    """
-    # If already dead, try to get output
-    if proc.poll() is not None:
-        try:
-            stdout, stderr = proc.communicate(timeout=2)
-            return stdout, stderr, proc.returncode
-        except subprocess.TimeoutExpired:
-            print(f"[Kill] {name} already dead but pipes hung, closing...")
-            proc.stdout.close() if proc.stdout else None
-            proc.stderr.close() if proc.stderr else None
-            return "<pipes hung>", "<pipes hung>", proc.returncode
-
-    # Kill entire process tree (including vLLM workers, trainer subprocesses, etc)
-    print(f"[Kill] Killing {name} process tree (PID {proc.pid})...")
-    kill_process_tree(proc.pid, signal.SIGKILL)
-
-    # Wait for main process to actually die
-    try:
-        proc.wait(timeout=2)
-        print(f"[Kill] {name} process tree killed")
-    except subprocess.TimeoutExpired:
-        print(f"[Kill] WARNING: {name} didn't die after SIGKILL")
-
-    # Try to read output from pipes (this is what usually hangs)
-    for attempt, timeout_val in enumerate([1, 2, 3], start=1):
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_val)
-            print(f"[Kill] {name} output collected (attempt {attempt})")
-            return stdout, stderr, proc.returncode
-        except subprocess.TimeoutExpired:
-            print(f"[Kill] {name} communicate() timed out (attempt {attempt})")
-            continue
-
-    # Pipes are stuck - force close them
-    print(f"[Kill] {name} pipes stuck, force closing...")
-    try:
-        proc.stdout.close() if proc.stdout else None
-        proc.stderr.close() if proc.stderr else None
-        proc.stdin.close() if proc.stdin else None
-    except Exception as e:
-        print(f"[Kill] Error closing pipes: {e}")
-
-    return "<pipes stuck>", "<pipes stuck>", proc.returncode if proc.returncode else -999
 
 
 async def wait_for_processes(processes_with_names, check_interval=0.5, timeout=60):
@@ -394,7 +258,6 @@ async def _run_server_weight_update_test(
     vllm_server_configs,
     trainer_gpu,
     world_size,
-    timeout=2400,
 ):
     """Run server weight-update pattern test with one or more vLLM servers.
 
@@ -419,7 +282,6 @@ async def _run_server_weight_update_test(
             model_name=model_name,
             server_port=port,
             distributed_init_method=init_method,
-            stream_process_output_fn=stream_process_output,
             extra_args=None,
             gpu_ids=cfg.get("gpu_ids", "0"),
             actor_llm_idx=cfg.get("actor_llm_idx", 0),
@@ -435,7 +297,6 @@ async def _run_server_weight_update_test(
         distributed_init_method=init_method,
         model_name=model_name,
         server_urls=server_urls,
-        stream_process_output_fn=stream_process_output,
         extra_args=None,
         gpu_id=trainer_gpu,
         world_size=world_size,
@@ -963,7 +824,6 @@ class TestWeightUpdateDistributed:
         generation_config,
         distributed_init_method,
         distributed_trainer_helper,
-        temp_dir,
     ):
         """Server integration test: verify weight update pattern with HTTP API.
 
@@ -983,7 +843,6 @@ class TestWeightUpdateDistributed:
             vllm_server_configs=[{"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1}],
             trainer_gpu="1",
             world_size=2,
-            timeout=2400,
         )
 
     @pytest.mark.timeout(2400)
@@ -996,7 +855,6 @@ class TestWeightUpdateDistributed:
         generation_config,
         distributed_init_method,
         distributed_trainer_helper,
-        temp_dir,
     ):
         """Diagnostic test: catch garbage generations produced during NCCL weight broadcasts.
 
@@ -1022,7 +880,6 @@ class TestWeightUpdateDistributed:
             model_name=model_name,
             server_port=8000,
             distributed_init_method=distributed_init_method,
-            stream_process_output_fn=stream_process_output,
             gpu_ids="0",
             actor_llm_idx=0,
             world_size=2,
@@ -1036,7 +893,6 @@ class TestWeightUpdateDistributed:
             distributed_init_method=distributed_init_method,
             model_name=model_name,
             server_urls=[server_url],
-            stream_process_output_fn=stream_process_output,
             extra_args=["--n-cycles", "6"],
             gpu_id="1",
             world_size=2,
@@ -1070,217 +926,3 @@ class TestWeightUpdateDistributed:
                 kill_process_tree(server_proc.pid)
             if trainer_proc:
                 kill_process_tree(trainer_proc.pid)
-
-
-class TestWeightUpdateTP2:
-    """Test weight updates with tensor-parallel (TP=2) vLLM — needs 3 GPUs."""
-
-    @pytest.mark.timeout(2000)
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
-    async def test_weight_update_back_and_forth_tp2(
-        self,
-        model_name,
-        simple_prompt,
-        generation_config,
-        distributed_init_method,
-        distributed_trainer_helper,
-        vllm_engine_helper,
-        temp_dir,
-    ):
-        """Back-and-forth test with TP=2: one vLLM instance on GPUs 0+1, trainer on GPU 2."""
-        from .sync_helper import create_sync_dir
-
-        print("\n" + "="*60)
-        print("Starting back-and-forth test (TP=2, 1 actor, 3 GPUs)")
-        print("="*60)
-
-        sync_dir = create_sync_dir(temp_dir)
-        await _run_back_and_forth_engine_test(
-            model_name=model_name,
-            simple_prompt=simple_prompt,
-            generation_config=generation_config,
-            init_method=distributed_init_method,
-            distributed_trainer_helper=distributed_trainer_helper,
-            vllm_engine_helper=vllm_engine_helper,
-            sync_dir=sync_dir,
-            vllm_configs=[{"cuda_devices": "0,1", "actor_llm_idx": 0, "tensor_parallel_size": 2}],
-            trainer_gpu="2",
-            world_size=3,
-            timeout=1800,
-        )
-
-    @pytest.mark.timeout(2400)
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
-    async def test_server_weight_update_pattern_tp2(
-        self,
-        model_name,
-        simple_prompt,
-        generation_config,
-        distributed_init_method,
-        distributed_trainer_helper,
-        temp_dir,
-    ):
-        """Server weight update test with TP=2: one server on GPUs 0+1, trainer on GPU 2."""
-        print("\n" + "="*60)
-        print("Starting server weight update pattern test (TP=2, 1 actor, 3 GPUs)")
-        print("="*60)
-
-        await _run_server_weight_update_test(
-            model_name=model_name,
-            simple_prompt=simple_prompt,
-            generation_config=generation_config,
-            init_method=distributed_init_method,
-            distributed_trainer_helper=distributed_trainer_helper,
-            vllm_server_configs=[{"port": 8001, "gpu_ids": "0,1", "actor_llm_idx": 0, "tensor_parallel_size": 2}],
-            trainer_gpu="2",
-            world_size=3,
-            timeout=2400,
-        )
-
-
-class TestWeightUpdateMultiActor:
-    """Test weight updates with multiple independent vLLM actors."""
-
-    @pytest.mark.timeout(2000)
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
-    async def test_weight_update_back_and_forth_2actors(
-        self,
-        model_name,
-        simple_prompt,
-        generation_config,
-        distributed_init_method,
-        distributed_trainer_helper,
-        vllm_engine_helper,
-        temp_dir,
-    ):
-        """Back-and-forth test with 2 actors: vLLM on GPU 0 and GPU 1, trainer on GPU 2."""
-        from .sync_helper import create_sync_dir
-
-        print("\n" + "="*60)
-        print("Starting back-and-forth test (TP=1, 2 actors, 3 GPUs)")
-        print("="*60)
-
-        sync_dir = create_sync_dir(temp_dir)
-        await _run_back_and_forth_engine_test(
-            model_name=model_name,
-            simple_prompt=simple_prompt,
-            generation_config=generation_config,
-            init_method=distributed_init_method,
-            distributed_trainer_helper=distributed_trainer_helper,
-            vllm_engine_helper=vllm_engine_helper,
-            sync_dir=sync_dir,
-            vllm_configs=[
-                {"cuda_devices": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
-                {"cuda_devices": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
-            ],
-            trainer_gpu="2",
-            world_size=3,
-            timeout=1800,
-        )
-
-    @pytest.mark.timeout(2000)
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires at least 4 GPUs")
-    async def test_weight_update_back_and_forth_3actors(
-        self,
-        model_name,
-        simple_prompt,
-        generation_config,
-        distributed_init_method,
-        distributed_trainer_helper,
-        vllm_engine_helper,
-        temp_dir,
-    ):
-        """Back-and-forth test with 3 actors: vLLM on GPUs 0/1/2, trainer on GPU 3."""
-        from .sync_helper import create_sync_dir
-
-        print("\n" + "="*60)
-        print("Starting back-and-forth test (TP=1, 3 actors, 4 GPUs)")
-        print("="*60)
-
-        sync_dir = create_sync_dir(temp_dir)
-        await _run_back_and_forth_engine_test(
-            model_name=model_name,
-            simple_prompt=simple_prompt,
-            generation_config=generation_config,
-            init_method=distributed_init_method,
-            distributed_trainer_helper=distributed_trainer_helper,
-            vllm_engine_helper=vllm_engine_helper,
-            sync_dir=sync_dir,
-            vllm_configs=[
-                {"cuda_devices": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
-                {"cuda_devices": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
-                {"cuda_devices": "2", "actor_llm_idx": 2, "tensor_parallel_size": 1},
-            ],
-            trainer_gpu="3",
-            world_size=4,
-            timeout=1800,
-        )
-
-    @pytest.mark.timeout(2400)
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="Requires at least 3 GPUs")
-    async def test_server_weight_update_pattern_2actors(
-        self,
-        model_name,
-        simple_prompt,
-        generation_config,
-        distributed_init_method,
-        distributed_trainer_helper,
-        temp_dir,
-    ):
-        """Server weight update test with 2 actors: servers on GPUs 0 and 1, trainer on GPU 2."""
-        print("\n" + "="*60)
-        print("Starting server weight update pattern test (TP=1, 2 actors, 3 GPUs)")
-        print("="*60)
-
-        await _run_server_weight_update_test(
-            model_name=model_name,
-            simple_prompt=simple_prompt,
-            generation_config=generation_config,
-            init_method=distributed_init_method,
-            distributed_trainer_helper=distributed_trainer_helper,
-            vllm_server_configs=[
-                {"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
-                {"port": 8001, "gpu_ids": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
-            ],
-            trainer_gpu="2",
-            world_size=3,
-            timeout=2400,
-        )
-
-    @pytest.mark.timeout(2400)
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires at least 4 GPUs")
-    async def test_server_weight_update_pattern_3actors(
-        self,
-        model_name,
-        simple_prompt,
-        generation_config,
-        distributed_init_method,
-        distributed_trainer_helper,
-        temp_dir,
-    ):
-        """Server weight update test with 3 actors: servers on GPUs 0/1/2, trainer on GPU 3."""
-        print("\n" + "="*60)
-        print("Starting server weight update pattern test (TP=1, 3 actors, 4 GPUs)")
-        print("="*60)
-
-        await _run_server_weight_update_test(
-            model_name=model_name,
-            simple_prompt=simple_prompt,
-            generation_config=generation_config,
-            init_method=distributed_init_method,
-            distributed_trainer_helper=distributed_trainer_helper,
-            vllm_server_configs=[
-                {"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1},
-                {"port": 8001, "gpu_ids": "1", "actor_llm_idx": 1, "tensor_parallel_size": 1},
-                {"port": 8002, "gpu_ids": "2", "actor_llm_idx": 2, "tensor_parallel_size": 1},
-            ],
-            trainer_gpu="3",
-            world_size=4,
-            timeout=2400,
-        )

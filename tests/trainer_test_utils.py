@@ -26,7 +26,7 @@ def _load_state_dict(model_name: str, device: str = "cuda:0") -> tuple:
     index_file = model_path / "model.safetensors.index.json"
 
     if index_file.exists():
-        print(f"[Trainer] Found index file, loading sharded model")
+        print("[Trainer] Found index file, loading sharded model")
         with open(index_file) as f:
             index = json.load(f)
         weight_map = index["weight_map"]

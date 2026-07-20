@@ -2,14 +2,9 @@
 
 import asyncio
 import pytest
-import tempfile
 from pathlib import Path
-from typing import Dict, List
 import time
-import os
 import subprocess
-import sys
-import signal
 
 # torch is needed at top level for pytest.mark.skipif decorators
 import torch
@@ -25,91 +20,9 @@ from .server_weight_update_utils import (
     analyze_and_verify_transitions,
     start_vllm_server,
     start_trainer_process,
+    stream_process_output,
+    kill_process_tree,
 )
-
-try:
-    import psutil
-
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-    print("WARNING: psutil not available, process tree cleanup will be limited")
-
-
-def stream_process_output(proc, name):
-    """Start background threads to continuously stream process stdout/stderr.
-
-    Args:
-        proc: subprocess.Popen object
-        name: Name for logging prefix (e.g., "vLLM Server", "Trainer")
-
-    Returns:
-        Tuple of (stdout_thread, stderr_thread)
-    """
-    import threading
-
-    def read_stream(stream, prefix):
-        """Read from stream and print with prefix."""
-        try:
-            for line in iter(stream.readline, ""):
-                if line:
-                    print(f"{prefix} {line.rstrip()}", flush=True)
-        except Exception as e:
-            print(f"{prefix} [Stream read error: {e}]", flush=True)
-
-    stdout_thread = threading.Thread(
-        target=read_stream,
-        args=(proc.stdout, f"[{name} OUT]"),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=read_stream,
-        args=(proc.stderr, f"[{name} ERR]"),
-        daemon=True,
-    )
-
-    stdout_thread.start()
-    stderr_thread.start()
-
-    return stdout_thread, stderr_thread
-
-
-def kill_process_tree(pid, sig=signal.SIGKILL):
-    """Kill a process and all its children/grandchildren.
-
-    Args:
-        pid: Process ID to kill
-        sig: Signal to send (default SIGKILL)
-    """
-    if not HAS_PSUTIL:
-        # Fallback: just kill the main process
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            pass
-        return
-
-    try:
-        parent = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return
-
-    # Get all children recursively
-    children = parent.children(recursive=True)
-
-    # Kill children first
-    for child in children:
-        try:
-            print(f"[Kill] Killing child process {child.pid}")
-            child.send_signal(sig)
-        except psutil.NoSuchProcess:
-            pass
-
-    # Kill parent
-    try:
-        parent.send_signal(sig)
-    except psutil.NoSuchProcess:
-        pass
 
 
 @pytest.fixture
@@ -210,7 +123,6 @@ async def _run_fast_llm_server_test(
     vllm_server_configs,
     trainer_gpu,
     world_size,
-    timeout=2400,
 ):
     """Run Fast-LLM server weight-update pattern test with one or more vLLM servers.
 
@@ -243,7 +155,6 @@ async def _run_fast_llm_server_test(
             model_name=model_name,
             server_port=port,
             distributed_init_method=init_method,
-            stream_process_output_fn=stream_process_output,
             extra_args=fast_llm_server_args,
             gpu_ids=cfg.get("gpu_ids", "0"),
             actor_llm_idx=cfg.get("actor_llm_idx", 0),
@@ -259,7 +170,6 @@ async def _run_fast_llm_server_test(
         distributed_init_method=init_method,
         model_name=model_name,
         server_urls=server_urls,
-        stream_process_output_fn=stream_process_output,
         extra_args=[
             "--redis-host", redis_host,
             "--redis-port", str(redis_port),
@@ -326,7 +236,6 @@ class TestFastLLMServerIntegration:
         distributed_init_method,
         fast_llm_trainer_helper,
         redis_server,
-        temp_dir,
     ):
         """Server integration test: verify Fast-LLM weight broadcast pattern with HTTP API.
 
@@ -354,7 +263,6 @@ class TestFastLLMServerIntegration:
             vllm_server_configs=[{"port": 8000, "gpu_ids": "0", "actor_llm_idx": 0, "tensor_parallel_size": 1}],
             trainer_gpu="1",
             world_size=2,
-            timeout=2400,
         )
 
     @pytest.mark.timeout(2400)
@@ -370,7 +278,6 @@ class TestFastLLMServerIntegration:
         distributed_init_method,
         fast_llm_trainer_helper,
         redis_server,
-        temp_dir,
     ):
         """Diagnostic test: catch garbage generations during Fast-LLM weight broadcasts.
 
@@ -397,7 +304,6 @@ class TestFastLLMServerIntegration:
             model_name=model_name,
             server_port=8000,
             distributed_init_method=distributed_init_method,
-            stream_process_output_fn=stream_process_output,
             extra_args=[
                 "--weight-update-mode", "fast-llm",
                 "--redis-host", redis_host,
@@ -416,7 +322,6 @@ class TestFastLLMServerIntegration:
             distributed_init_method=distributed_init_method,
             model_name=model_name,
             server_urls=[server_url],
-            stream_process_output_fn=stream_process_output,
             extra_args=[
                 "--redis-host", redis_host,
                 "--redis-port", str(redis_port),
@@ -471,7 +376,6 @@ class TestFastLLMServerTP2:
         distributed_init_method,
         fast_llm_trainer_helper,
         redis_server,
-        temp_dir,
     ):
         """Fast-LLM server test with TP=2: one server on GPUs 0+1, trainer on GPU 2.
 
@@ -495,7 +399,6 @@ class TestFastLLMServerTP2:
             vllm_server_configs=[{"port": 8001, "gpu_ids": "0,1", "actor_llm_idx": 0, "tensor_parallel_size": 2}],
             trainer_gpu="2",
             world_size=3,
-            timeout=2400,
         )
 
 
@@ -515,7 +418,6 @@ class TestFastLLMServerMultiActor:
         distributed_init_method,
         fast_llm_trainer_helper,
         redis_server,
-        temp_dir,
     ):
         """Fast-LLM server test with 2 actors: servers on GPUs 0 and 1, trainer on GPU 2.
 
@@ -542,7 +444,6 @@ class TestFastLLMServerMultiActor:
             ],
             trainer_gpu="2",
             world_size=3,
-            timeout=2400,
         )
 
     @pytest.mark.timeout(2400)
@@ -558,7 +459,6 @@ class TestFastLLMServerMultiActor:
         distributed_init_method,
         fast_llm_trainer_helper,
         redis_server,
-        temp_dir,
     ):
         """Fast-LLM server test with 3 actors: servers on GPUs 0/1/2, trainer on GPU 3.
 
@@ -586,5 +486,4 @@ class TestFastLLMServerMultiActor:
             ],
             trainer_gpu="3",
             world_size=4,
-            timeout=2400,
         )
