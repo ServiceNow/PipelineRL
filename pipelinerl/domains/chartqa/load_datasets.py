@@ -1,7 +1,8 @@
 import logging
 from typing import List
 import datasets
-from datasets import load_dataset
+
+from pipelinerl.domains._datasets_compat import load_dataset
 
 logger = logging.getLogger(__name__)
 

@@ -7,8 +7,9 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import datasets
 import hydra
-from datasets import load_dataset
 from omegaconf import DictConfig
+
+from pipelinerl.domains._datasets_compat import load_dataset
 
 """
 math_verify expects the following LaTeX format for the gold answer (with $ or \\boxed).

@@ -1,0 +1,31 @@
+# Qwen2.5-7B GSPO — Fast-LLM trainer backend (bf16). Multi-node launch:
+#   python -m pipelinerl.launch --config-name math_qwen7b_gspo_fllm
+# Node count is set by the launcher (env WORLD_SIZE), not here.
+#
+# Same recipe as the 0.5B Fast-LLM config — this inherits it and overrides only what the
+# larger model needs to fit in trainer memory. Change a shared hyperparameter in
+# math_qwen05_gspo_fllm / _common; it flows here automatically.
+# Precision variants: same CLI overrides as the 0.5B config
+#   fast_llm.model.distributed.compute_dtype=float16 vllm_config.vllm_kwargs.dtype=float16   (fp16-matched)
+
+defaults:
+  - math_qwen05_gspo_fllm
+  - _self_
+
+# Public HF id; override with a local snapshot path on the CLI if it can't be resolved.
+model_path: Qwen/Qwen2.5-7B
+
+fast_llm:
+  model:
+    multi_stage:
+      # ZeRO-3 also shards parameters (on top of optimizer state + gradients). MLP recompute
+      # below is already on, so trainer memory is tight — ZeRO-2's replicated parameters may
+      # not fit. Default to 3; drop to 2 only if there is headroom (2 avoids the per-step
+      # parameter all-gather).
+      zero_stage: 3
+    base_model:
+      decoder:
+        block:
+          mlp:
+            # Recompute MLP activations in the backward pass to save trainer memory.
+            recompute_level: full

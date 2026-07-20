@@ -74,7 +74,7 @@ vllm_config:
 
 world:
   replicas: 1
-  
+
   actor_fraction: 4
   preprocessor_fraction: 0
   finetune_fraction: 4
@@ -83,6 +83,11 @@ world:
 
   actor_group_port: 9000
   environment_start_port: 7777
+  # Unique identifier for this job run, used to namespace the pod IP exchange
+  # directory so stale files from previous runs are never seen.
+  # Defaults to $MASTER_ADDR when null (suitable for EAI and torchrun jobs).
+  run_id: null
+
 # this will be autocreated based on the config
 jobs: []
 
@@ -111,6 +116,72 @@ debug:
   streams_from: null
   place_inference_workers: true
   use_existing_llms: false
+  log_data_pipeline: false
+
+# Fast-LLM integration: when true, fast-llm is used as the trainer.
+# Data flows actors -> Redis (fast_llm_streaming) -> fast-llm training loop.
+# Weight updates are broadcast via NCCL using fast-llm's streaming callback.
+use_fast_llm: false
+# Whether the trainer broadcasts updated weights to vLLM after each training step.
+weight_broadcast: true
+
+# Fast-LLM trainer backend — CONTRACT + SCAFFOLD only (this section is used only when
+# use_fast_llm: true). Training HYPERPARAMETERS (steps, batch size, schedule, loss, zero stage,
+# precision, learning rate, …) are NOT defaulted here — they belong in the experiment config
+# (e.g. conf/math_qwen05_gspo_fllm.yaml), which sets them, mirroring how the DeepSpeed
+# hyperparameters live in the `finetune: base` group rather than inline here.
+# Fields set to null are populated by the launcher at runtime (source noted in the comment).
+fast_llm:
+  training:
+    num_workers: 0
+    wandb:
+      entity_name: null     # cfg.wandb.wandb_entity_name (null disables wandb)
+      project_name: null    # cfg.wandb.wandb_project_name
+      group_name: null      # cfg.wandb.wandb_group
+    logs:
+      interval: 1  # Logging frequency in optimizer steps
+    export:
+      format: ${fast_llm_finetune.model_format}   # export cadence (interval) is set per experiment
+
+  data:
+    truncate_documents: false  # Do not truncate RL rollouts
+    shuffle: disabled  # Streaming dataset ignores shuffling
+    datasets:
+      training:
+        type: streaming  # Redis-backed streaming dataset
+        host: null  # cfg.streams.host
+        port: null  # cfg.streams.port
+
+  pretrained:
+    format: ${fast_llm_finetune.model_format}
+    path: null      # cfg.model_path
+    model_weights: true
+
+  run:
+    experiment_dir: null   # exp_dir/finetune
+    experiment_name: null  # derived from exp_dir relative to cfg.wandb.wandb_workspace_root
+
+  # callbacks section is written only when weight_broadcast: true (removed by launcher otherwise)
+  callbacks:
+    streaming:
+      type: streaming
+      host: null  # cfg.streams.host
+      port: null  # cfg.streams.port
+      broadcast:
+        backend: nccl
+        external_world_size: null  # world_map.weight_update_group_size - 1
+        host: null                  # world_map.master_addr
+        port: null                  # cfg.world.actor_group_port
+      export:
+        format: ${fast_llm_finetune.model_format}
+        model_weights: true
+        optimizer_state: false
+
+# Launcher-specific fast-llm settings (not passed to fast-llm itself).
+fast_llm_finetune:
+  model_type: gpt      # fast-llm model type argument: fast-llm train <model_type>
+  model_format: qwen2  # pretrained/export format; interpolated into fast_llm config
+  torchrun_port: 29500  # master port for torchrun rendezvous
 
 me:
   # Which job is this one? This will be autopopulated

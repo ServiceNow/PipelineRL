@@ -33,6 +33,9 @@ train_batch_size: 1
 valid_batch_size: 4
 # Value of weight decay.
 weight_decay: 0.01
+# Adam optimizer betas (used by the adamw_torch / cpuadam optimizers).
+adam_beta1: 0.9
+adam_beta2: 0.999
 # Learning rate for training.
 learning_rate: 1e-6
 # How much to clip the gradient (no clipping if null)

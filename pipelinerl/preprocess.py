@@ -3,6 +3,8 @@ from collections import defaultdict, deque
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
+import contextlib
+import json
 import logging
 import queue
 import threading
@@ -76,7 +78,7 @@ def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
         group_rollouts[group_id].add(rollout_index)
 
     for group_id, rollout_ids in group_rollouts.items():
-        if len(rollout_ids) != group_size:
+        if not 1 <= len(rollout_ids) <= group_size:
             logger.error(f"Group sizes are wrong: {group_rollouts}")
             return False
 
@@ -367,6 +369,82 @@ def write_micro_batch_slices(
         data_writer.write(micro_batch, lead_trainer_id)
 
 
+def convert_to_fast_llm_format(entry: dict) -> dict:
+    """Convert a preprocessed sample entry to Fast-LLM streaming format.
+
+    Fast-LLM RedisDocument fields:
+    - tokens: list of token IDs (full sequence: prompt + completion)
+    - loss_masking_spans: list of (start, end) spans masked out of the loss (label == -100; prompt tokens)
+    - advantage: scalar float (per-rollout GRPO advantage)
+    - old_log_probabilities: list of floats, full sequence length (zeros for prompt tokens)
+    - reward: scalar float (raw per-rollout reward, a diagnostic; distinct from advantage)
+    - model_version: list of ints, full sequence length (per-token weight version; prompt positions
+      padded and masked out on the trainer side)
+    """
+    input_ids = entry["input_ids"]
+    tokens = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+
+    result: dict = {"tokens": tokens}
+
+    # loss_masking_spans: contiguous spans where label == -100 (prompt tokens to mask out).
+    # fast-llm sets labels to -100 at these positions, so only completion tokens contribute to loss.
+    if "labels" in entry:
+        labels = entry["labels"]
+        labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
+
+        spans = []
+        in_span = False
+        span_start = 0
+        for i, label in enumerate(labels):
+            if label == -100 and not in_span:
+                in_span = True
+                span_start = i
+            elif label != -100 and in_span:
+                spans.append((span_start, i))
+                in_span = False
+        if in_span:
+            spans.append((span_start, len(labels)))
+
+        if spans:
+            result["loss_masking_spans"] = spans
+
+    # advantage: scalar per rollout (populate_rl_data stores a list of per-step scalars;
+    # for single-step tasks like math there is exactly one element)
+    if "advantages" in entry:
+        advantages = entry["advantages"]
+        if advantages:
+            result["advantage"] = float(advantages[0])
+
+    # reward: raw (un-normalized) reward, a scalar per rollout (distinct from the group-relative
+    # advantage). Fast-LLM logs it as a diagnostic; it does not affect the loss.
+    if "reward" in entry:
+        result["reward"] = float(entry["reward"])
+
+    # old_log_probabilities: full sequence length, zeros for prompt tokens
+    # (prepare_rl_fields pads with zeros on the left to match len(input_ids))
+    if "old_logprobs" in entry:
+        old_logprobs = entry["old_logprobs"]
+        old_logprobs = old_logprobs.tolist() if hasattr(old_logprobs, "tolist") else list(old_logprobs)
+        result["old_log_probabilities"] = [float(x) for x in old_logprobs]
+
+    # model_version: full sequence length per-token weight version. When the server reports a
+    # per-completion-token version (`token_versions`, in-flight weight swaps), left-pad it to the full
+    # sequence like old_log_probabilities; prompt positions are masked out on the trainer side, so the
+    # pad value is inert. Otherwise fall back to the per-rollout scalar broadcast across all tokens.
+    scalar_version = entry.get("model_version")
+    token_versions = entry.get("token_versions")
+    if token_versions is not None and hasattr(token_versions, "tolist"):
+        token_versions = token_versions.tolist()
+    if token_versions:
+        pad_value = int(scalar_version) if scalar_version is not None else int(token_versions[0])
+        pad = [pad_value] * (len(tokens) - len(token_versions))
+        result["model_version"] = pad + [int(x) for x in token_versions]
+    elif scalar_version is not None:
+        result["model_version"] = [int(scalar_version)] * len(tokens)
+
+    return result
+
+
 def run_preprocessing_loop(
     
     cfg: DictConfig,
@@ -396,13 +474,27 @@ def run_preprocessing_loop(
         wait_for_inference_servers(llm_urls)
 
     input_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)
-    output_stream = StreamRangeSpec(
-        exp_path=exp_root_dir,
-        topic=cfg.preprocess.output,
-        partition_range=(0, max(world_map.total_finetune_gpus, 1)),
-    )
+    # For Fast-LLM: use SingleStreamSpec with shared=True (uses orjson serialization)
+    # For standard PipelineRL: use StreamRangeSpec with partitions per GPU
+    if cfg.use_fast_llm:
+        from fast_llm.data.dataset.config import REDIS_DATA_STREAM
+        fast_llm_stream_name = REDIS_DATA_STREAM
+        output_stream = SingleStreamSpec(
+            exp_path=exp_root_dir,
+            topic=cfg.preprocess.output,
+            partition=0,
+        )
+        use_shared_stream = True
+    else:
+        fast_llm_stream_name = None
+        output_stream = StreamRangeSpec(
+            exp_path=exp_root_dir,
+            topic=cfg.preprocess.output,
+            partition_range=(0, max(world_map.total_finetune_gpus, 1)),
+        )
+        use_shared_stream = False
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
-    logger.info("Streams initialized")
+    logger.info(f"Streams initialized (shared={use_shared_stream})")
 
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     pop_old_data = cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode
@@ -419,7 +511,7 @@ def run_preprocessing_loop(
     dataset_loader_thread.start()
     
     # Initialize TrainerState
-    trainer_state = TrainerState(exp_root_dir)
+    trainer_state = TrainerState(exp_root_dir, use_fast_llm=cfg.use_fast_llm, weight_broadcast=cfg.weight_broadcast)
     if cfg.debug.mode == "preprocessor":
         logger.info("Debug mode: preprocessor")
         trainer_state.debug_mode_init()
@@ -433,6 +525,9 @@ def run_preprocessing_loop(
         trainer_state.wait_for_model_version()
     final_train_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
+
+    def is_trainer_finished() -> bool:
+        return trainer_state.is_finished(samples_target)
 
     # Load published samples from state file
     llms = [
@@ -483,7 +578,14 @@ def run_preprocessing_loop(
     # Per-trainer sample tracking (similar to finetune_loop.py)
     total_filtered_out = 0  # Track total filtered samples across all batches
 
-    with write_to_streams(output_stream) as data_writer, write_to_streams(stats_streams) as stats_writer:
+    pipeline_log_file = None
+
+    with write_to_streams(output_stream, shared=use_shared_stream, stream_name_override=fast_llm_stream_name) as data_writer, write_to_streams(stats_streams) as stats_writer, contextlib.ExitStack() as pipeline_log_stack:
+        if cfg.use_fast_llm and cfg.debug.log_data_pipeline:
+            # Write alongside fast-llm rank files: {exp_dir}/finetune/data_pipeline_log/
+            log_dir = Path(cfg.output_dir) / "finetune" / "data_pipeline_log"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            pipeline_log_file = pipeline_log_stack.enter_context(open(log_dir / "preprocessor.jsonl", "a"))
         with SharedMemoryManager() as smm:
             # Create shared memory queues without the manager parameter
             input_queue = SharedMemoryQueue(smm, cfg.preprocess.input_queue_size, cfg.preprocess.shared_memory_entry_size)
@@ -519,11 +621,9 @@ def run_preprocessing_loop(
                 fetching_took = 0
                 writing_took = 0
                 num_filtered_out = 0
+                last_backpressure_log = 0.0
                 while True:
-                    if (
-                        trainer_state.samples_processed is not None
-                        and trainer_state.samples_processed >= samples_target
-                    ):
+                    if is_trainer_finished():
                         logger.info("Trainer signalled completion; stopping preprocessor loop")
                         break
                     if not input_queue.full():
@@ -589,13 +689,43 @@ def run_preprocessing_loop(
                     assert isinstance(trainer_state.samples_processed, int)
                     if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
                         # wait for the finetune loop to finish processing data
+                        now = time.time()
+                        if now - last_backpressure_log >= 10.0:
+                            last_backpressure_log = now
+                            logger.info(
+                                f"Back-pressure: published={published_samples} consumed={trainer_state.samples_processed}"
+                                f" unconsumed={published_samples - trainer_state.samples_processed} > max={max_unconsumed_samples}, waiting"
+                            )
                         continue
 
                     batch_done = False
                     start_writing = time.time()
                     while (len(processed_entries_queue) > 0 and not batch_done) or (cfg.preprocess.dataset_buffer_size and not batch_done):
                         logger.debug(f"[inner loop] trainer {trainer_id} has {samples_per_trainer[trainer_id]} samples, target is {target_samples_per_lead}")
-                        if cfg.finetune.seq_packing:
+
+                        # Fast-LLM path: write individual samples directly (Fast-LLM does its own packing)
+                        if cfg.use_fast_llm:
+                            write_start = time.time() if pipeline_log_file is not None else None
+                            write_samples = 0
+                            write_tokens = 0
+                            while len(processed_entries_queue) > 0:
+                                entry = processed_entries_queue.popleft()
+                                if pipeline_log_file is not None:
+                                    write_samples += 1
+                                    write_tokens += len(entry.get("input_ids", []))
+                                data_writer.write(convert_to_fast_llm_format(entry))
+                                published_samples += 1
+                            if pipeline_log_file is not None and write_samples > 0:
+                                pipeline_log_file.write(json.dumps({
+                                    "event": "WRITE",
+                                    "t_start": round(write_start, 3),
+                                    "t_end": round(time.time(), 3),
+                                    "samples": write_samples,
+                                    "tokens": write_tokens,
+                                }) + "\n")
+                                pipeline_log_file.flush()
+                            batch_done = True
+                        elif cfg.finetune.seq_packing:
                             if samples_per_trainer[trainer_id] == target_samples_per_lead:
                                 logger.debug(f"[inner loop] trainer {trainer_id} has all {target_samples_per_lead} samples, creating sentinel batch")
                                 sentinel_batch = create_sentinel_batch(
@@ -637,14 +767,17 @@ def run_preprocessing_loop(
                                     current_length = 0
                                     logger.debug(f"[inner loop] Packed microbatch with {len(current_batch)} samples for trainer {trainer_id}")
                         else:
+                            # Unpacked path: need a full micro-batch before collating.
+                            if len(processed_entries_queue) < cfg.finetune.train_batch_size:
+                                break  # wait for more data; outer loop will refill the queue
                             batch_entries = []
-                            for _ in range(cfg.finetune.train_batch_size ):
+                            for _ in range(cfg.finetune.train_batch_size):
                                 batch_entries.append(processed_entries_queue.popleft())
                             batch_encoding = collate(batch_entries, tokenizer=tokenizer)
                             write_micro_batch_slices(trainer_id, data_writer, batch_encoding, cfg.finetune.seq_parallel)
                             published_samples += len(batch_entries)
                             samples_per_trainer[trainer_id] += len(batch_entries)
-                            logger.debug(f"[inner loop] Packed microbatch with {len(batch_entries)} samples for trainer {trainer_id}")
+                            logger.debug(f"[inner loop] Unpacked microbatch with {len(batch_entries)} samples for trainer {trainer_id}")
                             trainer_id = (trainer_id + cfg.finetune.seq_parallel) % num_trainers
 
                         batch_done = published_samples == batch_boundary and trainer_id == 0
@@ -686,10 +819,12 @@ def run_preprocessing_loop(
                         processing_took = time.time() - start_processing
                         processed_samples = published_samples - last_published_samples
                         last_published_samples = published_samples
+                        consumed_samples = trainer_state.samples_processed or 0
                         logger.info(
                             f"Processed {processed_samples} samples (filtered out {num_filtered_out}) in {processing_took:.3f}s"
                             f" (fetching took {fetching_took:.3f} and writing took {writing_took:.3f})"
-                            f" and wrote to {output_stream}, total {published_samples} samples so far,"
+                            f" and wrote to {output_stream}, total {published_samples} samples so far"
+                            f" (trainer consumed {consumed_samples}, unconsumed {published_samples - consumed_samples}),"
                             f" {samples_in_output_queue} samples in output queue, max output queue entry size {output_queue.max_actual_entry_size()} bytes"
                         )
                         start_processing = time.time()
