@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-import pipelinerl.prerun_evidence as prerun_evidence
+import pipelinerl.domains.tau2.prerun as tau2_prerun
 from pipelinerl.actor import (
     actor_result_payload_size,
     make_calibration_group_evidence,
@@ -13,10 +13,16 @@ from pipelinerl.actor import (
 from pipelinerl.domains.tau2.prerun import (
     CALIBRATION_CAVEAT,
     GIB,
+    USER_SIMULATOR_MODEL,
+    USER_SIMULATOR_MODEL_ID,
+    USER_SIMULATOR_REVISION,
+    UserSimulatorDeployment,
+    ServiceIdentity,
     CalibrationGroupEvidence,
     PINNED_SOURCES,
     PreRunSpec,
-    ServiceIdentity,
+    validate_user_simulator_deployment,
+    validate_user_simulator_endpoint,
     TrainerMemoryCandidate,
     build_trainer_memory_budgets,
     finalize_prerun_manifest,
@@ -49,6 +55,10 @@ POLICY_ENDPOINTS = [
     "http://actor-0:8000",
     "http://actor-1:8000",
 ]
+
+USER_SIMULATOR_ENDPOINT = (
+    "http://dns-test-account-tau2-user:8000/v1"
+)
 
 
 def _memory_candidates() -> list[TrainerMemoryCandidate]:
@@ -138,6 +148,58 @@ def _snapshot(tmp_path: Path) -> Path:
     )
     (snapshot / "tokenizer.json").write_text('{"version":"1"}')
     return snapshot
+
+
+def _user_simulator_deployment(
+    tmp_path: Path,
+    monkeypatch,
+) -> UserSimulatorDeployment:
+    snapshot = tmp_path / "user-simulator"
+    snapshot.mkdir()
+    (snapshot / "model-00001-of-00002.safetensors").write_bytes(
+        b"user-shard-one"
+    )
+    (snapshot / "model-00002-of-00002.safetensors").write_bytes(
+        b"user-shard-two"
+    )
+    (snapshot / "tokenizer.json").write_text('{"version":"user"}')
+    model = hash_model_snapshot(
+        snapshot,
+        USER_SIMULATOR_MODEL_ID,
+        USER_SIMULATOR_REVISION,
+    )
+    monkeypatch.setattr(
+        tau2_prerun,
+        "USER_SIMULATOR_ARTIFACT_SHA256",
+        {
+            artifact.path: artifact.sha256
+            for artifact in model.artifacts
+        },
+    )
+    return UserSimulatorDeployment(
+        service=ServiceIdentity(
+            model=USER_SIMULATOR_MODEL,
+            endpoint=USER_SIMULATOR_ENDPOINT,
+        ),
+        model=model,
+        snapshot_path=str(snapshot),
+        job_spec_sha256="b" * 64,
+        submission_mode="restartable",
+        thinking_enabled=False,
+        gpu_type="test-h100-80gb",
+        gpu_count=2,
+        tensor_parallel_size=2,
+        max_model_len=16_384,
+        max_num_seqs=8,
+        measured_peak_in_flight=4,
+        observed_request_latencies_s=[0.2, 0.3],
+        observed_user_prompt_tokens=[4_000, 5_000],
+        prompt_headroom_factor=1.25,
+        generation_reserve_tokens=2_048,
+        snapshot_hash_bytes=sum(
+            artifact.size for artifact in model.artifacts
+        ),
+    )
 
 
 def _fingerprint(value: float) -> TensorFingerprint:
@@ -300,6 +362,63 @@ def test_snapshot_identity_and_gemma_text_topology_are_immutable(
     assert changed.snapshot_digest != first.snapshot_digest
 
 
+def test_user_simulator_deployment_requires_measured_profile_and_pins(
+    tmp_path,
+    monkeypatch,
+):
+    verified_artifacts = dict(
+        tau2_prerun.USER_SIMULATOR_ARTIFACT_SHA256
+    )
+    deployment = _user_simulator_deployment(
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        tau2_prerun,
+        "USER_SIMULATOR_SNAPSHOT",
+        deployment.snapshot_path,
+    )
+    validate_user_simulator_deployment(
+        deployment,
+        deployment.service,
+    )
+    extra_gpu = deployment.model_copy(update={"gpu_count": 4})
+    with pytest.raises(ValueError, match="GPU/TP"):
+        validate_user_simulator_deployment(
+            extra_gpu,
+            extra_gpu.service,
+        )
+    too_short = deployment.model_copy(
+        update={"max_model_len": 8_000}
+    )
+    with pytest.raises(ValueError, match="measured user-prompt"):
+        validate_user_simulator_deployment(
+            too_short,
+            too_short.service,
+        )
+    monkeypatch.setattr(
+        tau2_prerun,
+        "USER_SIMULATOR_ARTIFACT_SHA256",
+        verified_artifacts,
+    )
+    with pytest.raises(ValueError, match="verified artifact SHA256"):
+        validate_user_simulator_deployment(
+            deployment,
+            deployment.service,
+        )
+
+
+def test_user_simulator_endpoint_requires_resolved_internal_dns():
+    assert (
+        validate_user_simulator_endpoint(USER_SIMULATOR_ENDPOINT)
+        == USER_SIMULATOR_ENDPOINT
+    )
+    with pytest.raises(ValueError, match="resolved account-scoped"):
+        validate_user_simulator_endpoint(
+            "http://dns-<account>-tau2-user:8000/v1"
+        )
+
+
 def test_calibration_selection_and_caps_record_exact_small_sample():
     problems = [
         {
@@ -414,6 +533,7 @@ def test_tensor_fingerprint_covers_all_values_and_finiteness():
 
 def test_finalizer_requires_all_nine_gates_and_records_evidence(
     tmp_path: Path,
+    monkeypatch,
 ):
     evidence_dir = tmp_path / "evidence"
     append_evidence_record(
@@ -433,13 +553,20 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
             "calibration_groups",
             group,
         )
+    user_simulator_deployment = _user_simulator_deployment(
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        tau2_prerun,
+        "USER_SIMULATOR_SNAPSHOT",
+        user_simulator_deployment.snapshot_path,
+    )
     spec = PreRunSpec(
         model_snapshot=str(_snapshot(tmp_path)),
         source_pins=PINNED_SOURCES,
-        user_simulator=ServiceIdentity(
-            model="gpt-4.1-2025-04-14",
-            endpoint="https://api.openai.com/v1",
-        ),
+        user_simulator=user_simulator_deployment.service,
+        user_simulator_deployment=user_simulator_deployment,
         policy_model=(
             "google/gemma-4-26B-A4B-it@"
             "01e5b3ee840d3a9e0b0b493c593e85398a30ef75"
@@ -486,7 +613,17 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
     assert "1127684971bbca40465435a5cad69d67" in (
         manifest.topology_provenance
     )
-    assert "developers.openai.com" in manifest.user_simulator_provenance
+    assert "842da3794eaa0b77" in manifest.user_simulator_provenance
+    assert (
+        manifest.user_simulator_deployment.snapshot_hash_bytes
+        == sum(
+            artifact.size
+            for artifact in user_simulator_deployment.model.artifacts
+        )
+    )
+    assert "streams the complete" in (
+        manifest.user_simulator_snapshot_hash_io
+    )
 
 
 def test_actor_calibration_record_uses_attempted_oversize_and_real_spans():

@@ -97,8 +97,8 @@ test_dataset_names: []
 tau2_gym:
   head_url: ${oc.env:TAU2_GYM_HEAD_URL,PENDING_TAU2_GYM_HEAD_URL}
   policy_model_name: ${tau2_prerun.policy_model}
-  user_model_url: https://api.openai.com/v1
-  user_model_name: gpt-4.1-2025-04-14
+  user_model_url: ${oc.env:TAU2_USER_SIMULATOR_ENDPOINT,PENDING_ACCOUNT_SCOPED_TAU2_USER_ENDPOINT}
+  user_model_name: google/gemma-4-31B-it@842da3794eaa0b77d5f08bae87a17459d91ff475
   validation_interval_s: 30.0
   request_timeout_s: 3600.0
   startup_timeout_s: 600.0
@@ -110,6 +110,9 @@ tau2_prerun:
   spec_path: ${oc.env:TAU2_PRERUN_SPEC,PENDING_TAU2_PRERUN_SPEC}
   job_spec_path: ${oc.env:TAU2_JOB_SPEC_PATH,PENDING_TAU2_JOB_SPEC_PATH}
   model_snapshot: ${oc.env:TAU2_MODEL_SNAPSHOT,PENDING_TAU2_MODEL_SNAPSHOT}
+  user_simulator_job_spec_path: ${oc.env:TAU2_USER_SIM_JOB_SPEC_PATH,PENDING_TAU2_USER_SIM_JOB_SPEC_PATH}
+  user_simulator_snapshot: ${oc.env:TAU2_USER_SIM_SNAPSHOT,/mnt/llmd/base_models/gemma-4-31B-it}
+
   evidence_dir: ${output_dir}/tau2_prerun_evidence
   policy_model: google/gemma-4-26B-A4B-it@01e5b3ee840d3a9e0b0b493c593e85398a30ef75
   policy_endpoints: []

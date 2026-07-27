@@ -1,8 +1,10 @@
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import aiohttp
 import pytest
 import requests
 from omegaconf import OmegaConf
@@ -113,8 +115,9 @@ def test_load_tau2_problems_stamps_pipeline_metadata(tmp_path: Path):
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
         self.payload = payload
+        self.status = status
 
     async def __aenter__(self):
         return self
@@ -123,6 +126,15 @@ class _FakeResponse:
         return None
 
     def raise_for_status(self):
+        if self.status >= 400:
+            raise aiohttp.ClientResponseError(
+                request_info=SimpleNamespace(
+                    real_url="https://frozen-user.example/health"
+                ),
+                history=(),
+                status=self.status,
+                message="test readiness error",
+            )
         return None
 
     async def json(self):
@@ -130,15 +142,33 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self, config: dict):
+    def __init__(
+        self,
+        config: dict,
+        *,
+        user_health_results=None,
+        user_models_payload=None,
+    ):
         self.config = config
         self.get_urls = []
         self.post_urls = []
+        self.user_health_results = list(user_health_results or [])
+        self.user_models_payload = user_models_payload
 
-    def get(self, url):
+    def get(self, url, *, timeout=None):
         self.get_urls.append(url)
         if url.endswith("/global_config_dict_yaml"):
             return _FakeResponse(OmegaConf.to_yaml(OmegaConf.create(self.config)))
+        if url.endswith("/v1/models"):
+            return _FakeResponse(
+                self.user_models_payload
+                or {"data": [{"id": "gpt-user-sim"}]}
+            )
+        if url.endswith("/health") and self.user_health_results:
+            result = self.user_health_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return _FakeResponse({"status": "ok"}, status=result)
         return _FakeResponse({"status": "ok"})
 
     def post(self, url, *, json, timeout):
@@ -165,6 +195,103 @@ def test_client_routes_to_bound_agent_and_periodically_revalidates():
         assert first.reward == second.reward == 1.0
         assert session.post_urls == ["http://gym-host:12004/run"] * 2
         assert session.get_urls.count("http://gym-head:11000/global_config_dict_yaml") == 2
+
+        assert session.get_urls.count(
+            "https://frozen-user.example/health"
+        ) == 2
+        assert session.get_urls.count(
+            "https://frozen-user.example/v1/models"
+        ) == 2
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        pytest.param(503, id="http-503"),
+        pytest.param(
+            aiohttp.ClientConnectionError("simulator restarting"),
+            id="connection-error",
+        ),
+    ],
+)
+def test_user_simulator_readiness_retries_transient_failures(transient):
+    async def run_test():
+        session = _FakeSession(
+            _config(),
+            user_health_results=[transient, 200],
+        )
+        client = Tau2GymClient(_settings(), POLICY_URLS)
+        sleep = AsyncMock()
+
+        with patch(
+            "pipelinerl.domains.tau2.client.asyncio.sleep",
+            new=sleep,
+        ):
+            await client.ensure_valid(session)
+
+        sleep.assert_awaited_once()
+        assert session.get_urls.count(
+            "https://frozen-user.example/health"
+        ) == 2
+
+    asyncio.run(run_test())
+
+
+def test_user_simulator_readiness_exhaustion_is_actor_retryable():
+    async def run_test():
+        session = _FakeSession(
+            _config(),
+            user_health_results=[503],
+        )
+        settings = _settings().model_copy(
+            update={"startup_timeout_s": 0}
+        )
+        client = Tau2GymClient(settings, POLICY_URLS)
+        sleep = AsyncMock()
+
+        with patch(
+            "pipelinerl.domains.tau2.client.asyncio.sleep",
+            new=sleep,
+        ):
+            with pytest.raises(TimeoutError, match="did not recover"):
+                await client.ensure_valid(session)
+
+        sleep.assert_not_awaited()
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    ("payload", "pattern"),
+    [
+        (
+            {"data": [{"id": "wrong-model"}]},
+            "expected exactly",
+        ),
+        ({"data": "not-a-list"}, "malformed"),
+    ],
+)
+def test_user_simulator_identity_failure_does_not_retry(
+    payload,
+    pattern,
+):
+    async def run_test():
+        session = _FakeSession(
+            _config(),
+            user_models_payload=payload,
+        )
+        client = Tau2GymClient(_settings(), POLICY_URLS)
+        sleep = AsyncMock()
+
+        with patch(
+            "pipelinerl.domains.tau2.client.asyncio.sleep",
+            new=sleep,
+        ):
+            with pytest.raises(ValueError, match=pattern):
+                await client.ensure_valid(session)
+
+        sleep.assert_not_awaited()
 
     asyncio.run(run_test())
 
@@ -197,7 +324,9 @@ class _SyncResponse:
 def test_launch_validation_retries_only_service_readiness_errors():
     config = _config()
     responses = [
-        requests.ConnectionError("head booting"),
+        requests.ConnectionError("user simulator booting"),
+        _SyncResponse({"status": "ok"}),
+        _SyncResponse({"data": [{"id": "gpt-user-sim"}]}),
         _SyncResponse(config),
         _SyncResponse({"status": "ok"}),
         _SyncResponse({"status": "ok"}),
@@ -210,8 +339,37 @@ def test_launch_validation_retries_only_service_readiness_errors():
         bindings = validate_tau2_gym_sync(_settings(), POLICY_URLS)
 
     assert set(bindings) == set(POLICY_URLS)
-    assert get.call_count == 4
+    assert get.call_count == 6
     sleep.assert_called_once_with(1.0)
+
+
+@pytest.mark.parametrize(
+    ("payload", "pattern"),
+    [
+        ({}, "malformed"),
+        ({"data": [{"id": "wrong-model"}]}, "expected exactly"),
+    ],
+)
+def test_launch_validation_rejects_bad_user_model_identity_without_retry(
+    payload,
+    pattern,
+):
+    responses = [
+        _SyncResponse({"status": "ok"}),
+        _SyncResponse(payload),
+    ]
+    with (
+        patch(
+            "pipelinerl.domains.tau2.client.requests.get",
+            side_effect=responses,
+        ) as get,
+        patch("pipelinerl.domains.tau2.client.time.sleep") as sleep,
+    ):
+        with pytest.raises(ValueError, match=pattern):
+            validate_tau2_gym_sync(_settings(), POLICY_URLS)
+
+    assert get.call_count == 2
+    sleep.assert_not_called()
 
 
 def test_launch_validation_does_not_retry_bad_executed_config():
@@ -223,14 +381,18 @@ def test_launch_validation_does_not_retry_bad_executed_config():
     with (
         patch(
             "pipelinerl.domains.tau2.client.requests.get",
-            return_value=_SyncResponse(config),
+            side_effect=[
+                _SyncResponse({"status": "ok"}),
+                _SyncResponse({"data": [{"id": "gpt-user-sim"}]}),
+                _SyncResponse(config),
+            ],
         ) as get,
         patch("pipelinerl.domains.tau2.client.time.sleep") as sleep,
     ):
         with pytest.raises(ValueError, match="is not bound"):
             validate_tau2_gym_sync(_settings(), POLICY_URLS)
 
-    get.assert_called_once()
+    assert get.call_count == 3
     sleep.assert_not_called()
 
 

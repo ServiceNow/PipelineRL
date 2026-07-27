@@ -167,6 +167,42 @@ def _head_config_url(head_url: str) -> str:
     return f"{head_url.rstrip('/')}/global_config_dict_yaml"
 
 
+def _user_health_url(user_model_url: str) -> str:
+    return (
+        normalize_openai_base_url(user_model_url).removesuffix("/v1")
+        + "/health"
+    )
+
+
+def _user_models_url(user_model_url: str) -> str:
+    return f"{normalize_openai_base_url(user_model_url)}/models"
+
+
+def _validate_user_models_payload(
+    payload: Any,
+    expected_model: str,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise ValueError("Tau2 user simulator returned malformed /v1/models")
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise ValueError("Tau2 user simulator returned malformed /v1/models")
+    model_ids = []
+    for item in data:
+        if not isinstance(item, Mapping) or not isinstance(
+            item.get("id"), str
+        ):
+            raise ValueError(
+                "Tau2 user simulator returned malformed /v1/models"
+            )
+        model_ids.append(item["id"])
+    if model_ids != [expected_model]:
+        raise ValueError(
+            "Tau2 user simulator model aliases "
+            f"{model_ids!r}, expected exactly [{expected_model!r}]"
+        )
+
+
 def validate_tau2_gym_sync(
     settings: Tau2GymSettings | Mapping[str, Any],
     actor_llm_urls: Sequence[str],
@@ -176,6 +212,20 @@ def validate_tau2_gym_sync(
     retry_delay_s = 1.0
     while True:
         try:
+            user_health = requests.get(
+                _user_health_url(parsed_settings.user_model_url),
+                timeout=10.0,
+            )
+            user_health.raise_for_status()
+            user_models = requests.get(
+                _user_models_url(parsed_settings.user_model_url),
+                timeout=10.0,
+            )
+            user_models.raise_for_status()
+            _validate_user_models_payload(
+                user_models.json(),
+                parsed_settings.user_model_name,
+            )
             response = requests.get(_head_config_url(parsed_settings.head_url), timeout=10.0)
             response.raise_for_status()
             config = parse_executed_gym_config(response.json())
@@ -206,6 +256,55 @@ class Tau2GymClient:
         self._validated_at = 0.0
         self._validation_lock = asyncio.Lock()
 
+    async def _check_user_simulator(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        deadline = time.monotonic() + self.settings.startup_timeout_s
+        retry_delay_s = 1.0
+        while True:
+            try:
+                timeout = aiohttp.ClientTimeout(total=10.0)
+                async with session.get(
+                    _user_health_url(self.settings.user_model_url),
+                    timeout=timeout,
+                ) as response:
+                    response.raise_for_status()
+                async with session.get(
+                    _user_models_url(self.settings.user_model_url),
+                    timeout=timeout,
+                ) as response:
+                    response.raise_for_status()
+                    _validate_user_models_payload(
+                        await response.json(),
+                        self.settings.user_model_name,
+                    )
+                return
+            except aiohttp.ClientResponseError as exc:
+                if exc.status < 500:
+                    raise
+                transient_error = exc
+            except (
+                aiohttp.ClientConnectionError,
+                asyncio.TimeoutError,
+            ) as exc:
+                transient_error = exc
+
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError(
+                    "Tau2 user simulator did not recover before the "
+                    "readiness deadline"
+                ) from transient_error
+            sleep_s = min(retry_delay_s, remaining_s)
+            logger.warning(
+                "Tau2 user simulator is restarting; retrying in %.1fs: %s",
+                sleep_s,
+                transient_error,
+            )
+            await asyncio.sleep(sleep_s)
+            retry_delay_s = min(retry_delay_s * 2, 10.0)
+
     async def _fetch_executed_config(self, session: aiohttp.ClientSession) -> dict[str, Any]:
         async with session.get(_head_config_url(self.settings.head_url)) as response:
             response.raise_for_status()
@@ -223,6 +322,7 @@ class Tau2GymClient:
             now = time.monotonic()
             if self._bindings and now - self._validated_at < self.settings.validation_interval_s:
                 return
+            await self._check_user_simulator(session)
             config = await self._fetch_executed_config(session)
             bindings = validate_executed_gym_config(config, self.actor_llm_urls, self.settings)
             await asyncio.gather(*(self._check_agent(session, binding) for binding in bindings.values()))

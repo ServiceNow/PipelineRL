@@ -6,7 +6,8 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 
@@ -36,12 +37,35 @@ RUN1_POLICY_LOSS = "gspo"
 POLICY_LOSS_FALLBACK = "dppo"
 POLICY_LOSS_FALLBACK_TRIGGER = "bringup shows drift-attributable instability"
 GSPO_TOKEN_UPGRADE_TRIGGER = "demonstrated need for nonuniform token credit"
-USER_SIMULATOR_MODEL = "gpt-4.1-2025-04-14"
-USER_SIMULATOR_ENDPOINT = "https://api.openai.com/v1"
+USER_SIMULATOR_MODEL_ID = "google/gemma-4-31B-it"
+USER_SIMULATOR_REVISION = "842da3794eaa0b77d5f08bae87a17459d91ff475"
+USER_SIMULATOR_MODEL = (
+    f"{USER_SIMULATOR_MODEL_ID}@{USER_SIMULATOR_REVISION}"
+)
+USER_SIMULATOR_SNAPSHOT = "/mnt/llmd/base_models/gemma-4-31B-it"
+USER_SIMULATOR_ARTIFACT_SHA256 = {
+    "model-00001-of-00002.safetensors": (
+        "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa"
+    ),
+    "model-00002-of-00002.safetensors": (
+        "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10"
+    ),
+    "tokenizer.json": (
+        "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    ),
+}
+USER_SIMULATOR_SUBMISSION_MODE = "restartable"
 USER_SIMULATOR_PROVENANCE = (
-    "Fetched 2026-07-18 from https://developers.openai.com/api/docs/models/"
-    "gpt-4.1 and https://platform.openai.com/docs/api-reference; verified the "
-    "dated model snapshot and api.openai.com/v1 base."
+    "Verified 2026-07-27 from local snapshot "
+    "/mnt/llmd/base_models/gemma-4-31B-it at Hugging Face revision "
+    "842da3794eaa0b77d5f08bae87a17459d91ff475: "
+    "model-00001-of-00002.safetensors sha256 "
+    "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa; "
+    "model-00002-of-00002.safetensors sha256 "
+    "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10; "
+    "tokenizer.json sha256 "
+    "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f. "
+    "The separately managed EAI job owns the revision-bearing served alias."
 )
 CALIBRATION_DOMAINS = ("airline", "retail", "telecom")
 CALIBRATION_TASKS_PER_DOMAIN = 4
@@ -70,7 +94,7 @@ class SourcePins(BaseModel):
 PINNED_SOURCES = SourcePins(
     nemo_gym_sha="5f92a73217258074b74b7be26526c69f0ce3075d",
     strict_tito_patch_sha256=(
-        "5baf7f5cac1f0fa8dba3f3883f4e3a93ee89f38f23cc1d82467972e528c80250"
+        "0f712c906579803045d8f62576a7db01adbfb6e26a0cc52390b64f6b1be3a1b2"
     ),
     tau2_runtime_sha="befd120003fb55f48b498f6549556dcaf74582d5",
     tau2_data_sha="ce4013b0afe03c873488878b72851414f92f458b",
@@ -157,6 +181,151 @@ class ServiceIdentity(BaseModel):
     endpoint: str
 
 
+class UserSimulatorDeployment(BaseModel):
+    service: ServiceIdentity
+    model: ModelArtifactIdentity
+    snapshot_path: str
+    job_spec_sha256: str
+    submission_mode: Literal["restartable"]
+    thinking_enabled: bool
+    gpu_type: str
+    gpu_count: int
+    tensor_parallel_size: int
+    max_model_len: int
+    max_num_seqs: int
+    measured_peak_in_flight: int
+    observed_request_latencies_s: list[float]
+    observed_user_prompt_tokens: list[int]
+    prompt_headroom_factor: float
+    generation_reserve_tokens: int
+    snapshot_hash_bytes: int
+
+
+def validate_user_simulator_endpoint(endpoint: str) -> str:
+    normalized = endpoint.rstrip("/")
+    parsed = urlsplit(normalized)
+    host = parsed.hostname or ""
+    if (
+        parsed.scheme != "http"
+        or parsed.port != 8000
+        or parsed.path != "/v1"
+        or parsed.query
+        or parsed.fragment
+        or not host.startswith("dns-")
+        or not host.endswith("-tau2-user")
+        or "<" in host
+        or ">" in host
+    ):
+        raise ValueError(
+            "Tau2 user simulator endpoint must be the resolved account-scoped "
+            "http://dns-<account>-tau2-user:8000/v1 address"
+        )
+    return normalized
+
+
+def validate_user_simulator_deployment(
+    deployment: UserSimulatorDeployment,
+    service: ServiceIdentity,
+) -> None:
+    if deployment.service != service:
+        raise ValueError(
+            "Tau2 user simulator deployment service identity mismatch"
+        )
+    if service.model != USER_SIMULATOR_MODEL:
+        raise ValueError("Tau2 user simulator model identity mismatch")
+    validate_user_simulator_endpoint(service.endpoint)
+    if deployment.model.model_id != USER_SIMULATOR_MODEL_ID:
+        raise ValueError("Tau2 user simulator artifact model mismatch")
+    if deployment.model.revision != USER_SIMULATOR_REVISION:
+        raise ValueError("Tau2 user simulator artifact revision mismatch")
+    artifact_sha256 = {
+        artifact.path: artifact.sha256
+        for artifact in deployment.model.artifacts
+    }
+    if any(
+        artifact_sha256.get(path) != expected
+        for path, expected in USER_SIMULATOR_ARTIFACT_SHA256.items()
+    ):
+        raise ValueError(
+            "Tau2 user simulator verified artifact SHA256 mismatch"
+        )
+    if Path(deployment.snapshot_path) != Path(USER_SIMULATOR_SNAPSHOT):
+        raise ValueError("Tau2 user simulator snapshot path mismatch")
+    if (
+        len(deployment.job_spec_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in deployment.job_spec_sha256
+        )
+    ):
+        raise ValueError("Tau2 user simulator job digest is not SHA256")
+    if deployment.submission_mode != USER_SIMULATOR_SUBMISSION_MODE:
+        raise ValueError(
+            "Tau2 user simulator must use restartable submission mode"
+        )
+    if deployment.thinking_enabled:
+        raise ValueError(
+            "Tau2 user simulator must set enable_thinking=false"
+        )
+    if (
+        not deployment.gpu_type
+        or deployment.gpu_type.startswith("PENDING_")
+        or deployment.gpu_count <= 0
+        or deployment.tensor_parallel_size <= 0
+        or deployment.gpu_count != deployment.tensor_parallel_size
+    ):
+        raise ValueError("Tau2 user simulator GPU/TP profile is unresolved")
+    if (
+        deployment.max_model_len <= 0
+        or deployment.max_num_seqs <= 0
+        or deployment.measured_peak_in_flight <= 0
+        or deployment.measured_peak_in_flight
+        > deployment.max_num_seqs
+    ):
+        raise ValueError(
+            "Tau2 user simulator context/concurrency profile is invalid"
+        )
+    if (
+        not deployment.observed_request_latencies_s
+        or any(
+            latency <= 0
+            for latency in deployment.observed_request_latencies_s
+        )
+        or not deployment.observed_user_prompt_tokens
+        or any(
+            tokens <= 0
+            for tokens in deployment.observed_user_prompt_tokens
+        )
+        or deployment.prompt_headroom_factor <= 1
+        or deployment.generation_reserve_tokens <= 0
+    ):
+        raise ValueError(
+            "Tau2 user simulator measured serving evidence is incomplete"
+        )
+    required_context = (
+        math.ceil(
+            max(deployment.observed_user_prompt_tokens)
+            * deployment.prompt_headroom_factor
+        )
+        + deployment.generation_reserve_tokens
+    )
+    if deployment.max_model_len < required_context:
+        raise ValueError(
+            "Tau2 user simulator max_model_len is below the measured "
+            f"user-prompt headroom requirement {required_context}"
+        )
+    artifact_bytes = sum(
+        artifact.size for artifact in deployment.model.artifacts
+    )
+    if (
+        not deployment.model.artifacts
+        or deployment.snapshot_hash_bytes != artifact_bytes
+    ):
+        raise ValueError(
+            "Tau2 user simulator snapshot hash IO accounting mismatch"
+        )
+
+
 class GateResult(BaseModel):
     passed: bool
     detail: str
@@ -168,6 +337,7 @@ class PreRunSpec(BaseModel):
     model_snapshot: str
     source_pins: SourcePins
     user_simulator: ServiceIdentity
+    user_simulator_deployment: UserSimulatorDeployment
     policy_model: str
     policy_endpoints: list[str]
     expected_tp_size: int
@@ -191,6 +361,7 @@ class PreRunManifest(BaseModel):
     topology: GemmaTopology
     source_pins: SourcePins
     user_simulator: ServiceIdentity
+    user_simulator_deployment: UserSimulatorDeployment
     policy_model: str
     policy_endpoints: list[str]
     expected_tp_size: int
@@ -210,6 +381,11 @@ class PreRunManifest(BaseModel):
     model_revision_provenance: str = GEMMA_MODEL_REVISION_PROVENANCE
     topology_provenance: str = GEMMA_TOPOLOGY_PROVENANCE
     user_simulator_provenance: str = USER_SIMULATOR_PROVENANCE
+    user_simulator_snapshot_hash_io: str = (
+        "The finalizer streams the complete dense multimodal simulator "
+        "snapshot and records the exact byte count; production trusts the "
+        "approved job digest plus this manifest identity."
+    )
     alignment_activation: str = (
         "Configured Tau2 adapters emit full-length old/ref arrays; legacy adapters "
         "emit target-only suffix arrays. The serialized field shape is the schema "
@@ -826,6 +1002,20 @@ def finalize_prerun_manifest(
     evidence_dir: Path,
 ) -> PreRunManifest:
     snapshot = Path(spec.model_snapshot)
+    user_simulator_model = hash_model_snapshot(
+        Path(spec.user_simulator_deployment.snapshot_path),
+        USER_SIMULATOR_MODEL_ID,
+        USER_SIMULATOR_REVISION,
+    )
+    if user_simulator_model != spec.user_simulator_deployment.model:
+        raise ValueError(
+            "Tau2 user simulator snapshot does not match the approved "
+            "deployment identity"
+        )
+    validate_user_simulator_deployment(
+        spec.user_simulator_deployment,
+        spec.user_simulator,
+    )
     model = hash_model_snapshot(
         snapshot,
         spec.model_id,
@@ -872,8 +1062,6 @@ def finalize_prerun_manifest(
     gate1 = GateResult(
         passed=(
             spec.user_separation_asserted
-            and spec.user_simulator.model == USER_SIMULATOR_MODEL
-            and spec.user_simulator.endpoint == USER_SIMULATOR_ENDPOINT
             and spec.user_simulator.endpoint
             not in spec.policy_endpoints
             and spec.user_simulator.model != spec.policy_model
@@ -1019,6 +1207,9 @@ def finalize_prerun_manifest(
         topology=topology,
         source_pins=spec.source_pins,
         user_simulator=spec.user_simulator,
+        user_simulator_deployment=(
+            spec.user_simulator_deployment
+        ),
         policy_model=spec.policy_model,
         policy_endpoints=spec.policy_endpoints,
         expected_tp_size=spec.expected_tp_size,
