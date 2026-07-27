@@ -15,6 +15,9 @@ from pipelinerl.domains.tau2.client import (
 )
 
 _GYM_APP_PATH = Path("responses_api_models/vllm_model/app.py")
+_GYM_TAU2_APP_PATH = Path("responses_api_agents/tau2/app.py")
+_GYM_TAU2_REQUIREMENTS_PATH = Path("responses_api_agents/tau2/requirements.txt")
+_GYM_TAU2_SOURCE_PATH = Path("responses_api_agents/tau2/source.py")
 _GYM_APP_BASE_SHA256 = "80daf9e3c9edc6954e323eb0408e70a2af5f8c08579b171ebaa07cdcf3c15ae1"
 _GYM_APP_POST_PATCH_SHA256 = "ca2439870ca9902956e6b39f6967f517464a67d5c147e95125b53c9df67898a4"
 _GYM_PATCH_TARGETS = {
@@ -26,9 +29,17 @@ _GYM_PATCH_TARGETS = {
         "ab3947499d2e7f58b84cd7f3dad7c6117088202a7338602a62daf0e1946a4c9e",
         "7ebe99f9b66138cc12472bc5957617b9b7a3681c1a6e20f6fa8bdd556ccf14c3",
     ),
-    Path("responses_api_agents/tau2/app.py"): (
+    _GYM_TAU2_APP_PATH: (
         "c7c7f8ac760c0a0de294133053a571be2e2c765f6c3064262c08bf7a8e26e4d4",
-        "145e087637755fc9d4309d834c1be68f0c221b0823d6f427569128d20159e5cc",
+        "e3b5b24162c63a1b716f0f594fe81418cce9274329c070242078aee31ec3ea12",
+    ),
+    _GYM_TAU2_REQUIREMENTS_PATH: (
+        "35ec325e43e10e11dc835d893f6d5ac4f4eb663895019a72c5e2a6720d0ae580",
+        "169cf62b3a0fe4f9d928d80768588f649ed2a90b89bebe2d91d2f0db164d03f6",
+    ),
+    _GYM_TAU2_SOURCE_PATH: (
+        "3597df47cb0dcfec07c4f3c4b07428600e4c627a310de58e22e1c8e7568188e5",
+        "fe64f8321ee9c88bea4664b01c6a7cd3dbb3da0c0b95c9b6d550ac98de60b88d",
     ),
     _GYM_APP_PATH: (
         _GYM_APP_BASE_SHA256,

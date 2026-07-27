@@ -1,6 +1,8 @@
 import ast
 import copy
 import hashlib
+import importlib.util
+import json
 import os
 import py_compile
 import subprocess
@@ -10,11 +12,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from pipelinerl.domains.tau2.client import NEMO_GYM_SHA, NEMO_GYM_TITO_PATCH_SHA
+from pipelinerl.domains.tau2.client import (
+    NEMO_GYM_SHA,
+    NEMO_GYM_TITO_PATCH_SHA,
+    TAU2_RUNTIME_SHA,
+)
 from pipelinerl.entrypoints.run_tau2_gym import (
     _GYM_APP_PATH,
     _GYM_APP_POST_PATCH_SHA256,
     _GYM_PATCH_TARGETS,
+    _GYM_TAU2_REQUIREMENTS_PATH,
+    _GYM_TAU2_SOURCE_PATH,
     _GYM_TITO_PATCH_PATH,
     apply_gym_tito_patch,
     assert_dedicated_gym_checkout,
@@ -61,8 +69,15 @@ def test_patch_applies_to_dedicated_pinned_checkout(tmp_path: Path):
     for path, (_, post_sha) in _GYM_PATCH_TARGETS.items():
         target = checkout / path
         assert hashlib.sha256(target.read_bytes()).hexdigest() == post_sha
-        py_compile.compile(target, doraise=True)
+        if target.suffix == ".py":
+            py_compile.compile(target, doraise=True)
     assert _GYM_PATCH_TARGETS[_GYM_APP_PATH][1] == _GYM_APP_POST_PATCH_SHA256
+
+    requirements = (checkout / _GYM_TAU2_REQUIREMENTS_PATH).read_text().splitlines()
+    assert (
+        "tau2[knowledge] @ git+https://github.com/bxyu-nvidia/tau2-bench@"
+        f"{TAU2_RUNTIME_SHA}"
+    ) in requirements
 
     status = subprocess.check_output(
         ["git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=no"],
@@ -72,10 +87,13 @@ def test_patch_applies_to_dedicated_pinned_checkout(tmp_path: Path):
         str(path) for path in _GYM_PATCH_TARGETS
     }
 
-    target = checkout / _GYM_APP_PATH
-    target.write_text(target.read_text() + "\n")
-    with pytest.raises(RuntimeError, match="patch targets do not match"):
-        apply_gym_tito_patch(checkout)
+    for path in _GYM_PATCH_TARGETS:
+        target = checkout / path
+        original = target.read_bytes()
+        target.write_bytes(original + b"\n")
+        with pytest.raises(RuntimeError, match="patch targets do not match"):
+            apply_gym_tito_patch(checkout)
+        target.write_bytes(original)
 
 
 def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
@@ -90,7 +108,10 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     "NEMO_GYM_SOURCE_CHECKOUT" not in os.environ,
     reason="requires the pinned NeMo Gym source checkout",
 )
-def test_patched_strict_tito_and_provenance_guards_execute_and_are_used(tmp_path: Path):
+def test_patched_strict_tito_and_provenance_guards_execute_and_are_used(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     source = Path(os.environ["NEMO_GYM_SOURCE_CHECKOUT"]).resolve()
     run_dir = tmp_path / "run"
     checkout = run_dir / "nemo-gym"
@@ -104,6 +125,89 @@ def test_patched_strict_tito_and_provenance_guards_execute_and_are_used(tmp_path
         check=True,
     )
     apply_gym_tito_patch(checkout)
+
+    source_target = checkout / _GYM_TAU2_SOURCE_PATH
+    source_spec = importlib.util.spec_from_file_location("patched_tau2_source", source_target)
+    assert source_spec is not None and source_spec.loader is not None
+    source_module = importlib.util.module_from_spec(source_spec)
+    source_spec.loader.exec_module(source_module)
+
+    def install_direct_url(payload: str | None) -> None:
+        monkeypatch.setattr(
+            source_module,
+            "distribution",
+            lambda name: SimpleNamespace(
+                read_text=lambda filename: payload
+            )
+            if name == "tau2"
+            else None,
+        )
+
+    pinned_vcs_info = {
+        "vcs": "git",
+        "commit_id": TAU2_RUNTIME_SHA,
+        "requested_revision": TAU2_RUNTIME_SHA,
+    }
+    install_direct_url(json.dumps({"vcs_info": pinned_vcs_info}))
+    source_module.assert_tau2_runtime_revision()
+
+    def missing_distribution(name: str):
+        raise source_module.PackageNotFoundError(name)
+
+    monkeypatch.setattr(source_module, "distribution", missing_distribution)
+    with pytest.raises(RuntimeError, match="not installed"):
+        source_module.assert_tau2_runtime_revision()
+
+    invalid_direct_urls = [
+        (None, "no PEP 610"),
+        ("{", "malformed"),
+        (json.dumps({}), "runtime provenance"),
+        (
+            json.dumps(
+                {
+                    "vcs_info": {
+                        "vcs": "git",
+                        "requested_revision": TAU2_RUNTIME_SHA,
+                    }
+                }
+            ),
+            "runtime provenance",
+        ),
+        (
+            json.dumps(
+                {
+                    "vcs_info": {
+                        "vcs": "git",
+                        "commit_id": TAU2_RUNTIME_SHA,
+                    }
+                }
+            ),
+            "runtime provenance",
+        ),
+        (
+            json.dumps({"vcs_info": {**pinned_vcs_info, "vcs": "hg"}}),
+            "runtime provenance",
+        ),
+        (
+            json.dumps({"vcs_info": {**pinned_vcs_info, "commit_id": "0" * 40}}),
+            "runtime provenance",
+        ),
+        (
+            json.dumps(
+                {
+                    "vcs_info": {
+                        **pinned_vcs_info,
+                        "requested_revision": "bxyu/nemo_gym_stable",
+                    }
+                }
+            ),
+            "runtime provenance",
+        ),
+    ]
+    for payload, message in invalid_direct_urls:
+        install_direct_url(payload)
+        with pytest.raises(RuntimeError, match=message):
+            source_module.assert_tau2_runtime_revision()
 
     target = checkout / _GYM_APP_PATH
     tree = ast.parse(target.read_text())
@@ -224,6 +328,24 @@ def test_patched_strict_tito_and_provenance_guards_execute_and_are_used(tmp_path
 
     tau_target = checkout / "responses_api_agents/tau2/app.py"
     tau_tree = ast.parse(tau_target.read_text())
+    runtime_attestation = next(
+        node
+        for node in tau_tree.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "assert_tau2_runtime_revision"
+    )
+    tau2_import_lines = [
+        node.lineno
+        for node in tau_tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module is not None
+        and node.module.startswith("tau2.")
+    ]
+    assert tau2_import_lines
+    assert runtime_attestation.lineno < min(tau2_import_lines)
+
     tau_agent = next(
         node
         for node in tau_tree.body

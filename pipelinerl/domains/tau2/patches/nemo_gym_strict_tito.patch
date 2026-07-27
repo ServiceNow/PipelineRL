@@ -73,10 +73,10 @@ index 63869017..b54b1db7 100644
                  **last_response_output_item.model_dump(),
                  prompt_token_ids=message_dict["prompt_token_ids"],
 diff --git a/responses_api_agents/tau2/app.py b/responses_api_agents/tau2/app.py
-index 2f3c6d6a..44463334 100644
+index 2f3c6d6a..30a966f9 100644
 --- a/responses_api_agents/tau2/app.py
 +++ b/responses_api_agents/tau2/app.py
-@@ -14,6 +14,7 @@
+@@ -14,16 +14,21 @@
  # limitations under the License.
  
  from collections import defaultdict
@@ -84,7 +84,22 @@ index 2f3c6d6a..44463334 100644
  from os import environ
  from pathlib import Path
  from time import time
-@@ -51,6 +52,45 @@ from tau2.runner.batch import run_single_task
+ from typing import Any, Dict, List, Literal, Optional
+ 
+-from responses_api_agents.tau2.source import ensure_tau2_data_dir
++from responses_api_agents.tau2.source import (
++    assert_tau2_runtime_revision,
++    ensure_tau2_data_dir,
++)
+ 
+ 
+ DATA_DIR = Path(__file__).parent / "tau2_data"
+ environ["TAU2_DATA_DIR"] = str(DATA_DIR)
++assert_tau2_runtime_revision()
+ 
+ from fastapi import Body
+ from loguru import logger
+@@ -51,6 +56,45 @@ from tau2.runner.batch import run_single_task
  from tau2.utils.llm_utils import to_litellm_messages
  
  
@@ -130,7 +145,7 @@ index 2f3c6d6a..44463334 100644
  class Tau2Config(BaseResponsesAPIAgentConfig):
      model_server: ModelServerRef
      user_model_server: ModelServerRef
-@@ -157,6 +197,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
+@@ -157,6 +201,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
          # Tau starts trajectories with an assistant message
          input_items_1 += output_items[:1]
          input_items_2, output_items = split_responses_input_output_items(output_items[1:])
@@ -138,6 +153,71 @@ index 2f3c6d6a..44463334 100644
  
          prompt_usages = []
          completion_usages = []
+diff --git a/responses_api_agents/tau2/requirements.txt b/responses_api_agents/tau2/requirements.txt
+index 61c7b67d..e535719a 100644
+--- a/responses_api_agents/tau2/requirements.txt
++++ b/responses_api_agents/tau2/requirements.txt
+@@ -1,5 +1,5 @@
+ -e nemo-gym[dev] @ ../../
+-tau2[knowledge] @ git+https://github.com/bxyu-nvidia/tau2-bench@bxyu/nemo_gym_stable
++tau2[knowledge] @ git+https://github.com/bxyu-nvidia/tau2-bench@befd120003fb55f48b498f6549556dcaf74582d5
+ # tau2 [knowledge] extra deps listed explicitly: the extra is not applied to the
+ # `tau2[knowledge] @ git+URL` direct reference, so bm25/bm25_grep miss rank-bm25.
+ rank-bm25>=0.2.2
+diff --git a/responses_api_agents/tau2/source.py b/responses_api_agents/tau2/source.py
+index 11311eb4..e359ca10 100644
+--- a/responses_api_agents/tau2/source.py
++++ b/responses_api_agents/tau2/source.py
+@@ -14,8 +14,10 @@
+ # limitations under the License.
+ """Helpers for fetching the Tau2/Tau3 source data used by the Gym bridge."""
+ 
++import json
+ import os
+ import shutil
++from importlib.metadata import PackageNotFoundError, distribution
+ from pathlib import Path
+ from subprocess import run
+ from tempfile import TemporaryDirectory
+@@ -26,6 +28,38 @@ TAU2_BENCH_REF_ENV = "NEMO_GYM_TAU2_BENCH_REF"
+ 
+ DEFAULT_TAU2_BENCH_REPO_URL = "https://github.com/bxyu-nvidia/tau2-bench"
+ DEFAULT_TAU2_BENCH_REF = "bxyu/nemo_gym_stable"
++PINNED_TAU2_RUNTIME_SHA = "befd120003fb55f48b498f6549556dcaf74582d5"
++
++
++def assert_tau2_runtime_revision() -> None:
++    """Fail unless the installed Tau2 VCS requirement used the pinned commit."""
++
++    try:
++        tau2_distribution = distribution("tau2")
++    except PackageNotFoundError as exc:
++        raise RuntimeError("Tau2 distribution is not installed") from exc
++
++    direct_url_text = tau2_distribution.read_text("direct_url.json")
++    if direct_url_text is None:
++        raise RuntimeError("Tau2 distribution has no PEP 610 direct_url.json")
++    try:
++        direct_url = json.loads(direct_url_text)
++    except json.JSONDecodeError as exc:
++        raise RuntimeError("Tau2 direct_url.json is malformed") from exc
++
++    vcs_info = direct_url.get("vcs_info") if isinstance(direct_url, dict) else None
++    expected = {
++        "vcs": "git",
++        "commit_id": PINNED_TAU2_RUNTIME_SHA,
++        "requested_revision": PINNED_TAU2_RUNTIME_SHA,
++    }
++    actual = (
++        {field: vcs_info.get(field) for field in expected}
++        if isinstance(vcs_info, dict)
++        else None
++    )
++    if actual != expected:
++        raise RuntimeError(f"Tau2 runtime provenance is {actual!r}, expected {expected!r}")
+ 
+ 
+ def get_tau2_bench_repo_url() -> str:
 diff --git a/responses_api_models/vllm_model/app.py b/responses_api_models/vllm_model/app.py
 index 2395dc3b..45d49dbd 100644
 --- a/responses_api_models/vllm_model/app.py
