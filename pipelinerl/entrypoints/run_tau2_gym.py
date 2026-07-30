@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -31,7 +32,7 @@ _GYM_PATCH_TARGETS = {
     ),
     _GYM_TAU2_APP_PATH: (
         "c7c7f8ac760c0a0de294133053a571be2e2c765f6c3064262c08bf7a8e26e4d4",
-        "e3b5b24162c63a1b716f0f594fe81418cce9274329c070242078aee31ec3ea12",
+        "2200068b77edbed578f832141dd1dc862f51585d72819ed9d562c3152662ee87",
     ),
     _GYM_TAU2_REQUIREMENTS_PATH: (
         "35ec325e43e10e11dc835d893f6d5ac4f4eb663895019a72c5e2a6720d0ae580",
@@ -57,6 +58,18 @@ def build_gym_config(
     policy_model_name: str,
     user_model_url: str,
     user_model_name: str,
+    judge_model_url: str,
+    judge_model_name: str,
+    user_thinking_enabled: bool,
+    judge_thinking_enabled: bool,
+    judge_temperature: float,
+    judge_top_p: float,
+    judge_top_k: int,
+    judge_seed: int,
+    judge_initial_max_tokens: int,
+    judge_retry_max_tokens: int,
+    auxiliary_model_timeout_s: float,
+    request_timeout_s: float,
     host: str,
     head_port: int,
     service_port_start: int,
@@ -69,15 +82,40 @@ def build_gym_config(
     if not normalized_policy_urls or len(normalized_policy_urls) != len(set(normalized_policy_urls)):
         raise ValueError("At least one unique policy URL is required")
     normalized_user_url = normalize_openai_base_url(user_model_url)
+    normalized_judge_url = normalize_openai_base_url(judge_model_url)
+    if normalized_user_url != normalized_judge_url:
+        raise ValueError("Tau2 user and judge endpoints must be the same shared service")
     if normalized_user_url in normalized_policy_urls:
-        raise ValueError("Tau2 user-model endpoint must differ from every policy endpoint")
-    if user_model_name == policy_model_name:
-        raise ValueError("Tau2 user-model name must differ from the policy model name")
+        raise ValueError("Tau2 auxiliary-model endpoint must differ from every policy endpoint")
+    if len({policy_model_name, user_model_name, judge_model_name}) != 3:
+        raise ValueError("Tau2 policy, user, and judge model aliases must be distinct")
+    if not user_thinking_enabled or not judge_thinking_enabled:
+        raise ValueError("Tau2 run 1 requires user and judge thinking")
+    if (
+        not math.isfinite(judge_temperature)
+        or judge_temperature < 0
+        or not 0 < judge_top_p <= 1
+        or judge_top_k <= 0
+    ):
+        raise ValueError("Tau2 judge sampling parameters are invalid")
+    if judge_initial_max_tokens <= 0 or (
+        judge_retry_max_tokens < 2 * judge_initial_max_tokens
+    ):
+        raise ValueError("Tau2 judge retry budget must be at least twice the initial budget")
+    if (
+        not math.isfinite(auxiliary_model_timeout_s)
+        or not math.isfinite(request_timeout_s)
+        or not 0 < auxiliary_model_timeout_s < request_timeout_s
+    ):
+        raise ValueError("Tau2 auxiliary timeout must be positive and below request_timeout_s")
     if not policy_api_key_env.isidentifier() or not user_api_key_env.isidentifier():
         raise ValueError("API key environment-variable names must be valid identifiers")
 
     num_policies = len(normalized_policy_urls)
-    allocated_ports = [head_port, *range(service_port_start, service_port_start + 2 * num_policies + 1)]
+    allocated_ports = [
+        head_port,
+        *range(service_port_start, service_port_start + 2 * num_policies + 2),
+    ]
     if len(allocated_ports) != len(set(allocated_ports)):
         raise ValueError("Gym head and service ports overlap")
 
@@ -92,6 +130,18 @@ def build_gym_config(
         "pipelinerl_policy_model_name": policy_model_name,
         "pipelinerl_user_model_url": normalized_user_url,
         "pipelinerl_user_model_name": user_model_name,
+        "pipelinerl_judge_model_url": normalized_judge_url,
+        "pipelinerl_judge_model_name": judge_model_name,
+        "pipelinerl_user_thinking_enabled": user_thinking_enabled,
+        "pipelinerl_judge_thinking_enabled": judge_thinking_enabled,
+        "pipelinerl_judge_temperature": judge_temperature,
+        "pipelinerl_judge_top_p": judge_top_p,
+        "pipelinerl_judge_top_k": judge_top_k,
+        "pipelinerl_judge_seed": judge_seed,
+        "pipelinerl_judge_initial_max_tokens": judge_initial_max_tokens,
+        "pipelinerl_judge_retry_max_tokens": judge_retry_max_tokens,
+        "pipelinerl_auxiliary_model_timeout_s": auxiliary_model_timeout_s,
+        "pipelinerl_request_timeout_s": request_timeout_s,
         "pipelinerl_tau2_user": {
             "responses_api_models": {
                 "openai_model": {
@@ -101,6 +151,31 @@ def build_gym_config(
                     "openai_base_url": normalized_user_url,
                     "openai_api_key": f"${{oc.env:{user_api_key_env}}}",
                     "openai_model": user_model_name,
+                    "extra_body": {
+                        "chat_template_kwargs": {
+                            "enable_thinking": user_thinking_enabled,
+                        }
+                    },
+                    "openai_default_headers": {},
+                    "drop_input_reasoning_items": False,
+                }
+            }
+        },
+        "pipelinerl_tau2_judge": {
+            "responses_api_models": {
+                "openai_model": {
+                    "entrypoint": "app.py",
+                    "host": host,
+                    "port": service_port_start + num_policies + 1,
+                    "openai_base_url": normalized_judge_url,
+                    "openai_api_key": f"${{oc.env:{user_api_key_env}}}",
+                    "openai_model": judge_model_name,
+                    "extra_body": {
+                        "chat_template_kwargs": {
+                            "enable_thinking": judge_thinking_enabled,
+                        },
+                        "top_k": judge_top_k,
+                    },
                     "openai_default_headers": {},
                     "drop_input_reasoning_items": False,
                 }
@@ -130,12 +205,27 @@ def build_gym_config(
                 "tau2": {
                     "entrypoint": "app.py",
                     "host": host,
-                    "port": service_port_start + num_policies + 1 + index,
+                    "port": service_port_start + num_policies + 2 + index,
                     "model_server": {"type": "responses_api_models", "name": proxy_name},
                     "user_model_server": {
                         "type": "responses_api_models",
                         "name": "pipelinerl_tau2_user",
                     },
+                    "judge_model_server": {
+                        "type": "responses_api_models",
+                        "name": "pipelinerl_tau2_judge",
+                    },
+                    "user_model_name": user_model_name,
+                    "judge_model_name": judge_model_name,
+                    "user_thinking_enabled": user_thinking_enabled,
+                    "judge_thinking_enabled": judge_thinking_enabled,
+                    "judge_temperature": judge_temperature,
+                    "judge_top_p": judge_top_p,
+                    "judge_top_k": judge_top_k,
+                    "judge_seed": judge_seed,
+                    "judge_initial_max_tokens": judge_initial_max_tokens,
+                    "judge_retry_max_tokens": judge_retry_max_tokens,
+                    "auxiliary_model_timeout_s": auxiliary_model_timeout_s,
                     "num_workers": 1,
                     "user_llm_args": {},
                     "max_steps": max_steps,
@@ -246,6 +336,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-model-name", required=True)
     parser.add_argument("--user-model-url", required=True)
     parser.add_argument("--user-model-name", required=True)
+    parser.add_argument("--judge-model-url", required=True)
+    parser.add_argument("--judge-model-name", required=True)
+    parser.add_argument(
+        "--user-thinking-enabled",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+    )
+    parser.add_argument(
+        "--judge-thinking-enabled",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+    )
+    parser.add_argument("--judge-temperature", type=float, required=True)
+    parser.add_argument("--judge-top-p", type=float, required=True)
+    parser.add_argument("--judge-top-k", type=int, required=True)
+    parser.add_argument("--judge-seed", type=int, required=True)
+    parser.add_argument("--judge-initial-max-tokens", type=int, required=True)
+    parser.add_argument("--judge-retry-max-tokens", type=int, required=True)
+    parser.add_argument("--auxiliary-model-timeout-s", type=float, required=True)
+    parser.add_argument("--request-timeout-s", type=float, required=True)
     parser.add_argument("--host", required=True)
     parser.add_argument("--head-port", type=int, default=11000)
     parser.add_argument("--service-port-start", type=int, default=12000)
@@ -279,6 +389,18 @@ def main() -> None:
         policy_model_name=args.policy_model_name,
         user_model_url=args.user_model_url,
         user_model_name=args.user_model_name,
+        judge_model_url=args.judge_model_url,
+        judge_model_name=args.judge_model_name,
+        user_thinking_enabled=args.user_thinking_enabled,
+        judge_thinking_enabled=args.judge_thinking_enabled,
+        judge_temperature=args.judge_temperature,
+        judge_top_p=args.judge_top_p,
+        judge_top_k=args.judge_top_k,
+        judge_seed=args.judge_seed,
+        judge_initial_max_tokens=args.judge_initial_max_tokens,
+        judge_retry_max_tokens=args.judge_retry_max_tokens,
+        auxiliary_model_timeout_s=args.auxiliary_model_timeout_s,
+        request_timeout_s=args.request_timeout_s,
         host=args.host,
         head_port=args.head_port,
         service_port_start=args.service_port_start,

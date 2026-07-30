@@ -73,17 +73,24 @@ index 63869017..b54b1db7 100644
                  **last_response_output_item.model_dump(),
                  prompt_token_ids=message_dict["prompt_token_ids"],
 diff --git a/responses_api_agents/tau2/app.py b/responses_api_agents/tau2/app.py
-index 2f3c6d6a..30a966f9 100644
+index 2f3c6d6a..f95e7e04 100644
 --- a/responses_api_agents/tau2/app.py
 +++ b/responses_api_agents/tau2/app.py
-@@ -14,16 +14,21 @@
+@@ -13,21 +13,33 @@
+ # See the License for the specific language governing permissions and
  # limitations under the License.
  
++import asyncio
++import hashlib
++import json
++import math
  from collections import defaultdict
 +from collections.abc import Mapping
++from contextvars import ContextVar
  from os import environ
  from pathlib import Path
- from time import time
+-from time import time
++from time import perf_counter, time
  from typing import Any, Dict, List, Literal, Optional
  
 -from responses_api_agents.tau2.source import ensure_tau2_data_dir
@@ -98,8 +105,27 @@ index 2f3c6d6a..30a966f9 100644
 +assert_tau2_runtime_revision()
  
  from fastapi import Body
++from fastapi.encoders import jsonable_encoder
++from fastapi.responses import JSONResponse
  from loguru import logger
-@@ -51,6 +56,45 @@ from tau2.runner.batch import run_single_task
+-from pydantic import ConfigDict, Field
++from pydantic import ConfigDict, Field, model_validator
+ 
+ from nemo_gym.base_resources_server import (
+     BaseRunRequest,
+@@ -44,22 +56,515 @@ from nemo_gym.openai_utils import (
+ )
+ from nemo_gym.server_utils import get_server_url, is_nemo_gym_fastapi_entrypoint
+ from responses_api_models.vllm_model.app import VLLMConverter, split_responses_input_output_items
+-from tau2.data_model.simulation import SimulationRun, TextRunConfig
+-from tau2.data_model.tasks import Task
++from tau2.data_model.simulation import RewardInfo, SimulationRun, TextRunConfig
++from tau2.data_model.tasks import RewardType, Task
++from tau2.evaluator import evaluator_nl_assertions as tau2_nl_assertions
+ from tau2.evaluator.evaluator import EvaluationType
++from tau2.evaluator.evaluator_nl_assertions import NLAssertionsEvaluator
+ from tau2.runner.batch import run_single_task
++from tau2.user import user_simulator as tau2_user_simulator
  from tau2.utils.llm_utils import to_litellm_messages
  
  
@@ -107,6 +133,427 @@ index 2f3c6d6a..30a966f9 100644
 +    "model_version_start",
 +    "model_version_end",
 +    "policy_endpoint",
++)
++
++
++_PIPELINERL_JUDGE_MARKER_KEY = "pipelinerl_judge_reward_invalid"
++_PIPELINERL_JUDGE_REASON = "judge_reward_invalid"
++_PIPELINERL_JUDGE_STAGE = "judge"
++_USER_CALL_NAME = "user_simulator_response"
++_JUDGE_CALL_NAME = "nl_assertions_eval"
++_AUXILIARY_RUN_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
++    "pipelinerl_tau2_auxiliary_run_state",
++    default=None,
++)
++_JUDGE_ATTEMPT_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
++    "pipelinerl_tau2_judge_attempt_state",
++    default=None,
++)
++
++_ORIGINAL_USER_GENERATE = tau2_user_simulator.generate
++_ORIGINAL_JUDGE_GENERATE = tau2_nl_assertions.generate
++_ORIGINAL_NL_EVALUATE = NLAssertionsEvaluator.evaluate_nl_assertions
++_ORIGINAL_NL_CALCULATE = NLAssertionsEvaluator.calculate_reward
++
++
++class _JudgeOutputInvalid(RuntimeError):
++    def __init__(self, detail_code: str):
++        super().__init__(detail_code)
++        self.detail_code = detail_code
++
++
++class _JudgeRewardInvalid(RuntimeError):
++    def __init__(self, detail_code: str, attempt_count: int):
++        super().__init__(detail_code)
++        self.detail_code = detail_code
++        self.attempt_count = attempt_count
++
++
++def _require_auxiliary_state() -> dict[str, Any]:
++    state = _AUXILIARY_RUN_STATE.get()
++    if state is None:
++        raise RuntimeError("Tau2 auxiliary model call has no active PipelineRL run state")
++    return state
++
++
++def _validate_token_count(value: Any, field: str) -> int:
++    if type(value) is not int or value < 0:
++        raise RuntimeError(f"Tau2 auxiliary model response has invalid {field}")
++    return value
++
++
++def _response_metadata(message: Any) -> tuple[str, str, int, int]:
++    raw_data = message.raw_data
++    if not isinstance(raw_data, Mapping):
++        raise RuntimeError("Tau2 auxiliary model response has no raw response mapping")
++    response_model = raw_data.get("model")
++    choices = raw_data.get("choices")
++    if not isinstance(response_model, str) or not response_model:
++        raise RuntimeError("Tau2 auxiliary model response has no model alias")
++    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
++        raise RuntimeError("Tau2 auxiliary model response has invalid choices")
++    finish_reason = choices[0].get("finish_reason")
++    if not isinstance(finish_reason, str) or not finish_reason:
++        raise RuntimeError("Tau2 auxiliary model response has no finish_reason")
++    usage = message.usage
++    if not isinstance(usage, Mapping):
++        raise RuntimeError("Tau2 auxiliary model response has no usage")
++    return (
++        response_model,
++        finish_reason,
++        _validate_token_count(usage.get("prompt_tokens"), "prompt_tokens"),
++        _validate_token_count(usage.get("completion_tokens"), "completion_tokens"),
++    )
++
++
++def _validate_judge_content(content: Any, expected_outcomes: tuple[str, ...]) -> None:
++    if not isinstance(content, str) or not content.strip():
++        raise _JudgeOutputInvalid("missing_content")
++    try:
++        payload = json.loads(content)
++    except json.JSONDecodeError as exc:
++        raise _JudgeOutputInvalid("invalid_json") from exc
++    if not isinstance(payload, Mapping):
++        raise _JudgeOutputInvalid("invalid_object")
++    if "results" not in payload:
++        raise _JudgeOutputInvalid("missing_results")
++    results = payload["results"]
++    if not isinstance(results, list):
++        raise _JudgeOutputInvalid("invalid_results")
++    if len(results) != len(expected_outcomes):
++        raise _JudgeOutputInvalid("result_count_mismatch")
++    for expected, result in zip(expected_outcomes, results):
++        if not isinstance(result, Mapping):
++            raise _JudgeOutputInvalid("invalid_result")
++        if result.get("expectedOutcome") != expected:
++            raise _JudgeOutputInvalid("expected_outcome_mismatch")
++        if type(result.get("metExpectation")) is not bool:
++            raise _JudgeOutputInvalid("invalid_met_expectation")
++        reasoning = result.get("reasoning")
++        if not isinstance(reasoning, str) or not reasoning.strip():
++            raise _JudgeOutputInvalid("missing_reasoning")
++
++
++def _next_user_call_position(state: dict[str, Any]) -> tuple[int, int]:
++    last_user_call = next(
++        (
++            entry
++            for entry in reversed(state["auxiliary_model_calls"])
++            if entry["role"] == "user_simulator"
++        ),
++        None,
++    )
++    if last_user_call is not None and last_user_call["failure_code"] == "empty_message":
++        return last_user_call["call_index"], last_user_call["attempt_index"] + 1
++    call_index = state["next_user_call_index"]
++    state["next_user_call_index"] += 1
++    return call_index, 1
++
++
++def _append_auxiliary_call(
++    state: dict[str, Any],
++    *,
++    role: str,
++    call_index: int,
++    attempt_index: int,
++    requested_model_alias: str,
++    response_model_alias: str,
++    prompt_tokens: int,
++    completion_tokens: int,
++    latency_s: float,
++    finish_reason: str,
++    completion_budget: int | None,
++    content: str | None,
++    failure_code: str | None,
++) -> None:
++    if not math.isfinite(latency_s) or latency_s < 0:
++        raise RuntimeError("Tau2 auxiliary model call has invalid latency")
++    state["auxiliary_model_calls"].append(
++        {
++            "role": role,
++            "call_index": call_index,
++            "attempt_index": attempt_index,
++            "requested_model_alias": requested_model_alias,
++            "response_model_alias": response_model_alias,
++            "prompt_tokens": prompt_tokens,
++            "completion_tokens": completion_tokens,
++            "latency_s": latency_s,
++            "finish_reason": finish_reason,
++            "completion_budget": completion_budget,
++            "output_character_count": len(content) if isinstance(content, str) else 0,
++            "output_sha256": (
++                hashlib.sha256(content.encode("utf-8")).hexdigest()
++                if role == "judge" and isinstance(content, str)
++                else None
++            ),
++            "failure_code": failure_code,
++        }
++    )
++
++
++async def _pipelinerl_auxiliary_generate(
++    model: str,
++    messages: list[Any],
++    tools: list[Any] | None = None,
++    tool_choice: str | None = None,
++    call_name: str | None = None,
++    **kwargs: Any,
++) -> Any:
++    state = _require_auxiliary_state()
++    if kwargs.get("stream") not in (None, False):
++        raise RuntimeError("Tau2 auxiliary model calls must be non-streaming")
++
++    if call_name == _USER_CALL_NAME:
++        role = "user_simulator"
++        original_generate = _ORIGINAL_USER_GENERATE
++        requested_model_alias = state["user_model_name"]
++        call_index, attempt_index = _next_user_call_position(state)
++        completion_budget = kwargs.get("max_tokens")
++        call_kwargs = dict(kwargs)
++        call_kwargs["api_base"] = state["user_api_base"]
++        call_kwargs["api_key"] = "dummy api key"
++    elif call_name == _JUDGE_CALL_NAME:
++        role = "judge"
++        original_generate = _ORIGINAL_JUDGE_GENERATE
++        requested_model_alias = state["judge_model_name"]
++        attempt = _JUDGE_ATTEMPT_STATE.get()
++        if attempt is None:
++            raise RuntimeError("Tau2 judge call has no active assertion context")
++        call_index = 1
++        attempt_index = attempt["attempt_index"]
++        completion_budget = attempt["completion_budget"]
++        call_kwargs = dict(kwargs)
++        call_kwargs.update(
++            {
++                "api_base": state["judge_api_base"],
++                "api_key": "dummy api key",
++                "temperature": state["judge_temperature"],
++                "top_p": state["judge_top_p"],
++                "seed": state["judge_seed"],
++                "max_tokens": completion_budget,
++            }
++        )
++    else:
++        raise RuntimeError(f"Unexpected Tau2 auxiliary call_name {call_name!r}")
++
++    start = perf_counter()
++    message = await asyncio.wait_for(
++        original_generate(
++            model=requested_model_alias,
++            messages=messages,
++            tools=tools,
++            tool_choice=tool_choice,
++            call_name=call_name,
++            **call_kwargs,
++        ),
++        timeout=state["auxiliary_model_timeout_s"],
++    )
++    latency_s = perf_counter() - start
++    response_model, finish_reason, prompt_tokens, completion_tokens = _response_metadata(message)
++    if response_model not in state["approved_model_aliases"]:
++        raise RuntimeError(
++            f"Tau2 auxiliary model returned unapproved alias {response_model!r}"
++        )
++
++    content = message.content
++    failure_code = None
++    if role == "user_simulator":
++        if not content and not message.tool_calls:
++            failure_code = "empty_message"
++    else:
++        attempt = _JUDGE_ATTEMPT_STATE.get()
++        if attempt is None:
++            raise RuntimeError("Tau2 judge call lost its assertion context")
++        expected_outcomes = attempt["expected_outcomes"]
++        try:
++            if finish_reason == "length":
++                raise _JudgeOutputInvalid("finish_reason_length")
++            _validate_judge_content(content, expected_outcomes)
++        except _JudgeOutputInvalid as exc:
++            failure_code = exc.detail_code
++            _append_auxiliary_call(
++                state,
++                role=role,
++                call_index=call_index,
++                attempt_index=attempt_index,
++                requested_model_alias=requested_model_alias,
++                response_model_alias=response_model,
++                prompt_tokens=prompt_tokens,
++                completion_tokens=completion_tokens,
++                latency_s=latency_s,
++                finish_reason=finish_reason,
++                completion_budget=completion_budget,
++                content=content,
++                failure_code=failure_code,
++            )
++            raise
++
++    _append_auxiliary_call(
++        state,
++        role=role,
++        call_index=call_index,
++        attempt_index=attempt_index,
++        requested_model_alias=requested_model_alias,
++        response_model_alias=response_model,
++        prompt_tokens=prompt_tokens,
++        completion_tokens=completion_tokens,
++        latency_s=latency_s,
++        finish_reason=finish_reason,
++        completion_budget=completion_budget,
++        content=content,
++        failure_code=failure_code,
++    )
++    return message
++
++
++async def _pipelinerl_evaluate_nl_assertions(
++    cls: type[NLAssertionsEvaluator],
++    trajectory: list[Any],
++    nl_assertions: list[str],
++) -> list[Any]:
++    state = _require_auxiliary_state()
++    expected_outcomes = tuple(nl_assertions)
++    attempts = (
++        state["judge_initial_max_tokens"],
++        state["judge_retry_max_tokens"],
++    )
++    last_error: _JudgeOutputInvalid | None = None
++    for attempt_index, completion_budget in enumerate(attempts, start=1):
++        token = _JUDGE_ATTEMPT_STATE.set(
++            {
++                "expected_outcomes": expected_outcomes,
++                "attempt_index": attempt_index,
++                "completion_budget": completion_budget,
++            }
++        )
++        try:
++            return await _ORIGINAL_NL_EVALUATE(trajectory, nl_assertions)
++        except _JudgeOutputInvalid as exc:
++            last_error = exc
++        finally:
++            _JUDGE_ATTEMPT_STATE.reset(token)
++    assert last_error is not None
++    raise _JudgeRewardInvalid(last_error.detail_code, len(attempts))
++
++
++async def _pipelinerl_calculate_nl_reward(
++    cls: type[NLAssertionsEvaluator],
++    task: Task,
++    full_trajectory: list[Any],
++) -> RewardInfo:
++    try:
++        return await _ORIGINAL_NL_CALCULATE(task, full_trajectory)
++    except _JudgeRewardInvalid as exc:
++        marker = {
++            "reason": _PIPELINERL_JUDGE_REASON,
++            "producer_stage": _PIPELINERL_JUDGE_STAGE,
++            "detail_code": exc.detail_code,
++            "attempt_count": exc.attempt_count,
++            "diagnostic": "judge output failed strict assertion validation",
++        }
++        return RewardInfo(
++            reward=0.0,
++            nl_assertions=None,
++            reward_breakdown={RewardType.NL_ASSERTION: 0.0},
++            info={_PIPELINERL_JUDGE_MARKER_KEY: marker},
++        )
++
++
++def _judge_invalid_marker(result: SimulationRun) -> dict[str, Any] | None:
++    reward_info = result.reward_info
++    if reward_info is None or not isinstance(reward_info.info, Mapping):
++        return None
++    nl_info = reward_info.info.get("nl")
++    if not isinstance(nl_info, Mapping):
++        return None
++    marker = nl_info.get(_PIPELINERL_JUDGE_MARKER_KEY)
++    if marker is None:
++        return None
++    if not isinstance(marker, Mapping):
++        raise RuntimeError("Tau2 judge-invalid reward marker is malformed")
++    expected_keys = {
++        "reason",
++        "producer_stage",
++        "detail_code",
++        "attempt_count",
++        "diagnostic",
++    }
++    if set(marker) != expected_keys:
++        raise RuntimeError("Tau2 judge-invalid reward marker has unexpected fields")
++    if (
++        marker["reason"] != _PIPELINERL_JUDGE_REASON
++        or marker["producer_stage"] != _PIPELINERL_JUDGE_STAGE
++        or not isinstance(marker["detail_code"], str)
++        or not marker["detail_code"]
++        or type(marker["attempt_count"]) is not int
++        or marker["attempt_count"] not in (1, 2)
++        or not isinstance(marker["diagnostic"], str)
++        or not marker["diagnostic"]
++    ):
++        raise RuntimeError("Tau2 judge-invalid reward marker is malformed")
++    return dict(marker)
++
++
++def _rewardless_boundary_result(result: SimulationRun) -> dict[str, Any]:
++    payload = result.model_dump(mode="json")
++    reward_info = payload.get("reward_info")
++    if not isinstance(reward_info, dict) or "reward" not in reward_info:
++        raise RuntimeError("Tau2 judge-invalid result has no internal reward")
++    reward_info.pop("reward")
++    reward_breakdown = reward_info.get("reward_breakdown")
++    if isinstance(reward_breakdown, dict):
++        reward_breakdown.pop(RewardType.NL_ASSERTION.value, None)
++    return payload
++
++
++def _new_auxiliary_state(
++    config: "Tau2Config",
++    *,
++    user_api_base: str,
++    judge_api_base: str,
++) -> dict[str, Any]:
++    return {
++        "user_api_base": user_api_base,
++        "judge_api_base": judge_api_base,
++        "user_model_name": config.user_model_name,
++        "judge_model_name": config.judge_model_name,
++        "approved_model_aliases": (
++            config.user_model_name,
++            config.judge_model_name,
++        ),
++        "judge_temperature": config.judge_temperature,
++        "judge_top_p": config.judge_top_p,
++        "judge_top_k": config.judge_top_k,
++        "judge_seed": config.judge_seed,
++        "judge_initial_max_tokens": config.judge_initial_max_tokens,
++        "judge_retry_max_tokens": config.judge_retry_max_tokens,
++        "auxiliary_model_timeout_s": config.auxiliary_model_timeout_s,
++        "next_user_call_index": 1,
++        "auxiliary_model_calls": [],
++    }
++
++
++def _judge_sampling(state: Mapping[str, Any]) -> dict[str, Any]:
++    return {
++        "requested_model_alias": state["judge_model_name"],
++        "enable_thinking": True,
++        "temperature": state["judge_temperature"],
++        "top_p": state["judge_top_p"],
++        "top_k": state["judge_top_k"],
++        "seed": state["judge_seed"],
++        "initial_max_tokens": state["judge_initial_max_tokens"],
++        "retry_max_tokens": state["judge_retry_max_tokens"],
++        "auxiliary_model_timeout_s": state["auxiliary_model_timeout_s"],
++    }
++
++
++tau2_user_simulator.generate = _pipelinerl_auxiliary_generate
++tau2_nl_assertions.generate = _pipelinerl_auxiliary_generate
++NLAssertionsEvaluator.evaluate_nl_assertions = classmethod(
++    _pipelinerl_evaluate_nl_assertions
++)
++NLAssertionsEvaluator.calculate_reward = classmethod(
++    _pipelinerl_calculate_nl_reward
 +)
 +
 +
@@ -143,9 +590,109 @@ index 2f3c6d6a..30a966f9 100644
 +
 +
  class Tau2Config(BaseResponsesAPIAgentConfig):
++    model_config = ConfigDict(allow_inf_nan=False)
++
      model_server: ModelServerRef
      user_model_server: ModelServerRef
-@@ -157,6 +201,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
++    judge_model_server: ModelServerRef
++    user_model_name: str
++    judge_model_name: str
++    user_thinking_enabled: Literal[True]
++    judge_thinking_enabled: Literal[True]
++    judge_temperature: float = Field(ge=0)
++    judge_top_p: float = Field(gt=0, le=1)
++    judge_top_k: int = Field(gt=0)
++    judge_seed: int
++    judge_initial_max_tokens: int = Field(gt=0)
++    judge_retry_max_tokens: int = Field(gt=0)
++    auxiliary_model_timeout_s: float = Field(gt=0)
+     user_llm_args: dict = Field(default_factory=dict)
+     debug: bool = False
+     print_step_counts: bool = False
+     # Tau2 default
+     max_steps: int = 200
+ 
++    @model_validator(mode="after")
++    def validate_auxiliary_models(self):
++        if len(
++            {
++                self.model_server.name,
++                self.user_model_server.name,
++                self.judge_model_server.name,
++            }
++        ) != 3:
++            raise ValueError("Tau2 policy, user, and judge server refs must differ")
++        if self.user_model_name == self.judge_model_name:
++            raise ValueError("Tau2 user and judge model aliases must differ")
++        if self.judge_retry_max_tokens < 2 * self.judge_initial_max_tokens:
++            raise ValueError("Tau2 judge retry budget must be at least twice the initial budget")
++        return self
++
+ 
+ class Tau2RunRequest(BaseRunRequest):
+     model_config = ConfigDict(extra="allow")
+@@ -67,7 +572,7 @@ class Tau2RunRequest(BaseRunRequest):
+     config: TextRunConfig
+     task: Task
+     seed: int
+-    evaluation_type: EvaluationType
++    evaluation_type: Literal[EvaluationType.ALL]
+     save_dir: Literal[None]
+     user_voice_settings: Literal[None]
+     user_persona_config: Literal[None]
+@@ -80,7 +585,11 @@ class Tau2RunRequest(BaseRunRequest):
+ 
+ 
+ class Tau2VerifyResponse(Tau2RunRequest, BaseVerifyResponse):
++    schema_version: Literal[1] = 1
++    outcome: Literal["completed"] = "completed"
+     result: SimulationRun
++    auxiliary_model_calls: list[dict[str, Any]]
++    judge_sampling: dict[str, Any]
+     duration: float
+     num_steps: int
+     num_agent_calls: int
+@@ -119,11 +628,14 @@ class Tau2Agent(SimpleResponsesAPIAgent):
+         config: TextRunConfig = body_dict["config"]
+ 
+         # Need `openai/` provider prefix for LiteLLM
+-        config.llm_user = "openai/dummy user model"
+-        config.llm_args_user |= {
+-            "api_base": f"{self.base_url_for_run(get_server_url(self.config.user_model_server.name), body)}/v1",
+-            "api_key": "dummy api key",  # pragma: allowlist secret
+-        } | self.config.user_llm_args
++        user_api_base = (
++            f"{self.base_url_for_run(get_server_url(self.config.user_model_server.name), body)}/v1"
++        )
++        judge_api_base = (
++            f"{self.base_url_for_run(get_server_url(self.config.judge_model_server.name), body)}/v1"
++        )
++        config.llm_user = f"openai/{self.config.user_model_name}"
++        config.llm_args_user |= self.config.user_llm_args
+ 
+         extra_agent_args = {k: v for k, v in responses_create_params.items() if k in ("temperature", "top_p")}
+         if responses_create_params.get("max_output_tokens"):
+@@ -139,7 +651,18 @@ class Tau2Agent(SimpleResponsesAPIAgent):
+ 
+         config.max_steps = self.config.max_steps
+ 
+-        result = await run_single_task(**body_dict)
++        auxiliary_state = _new_auxiliary_state(
++            self.config,
++            user_api_base=user_api_base,
++            judge_api_base=judge_api_base,
++        )
++        auxiliary_token = _AUXILIARY_RUN_STATE.set(auxiliary_state)
++        try:
++            result = await run_single_task(**body_dict)
++        finally:
++            _AUXILIARY_RUN_STATE.reset(auxiliary_token)
++        auxiliary_model_calls = list(auxiliary_state["auxiliary_model_calls"])
++        judge_sampling = _judge_sampling(auxiliary_state)
+ 
+         messages_to_convert = []
+         for message in result.messages:
+@@ -157,6 +680,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
          # Tau starts trajectories with an assistant message
          input_items_1 += output_items[:1]
          input_items_2, output_items = split_responses_input_output_items(output_items[1:])
@@ -153,6 +700,76 @@ index 2f3c6d6a..30a966f9 100644
  
          prompt_usages = []
          completion_usages = []
+@@ -184,27 +708,52 @@ class Tau2Agent(SimpleResponsesAPIAgent):
+             max_prompt_tokens = max(prompt_usages)
+             max_completion_tokens = max(completion_usages)
+ 
++        response_params = dict(
++            input=body.responses_create_params.input + input_items_1 + input_items_2,
++            model=body.responses_create_params.model or "",
++            parallel_tool_calls=body.responses_create_params.parallel_tool_calls,
++            tool_choice=body.responses_create_params.tool_choice,
++            tools=body.responses_create_params.tools,
++        )
++        response = dict(
++            id=f"tau2-{body.config.domain}-{body.task.id}",
++            created_at=int(time()),
++            object="response",
++            output=output_items,
++            model=body.responses_create_params.model or "",
++            parallel_tool_calls=body.responses_create_params.parallel_tool_calls,
++            tool_choice=body.responses_create_params.tool_choice,
++            tools=body.responses_create_params.tools,
++        )
++        marker = _judge_invalid_marker(result)
++        if marker is not None:
++            boundary_payload = {
++                **body_dict,
++                "schema_version": 1,
++                "outcome": "boundary_failure",
++                **marker,
++                "responses_create_params": response_params,
++                "response": response,
++                "result": _rewardless_boundary_result(result),
++                "auxiliary_model_calls": auxiliary_model_calls,
++                "judge_sampling": judge_sampling,
++                "duration": result.duration,
++                "num_steps": len(result.messages),
++                "num_agent_calls": num_agent_calls,
++            }
++            return JSONResponse(
++                status_code=409,
++                content=jsonable_encoder(boundary_payload),
++            )
++
+         return Tau2VerifyResponse(
+             **body_dict,
+-            responses_create_params=dict(
+-                input=body.responses_create_params.input + input_items_1 + input_items_2,
+-                model=body.responses_create_params.model or "",
+-                parallel_tool_calls=body.responses_create_params.parallel_tool_calls,
+-                tool_choice=body.responses_create_params.tool_choice,
+-                tools=body.responses_create_params.tools,
+-            ),
+-            response=dict(
+-                id=f"tau2-{body.config.domain}-{body.task.id}",
+-                created_at=int(time()),
+-                object="response",
+-                output=output_items,
+-                model=body.responses_create_params.model or "",
+-                parallel_tool_calls=body.responses_create_params.parallel_tool_calls,
+-                tool_choice=body.responses_create_params.tool_choice,
+-                tools=body.responses_create_params.tools,
+-            ),
++            responses_create_params=response_params,
++            response=response,
+             reward=result.reward_info.reward,
+             result=result,
++            auxiliary_model_calls=auxiliary_model_calls,
++            judge_sampling=judge_sampling,
+             duration=result.duration,
+             num_steps=len(result.messages),
+             num_agent_calls=num_agent_calls,
 diff --git a/responses_api_agents/tau2/requirements.txt b/responses_api_agents/tau2/requirements.txt
 index 61c7b67d..e535719a 100644
 --- a/responses_api_agents/tau2/requirements.txt

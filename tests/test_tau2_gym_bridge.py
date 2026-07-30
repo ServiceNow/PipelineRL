@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,10 +9,13 @@ import aiohttp
 import pytest
 import requests
 from omegaconf import OmegaConf
+from pydantic import ValidationError
 
 from pipelinerl.domains.tau2.client import (
     NEMO_GYM_TITO_PATCH_SHA,
+    Tau2BoundaryFailure,
     Tau2GymClient,
+    Tau2GymContractError,
     Tau2GymSettings,
     validate_executed_gym_config,
     validate_tau2_gym_sync,
@@ -23,30 +27,189 @@ from pipelinerl.entrypoints.run_tau2_gym import build_gym_config, prepare_tau2_d
 POLICY_URLS = ["http://actor-0:8000/v1", "http://actor-1:8000/v1"]
 
 
-def _settings() -> Tau2GymSettings:
-    return Tau2GymSettings(
-        head_url="http://gym-head:11000",
-        policy_model_name="google/gemma-4-26b-a4b",
-        user_model_url="https://frozen-user.example/v1",
-        user_model_name="gpt-user-sim",
-        validation_interval_s=0,
-    )
+def _settings(**overrides) -> Tau2GymSettings:
+    values = {
+        "head_url": "http://gym-head:11000",
+        "policy_model_name": "qwen3.5-9b-policy",
+        "user_model_url": "https://frozen-aux.example/v1",
+        "user_model_name": "qwen3.5-27b-user",
+        "judge_model_url": "https://frozen-aux.example/v1",
+        "judge_model_name": "qwen3.5-27b-judge",
+        "user_thinking_enabled": True,
+        "judge_thinking_enabled": True,
+        "judge_temperature": 0.6,
+        "judge_top_p": 0.95,
+        "judge_top_k": 20,
+        "judge_seed": 17,
+        "judge_initial_max_tokens": 1024,
+        "judge_retry_max_tokens": 2048,
+        "auxiliary_model_timeout_s": 300.0,
+        "validation_interval_s": 0,
+    }
+    values.update(overrides)
+    return Tau2GymSettings(**values)
 
 
-def _config() -> dict:
-    return build_gym_config(
-        policy_urls=POLICY_URLS,
-        policy_model_name="google/gemma-4-26b-a4b",
-        user_model_url="https://frozen-user.example/v1",
-        user_model_name="gpt-user-sim",
-        host="gym-host",
-        head_port=11000,
-        service_port_start=12000,
-        max_steps=200,
-        policy_api_key_env="PIPELINERL_LLM_TOKEN",
-        user_api_key_env="TAU2_USER_API_KEY",
-        uses_reasoning_parser=True,
+def _config(**overrides) -> dict:
+    values = {
+        "policy_urls": POLICY_URLS,
+        "policy_model_name": "qwen3.5-9b-policy",
+        "user_model_url": "https://frozen-aux.example/v1",
+        "user_model_name": "qwen3.5-27b-user",
+        "judge_model_url": "https://frozen-aux.example/v1",
+        "judge_model_name": "qwen3.5-27b-judge",
+        "user_thinking_enabled": True,
+        "judge_thinking_enabled": True,
+        "judge_temperature": 0.6,
+        "judge_top_p": 0.95,
+        "judge_top_k": 20,
+        "judge_seed": 17,
+        "judge_initial_max_tokens": 1024,
+        "judge_retry_max_tokens": 2048,
+        "auxiliary_model_timeout_s": 300.0,
+        "request_timeout_s": 3600.0,
+        "host": "gym-host",
+        "head_port": 11000,
+        "service_port_start": 12000,
+        "max_steps": 200,
+        "policy_api_key_env": "PIPELINERL_LLM_TOKEN",
+        "user_api_key_env": "TAU2_USER_API_KEY",
+        "uses_reasoning_parser": True,
+    }
+    values.update(overrides)
+    return build_gym_config(**values)
+
+
+def _problem() -> dict:
+    return {
+        "config": {"domain": "retail"},
+        "task": {"id": "task-1"},
+        "seed": 7,
+        "evaluation_type": "all",
+        "save_dir": None,
+        "user_voice_settings": None,
+        "user_persona_config": None,
+        "verbose_logs": False,
+        "audio_debug": False,
+        "audio_taps": False,
+        "auto_review": False,
+        "review_mode": "full",
+        "hallucination_feedback": None,
+        "responses_create_params": {"input": [], "tools": []},
+    }
+
+
+def _auxiliary_calls() -> list[dict]:
+    return [
+        {
+            "role": "user_simulator",
+            "call_index": 1,
+            "attempt_index": 1,
+            "requested_model_alias": "qwen3.5-27b-user",
+            "response_model_alias": "qwen3.5-27b-user",
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "latency_s": 1.5,
+            "finish_reason": "stop",
+            "completion_budget": None,
+            "output_character_count": 80,
+            "output_sha256": None,
+            "failure_code": None,
+        },
+        {
+            "role": "judge",
+            "call_index": 1,
+            "attempt_index": 1,
+            "requested_model_alias": "qwen3.5-27b-judge",
+            "response_model_alias": "qwen3.5-27b-user",
+            "prompt_tokens": 200,
+            "completion_tokens": 30,
+            "latency_s": 2.5,
+            "finish_reason": "stop",
+            "completion_budget": 1024,
+            "output_character_count": 120,
+            "output_sha256": "a" * 64,
+            "failure_code": None,
+        },
+    ]
+
+
+def _judge_sampling() -> dict:
+    return {
+        "requested_model_alias": "qwen3.5-27b-judge",
+        "enable_thinking": True,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "seed": 17,
+        "initial_max_tokens": 1024,
+        "retry_max_tokens": 2048,
+        "auxiliary_model_timeout_s": 300.0,
+    }
+
+
+def _completed_payload() -> dict:
+    return {
+        **_problem(),
+        "schema_version": 1,
+        "outcome": "completed",
+        "reward": 1.0,
+        "response": {"output": []},
+        "result": {
+            "messages": [],
+            "termination_reason": "agent_stop",
+            "reward_info": {"reward": 1.0, "info": {"nl": None}},
+        },
+        "auxiliary_model_calls": _auxiliary_calls(),
+        "judge_sampling": _judge_sampling(),
+        "duration": 3.0,
+        "num_steps": 4,
+        "num_agent_calls": 2,
+        "min_prompt_tokens": 10,
+        "min_completion_tokens": 5,
+        "mean_prompt_tokens": 10,
+        "mean_completion_tokens": 5,
+        "max_prompt_tokens": 10,
+        "max_completion_tokens": 5,
+    }
+
+
+def _boundary_payload() -> dict:
+    marker = {
+        "reason": "judge_reward_invalid",
+        "producer_stage": "judge",
+        "detail_code": "result_count_mismatch",
+        "attempt_count": 2,
+        "diagnostic": "judge output failed strict assertion validation",
+    }
+    auxiliary_calls = _auxiliary_calls()
+    auxiliary_calls[-1]["failure_code"] = marker["detail_code"]
+    auxiliary_calls.append(
+        {
+            **auxiliary_calls[-1],
+            "attempt_index": 2,
+            "completion_budget": 2048,
+        }
     )
+    return {
+        **_problem(),
+        "schema_version": 1,
+        "outcome": "boundary_failure",
+        **marker,
+        "response": {"output": []},
+        "result": {
+            "messages": [],
+            "termination_reason": "agent_stop",
+            "reward_info": {
+                "info": {"nl": {"pipelinerl_judge_reward_invalid": marker}},
+            }
+        },
+        "auxiliary_model_calls": auxiliary_calls,
+        "judge_sampling": _judge_sampling(),
+        "duration": 3.0,
+        "num_steps": 4,
+        "num_agent_calls": 2,
+    }
 
 
 def test_generated_config_has_one_agent_per_policy_endpoint():
@@ -55,8 +218,8 @@ def test_generated_config_has_one_agent_per_policy_endpoint():
 
     assert config["pipelinerl_gym_patch_sha"] == NEMO_GYM_TITO_PATCH_SHA
     assert set(bindings) == set(POLICY_URLS)
-    assert bindings[POLICY_URLS[0]].agent_url == "http://gym-host:12003"
-    assert bindings[POLICY_URLS[1]].agent_url == "http://gym-host:12004"
+    assert bindings[POLICY_URLS[0]].agent_url == "http://gym-host:12004"
+    assert bindings[POLICY_URLS[1]].agent_url == "http://gym-host:12005"
     assert config["pipelinerl_policy_0"]["responses_api_models"]["vllm_model"]["base_url"] == POLICY_URLS[0]
 
 
@@ -70,21 +233,22 @@ def test_mapping_validation_rejects_policy_endpoint_drift():
         validate_executed_gym_config(config, POLICY_URLS, _settings())
 
 
-def test_generated_config_rejects_user_policy_alias():
-    with pytest.raises(ValueError, match="user-model endpoint must differ"):
-        build_gym_config(
-            policy_urls=POLICY_URLS,
-            policy_model_name="google/gemma-4-26b-a4b",
-            user_model_url=POLICY_URLS[0],
-            user_model_name="gpt-user-sim",
-            host="gym-host",
-            head_port=11000,
-            service_port_start=12000,
-            max_steps=200,
-            policy_api_key_env="PIPELINERL_LLM_TOKEN",
-            user_api_key_env="TAU2_USER_API_KEY",
-            uses_reasoning_parser=True,
-        )
+def test_generated_config_rejects_auxiliary_policy_endpoint_collision():
+    with pytest.raises(ValueError, match="auxiliary-model endpoint must differ"):
+        _config(user_model_url=POLICY_URLS[0], judge_model_url=POLICY_URLS[0])
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"judge_temperature": float("inf")},
+        {"auxiliary_model_timeout_s": float("nan")},
+        {"request_timeout_s": float("inf")},
+    ],
+)
+def test_generated_config_rejects_nonfinite_auxiliary_limits(updates):
+    with pytest.raises(ValueError):
+        _config(**updates)
 
 
 def test_load_tau2_problems_stamps_pipeline_metadata(tmp_path: Path):
@@ -129,7 +293,7 @@ class _FakeResponse:
         if self.status >= 400:
             raise aiohttp.ClientResponseError(
                 request_info=SimpleNamespace(
-                    real_url="https://frozen-user.example/health"
+                    real_url="https://frozen-aux.example/health"
                 ),
                 history=(),
                 status=self.status,
@@ -148,12 +312,16 @@ class _FakeSession:
         *,
         user_health_results=None,
         user_models_payload=None,
+        run_payload=None,
+        run_status=200,
     ):
         self.config = config
         self.get_urls = []
         self.post_urls = []
         self.user_health_results = list(user_health_results or [])
         self.user_models_payload = user_models_payload
+        self.run_payload = run_payload
+        self.run_status = run_status
 
     def get(self, url, *, timeout=None):
         self.get_urls.append(url)
@@ -162,7 +330,12 @@ class _FakeSession:
         if url.endswith("/v1/models"):
             return _FakeResponse(
                 self.user_models_payload
-                or {"data": [{"id": "gpt-user-sim"}]}
+                or {
+                    "data": [
+                        {"id": "qwen3.5-27b-user"},
+                        {"id": "qwen3.5-27b-judge"},
+                    ]
+                }
             )
         if url.endswith("/health") and self.user_health_results:
             result = self.user_health_results.pop(0)
@@ -174,12 +347,8 @@ class _FakeSession:
     def post(self, url, *, json, timeout):
         self.post_urls.append(url)
         return _FakeResponse(
-            {
-                "reward": 1.0,
-                "responses_create_params": json["responses_create_params"],
-                "response": {"output": []},
-                "result": {"passed": True},
-            }
+            copy.deepcopy(self.run_payload or _completed_payload()),
+            status=self.run_status,
         )
 
 
@@ -187,22 +356,187 @@ def test_client_routes_to_bound_agent_and_periodically_revalidates():
     async def run_test():
         session = _FakeSession(_config())
         client = Tau2GymClient(_settings(), POLICY_URLS)
-        problem = {"responses_create_params": {"input": [], "tools": []}}
+        problem = _problem()
 
         first = await client.run(POLICY_URLS[1], problem, session)
         second = await client.run(POLICY_URLS[1], problem, session)
 
         assert first.reward == second.reward == 1.0
-        assert session.post_urls == ["http://gym-host:12004/run"] * 2
+        assert session.post_urls == ["http://gym-host:12005/run"] * 2
         assert session.get_urls.count("http://gym-head:11000/global_config_dict_yaml") == 2
 
         assert session.get_urls.count(
-            "https://frozen-user.example/health"
+            "https://frozen-aux.example/health"
         ) == 2
         assert session.get_urls.count(
-            "https://frozen-user.example/v1/models"
+            "https://frozen-aux.example/v1/models"
         ) == 2
     asyncio.run(run_test())
+
+
+def test_client_raises_typed_rewardless_judge_boundary():
+    async def run_test():
+        session = _FakeSession(
+            _config(),
+            run_payload=_boundary_payload(),
+            run_status=409,
+        )
+        client = Tau2GymClient(_settings(), POLICY_URLS)
+
+        with pytest.raises(Tau2BoundaryFailure) as exc_info:
+            await client.run(POLICY_URLS[0], _problem(), session)
+
+        boundary = exc_info.value.boundary
+        assert boundary.reason == "judge_reward_invalid"
+        assert boundary.producer_stage == "judge"
+        assert boundary.attempt_count == 2
+        assert not hasattr(boundary, "reward")
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "marker-leak",
+        "marker-mismatch",
+        "numeric-boundary",
+        "nested-reward",
+        "judge-breakdown",
+    ],
+)
+def test_client_fails_closed_on_judge_boundary_contract_drift(case):
+    async def run_test():
+        status = 200
+        if case == "marker-leak":
+            payload = _completed_payload()
+            payload["result"] = _boundary_payload()["result"]
+        else:
+            status = 409
+            payload = _boundary_payload()
+            if case == "marker-mismatch":
+                payload["detail_code"] = "different"
+            elif case == "numeric-boundary":
+                payload["reward"] = 0.0
+            elif case == "nested-reward":
+                payload["result"]["reward_info"]["reward"] = 0.0
+            else:
+                payload["result"]["reward_info"][
+                    "reward_breakdown"
+                ] = {"NL_ASSERTION": 0.0}
+        session = _FakeSession(
+            _config(),
+            run_payload=payload,
+            run_status=status,
+        )
+        client = Tau2GymClient(_settings(), POLICY_URLS)
+
+        with pytest.raises(Tau2GymContractError):
+            await client.run(POLICY_URLS[0], _problem(), session)
+
+    asyncio.run(run_test())
+
+
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing-reason",
+        "extra-field",
+        "unknown-reason",
+        "unknown-stage",
+        "auxiliary-order",
+        "sampling",
+        "result",
+        "response-capture",
+        "input-capture",
+        "marker-type",
+        "call-audit",
+    ],
+)
+def test_client_rejects_every_malformed_judge_boundary_surface(case):
+    async def run_test():
+        payload = _boundary_payload()
+        if case == "missing-reason":
+            payload.pop("reason")
+        elif case == "extra-field":
+            payload["unexpected"] = True
+        elif case == "unknown-reason":
+            payload["reason"] = "other"
+        elif case == "unknown-stage":
+            payload["producer_stage"] = "other"
+        elif case == "auxiliary-order":
+            payload["auxiliary_model_calls"][-1]["attempt_index"] = 3
+        elif case == "sampling":
+            payload["judge_sampling"].pop("seed")
+        elif case == "result":
+            payload["result"].pop("messages")
+        elif case == "response-capture":
+            payload["response"].pop("output")
+        elif case == "input-capture":
+            payload["responses_create_params"].pop("input")
+        elif case == "marker-type":
+            payload["result"]["reward_info"]["info"]["nl"][
+                "pipelinerl_judge_reward_invalid"
+            ] = "invalid"
+        else:
+            payload["auxiliary_model_calls"][-1][
+                "failure_code"
+            ] = "invalid_json"
+
+        session = _FakeSession(
+            _config(),
+            run_payload=payload,
+            run_status=409,
+        )
+        client = Tau2GymClient(_settings(), POLICY_URLS)
+        with pytest.raises(Tau2GymContractError):
+            await client.run(POLICY_URLS[0], _problem(), session)
+
+    asyncio.run(run_test())
+
+
+def test_malformed_completed_response_remains_pydantic_validation_error():
+    async def run_test():
+        payload = _completed_payload()
+        payload["response"].pop("output")
+        session = _FakeSession(_config(), run_payload=payload)
+        client = Tau2GymClient(_settings(), POLICY_URLS)
+        with pytest.raises(ValidationError):
+            await client.run(POLICY_URLS[0], _problem(), session)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    ("updates", "pattern"),
+    [
+        ({"judge_model_url": "https://other.example/v1"}, "same shared service"),
+        ({"judge_model_name": "qwen3.5-27b-user"}, "aliases must be distinct"),
+        ({"judge_thinking_enabled": False}, "requires user and judge thinking"),
+        ({"judge_temperature": float("inf")}, "finite"),
+        ({"judge_retry_max_tokens": 2047}, "at least twice"),
+        ({"auxiliary_model_timeout_s": 3600.0}, "below request_timeout_s"),
+    ],
+)
+def test_settings_reject_invalid_auxiliary_contract(updates, pattern):
+    with pytest.raises(ValueError, match=pattern):
+        _settings(**updates)
+
+
+def test_executed_config_rejects_proxy_and_sampling_drift():
+    config = _config()
+    config["pipelinerl_tau2_judge"]["responses_api_models"]["openai_model"][
+        "extra_body"
+    ]["top_k"] = 19
+    with pytest.raises(ValueError, match="thinking or top-k"):
+        validate_executed_gym_config(config, POLICY_URLS, _settings())
+
+    config = _config()
+    config["pipelinerl_judge_seed"] = 18
+    with pytest.raises(ValueError, match="does not match"):
+        validate_executed_gym_config(config, POLICY_URLS, _settings())
 
 
 @pytest.mark.parametrize(
@@ -232,7 +566,7 @@ def test_user_simulator_readiness_retries_transient_failures(transient):
 
         sleep.assert_awaited_once()
         assert session.get_urls.count(
-            "https://frozen-user.example/health"
+            "https://frozen-aux.example/health"
         ) == 2
 
     asyncio.run(run_test())
@@ -267,6 +601,15 @@ def test_user_simulator_readiness_exhaustion_is_actor_retryable():
     [
         (
             {"data": [{"id": "wrong-model"}]},
+            "expected exactly",
+        ),
+        (
+            {
+                "data": [
+                    {"id": "qwen3.5-27b-judge"},
+                    {"id": "qwen3.5-27b-user"},
+                ]
+            },
             "expected exactly",
         ),
         ({"data": "not-a-list"}, "malformed"),
@@ -326,7 +669,7 @@ def test_launch_validation_retries_only_service_readiness_errors():
     responses = [
         requests.ConnectionError("user simulator booting"),
         _SyncResponse({"status": "ok"}),
-        _SyncResponse({"data": [{"id": "gpt-user-sim"}]}),
+        _SyncResponse({"data": [{"id": "qwen3.5-27b-user"}, {"id": "qwen3.5-27b-judge"}]}),
         _SyncResponse(config),
         _SyncResponse({"status": "ok"}),
         _SyncResponse({"status": "ok"}),
@@ -383,7 +726,7 @@ def test_launch_validation_does_not_retry_bad_executed_config():
             "pipelinerl.domains.tau2.client.requests.get",
             side_effect=[
                 _SyncResponse({"status": "ok"}),
-                _SyncResponse({"data": [{"id": "gpt-user-sim"}]}),
+                _SyncResponse({"data": [{"id": "qwen3.5-27b-user"}, {"id": "qwen3.5-27b-judge"}]}),
                 _SyncResponse(config),
             ],
         ) as get,

@@ -1,14 +1,19 @@
 import ast
+import asyncio
 import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import py_compile
 import subprocess
 from collections.abc import Mapping
+from contextvars import ContextVar
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -463,3 +468,843 @@ def test_patched_strict_tito_and_provenance_guards_execute_and_are_used(
     del raw_message["model_version_end"]
     with pytest.raises(RuntimeError, match="missing PipelineRL provenance"):
         attach([message], [item])
+
+
+    auxiliary_names = {
+        "_JudgeOutputInvalid",
+        "_JudgeRewardInvalid",
+        "_require_auxiliary_state",
+        "_validate_token_count",
+        "_response_metadata",
+        "_validate_judge_content",
+        "_next_user_call_position",
+        "_append_auxiliary_call",
+        "_pipelinerl_auxiliary_generate",
+        "_pipelinerl_evaluate_nl_assertions",
+        "_pipelinerl_calculate_nl_reward",
+        "_judge_invalid_marker",
+        "_rewardless_boundary_result",
+        "_new_auxiliary_state",
+        "_judge_sampling",
+    }
+    auxiliary_nodes = [
+        node
+        for node in tau_tree.body
+        if isinstance(
+            node,
+            (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+        )
+        and node.name in auxiliary_names
+    ]
+    assert {node.name for node in auxiliary_nodes} == auxiliary_names
+
+    class FakeRewardInfo:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeRewardTypeValue(str):
+        @property
+        def value(self):
+            return str(self)
+
+    auxiliary_context = ContextVar("test_auxiliary_state", default=None)
+    judge_attempt_context = ContextVar("test_judge_attempt", default=None)
+    auxiliary_namespace = {
+        "Any": Any,
+        "Mapping": Mapping,
+        "ContextVar": ContextVar,
+        "asyncio": asyncio,
+        "hashlib": hashlib,
+        "json": json,
+        "math": math,
+        "perf_counter": perf_counter,
+        "NLAssertionsEvaluator": object,
+        "Task": object,
+        "SimulationRun": object,
+        "RewardInfo": FakeRewardInfo,
+        "RewardType": SimpleNamespace(
+            NL_ASSERTION=FakeRewardTypeValue("NL_ASSERTION")
+        ),
+        "_AUXILIARY_RUN_STATE": auxiliary_context,
+        "_JUDGE_ATTEMPT_STATE": judge_attempt_context,
+        "_PIPELINERL_JUDGE_MARKER_KEY": "pipelinerl_judge_reward_invalid",
+        "_PIPELINERL_JUDGE_REASON": "judge_reward_invalid",
+        "_PIPELINERL_JUDGE_STAGE": "judge",
+        "_USER_CALL_NAME": "user_simulator_response",
+        "_JUDGE_CALL_NAME": "nl_assertions_eval",
+        "_ORIGINAL_USER_GENERATE": None,
+        "_ORIGINAL_JUDGE_GENERATE": None,
+        "_ORIGINAL_NL_EVALUATE": None,
+        "_ORIGINAL_NL_CALCULATE": None,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=auxiliary_nodes, type_ignores=[])
+            ),
+            str(tau_target),
+            "exec",
+        ),
+        auxiliary_namespace,
+    )
+
+    validate_judge = auxiliary_namespace["_validate_judge_content"]
+    judge_output_error = auxiliary_namespace["_JudgeOutputInvalid"]
+    valid_duplicate_output = json.dumps(
+        {
+            "results": [
+                {
+                    "expectedOutcome": "same assertion",
+                    "metExpectation": True,
+                    "reasoning": "first occurrence",
+                },
+                {
+                    "expectedOutcome": "same assertion",
+                    "metExpectation": False,
+                    "reasoning": "second occurrence",
+                },
+            ]
+        }
+    )
+    validate_judge(
+        valid_duplicate_output,
+        ("same assertion", "same assertion"),
+    )
+
+    invalid_judge_outputs = [
+        ("", ("a",), "missing_content"),
+        ("not json", ("a",), "invalid_json"),
+        (json.dumps([]), ("a",), "invalid_object"),
+        (json.dumps({}), ("a",), "missing_results"),
+        (json.dumps({"results": {}}), ("a",), "invalid_results"),
+        (json.dumps({"results": []}), ("a",), "result_count_mismatch"),
+        (
+            json.dumps({"results": ["not-an-object"]}),
+            ("a",),
+            "invalid_result",
+        ),
+        (
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "expectedOutcome": "a",
+                            "metExpectation": True,
+                            "reasoning": "ok",
+                        },
+                        {
+                            "expectedOutcome": "b",
+                            "metExpectation": True,
+                            "reasoning": "extra",
+                        },
+                    ]
+                }
+            ),
+            ("a",),
+            "result_count_mismatch",
+        ),
+        (
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "expectedOutcome": "b",
+                            "metExpectation": True,
+                            "reasoning": "reordered",
+                        },
+                        {
+                            "expectedOutcome": "a",
+                            "metExpectation": True,
+                            "reasoning": "reordered",
+                        },
+                    ]
+                }
+            ),
+            ("a", "b"),
+            "expected_outcome_mismatch",
+        ),
+        (
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "expectedOutcome": "a",
+                            "metExpectation": True,
+                            "reasoning": "ok",
+                        },
+                        {
+                            "expectedOutcome": "a",
+                            "metExpectation": True,
+                            "reasoning": "duplicate",
+                        },
+                    ]
+                }
+            ),
+            ("a", "b"),
+            "expected_outcome_mismatch",
+        ),
+        (
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "expectedOutcome": "wrong",
+                            "metExpectation": True,
+                            "reasoning": "wrong",
+                        }
+                    ]
+                }
+            ),
+            ("a",),
+            "expected_outcome_mismatch",
+        ),
+    ]
+    invalid_judge_outputs.extend(
+        (
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "expectedOutcome": "a",
+                            "metExpectation": value,
+                            "reasoning": "wrong type",
+                        }
+                    ]
+                }
+            ),
+            ("a",),
+            "invalid_met_expectation",
+        )
+        for value in (0, 1, "true")
+    )
+    invalid_judge_outputs.append(
+        (
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "expectedOutcome": "a",
+                            "metExpectation": True,
+                            "reasoning": " ",
+                        }
+                    ]
+                }
+            ),
+            ("a",),
+            "missing_reasoning",
+        )
+    )
+    for content, expected_outcomes, detail_code in invalid_judge_outputs:
+        with pytest.raises(judge_output_error, match=detail_code):
+            validate_judge(content, expected_outcomes)
+
+    wrapper = auxiliary_namespace["_pipelinerl_auxiliary_generate"]
+
+    def message(
+        *,
+        content: str | None,
+        model: str = "qwen-user-primary",
+        finish_reason: str = "stop",
+        usage: Mapping[str, int] | None = None,
+        tool_calls: list[Any] | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            content=content,
+            tool_calls=tool_calls,
+            usage=usage
+            if usage is not None
+            else {"prompt_tokens": 11, "completion_tokens": 7},
+            raw_data={
+                "model": model,
+                "choices": [{"finish_reason": finish_reason}],
+            },
+        )
+
+    def run_async(coro):
+        return asyncio.run(coro)
+
+    base_state = {
+        "user_api_base": "http://user-proxy/v1",
+        "judge_api_base": "http://judge-proxy/v1",
+        "user_model_name": "qwen-user-primary",
+        "judge_model_name": "qwen-judge-secondary",
+        "approved_model_aliases": (
+            "qwen-user-primary",
+            "qwen-judge-secondary",
+        ),
+        "judge_temperature": 0.6,
+        "judge_top_p": 0.95,
+        "judge_top_k": 20,
+        "judge_seed": 17,
+        "judge_initial_max_tokens": 64,
+        "judge_retry_max_tokens": 128,
+        "auxiliary_model_timeout_s": 1.0,
+        "next_user_call_index": 1,
+        "auxiliary_model_calls": [],
+    }
+    valid_single_output = json.dumps(
+        {
+            "results": [
+                {
+                    "expectedOutcome": "a",
+                    "metExpectation": True,
+                    "reasoning": "supported",
+                }
+            ]
+        }
+    )
+    captured_judge_requests = []
+
+    async def successful_judge_generate(**kwargs):
+        captured_judge_requests.append(kwargs)
+        return message(content=valid_single_output)
+
+    auxiliary_namespace["_ORIGINAL_JUDGE_GENERATE"] = successful_judge_generate
+    state = copy.deepcopy(base_state)
+    auxiliary_token = auxiliary_context.set(state)
+    attempt_token = judge_attempt_context.set(
+        {
+            "expected_outcomes": ("a",),
+            "attempt_index": 1,
+            "completion_budget": 64,
+        }
+    )
+    try:
+        run_async(
+            wrapper(
+                model="ignored-upstream-judge",
+                messages=[],
+                call_name="nl_assertions_eval",
+            )
+        )
+    finally:
+        judge_attempt_context.reset(attempt_token)
+        auxiliary_context.reset(auxiliary_token)
+    assert captured_judge_requests[0]["model"] == "qwen-judge-secondary"
+    assert captured_judge_requests[0]["api_base"] == "http://judge-proxy/v1"
+    assert {
+        key: captured_judge_requests[0][key]
+        for key in ("temperature", "top_p", "seed", "max_tokens")
+    } == {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "seed": 17,
+        "max_tokens": 64,
+    }
+    assert state["auxiliary_model_calls"] == [
+        {
+            "role": "judge",
+            "call_index": 1,
+            "attempt_index": 1,
+            "requested_model_alias": "qwen-judge-secondary",
+            "response_model_alias": "qwen-user-primary",
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "latency_s": state["auxiliary_model_calls"][0]["latency_s"],
+            "finish_reason": "stop",
+            "completion_budget": 64,
+            "output_character_count": len(valid_single_output),
+            "output_sha256": hashlib.sha256(
+                valid_single_output.encode("utf-8")
+            ).hexdigest(),
+            "failure_code": None,
+        }
+    ]
+
+    async def length_limited_judge_generate(**kwargs):
+        return message(
+            content=valid_single_output,
+            finish_reason="length",
+        )
+
+    auxiliary_namespace[
+        "_ORIGINAL_JUDGE_GENERATE"
+    ] = length_limited_judge_generate
+    length_state = copy.deepcopy(base_state)
+    auxiliary_token = auxiliary_context.set(length_state)
+    attempt_token = judge_attempt_context.set(
+        {
+            "expected_outcomes": ("a",),
+            "attempt_index": 1,
+            "completion_budget": 64,
+        }
+    )
+    try:
+        with pytest.raises(
+            judge_output_error,
+            match="finish_reason_length",
+        ):
+            run_async(
+                wrapper(
+                    model="ignored",
+                    messages=[],
+                    call_name="nl_assertions_eval",
+                )
+            )
+    finally:
+        judge_attempt_context.reset(attempt_token)
+        auxiliary_context.reset(auxiliary_token)
+    assert length_state["auxiliary_model_calls"][0][
+        "failure_code"
+    ] == "finish_reason_length"
+
+    async def unapproved_alias_generate(**kwargs):
+        return message(content=valid_single_output, model="rogue-model")
+
+    auxiliary_namespace["_ORIGINAL_JUDGE_GENERATE"] = unapproved_alias_generate
+    state = copy.deepcopy(base_state)
+    auxiliary_token = auxiliary_context.set(state)
+    attempt_token = judge_attempt_context.set(
+        {
+            "expected_outcomes": ("a",),
+            "attempt_index": 1,
+            "completion_budget": 64,
+        }
+    )
+    try:
+        with pytest.raises(RuntimeError, match="unapproved alias"):
+            run_async(
+                wrapper(
+                    model="ignored",
+                    messages=[],
+                    call_name="nl_assertions_eval",
+                )
+            )
+    finally:
+        judge_attempt_context.reset(attempt_token)
+        auxiliary_context.reset(auxiliary_token)
+    assert state["auxiliary_model_calls"] == []
+
+    auxiliary_token = auxiliary_context.set(copy.deepcopy(base_state))
+    try:
+        with pytest.raises(RuntimeError, match="Unexpected Tau2 auxiliary call_name"):
+            run_async(
+                wrapper(
+                    model="ignored",
+                    messages=[],
+                    call_name="future_auxiliary_role",
+                )
+            )
+    finally:
+        auxiliary_context.reset(auxiliary_token)
+
+    async def invalid_usage_generate(**kwargs):
+        return message(content=valid_single_output, usage={})
+
+    auxiliary_namespace["_ORIGINAL_JUDGE_GENERATE"] = invalid_usage_generate
+    auxiliary_token = auxiliary_context.set(copy.deepcopy(base_state))
+    attempt_token = judge_attempt_context.set(
+        {
+            "expected_outcomes": ("a",),
+            "attempt_index": 1,
+            "completion_budget": 64,
+        }
+    )
+    try:
+        with pytest.raises(RuntimeError, match="prompt_tokens"):
+            run_async(
+                wrapper(
+                    model="ignored",
+                    messages=[],
+                    call_name="nl_assertions_eval",
+                )
+            )
+    finally:
+        judge_attempt_context.reset(attempt_token)
+        auxiliary_context.reset(auxiliary_token)
+
+    async def transport_failure_generate(**kwargs):
+        raise ConnectionError("service unavailable")
+
+    auxiliary_namespace["_ORIGINAL_JUDGE_GENERATE"] = transport_failure_generate
+    auxiliary_token = auxiliary_context.set(copy.deepcopy(base_state))
+    attempt_token = judge_attempt_context.set(
+        {
+            "expected_outcomes": ("a",),
+            "attempt_index": 1,
+            "completion_budget": 64,
+        }
+    )
+    try:
+        with pytest.raises(ConnectionError, match="service unavailable"):
+            run_async(
+                wrapper(
+                    model="ignored",
+                    messages=[],
+                    call_name="nl_assertions_eval",
+                )
+            )
+    finally:
+        judge_attempt_context.reset(attempt_token)
+        auxiliary_context.reset(auxiliary_token)
+
+    async def stalled_generate(**kwargs):
+        await asyncio.sleep(10)
+
+    auxiliary_namespace["_ORIGINAL_JUDGE_GENERATE"] = stalled_generate
+    timeout_state = copy.deepcopy(base_state)
+    timeout_state["auxiliary_model_timeout_s"] = 0.001
+    auxiliary_token = auxiliary_context.set(timeout_state)
+    attempt_token = judge_attempt_context.set(
+        {
+            "expected_outcomes": ("a",),
+            "attempt_index": 1,
+            "completion_budget": 64,
+        }
+    )
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            run_async(
+                wrapper(
+                    model="ignored",
+                    messages=[],
+                    call_name="nl_assertions_eval",
+                )
+            )
+    finally:
+        judge_attempt_context.reset(attempt_token)
+        auxiliary_context.reset(auxiliary_token)
+    assert timeout_state["auxiliary_model_calls"] == []
+
+    user_messages = [
+        message(content=None),
+        message(content="retry succeeded"),
+        message(content="next turn"),
+    ]
+
+    async def user_generate(**kwargs):
+        return user_messages.pop(0)
+
+    auxiliary_namespace["_ORIGINAL_USER_GENERATE"] = user_generate
+    user_state = copy.deepcopy(base_state)
+    auxiliary_token = auxiliary_context.set(user_state)
+    try:
+        for _ in range(3):
+            run_async(
+                wrapper(
+                    model="ignored",
+                    messages=[],
+                    call_name="user_simulator_response",
+                )
+            )
+    finally:
+        auxiliary_context.reset(auxiliary_token)
+    assert [
+        (
+            call["call_index"],
+            call["attempt_index"],
+            call["failure_code"],
+        )
+        for call in user_state["auxiliary_model_calls"]
+    ] == [
+        (1, 1, "empty_message"),
+        (1, 2, None),
+        (2, 1, None),
+    ]
+
+    malformed_requests = []
+
+    async def malformed_judge_generate(**kwargs):
+        malformed_requests.append(kwargs)
+        return message(content=json.dumps({"results": []}))
+
+    auxiliary_namespace["_ORIGINAL_JUDGE_GENERATE"] = malformed_judge_generate
+
+    async def original_evaluate(trajectory, nl_assertions):
+        return await wrapper(
+            model="hard-coded-upstream-judge",
+            messages=[],
+            call_name="nl_assertions_eval",
+        )
+
+    auxiliary_namespace["_ORIGINAL_NL_EVALUATE"] = original_evaluate
+    retry_state = copy.deepcopy(base_state)
+    auxiliary_token = auxiliary_context.set(retry_state)
+    reward_invalid_error = auxiliary_namespace["_JudgeRewardInvalid"]
+    try:
+        with pytest.raises(reward_invalid_error) as exc_info:
+            run_async(
+                auxiliary_namespace["_pipelinerl_evaluate_nl_assertions"](
+                    object,
+                    [],
+                    ["a"],
+                )
+            )
+    finally:
+        auxiliary_context.reset(auxiliary_token)
+    assert exc_info.value.detail_code == "result_count_mismatch"
+    assert exc_info.value.attempt_count == 2
+    assert [
+        request["max_tokens"] for request in malformed_requests
+    ] == [64, 128]
+    assert all(
+        (
+            request["model"],
+            request["temperature"],
+            request["top_p"],
+            request["seed"],
+        )
+        == ("qwen-judge-secondary", 0.6, 0.95, 17)
+        for request in malformed_requests
+    )
+    assert [
+        call["attempt_index"] for call in retry_state["auxiliary_model_calls"]
+    ] == [1, 2]
+    assert all(
+        call["failure_code"] == "result_count_mismatch"
+        for call in retry_state["auxiliary_model_calls"]
+    )
+
+    async def invalid_calculate(task, trajectory):
+        raise reward_invalid_error("result_count_mismatch", 2)
+
+    auxiliary_namespace["_ORIGINAL_NL_CALCULATE"] = invalid_calculate
+    reward_info = run_async(
+        auxiliary_namespace["_pipelinerl_calculate_nl_reward"](
+            object,
+            object(),
+            [],
+        )
+    )
+    marker = reward_info.info["pipelinerl_judge_reward_invalid"]
+    assert reward_info.reward == 0.0
+    assert marker == {
+        "reason": "judge_reward_invalid",
+        "producer_stage": "judge",
+        "detail_code": "result_count_mismatch",
+        "attempt_count": 2,
+        "diagnostic": "judge output failed strict assertion validation",
+    }
+
+    generation_assignments = {
+        ast.unparse(target): ast.unparse(node.value)
+        for node in tau_tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and target.attr == "generate"
+    }
+    assert generation_assignments == {
+        "tau2_user_simulator.generate": "_pipelinerl_auxiliary_generate",
+        "tau2_nl_assertions.generate": "_pipelinerl_auxiliary_generate",
+    }
+    tau_config = next(
+        node
+        for node in tau_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "Tau2Config"
+    )
+    config_validator = copy.deepcopy(
+        next(
+            node
+            for node in tau_config.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "validate_auxiliary_models"
+        )
+    )
+    config_validator.decorator_list = []
+    config_namespace = {}
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[config_validator], type_ignores=[])
+            ),
+            str(tau_target),
+            "exec",
+        ),
+        config_namespace,
+    )
+    validate_config = config_namespace["validate_auxiliary_models"]
+    valid_config = SimpleNamespace(
+        model_server=SimpleNamespace(name="policy"),
+        user_model_server=SimpleNamespace(name="user"),
+        judge_model_server=SimpleNamespace(name="judge"),
+        user_model_name="user-alias",
+        judge_model_name="judge-alias",
+        judge_initial_max_tokens=64,
+        judge_retry_max_tokens=128,
+    )
+    assert validate_config(valid_config) is valid_config
+    invalid_config = copy.deepcopy(valid_config)
+    invalid_config.judge_model_server.name = "user"
+    with pytest.raises(ValueError, match="server refs must differ"):
+        validate_config(invalid_config)
+
+    assert _GYM_PATCH_TARGETS[Path("nemo_gym/openai_utils.py")][1] == (
+        "06210bba5847f52e71bdd8aba33390be3aec63bcc85ccc6210d42cc58b7f7fc6"
+    )
+
+    run_method_copy = copy.deepcopy(run_method)
+    run_method_copy.decorator_list = []
+
+    class FakeTau2RunRequest:
+        model_fields = (
+            "responses_create_params",
+            "config",
+            "task",
+            "seed",
+            "evaluation_type",
+            "save_dir",
+            "user_voice_settings",
+            "user_persona_config",
+            "verbose_logs",
+            "audio_debug",
+            "audio_taps",
+            "auto_review",
+            "review_mode",
+            "hallucination_feedback",
+        )
+
+    class FakeTau2VerifyResponse(dict):
+        def __init__(self, **kwargs):
+            super().__init__(schema_version=1, outcome="completed", **kwargs)
+
+    class FakeJSONResponse:
+        def __init__(self, *, status_code, content):
+            self.status_code = status_code
+            self.content = content
+
+    class FakeConverter:
+        def __init__(self, *, return_token_id_information):
+            assert return_token_id_information
+
+        def chat_completions_messages_to_responses_items(self, messages):
+            assert messages == []
+            return []
+
+    response_namespace = dict(auxiliary_namespace)
+    response_namespace.update(
+        {
+            "Tau2RunRequest": FakeTau2RunRequest,
+            "Tau2VerifyResponse": FakeTau2VerifyResponse,
+            "JSONResponse": FakeJSONResponse,
+            "jsonable_encoder": lambda value: value,
+            "VLLMConverter": FakeConverter,
+            "split_responses_input_output_items": lambda items: ([], []),
+            "to_litellm_messages": lambda messages: [],
+            "_attach_pipelinerl_provenance": lambda messages, items: None,
+            "get_server_url": lambda ref: ref,
+            "time": lambda: 123,
+        }
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[run_method_copy], type_ignores=[])
+            ),
+            str(tau_target),
+            "exec",
+        ),
+        response_namespace,
+    )
+
+    marker_info = {
+        "reason": "judge_reward_invalid",
+        "producer_stage": "judge",
+        "detail_code": "result_count_mismatch",
+        "attempt_count": 2,
+        "diagnostic": "judge output failed strict assertion validation",
+    }
+    active_result = SimpleNamespace(
+        messages=[],
+        reward_info=SimpleNamespace(
+            reward=0.0,
+            info={
+                "nl": {
+                    "pipelinerl_judge_reward_invalid": marker_info,
+                }
+            },
+        ),
+        duration=2.0,
+        model_dump=lambda mode: {
+            "messages": [],
+            "termination_reason": "agent_stop",
+            "reward_info": {
+                "reward": 0.0,
+                "reward_breakdown": {
+                    "NL_ASSERTION": 0.0,
+                    "DB": 1.0,
+                },
+                "info": {
+                    "nl": {
+                        "pipelinerl_judge_reward_invalid": marker_info,
+                    }
+                },
+            },
+        },
+    )
+
+    async def run_single_task(**kwargs):
+        return active_result
+
+    response_namespace["run_single_task"] = run_single_task
+    request_config = SimpleNamespace(
+        domain="retail",
+        llm_user=None,
+        llm_args_user={},
+        llm_agent=None,
+        llm_args_agent={},
+        max_steps=0,
+    )
+    request_task = SimpleNamespace(id="task-1")
+    request_params = SimpleNamespace(
+        input=[],
+        model="qwen-policy",
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+        model_dump=lambda exclude_unset: {},
+    )
+    request = SimpleNamespace(
+        responses_create_params=request_params,
+        config=request_config,
+        task=request_task,
+        seed=3,
+        evaluation_type="all",
+        save_dir=None,
+        user_voice_settings=None,
+        user_persona_config=None,
+        verbose_logs=False,
+        audio_debug=False,
+        audio_taps=False,
+        auto_review=False,
+        review_mode="full",
+        hallucination_feedback=None,
+    )
+    fake_agent = SimpleNamespace(
+        config=SimpleNamespace(
+            model_server=SimpleNamespace(name="policy"),
+            user_model_server=SimpleNamespace(name="user"),
+            judge_model_server=SimpleNamespace(name="judge"),
+            user_model_name="qwen-user-primary",
+            judge_model_name="qwen-judge-secondary",
+            user_llm_args={},
+            max_steps=200,
+            judge_temperature=0.6,
+            judge_top_p=0.95,
+            judge_top_k=20,
+            judge_seed=17,
+            judge_initial_max_tokens=64,
+            judge_retry_max_tokens=128,
+            auxiliary_model_timeout_s=1.0,
+        ),
+        base_url_for_run=lambda url, body: f"http://{url}",
+    )
+    patched_run = response_namespace["run"]
+    boundary_response = run_async(patched_run(fake_agent, request))
+    assert boundary_response.status_code == 409
+    assert boundary_response.content["outcome"] == "boundary_failure"
+    assert "reward" not in boundary_response.content
+    boundary_result = boundary_response.content["result"]
+    assert "reward" not in boundary_result["reward_info"]
+    assert "NL_ASSERTION" not in boundary_result["reward_info"][
+        "reward_breakdown"
+    ]
+    assert boundary_result["reward_info"]["reward_breakdown"]["DB"] == 1.0
+    assert boundary_response.content["auxiliary_model_calls"] == []
+
+    active_result.reward_info = SimpleNamespace(reward=0.75, info={})
+    completed_response = run_async(patched_run(fake_agent, request))
+    assert completed_response["outcome"] == "completed"
+    assert completed_response["reward"] == 0.75
+    assert completed_response["result"] is active_result
