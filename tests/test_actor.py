@@ -1,7 +1,12 @@
 from multiprocessing.managers import SharedMemoryManager
 from types import SimpleNamespace
 
+import pytest
+from omegaconf import OmegaConf
+
 from pipelinerl.actor import (
+    ActorLoop,
+    SlidingWindowAggregator,
     apply_group_boundary_policy,
     make_rollout_audit_record,
     make_training_group_envelope,
@@ -38,6 +43,7 @@ def _result(
     reward: float,
     model_version: int | None = 8,
     boundary_reason: str | None = None,
+    metrics_available: bool = True,
     atomic_group: bool = False,
     token_count: int = 1,
 ) -> RolloutResult:
@@ -60,6 +66,9 @@ def _result(
             "reason": boundary_reason,
             "detail": f"failure {boundary_reason}",
         }
+    if not metrics_available:
+        audit["reward"] = None
+        audit["reward_available"] = False
     texts = (
         []
         if boundary_reason is not None
@@ -82,7 +91,7 @@ def _result(
     )
     return RolloutResult(
         training_texts=texts,
-        metrics=_metrics(reward),
+        metrics=_metrics(reward) if metrics_available else None,
         latency=0.1,
         model_version=model_version,
         dataset_name="telecom",
@@ -128,6 +137,7 @@ def test_lowest_rollout_index_boundary_failure_drops_whole_group_once_and_audits
         reward=0.5,
         model_version=None,
         boundary_reason="malformed_gym_response",
+        metrics_available=False,
     )
     results = [higher_failure, valid_sibling, trigger]
     counters = {}
@@ -136,7 +146,11 @@ def test_lowest_rollout_index_boundary_failure_drops_whole_group_once_and_audits
 
     assert reason == "malformed_gym_response"
     assert counters == {"malformed_gym_response": 1}
-    assert [result.metrics.reward for result in results] == [0.25, 0.75, 0.5]
+    assert higher_failure.metrics is not None
+    assert higher_failure.metrics.reward == 0.25
+    assert valid_sibling.metrics is not None
+    assert valid_sibling.metrics.reward == 0.75
+    assert trigger.metrics is None
     assert all(result.audit["published"] is False for result in results)
     assert all(result.audit["entered_training"] is False for result in results)
     assert all(result.audit["drop_reason"] == reason for result in results)
@@ -152,9 +166,120 @@ def test_lowest_rollout_index_boundary_failure_drops_whole_group_once_and_audits
     write_rollout_audit_records(writer, results)
 
     assert len(writer.records) == 3
-    assert [record["reward"] for record in writer.records] == [0.25, 0.75, 0.5]
+    assert [record["reward"] for record in writer.records] == [0.25, 0.75, None]
     assert all(record["entered_training"] is False for record in writer.records)
     assert [record["n_training_texts"] for record in writer.records] == [0, 1, 0]
+
+
+def test_metrics_less_boundary_drops_whole_group_once_and_keeps_sibling_reward():
+    trigger = _result(
+        0,
+        reward=0.0,
+        model_version=None,
+        boundary_reason="termination_user_error",
+        metrics_available=False,
+    )
+    sibling = _result(1, reward=0.75, model_version=9)
+    counters = {}
+
+    reason = apply_group_boundary_policy([sibling, trigger], counters)
+
+    assert reason == "termination_user_error"
+    assert counters == {"termination_user_error": 1}
+    assert trigger.metrics is None
+    assert trigger.audit["group_drop_triggered_here"] is True
+    assert sibling.audit["group_drop_triggered_here"] is False
+    assert sibling.metrics is not None
+    assert sibling.metrics.reward == 0.75
+    assert all(
+        result.audit["entered_training"] is False
+        for result in (trigger, sibling)
+    )
+
+
+def test_metrics_less_boundary_stats_omit_reward_and_success_metrics():
+    result = _result(
+        0,
+        reward=0.0,
+        model_version=None,
+        boundary_reason="judge_reward_invalid",
+        metrics_available=False,
+    )
+    apply_group_boundary_policy([result], {})
+    actor = ActorLoop.__new__(ActorLoop)
+    actor.is_training = True
+    actor.cfg = OmegaConf.create(
+        {
+            "llm": {"parameters": {"max_tokens": 1}},
+            "actor": {},
+            "wandb": {"use_wandb": False},
+        }
+    )
+    actor.sliding_aggregator = SlidingWindowAggregator(window_size=2)
+    actor.init_stats()
+
+    actor.update_stats([result])
+
+    stats = actor.stats
+    assert "reward" not in stats
+    assert "success" not in stats
+    assert "overlong_success" not in stats
+    assert stats["overlong"]["telecom"]["group-1"] == [False]
+    assert stats["num_turns"]["telecom"]["group-1"] == [0]
+    assert actor.latency_list == [0.1]
+    assert make_rollout_audit_record(result)["reward"] is None
+
+    writer = _Writer()
+    actor.publish_stats(writer, {})
+
+    published = writer.records[0]
+    assert "reward_mean" not in published
+    assert "always_success" not in published
+    assert "never_success" not in published
+    assert "sometimes_success" not in published
+
+
+def test_generic_metrics_stats_are_unchanged():
+    result = _result(0, reward=0.75, model_version=8)
+    apply_group_boundary_policy([result], {})
+    actor = ActorLoop.__new__(ActorLoop)
+    actor.is_training = True
+    actor.cfg = OmegaConf.create(
+        {
+            "llm": {"parameters": {"max_tokens": 1}},
+            "actor": {},
+            "wandb": {"use_wandb": False},
+        }
+    )
+    actor.sliding_aggregator = SlidingWindowAggregator(window_size=2)
+    actor.init_stats()
+
+    actor.update_stats([result])
+
+    stats = actor.stats
+    assert stats["reward"]["telecom"]["group-1"] == [0.75]
+    assert stats["success"]["telecom"]["group-1"] == [True]
+    assert stats["overlong_success"]["telecom"]["group-1"] == [True]
+
+    writer = _Writer()
+    actor.publish_stats(writer, {})
+
+    published = writer.records[0]
+    assert published["reward_mean"] == 0.75
+    assert published["always_success"] == 1.0
+    assert published["never_success"] == 0.0
+    assert published["sometimes_success"] == 0.0
+
+
+def test_metrics_less_non_boundary_rollout_is_rejected():
+    result = _result(
+        0,
+        reward=0.0,
+        metrics_available=False,
+    )
+
+    with pytest.raises(ValueError, match="metrics-less rollout"):
+        apply_group_boundary_policy([result], {})
 
 
 def test_evaluation_group_is_published_without_being_marked_as_training_data():

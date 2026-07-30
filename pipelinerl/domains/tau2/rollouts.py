@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from transformers import PreTrainedTokenizerBase
 
 from pipelinerl.domains.tau2.client import (
+    Tau2BoundaryFailure,
     Tau2GymClient,
     Tau2GymSettings,
     Tau2RunResponse,
@@ -38,7 +39,23 @@ _PROVENANCE_FIELDS = {
     "policy_endpoint",
 }
 _CALL_FIELDS = _TOKEN_FIELDS | _PROVENANCE_FIELDS
-_INCOMPLETE_REASONS = {"context_length", "max_steps"}
+_FINISHED_REASONS = frozenset({"agent_stop", "user_stop"})
+_TRAIN_ZERO_REASONS = frozenset({"max_steps", "context_window_exceeded"})
+_CONDITIONAL_ZERO_REASONS = frozenset(
+    {"empty_tool_calls_and_content", "agent_error"}
+)
+_SEMANTIC_DROP_REASONS = frozenset({"user_error", "empty_user_message"})
+_FATAL_TERMINATION_REASONS = frozenset(
+    {"timeout", "infrastructure_error", "unexpected_error"}
+)
+_KNOWN_TERMINATION_REASONS = (
+    _FINISHED_REASONS
+    | _TRAIN_ZERO_REASONS
+    | _CONDITIONAL_ZERO_REASONS
+    | _SEMANTIC_DROP_REASONS
+    | _FATAL_TERMINATION_REASONS
+    | {"too_many_errors"}
+)
 _TAU2_GYM_CLIENTS: dict[tuple[str, tuple[str, ...]], Tau2GymClient] = {}
 
 
@@ -48,6 +65,10 @@ class Tau2TrajectoryError(ValueError):
     def __init__(self, reason: str, message: str) -> None:
         self.reason = reason
         super().__init__(message)
+
+
+class Tau2TerminationContractError(RuntimeError):
+    """Raised when a completed Gym response violates Tau2 termination semantics."""
 
 
 class Tau2Metrics(BaseMetrics):
@@ -318,7 +339,7 @@ def build_tau2_training_text(
         ref_logprobs=list(old_logprobs),
         input_ids=input_ids,
         labels=labels,
-        finished=termination_reason not in _INCOMPLETE_REASONS,
+        finished=termination_reason in _FINISHED_REASONS,
         prompt_tokens=len(input_ids) - output_tokens,
         output_tokens=output_tokens,
         metadata={
@@ -368,34 +389,196 @@ def _full_tau2_actions(result: Mapping[str, Any]) -> list[dict[str, Any]]:
     return actions
 
 
+def _audit_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, Mapping):
+        return dict(value)
+    return value
+
+
+def _validated_termination_reason(result: Mapping[str, Any]) -> str:
+    termination_reason = result.get("termination_reason")
+    if type(termination_reason) is not str or termination_reason not in _KNOWN_TERMINATION_REASONS:
+        raise Tau2TerminationContractError(
+            f"Tau2 returned missing or unknown termination reason {termination_reason!r}"
+        )
+    if termination_reason in _FATAL_TERMINATION_REASONS:
+        raise Tau2TerminationContractError(
+            f"Tau2 returned fatal termination reason {termination_reason}"
+        )
+    return termination_reason
+
+
+def _too_many_errors_evidence(result: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    tool_results: list[Any] = []
+    malformed_tool_results = 0
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, Mapping) or message.get("role") != "tool":
+                continue
+            if "tool_messages" not in message:
+                tool_results.append(message)
+                continue
+            nested = message["tool_messages"]
+            if not isinstance(nested, list):
+                malformed_tool_results += 1
+                continue
+            tool_results.extend(nested)
+
+    total_errors = 0
+    assistant_errors = 0
+    user_errors = 0
+    unattributed_errors = 0
+    error_results = []
+    for tool_result in tool_results:
+        if not isinstance(tool_result, Mapping):
+            malformed_tool_results += 1
+            continue
+        error = tool_result.get("error")
+        requestor = tool_result.get("requestor")
+        valid = type(error) is bool and requestor in {"assistant", "user"}
+        if not valid:
+            malformed_tool_results += 1
+        if error is not True:
+            continue
+        total_errors += 1
+        if requestor == "assistant":
+            assistant_errors += 1
+        elif requestor == "user":
+            user_errors += 1
+        else:
+            unattributed_errors += 1
+        error_results.append(
+            {
+                "id": tool_result.get("id"),
+                "turn_idx": tool_result.get("turn_idx"),
+                "requestor": requestor,
+            }
+        )
+
+    evidence = {
+        "tool_results_total": len(tool_results),
+        "tool_errors_total": total_errors,
+        "assistant_tool_errors": assistant_errors,
+        "user_tool_errors": user_errors,
+        "unattributed_tool_errors": unattributed_errors,
+        "malformed_tool_results": malformed_tool_results,
+        "error_results": error_results,
+    }
+    trusted = (
+        total_errors > 0
+        and malformed_tool_results == 0
+        and assistant_errors == total_errors
+    )
+    return evidence, trusted
+
+
 def _base_tau2_audit(
     problem: Mapping[str, Any],
-    run_response: Tau2RunResponse,
+    run_response: Any,
     *,
     policy_endpoint: str,
+    evaluator_reward: float | None,
 ) -> dict[str, Any]:
-    termination_reason = run_response.result.get("termination_reason")
+    termination_reason = _validated_termination_reason(run_response.result)
     task = problem.get("task")
     task_id = problem.get("task_id")
     if task_id is None and isinstance(task, Mapping):
         task_id = task.get("id")
     verifier_result = run_response.result.get("reward_info", run_response.result)
+    auxiliary_model_calls = [
+        _audit_value(call)
+        for call in getattr(run_response, "auxiliary_model_calls", [])
+    ]
+    judge_sampling = getattr(run_response, "judge_sampling", None)
     return {
         "task_id": task_id,
         "dataset_name": problem.get("dataset"),
         "domain": problem.get("domain", "tau2"),
         "policy_endpoint": policy_endpoint,
         "admission_policy_endpoint": policy_endpoint,
-        "reward": run_response.reward,
+        "reward": evaluator_reward,
+        "evaluator_reward": evaluator_reward,
+        "training_reward": None,
+        "reward_available": evaluator_reward is not None,
         "verifier_result": verifier_result,
         "actions": _full_tau2_actions(run_response.result),
-        "submitted": termination_reason not in _INCOMPLETE_REASONS,
-        "terminated": termination_reason is not None,
+        "submitted": termination_reason in _FINISHED_REASONS,
+        "terminated": True,
+        "finished": termination_reason in _FINISHED_REASONS,
+        "termination_reason": termination_reason,
         "stop_reason": termination_reason,
+        "disposition": None,
+        "labelled_policy_tokens": None,
         "entered_training": False,
         "drop_reason": None,
         "model_calls": [],
+        "auxiliary_model_calls": auxiliary_model_calls,
+        "judge_sampling": (
+            _audit_value(judge_sampling)
+            if judge_sampling is not None
+            else None
+        ),
     }
+
+
+def _update_capture_audit(audit: dict[str, Any], training_text: TrainingText) -> None:
+    metadata = training_text.metadata
+    audit.update(
+        {
+            "model_version": metadata["model_version"],
+            "model_version_min": metadata["model_version_min"],
+            "model_version_max": metadata["model_version_max"],
+            "model_version_spread": metadata["model_version_spread"],
+            "model_calls": metadata["model_calls"],
+            "prompt_tokens": training_text.prompt_tokens,
+            "output_tokens": training_text.output_tokens,
+            "response_tokens": training_text.output_tokens,
+            "labeled_tokens": training_text.output_tokens,
+            "labelled_policy_tokens": training_text.output_tokens,
+            "sequence_tokens": len(training_text.input_ids),
+        }
+    )
+
+
+def _semantic_boundary_result(
+    *,
+    reason: str,
+    detail: str,
+    audit: dict[str, Any],
+    latency: float,
+    problem: Mapping[str, Any],
+    labelled_policy_tokens: int,
+    model_version: int | None = None,
+    failure_fields: Mapping[str, Any] | None = None,
+) -> RolloutResult:
+    failure = {"reason": reason, "detail": detail}
+    if failure_fields:
+        failure.update(failure_fields)
+    audit.update(
+        {
+            "training_reward": None,
+            "reward_available": False,
+            "submitted": False,
+            "finished": False,
+            "disposition": "drop_group",
+            "labelled_policy_tokens": labelled_policy_tokens,
+            "drop_reason": reason,
+            "boundary_failure": failure,
+        }
+    )
+    return RolloutResult(
+        training_texts=[],
+        metrics=None,
+        latency=latency,
+        model_version=model_version,
+        dataset_name=problem.get("dataset"),
+        domain=problem.get("domain", "tau2"),
+        audit=audit,
+        atomic_group=True,
+    )
 
 
 async def generate_tau2_rollout(
@@ -407,13 +590,79 @@ async def generate_tau2_rollout(
     policy_endpoint = normalize_openai_base_url(llm.get_base_url())
     start_time = time.perf_counter()
     client = _get_tau2_gym_client(cfg)
+
+    def build_capture(
+        response: Tau2RunResponse,
+        *,
+        shared_memory_entry_size: int,
+    ) -> TrainingText:
+        llm.load_tokenizer()
+        assert llm.tokenizer is not None
+        return build_tau2_training_text(
+            response,
+            llm.tokenizer,
+            expected_policy_endpoint=policy_endpoint,
+            max_sequence_length=int(cfg.finetune.seq_length),
+            shared_memory_entry_size=shared_memory_entry_size,
+        )
+
     try:
         run_response = await client.run(
             policy_endpoint,
             problem,
             session,
         )
+    except Tau2BoundaryFailure as exc:
+        latency = time.perf_counter() - start_time
+        boundary = exc.boundary
+        audit = _base_tau2_audit(
+            problem,
+            boundary,
+            policy_endpoint=policy_endpoint,
+            evaluator_reward=None,
+        )
+        captured_response = Tau2RunResponse(
+            reward=0.0,
+            responses_create_params=boundary.responses_create_params,
+            response=boundary.response,
+            result=boundary.result,
+            duration=boundary.duration,
+            num_steps=boundary.num_steps,
+            num_agent_calls=boundary.num_agent_calls,
+        )
+        try:
+            training_text = build_capture(
+                captured_response,
+                shared_memory_entry_size=2**63 - 1,
+            )
+        except Tau2TrajectoryError as capture_error:
+            raise Tau2TerminationContractError(
+                "Tau2 judge-invalid boundary has invalid policy capture"
+            ) from capture_error
+        _update_capture_audit(audit, training_text)
+        return _semantic_boundary_result(
+            reason=boundary.reason,
+            detail=boundary.diagnostic,
+            audit=audit,
+            latency=latency,
+            problem=problem,
+            labelled_policy_tokens=training_text.output_tokens,
+            model_version=training_text.metadata["model_version"],
+            failure_fields={
+                "producer_stage": boundary.producer_stage,
+                "detail_code": boundary.detail_code,
+                "attempt_count": boundary.attempt_count,
+                "diagnostic": boundary.diagnostic,
+            },
+        )
     except ValidationError as exc:
+        if any(
+            "Tau2 response has no termination reason" in error["msg"]
+            for error in exc.errors(include_input=False)
+        ):
+            raise Tau2TerminationContractError(
+                "Tau2 completed response is missing termination_reason"
+            ) from exc
         latency = time.perf_counter() - start_time
         task = problem.get("task")
         task_id = problem.get("task_id")
@@ -434,67 +683,94 @@ async def generate_tau2_rollout(
             "domain": problem.get("domain", "tau2"),
             "policy_endpoint": policy_endpoint,
             "admission_policy_endpoint": policy_endpoint,
-            "reward": 0.0,
+            "reward": None,
+            "evaluator_reward": None,
+            "training_reward": None,
             "reward_available": False,
             "verifier_result": None,
             "actions": [],
             "submitted": None,
             "terminated": None,
+            "finished": None,
+            "termination_reason": None,
             "stop_reason": None,
+            "disposition": "drop_group",
+            "labelled_policy_tokens": None,
             "entered_training": False,
             "drop_reason": reason,
             "model_calls": [],
+            "auxiliary_model_calls": [],
+            "judge_sampling": None,
             "boundary_failure": {
                 "reason": reason,
                 "detail": "Tau2 Gym /run response failed schema validation",
                 "validation_errors": validation_errors,
             },
         }
-        metrics = Tau2Metrics(
-            reward=0.0,
-            success=False,
-            no_error=False,
-            no_answer=True,
-            boundary_failure=True,
-        )
         return RolloutResult(
             training_texts=[],
-            metrics=metrics,
+            metrics=None,
             latency=latency,
             dataset_name=problem.get("dataset"),
             domain=problem.get("domain", "tau2"),
             audit=audit,
             atomic_group=True,
         )
+
     latency = time.perf_counter() - start_time
+    evaluator_reward = run_response.reward
+    if type(evaluator_reward) not in (int, float) or not math.isfinite(evaluator_reward):
+        raise Tau2TerminationContractError(
+            f"Tau2 returned invalid evaluator reward {evaluator_reward!r}"
+        )
+    evaluator_reward = float(evaluator_reward)
     audit = _base_tau2_audit(
         problem,
         run_response,
         policy_endpoint=policy_endpoint,
+        evaluator_reward=evaluator_reward,
     )
+    termination_reason = audit["termination_reason"]
     metrics = Tau2Metrics(
-        reward=run_response.reward,
-        success=run_response.reward == 1.0,
+        reward=evaluator_reward,
+        success=evaluator_reward == 1.0,
         no_error=True,
         no_answer=False,
     )
-
-    llm.load_tokenizer()
-    assert llm.tokenizer is not None
     try:
-        training_text = build_tau2_training_text(
+        training_text = build_capture(
             run_response,
-            llm.tokenizer,
-            expected_policy_endpoint=policy_endpoint,
-            max_sequence_length=int(cfg.finetune.seq_length),
             shared_memory_entry_size=int(cfg.actor.shared_memory_entry_size),
         )
     except Tau2TrajectoryError as exc:
-        audit["boundary_failure"] = {
-            "reason": exc.reason,
-            "detail": str(exc),
-        }
-        audit["drop_reason"] = exc.reason
+        if (
+            termination_reason in _CONDITIONAL_ZERO_REASONS
+            and exc.reason == "no_policy_calls"
+        ):
+            reason = f"termination_{termination_reason}_no_labeled_span"
+            return _semantic_boundary_result(
+                reason=reason,
+                detail=(
+                    f"Tau2 {termination_reason} response has no labelled policy span"
+                ),
+                audit=audit,
+                latency=latency,
+                problem=problem,
+                labelled_policy_tokens=0,
+            )
+        audit.update(
+            {
+                "training_reward": None,
+                "reward_available": True,
+                "disposition": "drop_technical_boundary",
+                "labelled_policy_tokens": None,
+                "drop_reason": exc.reason,
+                "boundary_failure": {
+                    "reason": exc.reason,
+                    "detail": str(exc),
+                },
+            }
+        )
         metrics.no_error = False
         metrics.boundary_failure = True
         return RolloutResult(
@@ -507,26 +783,63 @@ async def generate_tau2_rollout(
             atomic_group=True,
         )
 
-    metadata = training_text.metadata
+    _update_capture_audit(audit, training_text)
+    model_version = training_text.metadata["model_version"]
+
+    if termination_reason in _SEMANTIC_DROP_REASONS:
+        reason = f"termination_{termination_reason}"
+        return _semantic_boundary_result(
+            reason=reason,
+            detail=f"Tau2 termination {termination_reason} is not reward-valid",
+            audit=audit,
+            latency=latency,
+            problem=problem,
+            labelled_policy_tokens=training_text.output_tokens,
+            model_version=model_version,
+        )
+
+    if termination_reason == "too_many_errors":
+        tool_error_evidence, trusted = _too_many_errors_evidence(run_response.result)
+        audit["tool_error_evidence"] = tool_error_evidence
+        if not trusted:
+            return _semantic_boundary_result(
+                reason="termination_too_many_errors_untrusted_provenance",
+                detail="Tau2 too_many_errors has untrusted tool-error provenance",
+                audit=audit,
+                latency=latency,
+                problem=problem,
+                labelled_policy_tokens=training_text.output_tokens,
+                model_version=model_version,
+            )
+
+    if termination_reason in _FINISHED_REASONS:
+        training_reward = evaluator_reward
+        finished = True
+        disposition = "train_evaluator_reward"
+    else:
+        training_reward = 0.0
+        finished = False
+        disposition = "train_zero"
+
+    training_text.reward = training_reward
+    training_text.finished = finished
     audit.update(
         {
-            "model_version": metadata["model_version"],
-            "model_version_min": metadata["model_version_min"],
-            "model_version_max": metadata["model_version_max"],
-            "model_version_spread": metadata["model_version_spread"],
-            "model_calls": metadata["model_calls"],
-            "prompt_tokens": training_text.prompt_tokens,
-            "output_tokens": training_text.output_tokens,
-            "response_tokens": training_text.output_tokens,
-            "labeled_tokens": training_text.output_tokens,
-            "sequence_tokens": len(training_text.input_ids),
+            "training_reward": training_reward,
+            "reward_available": True,
+            "submitted": finished,
+            "finished": finished,
+            "disposition": disposition,
+            "labelled_policy_tokens": training_text.output_tokens,
         }
     )
+    metrics.reward = training_reward
+    metrics.success = finished and training_reward == 1.0
     return RolloutResult(
         training_texts=[training_text],
         metrics=metrics,
         latency=latency,
-        model_version=metadata["model_version"],
+        model_version=model_version,
         dataset_name=problem.get("dataset"),
         domain=problem.get("domain", "tau2"),
         audit=audit,

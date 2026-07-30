@@ -85,7 +85,7 @@ class TrainingGroupEnvelope(BaseModel):
 
 class RolloutResult(BaseModel):
     training_texts: list[TrainingText]
-    metrics: BaseMetrics
+    metrics: BaseMetrics | None
     latency: float
     # optional so fields that it can be filled later after RolloutResult is created
     model_version: int | None = None

@@ -37,7 +37,6 @@ from pipelinerl.prerun_evidence import (
 )
 from pipelinerl.llm import TrainableLLM
 from pipelinerl.rollouts import (
-    BaseMetrics,
     RolloutResult,
     TrainingGroupEnvelope,
     rollout_has_overflow,
@@ -137,7 +136,8 @@ def make_rollout_audit_record(result: RolloutResult) -> dict:
     record["dataset_name"] = result.dataset_name
     record.setdefault("policy_endpoint", None)
     record.setdefault("model_calls", [])
-    record.setdefault("reward", result.metrics.reward)
+    if result.metrics is not None:
+        record.setdefault("reward", result.metrics.reward)
     record.setdefault("submitted", None)
     record.setdefault("terminated", None)
     record.setdefault("stop_reason", None)
@@ -193,6 +193,19 @@ def stamp_rollout_metadata(
         sample.group_id = full_group_id
 
 
+def _validate_boundary_metrics(result: RolloutResult) -> None:
+    if result.metrics is not None:
+        return
+    if (
+        not isinstance(result.audit.get("boundary_failure"), dict)
+        or result.audit.get("reward_available") is not False
+        or result.training_texts
+    ):
+        raise ValueError(
+            "A metrics-less rollout must be an empty typed boundary with unavailable reward"
+        )
+
+
 def apply_group_boundary_policy(
     rollout_results: List[RolloutResult],
     group_drop_counts: Dict[str, int],
@@ -201,6 +214,7 @@ def apply_group_boundary_policy(
 ) -> str | None:
     failures = []
     for result in rollout_results:
+        _validate_boundary_metrics(result)
         failure = result.audit.get("boundary_failure")
         if not isinstance(failure, dict):
             continue
@@ -794,13 +808,14 @@ class ActorLoop:
         if max_tokens is not None:
             is_overlong = any(training_text.output_tokens >= max_tokens for training_text in result.training_texts)
             metrics['overlong'] = is_overlong
-            metrics['overlong_success'] = is_overlong and result.metrics.success
+            if result.metrics is not None:
+                metrics['overlong_success'] = is_overlong and result.metrics.success
         
         return metrics
 
     def update_stats(self, rollout_results: List[RolloutResult]):
         for result in rollout_results:
-            assert isinstance(result.metrics, BaseMetrics), "Metrics should be an instance of BaseMetrics"
+            _validate_boundary_metrics(result)
             dataset_name = result.dataset_name
             group_id = result.group_id
             self.latency_list.append(result.latency)
@@ -820,7 +835,9 @@ class ActorLoop:
                 if dataset_name is not None:
                     self.dataset_to_domain[str(dataset_name)] = domain_key
             domain_agnostic_metrics = self.compute_domain_agnostic_metrics(result) 
-            all_metrics = result.metrics.model_dump() | domain_agnostic_metrics
+            all_metrics = domain_agnostic_metrics
+            if result.metrics is not None:
+                all_metrics = result.metrics.model_dump() | all_metrics
             for k, v in all_metrics.items():
                 if isinstance(v, list):
                     self.stats[k][dataset_name][group_id] += v
@@ -1194,12 +1211,14 @@ class ActorLoop:
             if ds_overlong and ds_overlong_success and ds_overlong > 0:
                 stats[f"{ds}/success_given_overlong"] = ds_overlong_success / ds_overlong
 
+        success_stats = self.stats.get("success")
+        if success_stats:
+            stats |= {
+                f"{split_name}{k}": v
+                for k, v in always_or_never_success_stats(success_stats).items()
+            }
         stats |= (
             {
-                f"{split_name}{k}": v
-                for k, v in always_or_never_success_stats(self.stats["success"]).items()
-            }
-            | {
                 f"{split_name}latency_" + k: v
                 for k, v in calculate_stats(self.latency_list).items()
             }
