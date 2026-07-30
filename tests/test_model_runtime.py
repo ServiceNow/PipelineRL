@@ -19,6 +19,9 @@ from pipelinerl.prerun_evidence import (
     QWEN35_9B_MODEL_ID,
     QWEN35_9B_MODEL_REVISION,
     QWEN35_27B_MODEL_DESCRIPTOR,
+    QWEN35_CHAT_TEMPLATE_SHA256,
+    QWEN35_TOKENIZER_CONFIG_SHA256,
+    QWEN35_TOOL_CALL_PARSER,
     TEXT_MODEL_DESCRIPTORS,
     assert_no_vision_parameters,
     hash_model_snapshot,
@@ -81,6 +84,8 @@ def _snapshot(
     )
     (snapshot / shard).write_bytes(b"qwen-text-weights")
     (snapshot / "tokenizer.json").write_text('{"version":"test"}')
+    (snapshot / "tokenizer_config.json").write_text('{"chat_template":"test"}')
+    (snapshot / "chat_template.jinja").write_text("test template")
     identity = hash_model_snapshot(
         snapshot,
         base_descriptor.model_id,
@@ -97,6 +102,8 @@ def _snapshot(
         artifact_sha256=(
             (shard, digests[shard]),
             ("tokenizer.json", digests["tokenizer.json"]),
+            ("tokenizer_config.json", digests["tokenizer_config.json"]),
+            ("chat_template.jinja", digests["chat_template.jinja"]),
         ),
     )
     return snapshot, descriptor, identity
@@ -245,17 +252,26 @@ def test_qwen_descriptor_registry_pins_both_verified_artifact_sets():
             QWEN35_27B_MODEL_DESCRIPTOR.revision,
         ),
     }
-    assert len(QWEN35_9B_MODEL_DESCRIPTOR.artifact_sha256) == 5
-    assert len(QWEN35_27B_MODEL_DESCRIPTOR.artifact_sha256) == 12
+    assert len(QWEN35_9B_MODEL_DESCRIPTOR.artifact_sha256) == 7
+    assert len(QWEN35_27B_MODEL_DESCRIPTOR.artifact_sha256) == 14
+    assert QWEN35_TOOL_CALL_PARSER == "qwen3_xml"
     for descriptor in (
         QWEN35_9B_MODEL_DESCRIPTOR,
         QWEN35_27B_MODEL_DESCRIPTOR,
     ):
-        assert all(
-            path == "tokenizer.json"
-            or path.startswith("model.safetensors-")
-            for path, _ in descriptor.artifact_sha256
-        )
+        paths = dict(descriptor.artifact_sha256)
+        assert set(paths) == {
+            *(
+                path
+                for path in paths
+                if path.startswith("model.safetensors-")
+            ),
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+        }
+        assert paths["tokenizer_config.json"] == QWEN35_TOKENIZER_CONFIG_SHA256
+        assert paths["chat_template.jinja"] == QWEN35_CHAT_TEMPLATE_SHA256
     assert (
         dict(QWEN35_9B_MODEL_DESCRIPTOR.artifact_sha256)["tokenizer.json"]
         == dict(QWEN35_27B_MODEL_DESCRIPTOR.artifact_sha256)["tokenizer.json"]
@@ -283,9 +299,17 @@ def test_qwen_snapshot_partitions_vision_and_mtp_outside_transfer(
     ]
 
 
-def test_qwen_snapshot_rejects_tampered_artifact(tmp_path):
+@pytest.mark.parametrize(
+    "artifact",
+    (
+        "model-00001-of-00001.safetensors",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ),
+)
+def test_qwen_snapshot_rejects_tampered_artifact(tmp_path, artifact):
     snapshot, descriptor, _ = _snapshot(tmp_path)
-    (snapshot / "model-00001-of-00001.safetensors").write_bytes(b"wrong")
+    (snapshot / artifact).write_bytes(b"wrong")
     identity = hash_model_snapshot(
         snapshot,
         descriptor.model_id,

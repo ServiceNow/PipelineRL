@@ -23,6 +23,7 @@ _GYM_PATCH_SHA_KEY = "pipelinerl_gym_patch_sha"
 _TAU2_RUNTIME_SHA_KEY = "pipelinerl_tau2_runtime_sha"
 _TAU2_DATA_SHA_KEY = "pipelinerl_tau2_data_sha"
 _POLICY_MODEL_NAME_KEY = "pipelinerl_policy_model_name"
+_POLICY_THINKING_KEY = "pipelinerl_policy_thinking_enabled"
 _USER_MODEL_URL_KEY = "pipelinerl_user_model_url"
 _USER_MODEL_NAME_KEY = "pipelinerl_user_model_name"
 _JUDGE_MODEL_URL_KEY = "pipelinerl_judge_model_url"
@@ -62,6 +63,7 @@ class Tau2GymSettings(BaseModel):
     user_model_name: str
     judge_model_url: str
     judge_model_name: str
+    policy_thinking_enabled: bool
     user_thinking_enabled: bool
     judge_thinking_enabled: bool
     judge_temperature: float = Field(ge=0)
@@ -83,8 +85,12 @@ class Tau2GymSettings(BaseModel):
             raise ValueError("Tau2 user and judge endpoints must be the same shared service")
         if len({self.policy_model_name, self.user_model_name, self.judge_model_name}) != 3:
             raise ValueError("Tau2 policy, user, and judge model aliases must be distinct")
-        if not self.user_thinking_enabled or not self.judge_thinking_enabled:
-            raise ValueError("Tau2 run 1 requires user and judge thinking")
+        if not (
+            self.policy_thinking_enabled
+            and self.user_thinking_enabled
+            and self.judge_thinking_enabled
+        ):
+            raise ValueError("Tau2 run 1 requires policy, user, and judge thinking")
         if self.judge_retry_max_tokens < 2 * self.judge_initial_max_tokens:
             raise ValueError("Tau2 judge retry budget must be at least twice the initial budget")
         if self.auxiliary_model_timeout_s >= self.request_timeout_s:
@@ -453,6 +459,7 @@ def validate_executed_gym_config(
         raise ValueError("Executed Gym judge-model name does not match PipelineRL configuration")
 
     executed_auxiliary = {
+        _POLICY_THINKING_KEY: settings.policy_thinking_enabled,
         _USER_THINKING_KEY: settings.user_thinking_enabled,
         _JUDGE_THINKING_KEY: settings.judge_thinking_enabled,
         _JUDGE_TEMPERATURE_KEY: settings.judge_temperature,
@@ -516,6 +523,10 @@ def validate_executed_gym_config(
             raise ValueError(f"Gym policy proxy {proxy_name} is not bound to {policy_url}")
         if policy_proxy.get("model") != settings.policy_model_name:
             raise ValueError(f"Gym policy proxy {proxy_name} serves the wrong model")
+        if policy_proxy.get("chat_template_kwargs") != {"enable_thinking": True}:
+            raise ValueError(f"Gym policy proxy {proxy_name} has wrong thinking configuration")
+        if policy_proxy.get("uses_reasoning_parser") is not True:
+            raise ValueError(f"Gym policy proxy {proxy_name} must use the reasoning parser")
         if agent.get("model_server") != {"type": "responses_api_models", "name": proxy_name}:
             raise ValueError(f"Gym Tau2 agent {agent_name} is not bound to {proxy_name}")
         expected_agent_fields = {

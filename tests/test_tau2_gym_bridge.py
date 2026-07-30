@@ -35,6 +35,7 @@ def _settings(**overrides) -> Tau2GymSettings:
         "user_model_name": "qwen3.5-27b-user",
         "judge_model_url": "https://frozen-aux.example/v1",
         "judge_model_name": "qwen3.5-27b-judge",
+        "policy_thinking_enabled": True,
         "user_thinking_enabled": True,
         "judge_thinking_enabled": True,
         "judge_temperature": 0.6,
@@ -58,6 +59,7 @@ def _config(**overrides) -> dict:
         "user_model_name": "qwen3.5-27b-user",
         "judge_model_url": "https://frozen-aux.example/v1",
         "judge_model_name": "qwen3.5-27b-judge",
+        "policy_thinking_enabled": True,
         "user_thinking_enabled": True,
         "judge_thinking_enabled": True,
         "judge_temperature": 0.6,
@@ -220,7 +222,11 @@ def test_generated_config_has_one_agent_per_policy_endpoint():
     assert set(bindings) == set(POLICY_URLS)
     assert bindings[POLICY_URLS[0]].agent_url == "http://gym-host:12004"
     assert bindings[POLICY_URLS[1]].agent_url == "http://gym-host:12005"
-    assert config["pipelinerl_policy_0"]["responses_api_models"]["vllm_model"]["base_url"] == POLICY_URLS[0]
+    policy_proxy = config["pipelinerl_policy_0"]["responses_api_models"]["vllm_model"]
+    assert policy_proxy["base_url"] == POLICY_URLS[0]
+    assert policy_proxy["uses_reasoning_parser"] is True
+    assert policy_proxy["chat_template_kwargs"] == {"enable_thinking": True}
+    assert config["pipelinerl_policy_thinking_enabled"] is True
 
 
 def test_mapping_validation_rejects_policy_endpoint_drift():
@@ -514,7 +520,8 @@ def test_malformed_completed_response_remains_pydantic_validation_error():
     [
         ({"judge_model_url": "https://other.example/v1"}, "same shared service"),
         ({"judge_model_name": "qwen3.5-27b-user"}, "aliases must be distinct"),
-        ({"judge_thinking_enabled": False}, "requires user and judge thinking"),
+        ({"policy_thinking_enabled": False}, "requires policy, user, and judge thinking"),
+        ({"judge_thinking_enabled": False}, "requires policy, user, and judge thinking"),
         ({"judge_temperature": float("inf")}, "finite"),
         ({"judge_retry_max_tokens": 2047}, "at least twice"),
         ({"auxiliary_model_timeout_s": 3600.0}, "below request_timeout_s"),
@@ -523,6 +530,37 @@ def test_malformed_completed_response_remains_pydantic_validation_error():
 def test_settings_reject_invalid_auxiliary_contract(updates, pattern):
     with pytest.raises(ValueError, match=pattern):
         _settings(**updates)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "pattern"),
+    (
+        ("top_level_thinking", "does not match"),
+        ("proxy_thinking", "wrong thinking"),
+        ("missing_proxy_thinking", "wrong thinking"),
+        ("reasoning_parser", "must use the reasoning parser"),
+    ),
+)
+def test_executed_config_rejects_policy_runtime_drift(mutation, pattern):
+    config = _config()
+    proxy = config["pipelinerl_policy_0"]["responses_api_models"]["vllm_model"]
+    if mutation == "top_level_thinking":
+        config["pipelinerl_policy_thinking_enabled"] = False
+    elif mutation == "proxy_thinking":
+        proxy["chat_template_kwargs"] = {"enable_thinking": False}
+    elif mutation == "missing_proxy_thinking":
+        proxy.pop("chat_template_kwargs")
+    else:
+        proxy["uses_reasoning_parser"] = False
+    with pytest.raises(ValueError, match=pattern):
+        validate_executed_gym_config(config, POLICY_URLS, _settings())
+
+
+def test_build_config_rejects_disabled_policy_runtime():
+    with pytest.raises(ValueError, match="requires policy, user, and judge thinking"):
+        _config(policy_thinking_enabled=False)
+    with pytest.raises(ValueError, match="requires the policy reasoning parser"):
+        _config(uses_reasoning_parser=False)
 
 
 def test_executed_config_rejects_proxy_and_sampling_drift():

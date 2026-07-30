@@ -80,6 +80,13 @@ _TEXT_KEY_MAPPING = ((r"^model\.language_model\.", "model."),)
 _QWEN_TOKENIZER_SHA256 = (
     "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
 )
+QWEN35_TOKENIZER_CONFIG_SHA256 = (
+    "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+)
+QWEN35_CHAT_TEMPLATE_SHA256 = (
+    "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+)
+QWEN35_TOOL_CALL_PARSER = "qwen3_xml"
 
 GEMMA_MODEL_DESCRIPTOR = TextModelDescriptor(
     model_id=GEMMA_MODEL_ID,
@@ -156,6 +163,8 @@ QWEN35_9B_MODEL_DESCRIPTOR = TextModelDescriptor(
             "b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6",
         ),
         ("tokenizer.json", _QWEN_TOKENIZER_SHA256),
+        ("tokenizer_config.json", QWEN35_TOKENIZER_CONFIG_SHA256),
+        ("chat_template.jinja", QWEN35_CHAT_TEMPLATE_SHA256),
     ),
     nontransferred_prefixes=("mtp.",),
     revision_verified=True,
@@ -164,7 +173,9 @@ QWEN35_9B_MODEL_DESCRIPTOR = TextModelDescriptor(
         "Verified 2026-07-30: Hugging Face refs resolve Qwen/Qwen3.5-9B "
         "to c202236235762e1c871ad0ccb60c8ee5ba337b9a; local snapshot "
         "/mnt/llmd/base_models/Qwen3.5-9B has every shard "
-        "plus tokenizer matches that revision's LFS SHA256 OID."
+        "plus tokenizer matches that revision's LFS SHA256 OID. "
+        "tokenizer_config.json and chat_template.jinja were byte-matched "
+        "to direct downloads from the same immutable revision."
     ),
 )
 
@@ -233,6 +244,8 @@ QWEN35_27B_MODEL_DESCRIPTOR = TextModelDescriptor(
             "d947ce7483c4109b55039f1359f4494d22390cf123568100abd89816802f097d",
         ),
         ("tokenizer.json", _QWEN_TOKENIZER_SHA256),
+        ("tokenizer_config.json", QWEN35_TOKENIZER_CONFIG_SHA256),
+        ("chat_template.jinja", QWEN35_CHAT_TEMPLATE_SHA256),
     ),
     nontransferred_prefixes=("mtp.",),
     revision_verified=True,
@@ -241,7 +254,9 @@ QWEN35_27B_MODEL_DESCRIPTOR = TextModelDescriptor(
         "Verified 2026-07-30: Hugging Face refs resolve Qwen/Qwen3.5-27B "
         "to fc05daec18b0a78c049392ed2e771dde82bdf654; local snapshot "
         "/mnt/llmd/base_models/Qwen3.5-27B has every shard "
-        "plus tokenizer matches that revision's LFS SHA256 OID."
+        "plus tokenizer matches that revision's LFS SHA256 OID. "
+        "tokenizer_config.json and chat_template.jinja were byte-matched "
+        "to direct downloads from the same immutable revision."
     ),
 )
 

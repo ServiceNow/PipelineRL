@@ -60,6 +60,7 @@ def build_gym_config(
     user_model_name: str,
     judge_model_url: str,
     judge_model_name: str,
+    policy_thinking_enabled: bool,
     user_thinking_enabled: bool,
     judge_thinking_enabled: bool,
     judge_temperature: float,
@@ -89,8 +90,14 @@ def build_gym_config(
         raise ValueError("Tau2 auxiliary-model endpoint must differ from every policy endpoint")
     if len({policy_model_name, user_model_name, judge_model_name}) != 3:
         raise ValueError("Tau2 policy, user, and judge model aliases must be distinct")
-    if not user_thinking_enabled or not judge_thinking_enabled:
-        raise ValueError("Tau2 run 1 requires user and judge thinking")
+    if not (
+        policy_thinking_enabled
+        and user_thinking_enabled
+        and judge_thinking_enabled
+    ):
+        raise ValueError("Tau2 run 1 requires policy, user, and judge thinking")
+    if not uses_reasoning_parser:
+        raise ValueError("Tau2 run 1 requires the policy reasoning parser")
     if (
         not math.isfinite(judge_temperature)
         or judge_temperature < 0
@@ -128,6 +135,7 @@ def build_gym_config(
         "pipelinerl_tau2_runtime_sha": TAU2_RUNTIME_SHA,
         "pipelinerl_tau2_data_sha": TAU2_DATA_SHA,
         "pipelinerl_policy_model_name": policy_model_name,
+        "pipelinerl_policy_thinking_enabled": policy_thinking_enabled,
         "pipelinerl_user_model_url": normalized_user_url,
         "pipelinerl_user_model_name": user_model_name,
         "pipelinerl_judge_model_url": normalized_judge_url,
@@ -197,6 +205,9 @@ def build_gym_config(
                     "model": policy_model_name,
                     "return_token_id_information": True,
                     "uses_reasoning_parser": uses_reasoning_parser,
+                    "chat_template_kwargs": {
+                        "enable_thinking": policy_thinking_enabled,
+                    },
                 }
             }
         }
@@ -339,6 +350,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-model-url", required=True)
     parser.add_argument("--judge-model-name", required=True)
     parser.add_argument(
+        "--policy-thinking-enabled",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+    )
+    parser.add_argument(
         "--user-thinking-enabled",
         action=argparse.BooleanOptionalAction,
         required=True,
@@ -365,7 +381,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--uses-reasoning-parser",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        required=True,
     )
     return parser.parse_args()
 
@@ -391,6 +407,7 @@ def main() -> None:
         user_model_name=args.user_model_name,
         judge_model_url=args.judge_model_url,
         judge_model_name=args.judge_model_name,
+        policy_thinking_enabled=args.policy_thinking_enabled,
         user_thinking_enabled=args.user_thinking_enabled,
         judge_thinking_enabled=args.judge_thinking_enabled,
         judge_temperature=args.judge_temperature,
