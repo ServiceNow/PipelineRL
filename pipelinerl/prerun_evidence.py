@@ -36,6 +36,7 @@ class TextModelDescriptor:
     tie_word_embeddings: bool
     key_mapping: tuple[tuple[str, str], ...]
     artifact_sha256: tuple[tuple[str, str], ...]
+    exact_artifact_set: bool
     nontransferred_prefixes: tuple[str, ...]
     revision_verified: bool
     # Deployment-role decision for run 1, not a technical trainability limit.
@@ -86,6 +87,40 @@ QWEN35_TOKENIZER_CONFIG_SHA256 = (
 QWEN35_CHAT_TEMPLATE_SHA256 = (
     "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
 )
+_QWEN_COMMON_ARTIFACT_SHA256 = (
+    (
+        ".gitattributes",
+        "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+    ),
+    (
+        "chat_template.jinja",
+        QWEN35_CHAT_TEMPLATE_SHA256,
+    ),
+    (
+        "merges.txt",
+        "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+    ),
+    (
+        "preprocessor_config.json",
+        "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    ),
+    (
+        "tokenizer.json",
+        _QWEN_TOKENIZER_SHA256,
+    ),
+    (
+        "tokenizer_config.json",
+        QWEN35_TOKENIZER_CONFIG_SHA256,
+    ),
+    (
+        "video_preprocessor_config.json",
+        "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    ),
+    (
+        "vocab.json",
+        "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+    ),
+)
 QWEN35_TOOL_CALL_PARSER = "qwen3_xml"
 
 GEMMA_MODEL_DESCRIPTOR = TextModelDescriptor(
@@ -119,6 +154,7 @@ GEMMA_MODEL_DESCRIPTOR = TextModelDescriptor(
             "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
         ),
     ),
+    exact_artifact_set=False,
     nontransferred_prefixes=(),
     revision_verified=GEMMA_MODEL_REVISION_VERIFIED,
     policy_eligible=True,
@@ -147,6 +183,22 @@ QWEN35_9B_MODEL_DESCRIPTOR = TextModelDescriptor(
     key_mapping=_TEXT_KEY_MAPPING,
     artifact_sha256=(
         (
+            "LICENSE",
+            "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+        ),
+        (
+            "README.md",
+            "c5f5a8c2dddab69cfbf05279235aa5fddb137939a06539c4c7637aa900fef6d0",
+        ),
+        (
+            "config.json",
+            "d0883072e01861ed0b2d47be3c16c36a8e81c224c7ffaa310c6558fb3f932b05",
+        ),
+        (
+            "model.safetensors.index.json",
+            "26d3539b516be613f39563617cb9d33b3f83d401298125be392c80cefb8f7fe5",
+        ),
+        (
             "model.safetensors-00001-of-00004.safetensors",
             "db6f444b43d318c92f360a13a25561a6a65b10c0631b8ed305a426dbaa6c380e",
         ),
@@ -162,10 +214,8 @@ QWEN35_9B_MODEL_DESCRIPTOR = TextModelDescriptor(
             "model.safetensors-00004-of-00004.safetensors",
             "b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6",
         ),
-        ("tokenizer.json", _QWEN_TOKENIZER_SHA256),
-        ("tokenizer_config.json", QWEN35_TOKENIZER_CONFIG_SHA256),
-        ("chat_template.jinja", QWEN35_CHAT_TEMPLATE_SHA256),
-    ),
+    ) + _QWEN_COMMON_ARTIFACT_SHA256,
+    exact_artifact_set=True,
     nontransferred_prefixes=("mtp.",),
     revision_verified=True,
     policy_eligible=True,
@@ -174,8 +224,7 @@ QWEN35_9B_MODEL_DESCRIPTOR = TextModelDescriptor(
         "to c202236235762e1c871ad0ccb60c8ee5ba337b9a; local snapshot "
         "/mnt/llmd/base_models/Qwen3.5-9B has every shard "
         "plus tokenizer matches that revision's LFS SHA256 OID. "
-        "tokenizer_config.json and chat_template.jinja were byte-matched "
-        "to direct downloads from the same immutable revision."
+        "The complete 16-file non-cache snapshot is byte-pinned."
     ),
 )
 
@@ -199,6 +248,22 @@ QWEN35_27B_MODEL_DESCRIPTOR = TextModelDescriptor(
     tie_word_embeddings=False,
     key_mapping=_TEXT_KEY_MAPPING,
     artifact_sha256=(
+        (
+            "README.md",
+            "ddee9e69c0a31278cb75e624422a075b8f95b6d81ae81abf3e72c0ec66ea75f0",
+        ),
+        (
+            "config.json",
+            "f8d190c5b89c1521220f935d2567a587d6e291ed69066a45a106560b05a2174c",
+        ),
+        (
+            "generation_config.json",
+            "303aba891d66ab63908a7b3cc9163bcb835fdf8b9f6301c73216f3f1eb3992dd",
+        ),
+        (
+            "model.safetensors.index.json",
+            "b3737e9d00bda0e37f0b873629d98bf9b407bef35735b9193c23d9844bcc96a6",
+        ),
         (
             "model.safetensors-00001-of-00011.safetensors",
             "9019228d172c87d5603266c2d56672d119e838facffa164de803a1ebf0d716d2",
@@ -243,10 +308,8 @@ QWEN35_27B_MODEL_DESCRIPTOR = TextModelDescriptor(
             "model.safetensors-00011-of-00011.safetensors",
             "d947ce7483c4109b55039f1359f4494d22390cf123568100abd89816802f097d",
         ),
-        ("tokenizer.json", _QWEN_TOKENIZER_SHA256),
-        ("tokenizer_config.json", QWEN35_TOKENIZER_CONFIG_SHA256),
-        ("chat_template.jinja", QWEN35_CHAT_TEMPLATE_SHA256),
-    ),
+    ) + _QWEN_COMMON_ARTIFACT_SHA256,
+    exact_artifact_set=True,
     nontransferred_prefixes=("mtp.",),
     revision_verified=True,
     policy_eligible=False,
@@ -255,8 +318,7 @@ QWEN35_27B_MODEL_DESCRIPTOR = TextModelDescriptor(
         "to fc05daec18b0a78c049392ed2e771dde82bdf654; local snapshot "
         "/mnt/llmd/base_models/Qwen3.5-27B has every shard "
         "plus tokenizer matches that revision's LFS SHA256 OID. "
-        "tokenizer_config.json and chat_template.jinja were byte-matched "
-        "to direct downloads from the same immutable revision."
+        "The complete 23-file non-cache snapshot is byte-pinned."
     ),
 )
 
@@ -495,7 +557,14 @@ def hash_model_snapshot(
     model_id: str,
     revision: str,
 ) -> ModelArtifactIdentity:
-    files = sorted(path for path in snapshot.rglob("*") if path.is_file())
+    # Hugging Face download locks and metadata are mutable bookkeeping,
+    # not model artifacts. Other nested files remain identity-bearing.
+    files = sorted(
+        path
+        for path in snapshot.rglob("*")
+        if path.is_file()
+        and path.relative_to(snapshot).parts[0] != ".cache"
+    )
     if not files:
         raise ValueError(f"Model snapshot {snapshot} contains no artifacts")
     artifacts = [
@@ -534,6 +603,8 @@ def validate_model_descriptor_artifacts(
     if len(expected) != len(descriptor.artifact_sha256):
         raise ValueError("Reviewed descriptor has duplicate artifact paths")
     observed = {artifact.path: artifact.sha256 for artifact in identity.artifacts}
+    if len(observed) != len(identity.artifacts):
+        raise ValueError("Model artifact identity has duplicate paths")
     mismatched = sorted(
         artifact
         for artifact, digest in expected.items()
@@ -542,6 +613,12 @@ def validate_model_descriptor_artifacts(
     if mismatched:
         raise ValueError(
             f"Model snapshot does not match reviewed artifact SHA256: {mismatched}"
+        )
+    if descriptor.exact_artifact_set and set(observed) != set(expected):
+        unexpected = sorted(set(observed) - set(expected))
+        raise ValueError(
+            "Model snapshot contains unreviewed artifacts: "
+            f"{unexpected}"
         )
 
 

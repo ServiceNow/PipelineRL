@@ -1,12 +1,15 @@
 import hashlib
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 from hydra import compose, initialize_config_dir
+from omegaconf import open_dict
 
+import pipelinerl.domains.tau2.client as tau2_client
 import pipelinerl.domains.tau2.prerun as tau2_prerun
 import pipelinerl.launch as launch
 import pipelinerl.prerun_evidence as prerun_evidence
@@ -19,11 +22,12 @@ from pipelinerl.domains.tau2.prerun import (
     POLICY_LOSS_FALLBACK,
     POLICY_LOSS_FALLBACK_TRIGGER,
     RUN1_POLICY_LOSS,
-    USER_SIMULATOR_MODEL,
-    USER_SIMULATOR_MODEL_ID,
-    USER_SIMULATOR_REVISION,
-    USER_SIMULATOR_SNAPSHOT,
-    UserSimulatorDeployment,
+    AUXILIARY_JUDGE_MODEL,
+    AUXILIARY_MODEL_ID,
+    AUXILIARY_MODEL_REVISION,
+    AUXILIARY_MODEL_SNAPSHOT,
+    AUXILIARY_USER_MODEL,
+    AuxiliaryModelDeployment,
     CalibrationSummary,
     DerivedLimit,
     GateResult,
@@ -47,7 +51,7 @@ from pipelinerl.prerun_evidence import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CALIBRATION_JOB = ROOT / "tau2_gemma_calibration.yaml"
-USER_SIMULATOR_JOB = ROOT / "tau2_gemma_user_sim.yaml"
+AUXILIARY_MODEL_JOB = ROOT / "tau2_qwen_auxiliary.yaml"
 USER_SIMULATOR_ENDPOINT = "http://dns-test-account-tau2-user:8000/v1"
 POLICY_ENDPOINTS = [
     "http://tau2-gemma-calibration-3:8080",
@@ -69,46 +73,97 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _user_simulator_fixture(
+def _write_auxiliary_snapshot(snapshot: Path) -> None:
+    descriptor = QWEN35_27B_MODEL_DESCRIPTOR
+    config = {
+        "model_type": descriptor.composite_model_type,
+        "tie_word_embeddings": descriptor.tie_word_embeddings,
+        "text_config": {
+            "model_type": descriptor.text_model_type,
+            "num_hidden_layers": descriptor.num_hidden_layers,
+            "hidden_size": descriptor.hidden_size,
+            "intermediate_size": descriptor.intermediate_size,
+            "max_position_embeddings": descriptor.max_position_embeddings,
+            "vocab_size": descriptor.vocab_size,
+            "tie_word_embeddings": descriptor.tie_word_embeddings,
+        },
+    }
+    (snapshot / "config.json").write_text(json.dumps(config))
+    shard = "model.safetensors"
+    weight_map = {
+        "model.language_model.embed_tokens.weight": shard,
+        "model.language_model.norm.weight": shard,
+        "model.visual.blocks.0.weight": shard,
+        "mtp.layers.0.weight": shard,
+        "lm_head.weight": shard,
+    }
+    for layer in range(descriptor.num_hidden_layers):
+        weight_map[
+            f"model.language_model.layers.{layer}.self_attn.q_proj.weight"
+        ] = shard
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    (snapshot / shard).write_bytes(b"auxiliary-weights")
+    (snapshot / "tokenizer.json").write_text("{\"version\":\"qwen\"}")
+
+
+def _auxiliary_model_fixture(
     tmp_path: Path,
     monkeypatch,
-) -> tuple[Path, UserSimulatorDeployment]:
-    snapshot = tmp_path / "user-simulator-snapshot"
+) -> tuple[Path, AuxiliaryModelDeployment]:
+    snapshot = tmp_path / "auxiliary-model-snapshot"
     snapshot.mkdir()
-    (snapshot / "model-00001-of-00002.safetensors").write_bytes(
-        b"user-shard-one"
-    )
-    (snapshot / "model-00002-of-00002.safetensors").write_bytes(
-        b"user-shard-two"
-    )
-    (snapshot / "tokenizer.json").write_text('{"version":"user"}')
+    _write_auxiliary_snapshot(snapshot)
     model = hash_model_snapshot(
         snapshot,
-        USER_SIMULATOR_MODEL_ID,
-        USER_SIMULATOR_REVISION,
+        AUXILIARY_MODEL_ID,
+        AUXILIARY_MODEL_REVISION,
+    )
+    descriptor = replace(
+        QWEN35_27B_MODEL_DESCRIPTOR,
+        artifact_sha256=tuple(
+            (artifact.path, artifact.sha256) for artifact in model.artifacts
+        ),
     )
     monkeypatch.setattr(
         tau2_prerun,
-        "USER_SIMULATOR_ARTIFACT_SHA256",
-        {
-            artifact.path: artifact.sha256
-            for artifact in model.artifacts
-        },
+        "AUXILIARY_MODEL_DESCRIPTOR",
+        descriptor,
     )
-    job_path = tmp_path / "user-simulator.yaml"
+    monkeypatch.setattr(
+        tau2_prerun,
+        "AUXILIARY_MODEL_SNAPSHOT",
+        str(snapshot),
+    )
+    observed_latencies = {
+        "user_simulator": [0.2, 0.3],
+        "judge": [0.5, 0.7],
+    }
+    observed_prompts = {
+        "user_simulator": [4_000, 5_000],
+        "judge": [8_000, 9_000],
+    }
+    headroom = {"user_simulator": 1.25, "judge": 1.5}
+    generation_reserve = {"user_simulator": 2_048, "judge": 4_096}
+    snapshot_hash_bytes = sum(artifact.size for artifact in model.artifacts)
+    job_path = tmp_path / "auxiliary-model.yaml"
     job = {
-        "name": "tau2-gemma-user-sim",
+        "name": "tau2-qwen-auxiliary",
         "bid": 9999,
+        "data": [
+            "snow.research.tapes.base_models:/mnt/llmd/base_models:ro",
+        ],
         "command": [
             "python -m vllm.entrypoints.openai.api_server "
-            '--model "${TAU2_USER_SIM_SNAPSHOT}" '
-            '--served-model-name "${TAU2_USER_SIM_MODEL_ALIAS}" '
+            '--model "${TAU2_AUX_MODEL_SNAPSHOT}" '
+            "--served-model-name "
+            '"${TAU2_USER_MODEL_ALIAS}" '
+            '"${TAU2_JUDGE_MODEL_ALIAS}" '
             "--dtype bfloat16 --host 0.0.0.0 --port 8000 "
-            '--tensor-parallel-size "${TAU2_USER_SIM_TP_SIZE}" '
-            '--max-model-len "${TAU2_USER_SIM_MAX_MODEL_LEN}" '
-            '--max-num-seqs "${TAU2_USER_SIM_MAX_NUM_SEQS}" '
-            "--default-chat-template-kwargs "
-            "'{\"enable_thinking\": false}'"
+            '--tensor-parallel-size "${TAU2_AUX_TP_SIZE}" '
+            '--max-model-len "${TAU2_AUX_MAX_MODEL_LEN}" '
+            '--max-num-seqs "${TAU2_AUX_MAX_NUM_SEQS}"'
         ],
         "resources": {
             "cpu": 16,
@@ -132,52 +187,64 @@ def _user_simulator_fixture(
         "preemptable": True,
         "restartable": True,
         "environmentVars": [
-            f"TAU2_USER_SIM_MODEL_ID={USER_SIMULATOR_MODEL_ID}",
-            f"TAU2_USER_SIM_REVISION={USER_SIMULATOR_REVISION}",
-            f"TAU2_USER_SIM_MODEL_ALIAS={USER_SIMULATOR_MODEL}",
-            f"TAU2_USER_SIM_SNAPSHOT={snapshot}",
-            "TAU2_USER_SIM_GPU_TYPE=test-h100-80gb",
-            "TAU2_USER_SIM_GPU_COUNT=2",
-            "TAU2_USER_SIM_TP_SIZE=2",
-            "TAU2_USER_SIM_MAX_MODEL_LEN=16384",
-            "TAU2_USER_SIM_MAX_NUM_SEQS=8",
-            "TAU2_USER_SIM_SNAPSHOT_HASH_BYTES="
-            f"{sum(artifact.size for artifact in model.artifacts)}",
-            "TAU2_USER_SIM_THINKING=false",
-            "TAU2_USER_SIM_SUBMISSION_MODE=restartable",
+            f"TAU2_AUX_MODEL_ID={AUXILIARY_MODEL_ID}",
+            f"TAU2_AUX_MODEL_REVISION={AUXILIARY_MODEL_REVISION}",
+            f"TAU2_USER_MODEL_ALIAS={AUXILIARY_USER_MODEL}",
+            f"TAU2_JUDGE_MODEL_ALIAS={AUXILIARY_JUDGE_MODEL}",
+            f"TAU2_AUX_MODEL_SNAPSHOT={snapshot}",
+            "TAU2_AUX_GPU_TYPE=test-h100-80gb",
+            "TAU2_AUX_GPU_COUNT=2",
+            "TAU2_AUX_TP_SIZE=2",
+            "TAU2_AUX_MAX_MODEL_LEN=20000",
+            "TAU2_AUX_MAX_NUM_SEQS=8",
+            "TAU2_AUX_MEASURED_PEAK_IN_FLIGHT=4",
+            "TAU2_AUX_OBSERVED_REQUEST_LATENCIES_S_JSON="
+            + json.dumps(observed_latencies),
+            "TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON=" + json.dumps(observed_prompts),
+            "TAU2_AUX_PROMPT_HEADROOM_FACTORS_JSON=" + json.dumps(headroom),
+            "TAU2_AUX_GENERATION_RESERVE_TOKENS_JSON=" + json.dumps(generation_reserve),
+            f"TAU2_AUX_SNAPSHOT_HASH_BYTES={snapshot_hash_bytes}",
+            "TAU2_AUX_SUBMISSION_MODE=restartable",
+            "VLLM_BATCH_INVARIANT=0",
         ],
     }
     job_path.write_text(yaml.safe_dump(job, sort_keys=False))
-    monkeypatch.setattr(
-        tau2_prerun,
-        "USER_SIMULATOR_SNAPSHOT",
-        str(snapshot),
-    )
-    deployment = UserSimulatorDeployment(
-        service=ServiceIdentity(
-            model=USER_SIMULATOR_MODEL,
-            endpoint=USER_SIMULATOR_ENDPOINT,
+    endpoint = USER_SIMULATOR_ENDPOINT
+    deployment = AuxiliaryModelDeployment(
+        user_service=ServiceIdentity(
+            model=AUXILIARY_USER_MODEL,
+            endpoint=endpoint,
+        ),
+        judge_service=ServiceIdentity(
+            model=AUXILIARY_JUDGE_MODEL,
+            endpoint=endpoint,
         ),
         model=model,
         snapshot_path=str(snapshot),
         job_spec_sha256=_sha256(job_path),
         submission_mode="restartable",
-        thinking_enabled=False,
+        batch_invariant=False,
         gpu_type="test-h100-80gb",
         gpu_count=2,
         tensor_parallel_size=2,
-        max_model_len=16_384,
+        max_model_len=20_000,
         max_num_seqs=8,
         measured_peak_in_flight=4,
-        observed_request_latencies_s=[0.2, 0.3],
-        observed_user_prompt_tokens=[4_000, 5_000],
-        prompt_headroom_factor=1.25,
-        generation_reserve_tokens=2_048,
-        snapshot_hash_bytes=sum(
-            artifact.size for artifact in model.artifacts
-        ),
+        observed_request_latencies_s=observed_latencies,
+        observed_prompt_tokens=observed_prompts,
+        prompt_headroom_factors=headroom,
+        generation_reserve_tokens=generation_reserve,
+        snapshot_hash_bytes=snapshot_hash_bytes,
     )
     return job_path, deployment
+
+
+def _set_auxiliary_identity(cfg) -> None:
+    with open_dict(cfg.tau2_gym):
+        cfg.tau2_gym.user_model_url = USER_SIMULATOR_ENDPOINT
+        cfg.tau2_gym.user_model_name = AUXILIARY_USER_MODEL
+        cfg.tau2_gym.judge_model_url = USER_SIMULATOR_ENDPOINT
+        cfg.tau2_gym.judge_model_name = AUXILIARY_JUDGE_MODEL
 
 
 def _candidate() -> TrainerMemoryCandidate:
@@ -205,7 +272,7 @@ def _limit(value: int) -> DerivedLimit:
 
 def _ready_manifest(
     job_digest: str,
-    user_simulator_deployment: UserSimulatorDeployment,
+    auxiliary_model_deployment: AuxiliaryModelDeployment,
 ) -> PreRunManifest:
     candidate = _candidate()
     limits = {
@@ -260,6 +327,7 @@ def _ready_manifest(
         )
     }
     return PreRunManifest(
+        schema_version=2,
         job_spec_sha256=job_digest,
         model=ModelArtifactIdentity(
             model_id=GEMMA_MODEL_ID,
@@ -296,8 +364,7 @@ def _ready_manifest(
             ),
         ),
         source_pins=PINNED_SOURCES,
-        user_simulator=user_simulator_deployment.service,
-        user_simulator_deployment=user_simulator_deployment,
+        auxiliary_model_deployment=auxiliary_model_deployment,
         policy_model=GEMMA_POLICY_IDENTITY,
         policy_endpoints=POLICY_ENDPOINTS,
         expected_tp_size=2,
@@ -324,14 +391,12 @@ def _ready_manifest(
 def _production_cfg(
     tmp_path: Path,
     manifest: PreRunManifest,
-    user_simulator_job_path: Path,
-    user_simulator_deployment: UserSimulatorDeployment,
+    auxiliary_model_job_path: Path,
+    auxiliary_model_deployment: AuxiliaryModelDeployment,
 ):
     snapshot_path = tmp_path / "snapshot"
     snapshot_path.mkdir()
-    (snapshot_path / "model.safetensors").write_bytes(
-        b"weights"
-    )
+    (snapshot_path / "model.safetensors").write_bytes(b"weights")
     model_identity = hash_model_snapshot(
         snapshot_path,
         GEMMA_MODEL_ID,
@@ -339,21 +404,15 @@ def _production_cfg(
     )
     manifest = manifest.model_copy(update={"model": model_identity})
     manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        manifest.model_dump_json(indent=2) + "\n"
-    )
+    manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n")
     cfg = _compose_recipe()
     cfg.output_dir = str(tmp_path / "output")
     cfg.tau2_prerun.manifest_path = str(manifest_path)
     cfg.tau2_prerun.job_spec_path = str(CALIBRATION_JOB)
     cfg.tau2_prerun.model_snapshot = str(snapshot_path)
-    cfg.tau2_gym.user_model_url = USER_SIMULATOR_ENDPOINT
-    cfg.tau2_prerun.user_simulator_job_spec_path = str(
-        user_simulator_job_path
-    )
-    cfg.tau2_prerun.user_simulator_snapshot = (
-        user_simulator_deployment.snapshot_path
-    )
+    _set_auxiliary_identity(cfg)
+    cfg.tau2_prerun.user_simulator_job_spec_path = str(auxiliary_model_job_path)
+    cfg.tau2_prerun.user_simulator_snapshot = auxiliary_model_deployment.snapshot_path
     return cfg
 
 
@@ -361,15 +420,15 @@ def _production_case(
     tmp_path: Path,
     monkeypatch,
     manifest_job_digest: str,
-) -> tuple[PreRunManifest, Path, UserSimulatorDeployment]:
-    user_simulator_job_path, deployment = (
-        _user_simulator_fixture(tmp_path, monkeypatch)
+) -> tuple[PreRunManifest, Path, AuxiliaryModelDeployment]:
+    auxiliary_model_job_path, deployment = _auxiliary_model_fixture(
+        tmp_path, monkeypatch
     )
     manifest = _ready_manifest(
         manifest_job_digest,
         deployment,
     )
-    return manifest, user_simulator_job_path, deployment
+    return manifest, auxiliary_model_job_path, deployment
 
 
 def _assert_main_fails_before_process(
@@ -389,34 +448,28 @@ def _assert_main_fails_before_process(
     assert started == []
 
 
-def test_recipe_records_loss_identity_and_pending_measured_caps():
+def test_recipe_records_transitional_policy_boundary_and_pending_caps():
     cfg = _compose_recipe()
     assert cfg.finetune.rl.policy_loss == "gspo"
     assert cfg.tau2_prerun.policy_loss_fallback == "dppo"
-    assert (
-        cfg.tau2_prerun.policy_loss_fallback_trigger
-        == POLICY_LOSS_FALLBACK_TRIGGER
-    )
-    assert (
-        cfg.tau2_prerun.gspo_token_upgrade_trigger
-        == GSPO_TOKEN_UPGRADE_TRIGGER
-    )
+    assert cfg.tau2_prerun.policy_loss_fallback_trigger == POLICY_LOSS_FALLBACK_TRIGGER
+    assert cfg.tau2_prerun.gspo_token_upgrade_trigger == GSPO_TOKEN_UPGRADE_TRIGGER
     assert cfg.finetune.seq_packing is False
     assert cfg.finetune.seq_parallel == 1
     assert cfg.actor.shared_memory_entry_size is None
     assert cfg.preprocess.shared_memory_entry_size is None
     assert cfg.finetune.seq_length is None
     assert cfg.vllm_config.vllm_kwargs.max_model_len is None
-    assert cfg.tau2_gym.user_model_name == USER_SIMULATOR_MODEL
+    # W12 changes only the auxiliary contract. W14 atomically repoints these
+    # remaining executable recipe fields and removes the Gemma descriptor.
+    assert str(cfg.tau2_gym.user_model_name).startswith("google/gemma-")
     assert str(cfg.tau2_gym.user_model_url).startswith("PENDING_")
-    assert str(
-        cfg.tau2_prerun.user_simulator_job_spec_path
-    ).startswith("PENDING_")
-    assert cfg.tau2_prerun.user_simulator_snapshot == USER_SIMULATOR_SNAPSHOT
+    assert str(cfg.tau2_prerun.user_simulator_job_spec_path).startswith("PENDING_")
+    assert str(cfg.tau2_prerun.user_simulator_snapshot).endswith("gemma-4-31B-it")
     assert len(cfg.tau2_prerun.production_memory_candidates) == 3
 
 
-def test_calibration_job_records_s1_s2_and_pending_s5_table():
+def test_calibration_job_records_shared_auxiliary_provenance():
     job = yaml.safe_load(CALIBRATION_JOB.read_text())
     assert job["resources"]["replicas"] == 4
     assert job["resources"]["gpu"] == 8
@@ -428,14 +481,18 @@ def test_calibration_job_records_s1_s2_and_pending_s5_table():
         entry.split("=", 1)[0]: entry.split("=", 1)[1]
         for entry in job["environmentVars"]
     }
-    assert env["TAU2_USER_SIMULATOR_MODEL"] == USER_SIMULATOR_MODEL
+    assert env["TAU2_USER_SIMULATOR_MODEL"] == AUXILIARY_USER_MODEL
+    assert env["TAU2_JUDGE_MODEL"] == AUXILIARY_JUDGE_MODEL
     assert env["TAU2_USER_SIMULATOR_ENDPOINT"].startswith("PENDING_")
-    assert "separately managed" in env["TAU2_USER_SIMULATOR_PLACEMENT"]
+    assert env["TAU2_JUDGE_ENDPOINT"] == env["TAU2_USER_SIMULATOR_ENDPOINT"]
+    assert "separately managed" in env["TAU2_AUXILIARY_PLACEMENT"]
     assert env["TAU2_USER_API_KEY"] == "keyless-internal-dummy"
-    assert env["TAU2_USER_SIM_JOB_SPEC_PATH"] == str(
-        USER_SIMULATOR_JOB
-    )
-    assert env["TAU2_MODEL_REVISION_STATUS"] == "VERIFIED_2026-07-19"
+    assert env["TAU2_USER_SIM_JOB_SPEC_PATH"] == str(AUXILIARY_MODEL_JOB)
+    assert env["TAU2_USER_SIM_SNAPSHOT"] == AUXILIARY_MODEL_SNAPSHOT
+    assert env["TAU2_AUXILIARY_BATCH_INVARIANT"].startswith("0 ")
+    assert env["TAU2_AUXILIARY_MAX_MODEL_LEN"].startswith("PENDING_")
+    assert env["TAU2_AUXILIARY_ROLE_EVIDENCE"].startswith("PENDING_")
+    assert env["TAU2_AUXILIARY_SNAPSHOT_HASH_IO"].startswith("PENDING_")
     assert env["TAU2_STRICT_TITO_PATCH_SHA256"] == (
         PINNED_SOURCES.strict_tito_patch_sha256
     )
@@ -447,65 +504,71 @@ def test_calibration_job_records_s1_s2_and_pending_s5_table():
     table = json.loads(env["TAU2_S5_MEMORY_BUDGET_TABLE_JSON"])
     assert [row["nodes"] for row in table] == [4, 6, 8]
     assert all(
-        row["activation_bytes_at_measured_p99"]
-        == "pending_calibration"
+        row["activation_bytes_at_measured_p99"] == "pending_calibration"
         for row in table
     )
     assert all(row["fits"] == "pending_calibration" for row in table)
 
 
-def test_user_simulator_job_is_restartable_and_measurement_gated():
-    job = yaml.safe_load(USER_SIMULATOR_JOB.read_text())
+def test_calibration_source_pins_match_executed_contract():
+    job = yaml.safe_load(CALIBRATION_JOB.read_text())
+    env = {
+        entry.split("=", 1)[0]: entry.split("=", 1)[1]
+        for entry in job["environmentVars"]
+    }
+    expected = {
+        "nemo_gym_sha": tau2_client.NEMO_GYM_SHA,
+        "strict_tito_patch_sha256": tau2_client.NEMO_GYM_TITO_PATCH_SHA,
+        "tau2_runtime_sha": tau2_client.TAU2_RUNTIME_SHA,
+        "tau2_data_sha": tau2_client.TAU2_DATA_SHA,
+    }
+    assert PINNED_SOURCES.model_dump() == expected
+    assert env["TAU2_NEMO_GYM_SHA"] == expected["nemo_gym_sha"]
+    assert (
+        env["TAU2_STRICT_TITO_PATCH_SHA256"]
+        == expected["strict_tito_patch_sha256"]
+    )
+    assert env["TAU2_RUNTIME_SHA"] == expected["tau2_runtime_sha"]
+    assert env["TAU2_DATA_SHA"] == expected["tau2_data_sha"]
+
+
+def test_auxiliary_job_is_two_alias_restartable_and_measurement_gated():
+    job = yaml.safe_load(AUXILIARY_MODEL_JOB.read_text())
     calibration_job = yaml.safe_load(CALIBRATION_JOB.read_text())
     environment = {
         entry.split("=", 1)[0]: entry.split("=", 1)[1]
         for entry in job["environmentVars"]
     }
-    assert job["name"] == "tau2-gemma-user-sim"
+    assert job["name"] == "tau2-qwen-auxiliary"
     assert job["restartable"] is True
     assert job["preemptable"] is True
     assert job["bid"] == calibration_job["bid"] == 9999
-    assert (
-        "snow.research.tapes.base_models:/mnt/llmd/base_models:ro"
-        in job["data"]
-    )
+    assert "snow.research.tapes.base_models:/mnt/llmd/base_models:ro" in job["data"]
     assert job["resources"]["replicas"] == 1
-    assert str(job["resources"]["gpu"]) == environment[
-        "TAU2_USER_SIM_GPU_COUNT"
-    ]
+    assert str(job["resources"]["gpu"]) == environment["TAU2_AUX_GPU_COUNT"]
     assert str(job["resources"]["gpu"]).startswith("PENDING_")
     assert str(job["resources"]["gpuModel"]).startswith("PENDING_")
-    assert environment["TAU2_USER_SIM_MODEL_ID"] == (
-        USER_SIMULATOR_MODEL_ID
-    )
-    assert environment["TAU2_USER_SIM_REVISION"] == (
-        USER_SIMULATOR_REVISION
-    )
-    assert environment["TAU2_USER_SIM_MODEL_ALIAS"] == (
-        USER_SIMULATOR_MODEL
-    )
-    assert environment["TAU2_USER_SIM_SNAPSHOT"] == (
-        USER_SIMULATOR_SNAPSHOT
-    )
-    assert environment["TAU2_USER_SIM_MAX_MODEL_LEN"] == (
-        "PENDING_MEASURED_USER_SIDE_MAX_MODEL_LEN"
-    )
-    assert environment["TAU2_USER_SIM_MAX_NUM_SEQS"].startswith(
-        "PENDING_"
-    )
-    assert environment["TAU2_USER_SIM_SNAPSHOT_HASH_BYTES"].startswith(
-        "PENDING_"
-    )
-    assert environment["TAU2_USER_SIM_THINKING"] == "false"
-    assert environment["TAU2_USER_SIM_SUBMISSION_MODE"] == "restartable"
+    assert environment["TAU2_AUX_MODEL_ID"] == AUXILIARY_MODEL_ID
+    assert environment["TAU2_AUX_MODEL_REVISION"] == AUXILIARY_MODEL_REVISION
+    assert environment["TAU2_USER_MODEL_ALIAS"] == AUXILIARY_USER_MODEL
+    assert environment["TAU2_JUDGE_MODEL_ALIAS"] == AUXILIARY_JUDGE_MODEL
+    assert environment["TAU2_AUX_MODEL_SNAPSHOT"] == AUXILIARY_MODEL_SNAPSHOT
+    assert environment["TAU2_AUX_MAX_MODEL_LEN"].startswith("PENDING_")
+    assert environment["TAU2_AUX_MAX_NUM_SEQS"].startswith("PENDING_")
+    assert environment["TAU2_AUX_SNAPSHOT_HASH_BYTES"].startswith("PENDING_")
+    assert environment["TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON"].startswith("PENDING_")
+    assert environment["VLLM_BATCH_INVARIANT"] == "0"
+    assert environment["TAU2_AUX_SUBMISSION_MODE"] == "restartable"
     command = " ".join(str(part) for part in job["command"])
     assert "vllm.entrypoints.openai.api_server" in command
-    assert '--model "${TAU2_USER_SIM_SNAPSHOT}"' in command
-    assert '--served-model-name "${TAU2_USER_SIM_MODEL_ALIAS}"' in command
-    assert '--tensor-parallel-size "${TAU2_USER_SIM_TP_SIZE}"' in command
-    assert '--max-model-len "${TAU2_USER_SIM_MAX_MODEL_LEN}"' in command
-    assert '--max-num-seqs "${TAU2_USER_SIM_MAX_NUM_SEQS}"' in command
-    assert '{"enable_thinking": false}' in command
+    assert '--model "${TAU2_AUX_MODEL_SNAPSHOT}"' in command
+    assert (
+        '--served-model-name "${TAU2_USER_MODEL_ALIAS}" "${TAU2_JUDGE_MODEL_ALIAS}"'
+    ) in command
+    assert '--tensor-parallel-size "${TAU2_AUX_TP_SIZE}"' in command
+    assert '--max-model-len "${TAU2_AUX_MAX_MODEL_LEN}"' in command
+    assert '--max-num-seqs "${TAU2_AUX_MAX_NUM_SEQS}"' in command
+    assert "--default-chat-template-kwargs" not in command
 
 
 def test_cpu_offload_profile_only_offloads_optimizer():
@@ -581,11 +644,11 @@ def test_absent_manifest_fails_before_process(
     cfg.output_dir = str(tmp_path / "output")
     cfg.tau2_prerun.manifest_path = str(tmp_path / "missing.json")
     cfg.tau2_prerun.job_spec_path = str(CALIBRATION_JOB)
-    user_job, deployment = _user_simulator_fixture(
+    user_job, deployment = _auxiliary_model_fixture(
         tmp_path,
         monkeypatch,
     )
-    cfg.tau2_gym.user_model_url = USER_SIMULATOR_ENDPOINT
+    _set_auxiliary_identity(cfg)
     cfg.tau2_prerun.user_simulator_job_spec_path = str(user_job)
     cfg.tau2_prerun.user_simulator_snapshot = (
         deployment.snapshot_path
@@ -632,6 +695,66 @@ def test_unready_manifest_fails_before_process(
     )
 
 
+def test_missing_manifest_schema_fails_before_process(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        prerun_evidence,
+        "GEMMA_MODEL_REVISION_VERIFIED",
+        True,
+    )
+    manifest, user_job, deployment = _production_case(
+        tmp_path,
+        monkeypatch,
+        _sha256(CALIBRATION_JOB),
+    )
+    cfg = _production_cfg(
+        tmp_path,
+        manifest,
+        user_job,
+        deployment,
+    )
+    manifest_path = Path(str(cfg.tau2_prerun.manifest_path))
+    payload = json.loads(manifest_path.read_text())
+    del payload["schema_version"]
+    manifest_path.write_text(json.dumps(payload))
+
+    _assert_main_fails_before_process(
+        cfg,
+        monkeypatch,
+        "schema_version",
+    )
+
+
+def test_stale_manifest_schema_fails_before_process(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        prerun_evidence,
+        "GEMMA_MODEL_REVISION_VERIFIED",
+        True,
+    )
+    manifest, user_job, deployment = _production_case(
+        tmp_path,
+        monkeypatch,
+        _sha256(CALIBRATION_JOB),
+    )
+    manifest = manifest.model_copy(update={"schema_version": 1})
+    cfg = _production_cfg(
+        tmp_path,
+        manifest,
+        user_job,
+        deployment,
+    )
+    _assert_main_fails_before_process(
+        cfg,
+        monkeypatch,
+        "manifest schema version 1 is not supported",
+    )
+
+
 def test_manifest_digest_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
@@ -659,7 +782,7 @@ def test_manifest_digest_mismatch_fails_before_process(
     )
 
 
-def test_user_simulator_job_digest_mismatch_fails_before_process(
+def test_auxiliary_model_job_digest_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
@@ -678,7 +801,7 @@ def test_user_simulator_job_digest_mismatch_fails_before_process(
         update={"job_spec_sha256": "0" * 64}
     )
     manifest = manifest.model_copy(
-        update={"user_simulator_deployment": bad_deployment}
+        update={"auxiliary_model_deployment": bad_deployment}
     )
     cfg = _production_cfg(
         tmp_path,
@@ -689,11 +812,11 @@ def test_user_simulator_job_digest_mismatch_fails_before_process(
     _assert_main_fails_before_process(
         cfg,
         monkeypatch,
-        "user simulator job digest",
+        "auxiliary model job digest",
     )
 
 
-def test_user_simulator_profile_mismatch_fails_before_process(
+def test_auxiliary_model_profile_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
@@ -711,8 +834,8 @@ def test_user_simulator_profile_mismatch_fails_before_process(
     job = yaml.safe_load(user_job.read_text())
     job["environmentVars"] = [
         (
-            "TAU2_USER_SIM_MAX_MODEL_LEN=8192"
-            if entry.startswith("TAU2_USER_SIM_MAX_MODEL_LEN=")
+            "TAU2_AUX_MAX_MODEL_LEN=8192"
+            if entry.startswith("TAU2_AUX_MAX_MODEL_LEN=")
             else entry
         )
         for entry in job["environmentVars"]
@@ -723,7 +846,7 @@ def test_user_simulator_profile_mismatch_fails_before_process(
     )
     manifest = manifest.model_copy(
         update={
-            "user_simulator_deployment": mismatched_deployment
+            "auxiliary_model_deployment": mismatched_deployment
         }
     )
     cfg = _production_cfg(
@@ -735,23 +858,30 @@ def test_user_simulator_profile_mismatch_fails_before_process(
     _assert_main_fails_before_process(
         cfg,
         monkeypatch,
-        "TAU2_USER_SIM_MAX_MODEL_LEN",
+        "TAU2_AUX_MAX_MODEL_LEN",
     )
 
 
 @pytest.mark.parametrize(
     ("tamper", "pattern"),
     [
-        ("gpu_model", "user simulator job GPU type"),
-        ("snapshot_hash", "TAU2_USER_SIM_SNAPSHOT_HASH_BYTES"),
+        ("gpu_model", "auxiliary model job GPU type"),
+        ("snapshot_hash", "TAU2_AUX_SNAPSHOT_HASH_BYTES"),
         ("pending", "unresolved PENDING_"),
         ("cpu", "cpu resource is unresolved"),
-        ("name", "user simulator job name"),
-        ("bid", "user simulator job bid"),
-        ("command", "user simulator job command is missing"),
+        ("name", "auxiliary model job name"),
+        ("bid", "auxiliary model job bid"),
+        ("command", "auxiliary model job command is missing"),
+        ("alias_reorder", "auxiliary ordered served aliases"),
+        ("alias_missing", "auxiliary ordered served aliases"),
+        ("alias_extra", "auxiliary ordered served aliases"),
+        ("default_thinking", "must not set a server thinking default"),
+        ("batch_invariant", "batch-invariance calibration setting"),
+        ("role_evidence", "TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON"),
+        ("mount", "snapshot mount must be read-only"),
     ],
 )
-def test_user_simulator_execution_profile_mismatch_fails_before_process(
+def test_auxiliary_execution_profile_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
     tamper,
@@ -774,10 +904,8 @@ def test_user_simulator_execution_profile_mismatch_fails_before_process(
     elif tamper == "snapshot_hash":
         job["environmentVars"] = [
             (
-                "TAU2_USER_SIM_SNAPSHOT_HASH_BYTES=1"
-                if entry.startswith(
-                    "TAU2_USER_SIM_SNAPSHOT_HASH_BYTES="
-                )
+                "TAU2_AUX_SNAPSHOT_HASH_BYTES=1"
+                if entry.startswith("TAU2_AUX_SNAPSHOT_HASH_BYTES=")
                 else entry
             )
             for entry in job["environmentVars"]
@@ -787,25 +915,67 @@ def test_user_simulator_execution_profile_mismatch_fails_before_process(
     elif tamper == "cpu":
         job["resources"]["cpu"] = 0
     elif tamper == "name":
-        job["name"] = "pending-user-simulator"
+        job["name"] = "pending-auxiliary"
     elif tamper == "bid":
         job["bid"] = 9998
-    else:
+    elif tamper == "command":
         job["command"] = [
             part.replace(
-                '--max-model-len "${TAU2_USER_SIM_MAX_MODEL_LEN}" ',
+                '--max-model-len "${TAU2_AUX_MAX_MODEL_LEN}" ',
                 "",
             )
             for part in job["command"]
         ]
+    elif tamper == "alias_reorder":
+        job["command"] = [
+            part.replace(
+                '"${TAU2_USER_MODEL_ALIAS}" "${TAU2_JUDGE_MODEL_ALIAS}"',
+                '"${TAU2_JUDGE_MODEL_ALIAS}" "${TAU2_USER_MODEL_ALIAS}"',
+            )
+            for part in job["command"]
+        ]
+    elif tamper == "alias_missing":
+        job["command"] = [
+            part.replace(' "${TAU2_JUDGE_MODEL_ALIAS}"', "") for part in job["command"]
+        ]
+    elif tamper == "alias_extra":
+        job["command"] = [
+            part.replace(
+                '"${TAU2_JUDGE_MODEL_ALIAS}"',
+                '"${TAU2_JUDGE_MODEL_ALIAS}" unexpected-alias',
+            )
+            for part in job["command"]
+        ]
+    elif tamper == "default_thinking":
+        job["command"] = [
+            part + " --default-chat-template-kwargs {}" for part in job["command"]
+        ]
+    elif tamper == "batch_invariant":
+        job["environmentVars"] = [
+            (
+                "VLLM_BATCH_INVARIANT=1"
+                if entry.startswith("VLLM_BATCH_INVARIANT=")
+                else entry
+            )
+            for entry in job["environmentVars"]
+        ]
+    elif tamper == "role_evidence":
+        job["environmentVars"] = [
+            (
+                'TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON={"user_simulator":[1]}'
+                if entry.startswith("TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON=")
+                else entry
+            )
+            for entry in job["environmentVars"]
+        ]
+    else:
+        job["data"] = ["snow.research.tapes.base_models:/mnt/llmd/base_models:rw"]
     user_job.write_text(yaml.safe_dump(job, sort_keys=False))
     mismatched_deployment = deployment.model_copy(
         update={"job_spec_sha256": _sha256(user_job)}
     )
     manifest = manifest.model_copy(
-        update={
-            "user_simulator_deployment": mismatched_deployment
-        }
+        update={"auxiliary_model_deployment": mismatched_deployment}
     )
     cfg = _production_cfg(
         tmp_path,
@@ -900,7 +1070,7 @@ def test_pipeline_parallel_policy_is_rejected_before_process(
 ):
     cfg = _compose_recipe()
     cfg.output_dir = str(tmp_path / "output")
-    cfg.tau2_gym.user_model_url = USER_SIMULATOR_ENDPOINT
+    _set_auxiliary_identity(cfg)
     cfg.vllm_config.vllm_kwargs["pipeline-parallel-size"] = 2
     _assert_main_fails_before_process(
         cfg,
@@ -941,11 +1111,11 @@ def test_calibration_spec_enforces_safe_profile(
     cfg.finetune.max_train_steps = 1
     cfg.finetune.interrupt_train_steps = 1
     cfg.tau2_prerun.job_spec_path = str(CALIBRATION_JOB)
-    user_job, deployment = _user_simulator_fixture(
+    user_job, deployment = _auxiliary_model_fixture(
         tmp_path,
         monkeypatch,
     )
-    cfg.tau2_gym.user_model_url = USER_SIMULATOR_ENDPOINT
+    _set_auxiliary_identity(cfg)
     cfg.tau2_prerun.user_simulator_job_spec_path = str(user_job)
     cfg.tau2_prerun.user_simulator_snapshot = (
         deployment.snapshot_path
@@ -963,8 +1133,7 @@ def test_calibration_spec_enforces_safe_profile(
     spec = PreRunSpec(
         model_snapshot=str(snapshot_path),
         source_pins=PINNED_SOURCES,
-        user_simulator=deployment.service,
-        user_simulator_deployment=deployment,
+        auxiliary_model_deployment=deployment,
         policy_model=GEMMA_POLICY_IDENTITY,
         policy_endpoints=POLICY_ENDPOINTS,
         expected_tp_size=2,

@@ -91,7 +91,6 @@ def _snapshot(
         base_descriptor.model_id,
         base_descriptor.revision,
     )
-    digests = {artifact.path: artifact.sha256 for artifact in identity.artifacts}
     descriptor = replace(
         base_descriptor,
         num_hidden_layers=2,
@@ -99,11 +98,9 @@ def _snapshot(
         intermediate_size=16,
         max_position_embeddings=64,
         vocab_size=32,
-        artifact_sha256=(
-            (shard, digests[shard]),
-            ("tokenizer.json", digests["tokenizer.json"]),
-            ("tokenizer_config.json", digests["tokenizer_config.json"]),
-            ("chat_template.jinja", digests["chat_template.jinja"]),
+        artifact_sha256=tuple(
+            (artifact.path, artifact.sha256)
+            for artifact in identity.artifacts
         ),
     )
     return snapshot, descriptor, identity
@@ -252,30 +249,92 @@ def test_qwen_descriptor_registry_pins_both_verified_artifact_sets():
             QWEN35_27B_MODEL_DESCRIPTOR.revision,
         ),
     }
-    assert len(QWEN35_9B_MODEL_DESCRIPTOR.artifact_sha256) == 7
-    assert len(QWEN35_27B_MODEL_DESCRIPTOR.artifact_sha256) == 14
+    assert len(QWEN35_9B_MODEL_DESCRIPTOR.artifact_sha256) == 16
+    assert len(QWEN35_27B_MODEL_DESCRIPTOR.artifact_sha256) == 23
     assert QWEN35_TOOL_CALL_PARSER == "qwen3_xml"
     for descriptor in (
         QWEN35_9B_MODEL_DESCRIPTOR,
         QWEN35_27B_MODEL_DESCRIPTOR,
     ):
         paths = dict(descriptor.artifact_sha256)
-        assert set(paths) == {
-            *(
-                path
-                for path in paths
-                if path.startswith("model.safetensors-")
-            ),
+        assert descriptor.exact_artifact_set is True
+        assert {
+            ".gitattributes",
+            "README.md",
+            "chat_template.jinja",
+            "config.json",
+            "merges.txt",
+            "model.safetensors.index.json",
+            "preprocessor_config.json",
             "tokenizer.json",
             "tokenizer_config.json",
-            "chat_template.jinja",
-        }
+            "video_preprocessor_config.json",
+            "vocab.json",
+        } <= set(paths)
         assert paths["tokenizer_config.json"] == QWEN35_TOKENIZER_CONFIG_SHA256
         assert paths["chat_template.jinja"] == QWEN35_CHAT_TEMPLATE_SHA256
+    qwen9_paths = dict(QWEN35_9B_MODEL_DESCRIPTOR.artifact_sha256)
+    qwen27_paths = dict(QWEN35_27B_MODEL_DESCRIPTOR.artifact_sha256)
+    assert "LICENSE" in qwen9_paths
+    assert "generation_config.json" not in qwen9_paths
+    assert "LICENSE" not in qwen27_paths
+    assert "generation_config.json" in qwen27_paths
     assert (
         dict(QWEN35_9B_MODEL_DESCRIPTOR.artifact_sha256)["tokenizer.json"]
         == dict(QWEN35_27B_MODEL_DESCRIPTOR.artifact_sha256)["tokenizer.json"]
     )
+
+
+def test_snapshot_identity_excludes_huggingface_download_cache(tmp_path):
+    snapshot, descriptor, identity = _snapshot(tmp_path)
+    cache = snapshot / ".cache" / "huggingface" / "download"
+    cache.mkdir(parents=True)
+    (cache / "config.json.lock").write_text("")
+    (cache / "config.json.metadata").write_text("mutable")
+
+    rehashed = hash_model_snapshot(
+        snapshot,
+        descriptor.model_id,
+        descriptor.revision,
+    )
+
+    assert rehashed == identity
+
+
+def test_exact_qwen_snapshot_rejects_unreviewed_artifact(tmp_path):
+    snapshot, descriptor, _ = _snapshot(tmp_path)
+    (snapshot / "generation_config.json").write_text("{}")
+    identity = hash_model_snapshot(
+        snapshot,
+        descriptor.model_id,
+        descriptor.revision,
+    )
+
+    with pytest.raises(ValueError, match="unreviewed artifacts"):
+        inspect_text_model_snapshot(snapshot, descriptor, identity)
+
+
+def test_model_identity_rejects_duplicate_artifact_paths(tmp_path):
+    snapshot, descriptor, identity = _snapshot(tmp_path)
+    duplicate = identity.model_copy(
+        update={"artifacts": [*identity.artifacts, identity.artifacts[0]]}
+    )
+
+    with pytest.raises(ValueError, match="duplicate paths"):
+        inspect_text_model_snapshot(snapshot, descriptor, duplicate)
+
+
+def test_exact_qwen_snapshot_rejects_missing_artifact(tmp_path):
+    snapshot, descriptor, _ = _snapshot(tmp_path)
+    (snapshot / "chat_template.jinja").unlink()
+    identity = hash_model_snapshot(
+        snapshot,
+        descriptor.model_id,
+        descriptor.revision,
+    )
+
+    with pytest.raises(ValueError, match="artifact SHA256"):
+        inspect_text_model_snapshot(snapshot, descriptor, identity)
 
 
 def test_qwen_snapshot_partitions_vision_and_mtp_outside_transfer(
@@ -303,6 +362,8 @@ def test_qwen_snapshot_partitions_vision_and_mtp_outside_transfer(
     "artifact",
     (
         "model-00001-of-00001.safetensors",
+        "config.json",
+        "model.safetensors.index.json",
         "tokenizer_config.json",
         "chat_template.jinja",
     ),
@@ -360,6 +421,13 @@ def test_qwen_snapshot_fails_closed_on_structure_drift(
         snapshot,
         descriptor.model_id,
         descriptor.revision,
+    )
+    descriptor = replace(
+        descriptor,
+        artifact_sha256=tuple(
+            (artifact.path, artifact.sha256)
+            for artifact in identity.artifacts
+        ),
     )
 
     with pytest.raises(ValueError, match=message):

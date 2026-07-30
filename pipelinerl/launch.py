@@ -1,7 +1,9 @@
 import hashlib
+import json
 import logging
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -65,48 +67,51 @@ def _job_environment(job: dict) -> dict[str, str]:
     entries = job.get("environmentVars")
     if not isinstance(entries, list):
         raise ValueError(
-            "Tau2 user simulator job environmentVars is not a list"
+            "Tau2 auxiliary model job environmentVars is not a list"
         )
     environment = {}
     for entry in entries:
         if not isinstance(entry, str) or "=" not in entry:
             raise ValueError(
-                "Tau2 user simulator job has a malformed environment entry"
+                "Tau2 auxiliary model job has a malformed environment entry"
             )
         key, value = entry.split("=", 1)
         if key in environment:
             raise ValueError(
-                f"Tau2 user simulator job repeats environment key {key}"
+                f"Tau2 auxiliary model job repeats environment key {key}"
             )
         environment[key] = value
     return environment
 
 
-def _validate_user_simulator_job_spec(
+def _validate_auxiliary_model_job_spec(
     job_spec_path: Path,
     deployment,
-    expected_service,
+    expected_user_service,
+    expected_judge_service,
 ) -> None:
     from pipelinerl.domains.tau2.prerun import (
-        USER_SIMULATOR_MODEL,
-        USER_SIMULATOR_MODEL_ID,
-        USER_SIMULATOR_REVISION,
-        USER_SIMULATOR_SNAPSHOT,
-        validate_user_simulator_deployment,
+        AUXILIARY_JUDGE_MODEL,
+        AUXILIARY_MODEL_ID,
+        AUXILIARY_MODEL_REVISION,
+        AUXILIARY_MODEL_SNAPSHOT,
+        AUXILIARY_USER_MODEL,
+        validate_auxiliary_model_deployment,
     )
 
-    validate_user_simulator_deployment(
+    validate_auxiliary_model_deployment(
         deployment,
-        expected_service,
+        expected_user_service,
+        expected_judge_service,
     )
     _require_equal(
         deployment.job_spec_sha256,
         _sha256_file(job_spec_path),
-        "user simulator job digest",
+        "auxiliary model job digest",
     )
     job = yaml.safe_load(job_spec_path.read_text())
     if not isinstance(job, dict):
-        raise ValueError("Tau2 user simulator job spec is not a mapping")
+        raise ValueError("Tau2 auxiliary model job spec is not a mapping")
     pending_values = []
     values_to_check = [job]
     while values_to_check:
@@ -119,93 +124,123 @@ def _validate_user_simulator_job_spec(
         elif isinstance(value, str) and "PENDING_" in value:
             pending_values.append(value)
     if pending_values:
-        raise ValueError("Tau2 user simulator job has unresolved PENDING_ values")
+        raise ValueError(
+            "Tau2 auxiliary model job has unresolved PENDING_ values"
+        )
     environment = _job_environment(job)
     required_environment = {
-        "TAU2_USER_SIM_MODEL_ID",
-        "TAU2_USER_SIM_REVISION",
-        "TAU2_USER_SIM_MODEL_ALIAS",
-        "TAU2_USER_SIM_SNAPSHOT",
-        "TAU2_USER_SIM_GPU_TYPE",
-        "TAU2_USER_SIM_GPU_COUNT",
-        "TAU2_USER_SIM_TP_SIZE",
-        "TAU2_USER_SIM_MAX_MODEL_LEN",
-        "TAU2_USER_SIM_MAX_NUM_SEQS",
-        "TAU2_USER_SIM_SNAPSHOT_HASH_BYTES",
-        "TAU2_USER_SIM_THINKING",
-        "TAU2_USER_SIM_SUBMISSION_MODE",
+        "TAU2_AUX_MODEL_ID",
+        "TAU2_AUX_MODEL_REVISION",
+        "TAU2_USER_MODEL_ALIAS",
+        "TAU2_JUDGE_MODEL_ALIAS",
+        "TAU2_AUX_MODEL_SNAPSHOT",
+        "TAU2_AUX_GPU_TYPE",
+        "TAU2_AUX_GPU_COUNT",
+        "TAU2_AUX_TP_SIZE",
+        "TAU2_AUX_MAX_MODEL_LEN",
+        "TAU2_AUX_MAX_NUM_SEQS",
+        "TAU2_AUX_MEASURED_PEAK_IN_FLIGHT",
+        "TAU2_AUX_OBSERVED_REQUEST_LATENCIES_S_JSON",
+        "TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON",
+        "TAU2_AUX_PROMPT_HEADROOM_FACTORS_JSON",
+        "TAU2_AUX_GENERATION_RESERVE_TOKENS_JSON",
+        "TAU2_AUX_SNAPSHOT_HASH_BYTES",
+        "TAU2_AUX_SUBMISSION_MODE",
+        "VLLM_BATCH_INVARIANT",
     }
     missing = required_environment - environment.keys()
     if missing:
         raise ValueError(
-            "Tau2 user simulator job is missing environment keys "
+            "Tau2 auxiliary model job is missing environment keys "
             f"{sorted(missing)}"
         )
     _require_equal(
-        environment["TAU2_USER_SIM_MODEL_ID"],
-        USER_SIMULATOR_MODEL_ID,
-        "user simulator job model",
+        environment["TAU2_AUX_MODEL_ID"],
+        AUXILIARY_MODEL_ID,
+        "auxiliary model job model",
     )
     _require_equal(
-        environment["TAU2_USER_SIM_REVISION"],
-        USER_SIMULATOR_REVISION,
-        "user simulator job revision",
+        environment["TAU2_AUX_MODEL_REVISION"],
+        AUXILIARY_MODEL_REVISION,
+        "auxiliary model job revision",
     )
     _require_equal(
-        environment["TAU2_USER_SIM_MODEL_ALIAS"],
-        USER_SIMULATOR_MODEL,
-        "user simulator job alias",
+        environment["TAU2_USER_MODEL_ALIAS"],
+        AUXILIARY_USER_MODEL,
+        "auxiliary user alias",
     )
     _require_equal(
-        Path(environment["TAU2_USER_SIM_SNAPSHOT"]),
-        Path(USER_SIMULATOR_SNAPSHOT),
-        "user simulator job snapshot",
+        environment["TAU2_JUDGE_MODEL_ALIAS"],
+        AUXILIARY_JUDGE_MODEL,
+        "auxiliary judge alias",
     )
     _require_equal(
-        environment["TAU2_USER_SIM_GPU_TYPE"],
+        Path(environment["TAU2_AUX_MODEL_SNAPSHOT"]),
+        Path(AUXILIARY_MODEL_SNAPSHOT),
+        "auxiliary model job snapshot",
+    )
+    _require_equal(
+        environment["TAU2_AUX_GPU_TYPE"],
         deployment.gpu_type,
-        "user simulator GPU type",
+        "auxiliary model GPU type",
     )
     numeric_environment = {
-        "TAU2_USER_SIM_GPU_COUNT": deployment.gpu_count,
-        "TAU2_USER_SIM_TP_SIZE": deployment.tensor_parallel_size,
-        "TAU2_USER_SIM_MAX_MODEL_LEN": deployment.max_model_len,
-        "TAU2_USER_SIM_MAX_NUM_SEQS": deployment.max_num_seqs,
-        "TAU2_USER_SIM_SNAPSHOT_HASH_BYTES": deployment.snapshot_hash_bytes,
+        "TAU2_AUX_GPU_COUNT": deployment.gpu_count,
+        "TAU2_AUX_TP_SIZE": deployment.tensor_parallel_size,
+        "TAU2_AUX_MAX_MODEL_LEN": deployment.max_model_len,
+        "TAU2_AUX_MAX_NUM_SEQS": deployment.max_num_seqs,
+        "TAU2_AUX_MEASURED_PEAK_IN_FLIGHT": (deployment.measured_peak_in_flight),
+        "TAU2_AUX_SNAPSHOT_HASH_BYTES": deployment.snapshot_hash_bytes,
     }
     for key, expected in numeric_environment.items():
         try:
             actual = int(environment[key])
         except ValueError as exc:
+            raise ValueError(f"Tau2 auxiliary model job {key} is unresolved") from exc
+        _require_equal(actual, expected, key)
+    json_environment = {
+        "TAU2_AUX_OBSERVED_REQUEST_LATENCIES_S_JSON": (
+            deployment.observed_request_latencies_s
+        ),
+        "TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON": (
+            deployment.observed_prompt_tokens
+        ),
+        "TAU2_AUX_PROMPT_HEADROOM_FACTORS_JSON": (
+            deployment.prompt_headroom_factors
+        ),
+        "TAU2_AUX_GENERATION_RESERVE_TOKENS_JSON": (
+            deployment.generation_reserve_tokens
+        ),
+    }
+    for key, expected in json_environment.items():
+        try:
+            actual = json.loads(environment[key])
+        except json.JSONDecodeError as exc:
             raise ValueError(
-                f"Tau2 user simulator job {key} is unresolved"
+                f"Tau2 auxiliary model job {key} is invalid JSON"
             ) from exc
         _require_equal(actual, expected, key)
     _require_equal(
-        environment["TAU2_USER_SIM_THINKING"],
-        "false",
-        "user simulator thinking mode",
+        environment["TAU2_AUX_SUBMISSION_MODE"],
+        "restartable",
+        "auxiliary model submission mode",
     )
     _require_equal(
-        environment["TAU2_USER_SIM_SUBMISSION_MODE"],
-        "restartable",
-        "user simulator submission mode",
+        environment["VLLM_BATCH_INVARIANT"],
+        "0",
+        "auxiliary batch-invariance calibration setting",
     )
     _require_equal(
         job.get("name"),
-        "tau2-gemma-user-sim",
-        "user simulator job name",
+        "tau2-qwen-auxiliary",
+        "auxiliary model job name",
     )
-    _require_equal(
-        job.get("bid"),
-        9999,
-        "user simulator job bid",
-    )
-    _require_equal(job.get("restartable"), True, "user simulator restartable")
-    _require_equal(job.get("preemptable"), True, "user simulator preemptable")
+    _require_equal(job.get("bid"), 9999, "auxiliary model job bid")
+    _require_equal(job.get("restartable"), True, "auxiliary model restartable")
+    _require_equal(job.get("preemptable"), True, "auxiliary model preemptable")
     resources = job.get("resources")
     if not isinstance(resources, dict):
-        raise ValueError("Tau2 user simulator resources is not a mapping")
+        raise ValueError("Tau2 auxiliary model resources is not a mapping")
     for resource_name in ("cpu", "mem"):
         resource_value = resources.get(resource_name)
         if (
@@ -214,23 +249,25 @@ def _validate_user_simulator_job_spec(
             or resource_value <= 0
         ):
             raise ValueError(
-                f"Tau2 user simulator {resource_name} resource is unresolved"
+                f"Tau2 auxiliary model {resource_name} resource is unresolved"
             )
     _require_equal(
         resources.get("gpu"),
         deployment.gpu_count,
-        "user simulator job GPU count",
+        "auxiliary model job GPU count",
     )
     _require_equal(
         resources.get("gpuModel"),
         deployment.gpu_type,
-        "user simulator job GPU type",
+        "auxiliary model job GPU type",
     )
-    _require_equal(
-        resources.get("replicas"),
-        1,
-        "user simulator job replicas",
-    )
+    _require_equal(resources.get("replicas"), 1, "auxiliary model job replicas")
+    data = job.get("data")
+    if (
+        not isinstance(data, list)
+        or "snow.research.tapes.base_models:/mnt/llmd/base_models:ro" not in data
+    ):
+        raise ValueError("Tau2 auxiliary model snapshot mount must be read-only")
     options = job.get("options")
     internal_dns = (
         options.get("internal-dns")
@@ -239,12 +276,12 @@ def _validate_user_simulator_job_spec(
     )
     if not isinstance(internal_dns, dict):
         raise ValueError(
-            "Tau2 user simulator job has no internal DNS configuration"
+            "Tau2 auxiliary model job has no internal DNS configuration"
         )
     _require_equal(
         internal_dns.get("name"),
         "tau2-user",
-        "user simulator DNS name",
+        "auxiliary model DNS name",
     )
     ports = internal_dns.get("ports")
     expected_port = {
@@ -254,37 +291,54 @@ def _validate_user_simulator_job_spec(
     }
     if not isinstance(ports, list) or expected_port not in ports:
         raise ValueError(
-            "Tau2 user simulator job does not expose TCP port 8000"
+            "Tau2 auxiliary model job does not expose TCP port 8000"
         )
     command_parts = job.get("command")
     if not isinstance(command_parts, list) or not all(
         isinstance(part, str) for part in command_parts
     ):
-        raise ValueError(
-            "Tau2 user simulator job command is not a string list"
-        )
+        raise ValueError("Tau2 auxiliary model job command is not a string list")
     command = " ".join(command_parts)
     required_command_parts = (
         "vllm.entrypoints.openai.api_server",
-        '--model "${TAU2_USER_SIM_SNAPSHOT}"',
-        '--served-model-name "${TAU2_USER_SIM_MODEL_ALIAS}"',
+        '--model "${TAU2_AUX_MODEL_SNAPSHOT}"',
         "--dtype bfloat16",
         "--host 0.0.0.0",
         "--port 8000",
-        '--tensor-parallel-size "${TAU2_USER_SIM_TP_SIZE}"',
-        '--max-model-len "${TAU2_USER_SIM_MAX_MODEL_LEN}"',
-        '--max-num-seqs "${TAU2_USER_SIM_MAX_NUM_SEQS}"',
-        "--default-chat-template-kwargs",
-        '{"enable_thinking": false}',
+        '--tensor-parallel-size "${TAU2_AUX_TP_SIZE}"',
+        '--max-model-len "${TAU2_AUX_MAX_MODEL_LEN}"',
+        '--max-num-seqs "${TAU2_AUX_MAX_NUM_SEQS}"',
     )
     missing_command_parts = [
         part for part in required_command_parts if part not in command
     ]
     if missing_command_parts:
         raise ValueError(
-            "Tau2 user simulator job command is missing "
-            f"{missing_command_parts}"
+            f"Tau2 auxiliary model job command is missing {missing_command_parts}"
         )
+    if "--default-chat-template-kwargs" in command:
+        raise ValueError(
+            "Tau2 auxiliary model job must not set a server thinking default"
+        )
+    command_tokens = shlex.split(command)
+    if command_tokens.count("--served-model-name") != 1:
+        raise ValueError(
+            "Tau2 auxiliary model job must set served-model-name exactly once"
+        )
+    alias_start = command_tokens.index("--served-model-name") + 1
+    alias_end = next(
+        (
+            index
+            for index in range(alias_start, len(command_tokens))
+            if command_tokens[index].startswith("--")
+        ),
+        len(command_tokens),
+    )
+    _require_equal(
+        command_tokens[alias_start:alias_end],
+        ["${TAU2_USER_MODEL_ALIAS}", "${TAU2_JUDGE_MODEL_ALIAS}"],
+        "auxiliary ordered served aliases",
+    )
 
 
 def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
@@ -292,9 +346,10 @@ def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
         GSPO_TOKEN_UPGRADE_TRIGGER,
         POLICY_LOSS_FALLBACK,
         POLICY_LOSS_FALLBACK_TRIGGER,
+        AUXILIARY_JUDGE_MODEL,
+        AUXILIARY_USER_MODEL,
         RUN1_POLICY_LOSS,
-        USER_SIMULATOR_MODEL,
-        validate_user_simulator_endpoint,
+        validate_auxiliary_model_endpoint,
     )
     from pipelinerl.prerun_evidence import (
         GEMMA_MODEL_ID,
@@ -349,13 +404,26 @@ def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
         GEMMA_POLICY_IDENTITY,
         "Gym policy model",
     )
-    validate_user_simulator_endpoint(
+    user_endpoint = validate_auxiliary_model_endpoint(
         str(cfg.tau2_gym.user_model_url)
+    )
+    judge_endpoint = validate_auxiliary_model_endpoint(
+        str(cfg.tau2_gym.judge_model_url)
+    )
+    _require_equal(
+        judge_endpoint,
+        user_endpoint,
+        "shared auxiliary endpoint",
     )
     _require_equal(
         str(cfg.tau2_gym.user_model_name),
-        USER_SIMULATOR_MODEL,
+        AUXILIARY_USER_MODEL,
         "user model",
+    )
+    _require_equal(
+        str(cfg.tau2_gym.judge_model_name),
+        AUXILIARY_JUDGE_MODEL,
+        "judge model",
     )
     _require_equal(
         int(cfg.vllm_config.vllm_kwargs["tensor-parallel-size"]),
@@ -377,7 +445,7 @@ def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
 def _validate_tau2_calibration(
     cfg: DictConfig,
     job_spec_path: Path,
-    user_simulator_job_spec_path: Path,
+    auxiliary_model_job_spec_path: Path,
 ) -> None:
     from pipelinerl.domains.tau2.prerun import (
         CALIBRATION_ROLLOUTS,
@@ -385,8 +453,9 @@ def _validate_tau2_calibration(
         PINNED_SOURCES,
         POLICY_LOSS_FALLBACK,
         POLICY_LOSS_FALLBACK_TRIGGER,
+        AUXILIARY_JUDGE_MODEL,
+        AUXILIARY_USER_MODEL,
         RUN1_POLICY_LOSS,
-        USER_SIMULATOR_MODEL,
         PreRunSpec,
         ServiceIdentity,
         TrainerMemoryCandidate,
@@ -430,29 +499,35 @@ def _validate_tau2_calibration(
         "snapshot",
     )
     _require_equal(spec.source_pins, PINNED_SOURCES, "source pins")
-    expected_user_simulator = ServiceIdentity(
-        model=USER_SIMULATOR_MODEL,
+    expected_user_service = ServiceIdentity(
+        model=AUXILIARY_USER_MODEL,
         endpoint=str(cfg.tau2_gym.user_model_url),
     )
+    expected_judge_service = ServiceIdentity(
+        model=AUXILIARY_JUDGE_MODEL,
+        endpoint=str(cfg.tau2_gym.judge_model_url),
+    )
+    deployment = spec.auxiliary_model_deployment
     _require_equal(
-        spec.user_simulator,
-        expected_user_simulator,
-        "user simulator",
+        deployment.user_service,
+        expected_user_service,
+        "auxiliary user service",
     )
     _require_equal(
-        spec.user_simulator_deployment.service,
-        expected_user_simulator,
-        "user simulator deployment service",
+        deployment.judge_service,
+        expected_judge_service,
+        "auxiliary judge service",
     )
     _require_equal(
-        Path(spec.user_simulator_deployment.snapshot_path).resolve(),
+        Path(deployment.snapshot_path).resolve(),
         Path(str(prerun.user_simulator_snapshot)).resolve(),
-        "user simulator snapshot",
+        "auxiliary model snapshot",
     )
-    _validate_user_simulator_job_spec(
-        user_simulator_job_spec_path,
-        spec.user_simulator_deployment,
-        expected_user_simulator,
+    _validate_auxiliary_model_job_spec(
+        auxiliary_model_job_spec_path,
+        deployment,
+        expected_user_service,
+        expected_judge_service,
     )
     _require_equal(
         spec.policy_model,
@@ -625,7 +700,7 @@ def _validate_tau2_calibration(
 def _validate_tau2_production(
     cfg: DictConfig,
     job_spec_path: Path,
-    user_simulator_job_spec_path: Path,
+    auxiliary_model_job_spec_path: Path,
 ) -> None:
     from pipelinerl.domains.tau2.prerun import (
         CALIBRATION_CAVEAT,
@@ -635,8 +710,9 @@ def _validate_tau2_production(
         PINNED_SOURCES,
         POLICY_LOSS_FALLBACK,
         POLICY_LOSS_FALLBACK_TRIGGER,
+        AUXILIARY_JUDGE_MODEL,
+        AUXILIARY_USER_MODEL,
         RUN1_POLICY_LOSS,
-        USER_SIMULATOR_MODEL,
         PreRunManifest,
         ServiceIdentity,
         require_ready_manifest,
@@ -693,31 +769,35 @@ def _validate_tau2_production(
         PINNED_SOURCES,
         "manifest source pins",
     )
-    expected_user_simulator = ServiceIdentity(
-        model=USER_SIMULATOR_MODEL,
+    expected_user_service = ServiceIdentity(
+        model=AUXILIARY_USER_MODEL,
         endpoint=str(cfg.tau2_gym.user_model_url),
     )
+    expected_judge_service = ServiceIdentity(
+        model=AUXILIARY_JUDGE_MODEL,
+        endpoint=str(cfg.tau2_gym.judge_model_url),
+    )
+    deployment = manifest.auxiliary_model_deployment
     _require_equal(
-        manifest.user_simulator,
-        expected_user_simulator,
-        "manifest user simulator",
+        deployment.user_service,
+        expected_user_service,
+        "manifest auxiliary user service",
     )
     _require_equal(
-        manifest.user_simulator_deployment.service,
-        expected_user_simulator,
-        "manifest user simulator deployment service",
+        deployment.judge_service,
+        expected_judge_service,
+        "manifest auxiliary judge service",
     )
     _require_equal(
-        Path(
-            manifest.user_simulator_deployment.snapshot_path
-        ).resolve(),
+        Path(deployment.snapshot_path).resolve(),
         Path(str(prerun.user_simulator_snapshot)).resolve(),
-        "manifest user simulator snapshot",
+        "manifest auxiliary model snapshot",
     )
-    _validate_user_simulator_job_spec(
-        user_simulator_job_spec_path,
-        manifest.user_simulator_deployment,
-        expected_user_simulator,
+    _validate_auxiliary_model_job_spec(
+        auxiliary_model_job_spec_path,
+        deployment,
+        expected_user_service,
+        expected_judge_service,
     )
     _require_equal(
         manifest.policy_model,
@@ -885,7 +965,7 @@ def validate_tau2_prerun(cfg: DictConfig) -> None:
         prerun,
         "job_spec_path",
     )
-    user_simulator_job_spec_path = _required_prerun_path(
+    auxiliary_model_job_spec_path = _required_prerun_path(
         prerun,
         "user_simulator_job_spec_path",
     )
@@ -894,13 +974,13 @@ def validate_tau2_prerun(cfg: DictConfig) -> None:
         _validate_tau2_calibration(
             cfg,
             job_spec_path,
-            user_simulator_job_spec_path,
+            auxiliary_model_job_spec_path,
         )
     elif phase == "production":
         _validate_tau2_production(
             cfg,
             job_spec_path,
-            user_simulator_job_spec_path,
+            auxiliary_model_job_spec_path,
         )
     else:
         raise ValueError(

@@ -1,0 +1,70 @@
+# Standalone shared Tau2 simulator and NL-judge service. This file is
+# deliberately fail-closed until Rafa resolves every PENDING_* serving
+# measurement and approves both this exact file and a submission command using
+# --restartable alone (no --preemptable or --non-preemptable flag).
+image: registry.toolkit-sp.yul201.service-now.com/snow.research.tapes/interactive-toolkit:throughput
+data:
+  - snow.research.tapes.rafael_pardinas_home:/home/toolkit:rw
+  - snow.research.tapes.transformers_cache:/transformers_cache:rw
+  - snow.research.tapes.base_models:/mnt/llmd/base_models:ro
+command:
+  - /opt/conda/bin/conda
+  - run
+  - -n
+  - pipeline-rl
+  - --no-capture-output
+  - bash
+  - -lc
+  - >-
+    exec python -m vllm.entrypoints.openai.api_server
+    --model "${TAU2_AUX_MODEL_SNAPSHOT}"
+    --served-model-name "${TAU2_USER_MODEL_ALIAS}" "${TAU2_JUDGE_MODEL_ALIAS}"
+    --dtype bfloat16
+    --host 0.0.0.0
+    --port 8000
+    --tensor-parallel-size "${TAU2_AUX_TP_SIZE}"
+    --max-model-len "${TAU2_AUX_MAX_MODEL_LEN}"
+    --max-num-seqs "${TAU2_AUX_MAX_NUM_SEQS}"
+
+resources:
+  cpu: PENDING_AUX_CPU_COUNT
+  gpu: PENDING_MEASURED_AUX_GPU_COUNT
+  gpuModel: PENDING_MEASURED_AUX_GPU_TYPE
+  mem: PENDING_AUX_MEMORY_GIB
+  replicas: 1
+options:
+  internal-dns:
+    name: tau2-user
+    ports:
+      - {port: 8000, target-port: 8000, protocol: TCP}
+
+name: tau2-qwen-auxiliary
+# Rafa explicitly keeps the restartable service at the calibration bid.
+bid: 9999
+interactive: false
+preemptable: true
+restartable: true
+workdir: /home/toolkit/PipelineRL
+environmentVars:
+  - HOME=/home/toolkit
+  - TAU2_AUX_MODEL_ID=Qwen/Qwen3.5-27B
+  - TAU2_AUX_MODEL_REVISION=fc05daec18b0a78c049392ed2e771dde82bdf654
+  - TAU2_USER_MODEL_ALIAS=qwen3.5-27b-user@fc05daec18b0a78c049392ed2e771dde82bdf654
+  - TAU2_JUDGE_MODEL_ALIAS=qwen3.5-27b-judge@fc05daec18b0a78c049392ed2e771dde82bdf654
+  - TAU2_AUX_MODEL_SNAPSHOT=/mnt/llmd/base_models/Qwen3.5-27B
+  - TAU2_AUX_GPU_TYPE=PENDING_MEASURED_AUX_GPU_TYPE
+  - TAU2_AUX_GPU_COUNT=PENDING_MEASURED_AUX_GPU_COUNT
+  - TAU2_AUX_TP_SIZE=PENDING_MEASURED_AUX_TP_SIZE
+  # An HTTP 400 from either role kills the actor run. Resolve this from the
+  # larger measured role-specific prompt/headroom/reserve requirement.
+  - TAU2_AUX_MAX_MODEL_LEN=PENDING_MEASURED_LARGER_ROLE_MAX_MODEL_LEN
+  - TAU2_AUX_MAX_NUM_SEQS=PENDING_MEASURED_AGGREGATE_CONCURRENCY
+  - TAU2_AUX_MEASURED_PEAK_IN_FLIGHT=PENDING_MEASURED_PEAK_IN_FLIGHT
+  - TAU2_AUX_OBSERVED_REQUEST_LATENCIES_S_JSON=PENDING_ROLE_REQUEST_LATENCY_DISTRIBUTIONS_JSON
+  - TAU2_AUX_OBSERVED_PROMPT_TOKENS_JSON=PENDING_ROLE_PROMPT_TOKEN_DISTRIBUTIONS_JSON
+  - TAU2_AUX_PROMPT_HEADROOM_FACTORS_JSON=PENDING_ROLE_PROMPT_HEADROOM_FACTORS_JSON
+  - TAU2_AUX_GENERATION_RESERVE_TOKENS_JSON=PENDING_ROLE_GENERATION_RESERVES_JSON
+  - TAU2_AUX_SNAPSHOT_HASH_BYTES=PENDING_EXACT_NON_CACHE_QWEN27_SNAPSHOT_HASH_IO_BYTES
+  - TAU2_AUX_SUBMISSION_MODE=restartable
+  # Measure seeded judge stability before considering batch-invariant kernels.
+  - VLLM_BATCH_INVARIANT=0
