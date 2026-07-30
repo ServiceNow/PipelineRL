@@ -61,7 +61,7 @@ class _Model:
         return {name}
 
 
-def _worker(model=None):
+def _worker(model=None, *, tied_output_head=True):
     return SimpleNamespace(
         rank=1,
         local_rank=1,
@@ -72,7 +72,7 @@ def _worker(model=None):
         model_update_group=_BroadcastGroup(),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
-                tie_word_embeddings=True,
+                tie_word_embeddings=tied_output_head,
             )
         ),
     )
@@ -109,6 +109,30 @@ def _request(*, collect_evidence):
                     "model.layers.0.self_attn."
                     "k_proj.weight"
                 ),
+                shape=[2],
+                dtype="torch.float32",
+            ),
+        ],
+    )
+
+
+def _dense_request() -> WeightUpdateRequest:
+    return WeightUpdateRequest(
+        version=192,
+        collect_evidence=True,
+        parameters_info=[
+            ParameterInfo(
+                name="model.embed_tokens.weight",
+                shape=[2],
+                dtype="torch.float32",
+            ),
+            ParameterInfo(
+                name="model.layers.0.self_attn.q_proj.weight",
+                shape=[2],
+                dtype="torch.float32",
+            ),
+            ParameterInfo(
+                name="lm_head.weight",
                 shape=[2],
                 dtype="torch.float32",
             ),
@@ -175,6 +199,37 @@ def test_worker_receipts_cover_packed_experts_kv_and_tied_head(
         fingerprint = receipt["received_fingerprint"]
         assert fingerprint["numel"] == 2
         assert fingerprint["finite_count"] == 2
+
+
+def test_dense_untied_worker_receipts_keep_embedding_and_head_distinct(
+    monkeypatch,
+):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        "pipelinerl.vllm1.pipelinerl.vllm_quantization."
+        "invalidate_fp32_cache",
+        lambda: None,
+    )
+
+    result = WorkerExtension.receive_weight_update(
+        _worker(tied_output_head=False),
+        _dense_request().model_dump_json(),
+    )
+
+    receipts = {
+        receipt["source_name"]: receipt
+        for receipt in result["receipts"]
+    }
+    assert receipts["model.embed_tokens.weight"]["categories"] == [
+        "embedding"
+    ]
+    assert receipts["lm_head.weight"]["categories"] == [
+        "output_head"
+    ]
+    assert receipts[
+        "model.layers.0.self_attn.q_proj.weight"
+    ]["categories"] == []
 
 
 def test_default_off_accepts_multi_name_load_without_fingerprinting(

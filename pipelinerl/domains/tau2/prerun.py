@@ -15,22 +15,23 @@ from pipelinerl.prerun_evidence import (
     GEMMA_MODEL_ID,
     GEMMA_MODEL_REVISION,
     GEMMA_MODEL_REVISION_PROVENANCE,
-    GEMMA_POLICY_IDENTITY,
     GEMMA_TOPOLOGY_PROVENANCE,
     PARITY_MAX_ABS_TOLERANCE,
     PARITY_TOLERANCE_BASIS,
-    REQUIRED_TRANSFER_CATEGORIES,
-    GemmaTopology,
     ModelArtifactIdentity,
+    TextModelTopology,
     ParityEvidence,
     TransferEvidence,
     assert_no_vision_parameters,
-    gemma_revision_is_verified,
+    get_text_model_descriptor,
     hash_model_snapshot,
-    inspect_gemma_snapshot,
+    inspect_text_model_snapshot,
     make_parity_evidence,
+    model_revision_is_verified,
     parameter_categories,
+    parameter_layer_indices,
     read_evidence_records,
+    required_transfer_categories,
 )
 
 RUN1_POLICY_LOSS = "gspo"
@@ -358,7 +359,7 @@ class PreRunManifest(BaseModel):
     schema_version: int = 1
     job_spec_sha256: str
     model: ModelArtifactIdentity
-    topology: GemmaTopology
+    topology: TextModelTopology
     source_pins: SourcePins
     user_simulator: ServiceIdentity
     user_simulator_deployment: UserSimulatorDeployment
@@ -746,6 +747,7 @@ def _validate_transfer(
     *,
     endpoints: Sequence[str],
     tp_size: int,
+    topology: TextModelTopology,
 ) -> GateResult:
     candidates = [
         event for event in events if event.phase == "after_optimizer"
@@ -795,6 +797,23 @@ def _validate_transfer(
             passed=False,
             detail="transfer contains no source tensors",
         )
+    expected_layers = set(range(topology.num_hidden_layers))
+    topology_layers = set(topology.layer_indices)
+    if topology_layers != expected_layers:
+        return GateResult(
+            passed=False,
+            detail="model topology layer coverage mismatch",
+        )
+    source_layers = parameter_layer_indices(source_names)
+    if source_layers != expected_layers:
+        return GateResult(
+            passed=False,
+            detail=(
+                "trainer source layer coverage mismatch: "
+                f"observed={sorted(source_layers)}, "
+                f"expected={sorted(expected_layers)}"
+            ),
+        )
     assert_no_vision_parameters(
         source_names,
         surface="trainer transfer",
@@ -802,6 +821,14 @@ def _validate_transfer(
     for endpoint in event.endpoints:
         worker_ranks = [worker.rank for worker in endpoint.workers]
         expected_ranks = set(range(tp_size))
+        if tp_size > 0 and len(worker_ranks) > tp_size:
+            return GateResult(
+                passed=False,
+                detail=(
+                    f"{endpoint.endpoint} gate 3 requires vLLM "
+                    "pipeline parallel size 1"
+                ),
+            )
         if (
             tp_size <= 0
             or len(worker_ranks) != tp_size
@@ -853,7 +880,10 @@ def _validate_transfer(
                         name,
                         *receipt.loaded_names,
                     ]
-                    for category in parameter_categories(parameter_name)
+                    for category in parameter_categories(
+                        parameter_name,
+                        tied_output_head=topology.tie_word_embeddings,
+                    )
                 }
                 if set(receipt.categories) != expected_categories:
                     return GateResult(
@@ -864,7 +894,27 @@ def _validate_transfer(
                         ),
                     )
                 categories.update(expected_categories)
-            missing = REQUIRED_TRANSFER_CATEGORIES - categories
+            loaded_layers = parameter_layer_indices(
+                loaded_name
+                for receipt in worker.receipts
+                for loaded_name in receipt.loaded_names
+            )
+            if loaded_layers != expected_layers:
+                return GateResult(
+                    passed=False,
+                    detail=(
+                        f"{endpoint.endpoint} rank {worker.rank} "
+                        "loaded layer coverage mismatch: "
+                        f"observed={sorted(loaded_layers)}, "
+                        f"expected={sorted(expected_layers)}"
+                    ),
+                )
+            if loaded_layers:
+                categories.add("backbone")
+            missing = (
+                required_transfer_categories(topology.num_experts)
+                - categories
+            )
             if missing:
                 return GateResult(
                     passed=False,
@@ -876,8 +926,8 @@ def _validate_transfer(
     return GateResult(
         passed=True,
         detail=(
-            "all after-optimizer tensors and required categories reached "
-            "every TP worker"
+            "all after-optimizer tensors, layers, and required categories "
+            "reached every TP worker"
         ),
     )
 
@@ -1002,6 +1052,15 @@ def finalize_prerun_manifest(
     evidence_dir: Path,
 ) -> PreRunManifest:
     snapshot = Path(spec.model_snapshot)
+    descriptor = get_text_model_descriptor(
+        spec.model_id,
+        spec.model_revision,
+    )
+    revision_provenance = (
+        GEMMA_MODEL_REVISION_PROVENANCE
+        if descriptor.model_id == GEMMA_MODEL_ID
+        else descriptor.provenance
+    )
     user_simulator_model = hash_model_snapshot(
         Path(spec.user_simulator_deployment.snapshot_path),
         USER_SIMULATOR_MODEL_ID,
@@ -1021,7 +1080,11 @@ def finalize_prerun_manifest(
         spec.model_id,
         spec.model_revision,
     )
-    topology = inspect_gemma_snapshot(snapshot)
+    topology = inspect_text_model_snapshot(
+        snapshot,
+        descriptor,
+        model,
+    )
     transfers = [
         TransferEvidence.model_validate(record)
         for record in read_evidence_records(
@@ -1074,23 +1137,24 @@ def finalize_prerun_manifest(
     )
     source_model_pins_match = (
         spec.source_pins == PINNED_SOURCES
-        and spec.model_id == GEMMA_MODEL_ID
-        and spec.model_revision == GEMMA_MODEL_REVISION
-        and spec.policy_model == GEMMA_POLICY_IDENTITY
-        and gemma_revision_is_verified()
+        and descriptor.policy_eligible
+        and spec.policy_model
+        == f"{descriptor.model_id}@{descriptor.revision}"
+        and model_revision_is_verified(descriptor)
     )
     gate2 = GateResult(
         passed=source_model_pins_match,
         detail=(
             "executed source/model pins match="
             f"{source_model_pins_match}; revision provenance="
-            f"{GEMMA_MODEL_REVISION_PROVENANCE}"
+            f"{revision_provenance}"
         ),
     )
     gate3 = _validate_transfer(
         transfers,
         endpoints=spec.policy_endpoints,
         tp_size=spec.expected_tp_size,
+        topology=topology,
     )
     gate4 = _validate_parity(
         parity,
@@ -1193,7 +1257,7 @@ def finalize_prerun_manifest(
     gates = {
         "1_user_separation": gate1,
         "2_source_pins": gate2,
-        "3_moe_transfer": gate3,
+        "3_model_transfer": gate3,
         "4_policy_parity": gate4,
         "5_packing_isolation": gate5,
         "6_endpoint_affinity": gate6,
@@ -1206,6 +1270,8 @@ def finalize_prerun_manifest(
         model=model,
         topology=topology,
         source_pins=spec.source_pins,
+        model_revision_provenance=revision_provenance,
+        topology_provenance=descriptor.provenance,
         user_simulator=spec.user_simulator,
         user_simulator_deployment=(
             spec.user_simulator_deployment

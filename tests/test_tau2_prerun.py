@@ -32,9 +32,11 @@ from pipelinerl.domains.tau2.prerun import (
 )
 from pipelinerl.prerun_evidence import (
     EndpointTransferReceipt,
+    GEMMA_MODEL_DESCRIPTOR,
     ParameterTransferReceipt,
     ParityEvidence,
     TensorFingerprint,
+    TextModelTopology,
     TransferEvidence,
     WorkerTransferReceipt,
     append_evidence_record,
@@ -214,14 +216,20 @@ def _fingerprint(value: float) -> TensorFingerprint:
 
 
 def _source_fingerprints() -> dict[str, TensorFingerprint]:
-    return {
+    sources = {
         "model.embed_tokens.weight": _fingerprint(1.0),
         "model.layers.0.experts.gate_up_proj": _fingerprint(2.0),
         "model.layers.0.router.proj.weight": _fingerprint(3.0),
-        "model.layers.0.self_attn.qkv_proj.weight": (
-            _fingerprint(4.0)
-        ),
     }
+    sources.update(
+        {
+            f"model.layers.{index}.self_attn.q_proj.weight": _fingerprint(
+                4.0 + index
+            )
+            for index in range(30)
+        }
+    )
+    return sources
 
 
 def _loaded_names(source_name: str) -> list[str]:
@@ -241,6 +249,8 @@ def _loaded_names(source_name: str) -> list[str]:
 def _worker_receipt(
     rank: int,
     sources: dict[str, TensorFingerprint],
+    *,
+    tied_output_head: bool = True,
 ) -> WorkerTransferReceipt:
     receipts = []
     for name, fingerprint in sources.items():
@@ -248,7 +258,10 @@ def _worker_receipt(
         categories = {
             category
             for parameter_name in [name, *loaded_names]
-            for category in parameter_categories(parameter_name)
+            for category in parameter_categories(
+                parameter_name,
+                tied_output_head=tied_output_head,
+            )
         }
         receipts.append(
             ParameterTransferReceipt(
@@ -276,6 +289,86 @@ def _transfer_evidence() -> TransferEvidence:
                 workers=[
                     _worker_receipt(0, sources),
                     _worker_receipt(1, sources),
+                ],
+            )
+            for endpoint in POLICY_ENDPOINTS
+        ],
+    )
+
+
+def _gemma_text_topology() -> TextModelTopology:
+    return TextModelTopology(
+        model_type="gemma4",
+        text_model_type="gemma4_text",
+        num_hidden_layers=30,
+        hidden_size=2816,
+        intermediate_size=2112,
+        num_experts=128,
+        top_k_experts=8,
+        moe_intermediate_size=704,
+        max_position_embeddings=262_144,
+        vocab_size=262_144,
+        tie_word_embeddings=True,
+        layer_indices=list(range(30)),
+        text_tensor_count=len(_source_fingerprints()),
+        vision_tensor_count=1,
+        nontransferred_tensor_count=0,
+        transfer_categories=[
+            "backbone",
+            "embedding",
+            "expert",
+            "output_head",
+            "router",
+        ],
+    )
+
+
+def _dense_text_topology() -> TextModelTopology:
+    return TextModelTopology(
+        model_type="qwen3_5",
+        text_model_type="qwen3_5_text",
+        num_hidden_layers=2,
+        hidden_size=8,
+        intermediate_size=16,
+        num_experts=0,
+        top_k_experts=0,
+        moe_intermediate_size=0,
+        max_position_embeddings=64,
+        vocab_size=32,
+        tie_word_embeddings=False,
+        layer_indices=[0, 1],
+        text_tensor_count=4,
+        vision_tensor_count=0,
+        nontransferred_tensor_count=0,
+        transfer_categories=[
+            "backbone",
+            "embedding",
+            "output_head",
+        ],
+    )
+
+
+def _dense_transfer_evidence() -> TransferEvidence:
+    sources = {
+        "model.embed_tokens.weight": _fingerprint(1.0),
+        "model.layers.0.self_attn.q_proj.weight": _fingerprint(2.0),
+        "model.layers.1.self_attn.q_proj.weight": _fingerprint(3.0),
+        "lm_head.weight": _fingerprint(4.0),
+    }
+    return TransferEvidence(
+        phase="after_optimizer",
+        version=192,
+        source_fingerprints=sources,
+        endpoints=[
+            EndpointTransferReceipt(
+                endpoint=endpoint,
+                workers=[
+                    _worker_receipt(
+                        rank,
+                        sources,
+                        tied_output_head=False,
+                    )
+                    for rank in range(2)
                 ],
             )
             for endpoint in POLICY_ENDPOINTS
@@ -531,6 +624,131 @@ def test_tensor_fingerprint_covers_all_values_and_finiteness():
     )
 
 
+def test_dense_untied_transfer_covers_every_layer_and_required_category():
+    gate = tau2_prerun._validate_transfer(
+        [_dense_transfer_evidence()],
+        endpoints=POLICY_ENDPOINTS,
+        tp_size=2,
+        topology=_dense_text_topology(),
+    )
+
+    assert gate.passed is True
+
+
+def test_transfer_rejects_missing_trainer_source_layer():
+    transfer = _dense_transfer_evidence()
+    layer_one = "model.layers.1.self_attn.q_proj.weight"
+    del transfer.source_fingerprints[layer_one]
+    for endpoint in transfer.endpoints:
+        for worker in endpoint.workers:
+            worker.receipts = [
+                receipt
+                for receipt in worker.receipts
+                if receipt.source_name != layer_one
+            ]
+
+    gate = tau2_prerun._validate_transfer(
+        [transfer],
+        endpoints=POLICY_ENDPOINTS,
+        tp_size=2,
+        topology=_dense_text_topology(),
+    )
+
+    assert gate.passed is False
+    assert "trainer source layer coverage mismatch" in gate.detail
+
+
+def test_transfer_rejects_missing_loaded_layer_on_one_worker():
+    transfer = _dense_transfer_evidence()
+    worker = transfer.endpoints[0].workers[0]
+    layer_one = next(
+        receipt
+        for receipt in worker.receipts
+        if receipt.source_name.startswith("model.layers.1.")
+    )
+    layer_one.loaded_names = [
+        "model.layers.0.self_attn.q_proj.weight"
+    ]
+
+    gate = tau2_prerun._validate_transfer(
+        [transfer],
+        endpoints=POLICY_ENDPOINTS,
+        tp_size=2,
+        topology=_dense_text_topology(),
+    )
+
+    assert gate.passed is False
+    assert "rank 0 loaded layer coverage mismatch" in gate.detail
+
+
+def test_transfer_rejects_pipeline_parallel_worker_topology():
+    transfer = _dense_transfer_evidence()
+    for endpoint in transfer.endpoints:
+        endpoint.workers.extend(
+            _worker_receipt(
+                rank,
+                transfer.source_fingerprints,
+                tied_output_head=False,
+            )
+            for rank in (2, 3)
+        )
+
+    gate = tau2_prerun._validate_transfer(
+        [transfer],
+        endpoints=POLICY_ENDPOINTS,
+        tp_size=2,
+        topology=_dense_text_topology(),
+    )
+
+    assert gate.passed is False
+    assert "requires vLLM pipeline parallel size 1" in gate.detail
+
+
+def test_dense_untied_transfer_requires_output_head():
+    transfer = _dense_transfer_evidence()
+    del transfer.source_fingerprints["lm_head.weight"]
+    for endpoint in transfer.endpoints:
+        for worker in endpoint.workers:
+            worker.receipts = [
+                receipt
+                for receipt in worker.receipts
+                if receipt.source_name != "lm_head.weight"
+            ]
+
+    gate = tau2_prerun._validate_transfer(
+        [transfer],
+        endpoints=POLICY_ENDPOINTS,
+        tp_size=2,
+        topology=_dense_text_topology(),
+    )
+
+    assert gate.passed is False
+    assert "missing categories ['output_head']" in gate.detail
+
+
+def test_moe_transfer_still_requires_router_category():
+    transfer = _transfer_evidence()
+    router = "model.layers.0.router.proj.weight"
+    del transfer.source_fingerprints[router]
+    for endpoint in transfer.endpoints:
+        for worker in endpoint.workers:
+            worker.receipts = [
+                receipt
+                for receipt in worker.receipts
+                if receipt.source_name != router
+            ]
+
+    gate = tau2_prerun._validate_transfer(
+        [transfer],
+        endpoints=POLICY_ENDPOINTS,
+        tp_size=2,
+        topology=_gemma_text_topology(),
+    )
+
+    assert gate.passed is False
+    assert "missing categories ['router']" in gate.detail
+
+
 def test_finalizer_requires_all_nine_gates_and_records_evidence(
     tmp_path: Path,
     monkeypatch,
@@ -562,6 +780,18 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
         "USER_SIMULATOR_SNAPSHOT",
         user_simulator_deployment.snapshot_path,
     )
+
+    def inspect_policy_snapshot(snapshot, descriptor, identity):
+        assert descriptor is GEMMA_MODEL_DESCRIPTOR
+        assert identity.model_id == descriptor.model_id
+        assert identity.revision == descriptor.revision
+        return _gemma_text_topology()
+
+    monkeypatch.setattr(
+        tau2_prerun,
+        "inspect_text_model_snapshot",
+        inspect_policy_snapshot,
+    )
     spec = PreRunSpec(
         model_snapshot=str(_snapshot(tmp_path)),
         source_pins=PINNED_SOURCES,
@@ -591,6 +821,9 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
     assert manifest.ready is True
     assert len(manifest.gates) == 9
     assert all(gate.passed for gate in manifest.gates.values())
+    assert manifest.gates["3_model_transfer"].passed is True
+    assert manifest.topology.layer_indices == list(range(30))
+    assert "backbone" in manifest.topology.transfer_categories
     assert manifest.parity_tolerance == 0.05
     assert "6.4 BF16 epsilons" in (
         manifest.parity_tolerance_basis

@@ -37,10 +37,10 @@ from pipelinerl.prerun_evidence import (
     GEMMA_MODEL_ID,
     GEMMA_MODEL_REVISION,
     GEMMA_POLICY_IDENTITY,
-    REQUIRED_TRANSFER_CATEGORIES,
+    QWEN35_27B_MODEL_DESCRIPTOR,
     ArtifactDigest,
-    GemmaTopology,
     ModelArtifactIdentity,
+    TextModelTopology,
     hash_model_snapshot,
 )
 
@@ -273,21 +273,26 @@ def _ready_manifest(
                 )
             ],
         ),
-        topology=GemmaTopology(
+        topology=TextModelTopology(
             model_type="gemma4",
             text_model_type="gemma4_text",
             num_hidden_layers=30,
             hidden_size=2816,
+            intermediate_size=2112,
             num_experts=128,
             top_k_experts=8,
             moe_intermediate_size=704,
             max_position_embeddings=262144,
             vocab_size=262144,
             tie_word_embeddings=True,
+            layer_indices=list(range(30)),
             text_tensor_count=1,
             vision_tensor_count=0,
+            nontransferred_tensor_count=0,
             transfer_categories=sorted(
-                REQUIRED_TRANSFER_CATEGORIES
+                {
+                    "backbone", "embedding", "expert", "output_head", "router"
+                }
             ),
         ),
         source_pins=PINNED_SOURCES,
@@ -886,6 +891,36 @@ def test_unverified_revision_fails_before_process(
         cfg,
         monkeypatch,
         "unverified placeholder",
+    )
+
+
+def test_pipeline_parallel_policy_is_rejected_before_process(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _compose_recipe()
+    cfg.output_dir = str(tmp_path / "output")
+    cfg.tau2_gym.user_model_url = USER_SIMULATOR_ENDPOINT
+    cfg.vllm_config.vllm_kwargs["pipeline-parallel-size"] = 2
+    _assert_main_fails_before_process(
+        cfg,
+        monkeypatch,
+        "vLLM pipeline parallel size for gate 3",
+    )
+
+
+def test_qwen_27b_simulator_is_rejected_as_run1_policy_before_process(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _compose_recipe()
+    cfg.output_dir = str(tmp_path / "output")
+    cfg.finetune.config_name = QWEN35_27B_MODEL_DESCRIPTOR.model_id
+    cfg.finetune.model_revision = QWEN35_27B_MODEL_DESCRIPTOR.revision
+    _assert_main_fails_before_process(
+        cfg,
+        monkeypatch,
+        "not eligible for the run-1 policy role",
     )
 
 

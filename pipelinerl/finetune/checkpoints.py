@@ -21,10 +21,11 @@ from transformers import (
 from transformers.models.auto.modeling_auto import _BaseAutoModelClass
 
 from pipelinerl.prerun_evidence import (
-    GEMMA_MODEL_ID,
-    GEMMA_MODEL_REVISION,
+    GEMMA_MODEL_DESCRIPTOR,
+    TextModelDescriptor,
     assert_no_vision_parameters,
-    require_verified_gemma_revision,
+    get_text_model_descriptor,
+    require_verified_model_revision,
 )
 
 from .context import get_accelerator, logger
@@ -32,7 +33,6 @@ from .lora import has_lora_checkpoint, lora_load, lora_save, prepare_lora_model
 from .types import ModelClass, TrainingMetrics
 from .value_model import AutoModelForCausalLMWithValueHead
 
-_GEMMA4_TEXT_KEY_MAPPING = {r"^model\.language_model\.": "model."}
 
 
 def is_deepspeed_model(model) -> bool:
@@ -150,37 +150,73 @@ def load_tokenizer(config_name, *, revision: str | None = None):
     return tokenizer
 
 
-def get_model_loader(args, model_class: ModelClass):
-    """Return the configured model class and text-only Gemma load arguments."""
-    model_cls = get_auto_model_class(model_class)
-    if not getattr(args, "text_only_gemma4", False):
-        return model_cls, {}
-    if model_class != "causal-language-modeling":
-        raise ValueError("text_only_gemma4 requires causal-language-modeling")
-    revision = getattr(args, "model_revision", None)
-    if (
-        args.config_name != GEMMA_MODEL_ID
-        or revision != GEMMA_MODEL_REVISION
-    ):
+def _configured_text_model_descriptor(
+    args,
+) -> TextModelDescriptor | None:
+    legacy_gemma = bool(getattr(args, "text_only_gemma4", False))
+    text_only_composite = bool(
+        getattr(args, "text_only_composite_model", False)
+    )
+    if legacy_gemma and text_only_composite:
         raise ValueError(
-            "text_only_gemma4 requires the reviewed Gemma model ID and revision"
+            "Configure only one text-only composite-model selector"
         )
-    require_verified_gemma_revision()
-    config_args = {"trust_remote_code": args.trust_remote_code}
-    if revision is not None:
-        config_args["revision"] = revision
+    if not legacy_gemma and not text_only_composite:
+        return None
+    descriptor = get_text_model_descriptor(
+        args.config_name,
+        getattr(args, "model_revision", None),
+    )
+    if legacy_gemma and descriptor is not GEMMA_MODEL_DESCRIPTOR:
+        raise ValueError(
+            "text_only_gemma4 requires the reviewed Gemma model ID and "
+            "revision"
+        )
+    return descriptor
+
+
+def get_model_loader(args, model_class: ModelClass):
+    """Return the configured model class and text-only load arguments."""
+    descriptor = _configured_text_model_descriptor(args)
+    if descriptor is None:
+        return get_auto_model_class(model_class), {}
+    if model_class != "causal-language-modeling":
+        raise ValueError(
+            "Text-only composite models require causal-language-modeling"
+        )
+    if not descriptor.policy_eligible:
+        raise ValueError(
+            f"{descriptor.model_id}@{descriptor.revision} is not eligible "
+            "for the run-1 policy role"
+        )
+    require_verified_model_revision(descriptor)
+    revision = getattr(args, "model_revision", None)
     composite_config = transformers.AutoConfig.from_pretrained(
         args.config_name,
-        **config_args,
+        trust_remote_code=args.trust_remote_code,
+        revision=revision,
     )
-    if composite_config.model_type != "gemma4":
-        raise ValueError("text_only_gemma4 requires a Gemma4 composite checkpoint")
+    if composite_config.model_type != descriptor.composite_model_type:
+        raise ValueError(
+            "Composite model type does not match the reviewed descriptor"
+        )
     text_config = getattr(composite_config, "text_config", None)
-    if text_config is None or text_config.model_type != "gemma4_text":
-        raise ValueError("Gemma4 composite checkpoint has no Gemma4 text config")
-    return transformers.Gemma4ForCausalLM, {
+    text_config_cls = getattr(
+        transformers,
+        descriptor.text_config_class_name,
+    )
+    if (
+        not isinstance(text_config, text_config_cls)
+        or text_config.model_type != descriptor.text_model_type
+    ):
+        raise ValueError(
+            "Composite checkpoint text config does not match the reviewed "
+            "descriptor"
+        )
+    model_cls = getattr(transformers, descriptor.model_class_name)
+    return model_cls, {
         "config": text_config,
-        "key_mapping": _GEMMA4_TEXT_KEY_MAPPING,
+        "key_mapping": dict(descriptor.key_mapping),
     }
 
 
@@ -258,7 +294,7 @@ def load_model(args, model_class, current_dir):
     logger.info(f"Loading args: {loading_args}")
 
     model = model_cls.from_pretrained(model_to_load, **loading_args)
-    if getattr(args, "text_only_gemma4", False):
+    if _configured_text_model_descriptor(args) is not None:
         assert_no_vision_parameters(
             (name for name, _ in model.named_parameters()),
             surface="trainer model",

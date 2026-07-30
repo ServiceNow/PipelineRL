@@ -363,6 +363,11 @@ def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
         "vLLM tensor parallel size",
     )
     _require_equal(
+        int(cfg.vllm_config.vllm_kwargs["pipeline-parallel-size"]),
+        1,
+        "vLLM pipeline parallel size for gate 3",
+    )
+    _require_equal(
         bool(cfg.use_deepspeed),
         True,
         "DeepSpeed enablement",
@@ -861,10 +866,20 @@ def validate_tau2_prerun(cfg: DictConfig) -> None:
     if not prerun:
         return
     from pipelinerl.prerun_evidence import (
-        require_verified_gemma_revision,
+        get_text_model_descriptor,
+        require_verified_model_revision,
     )
 
-    require_verified_gemma_revision()
+    descriptor = get_text_model_descriptor(
+        str(cfg.finetune.config_name),
+        str(cfg.finetune.get("model_revision")),
+    )
+    require_verified_model_revision(descriptor)
+    if not descriptor.policy_eligible:
+        raise ValueError(
+            f"{descriptor.model_id}@{descriptor.revision} is not eligible "
+            "for the run-1 policy role"
+        )
     _validate_tau2_recipe_identity(cfg)
     job_spec_path = _required_prerun_path(
         prerun,
