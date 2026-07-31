@@ -49,17 +49,17 @@ def _sha256_file(path: Path) -> str:
 def _required_prerun_path(prerun: DictConfig, key: str) -> Path:
     value = str(prerun.get(key, ""))
     if not value or value.startswith("PENDING_"):
-        raise ValueError(f"Tau2/Gemma {key} is unresolved")
+        raise ValueError(f"Tau2/Qwen {key} is unresolved")
     path = Path(value)
     if not path.is_file():
-        raise ValueError(f"Tau2/Gemma {key} does not exist: {path}")
+        raise ValueError(f"Tau2/Qwen {key} does not exist: {path}")
     return path
 
 
 def _require_equal(actual, expected, label: str) -> None:
     if actual != expected:
         raise ValueError(
-            f"Tau2/Gemma {label}={actual!r}, expected {expected!r}"
+            f"Tau2/Qwen {label}={actual!r}, expected {expected!r}"
         )
 
 
@@ -359,37 +359,42 @@ def _validate_auxiliary_model_job_spec(
 
 
 def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
+    from pipelinerl.domains.tau2.client import Tau2GymSettings
     from pipelinerl.domains.tau2.prerun import (
+        AUXILIARY_JUDGE_MODEL,
+        AUXILIARY_USER_MODEL,
         GSPO_TOKEN_UPGRADE_TRIGGER,
         POLICY_LOSS_FALLBACK,
         POLICY_LOSS_FALLBACK_TRIGGER,
-        AUXILIARY_JUDGE_MODEL,
-        AUXILIARY_USER_MODEL,
+        POLICY_MODEL_ID,
+        POLICY_MODEL_IDENTITY,
+        POLICY_MODEL_REVISION,
+        POLICY_MODEL_SNAPSHOT,
         RUN1_POLICY_LOSS,
         validate_auxiliary_model_endpoint,
     )
-    from pipelinerl.prerun_evidence import (
-        GEMMA_MODEL_ID,
-        GEMMA_MODEL_REVISION,
-        GEMMA_POLICY_IDENTITY,
-    )
+    from pipelinerl.prerun_evidence import QWEN35_TOOL_CALL_PARSER
 
     prerun = cfg.tau2_prerun
-    _require_equal(str(cfg.model_path), GEMMA_MODEL_ID, "model_path")
+    _require_equal(str(cfg.model_path), POLICY_MODEL_ID, "model_path")
     _require_equal(
         str(cfg.finetune.config_name),
-        GEMMA_MODEL_ID,
+        POLICY_MODEL_ID,
         "finetune.config_name",
     )
     _require_equal(
         str(cfg.finetune.get("model_revision")),
-        GEMMA_MODEL_REVISION,
+        POLICY_MODEL_REVISION,
         "finetune.model_revision",
     )
+    if "text_only_gemma4" in cfg.finetune:
+        raise ValueError(
+            "Tau2/Qwen finetune.text_only_gemma4 was removed"
+        )
     _require_equal(
-        bool(cfg.finetune.get("text_only_gemma4", False)),
+        bool(cfg.finetune.get("text_only_composite_model", False)),
         True,
-        "finetune.text_only_gemma4",
+        "finetune.text_only_composite_model",
     )
     _require_equal(
         str(cfg.finetune.rl.policy_loss),
@@ -398,8 +403,13 @@ def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
     )
     _require_equal(
         str(prerun.policy_model),
-        GEMMA_POLICY_IDENTITY,
+        POLICY_MODEL_IDENTITY,
         "policy_model",
+    )
+    _require_equal(
+        Path(str(prerun.model_snapshot)).resolve(),
+        Path(POLICY_MODEL_SNAPSHOT).resolve(),
+        "policy model snapshot",
     )
     _require_equal(
         str(prerun.policy_loss_fallback),
@@ -416,16 +426,20 @@ def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
         GSPO_TOKEN_UPGRADE_TRIGGER,
         "gspo_token_upgrade_trigger",
     )
+
+    settings = Tau2GymSettings.model_validate(
+        OmegaConf.to_container(cfg.tau2_gym, resolve=True)
+    )
     _require_equal(
-        str(cfg.tau2_gym.policy_model_name),
-        GEMMA_POLICY_IDENTITY,
+        settings.policy_model_name,
+        POLICY_MODEL_IDENTITY,
         "Gym policy model",
     )
     user_endpoint = validate_auxiliary_model_endpoint(
-        str(cfg.tau2_gym.user_model_url)
+        settings.user_model_url
     )
     judge_endpoint = validate_auxiliary_model_endpoint(
-        str(cfg.tau2_gym.judge_model_url)
+        settings.judge_model_url
     )
     _require_equal(
         judge_endpoint,
@@ -433,22 +447,66 @@ def _validate_tau2_recipe_identity(cfg: DictConfig) -> None:
         "shared auxiliary endpoint",
     )
     _require_equal(
-        str(cfg.tau2_gym.user_model_name),
+        settings.user_model_name,
         AUXILIARY_USER_MODEL,
         "user model",
     )
     _require_equal(
-        str(cfg.tau2_gym.judge_model_name),
+        settings.judge_model_name,
         AUXILIARY_JUDGE_MODEL,
         "judge model",
     )
     _require_equal(
-        int(cfg.vllm_config.vllm_kwargs["tensor-parallel-size"]),
+        (
+            settings.policy_thinking_enabled,
+            settings.user_thinking_enabled,
+            settings.judge_thinking_enabled,
+        ),
+        (True, True, True),
+        "role thinking",
+    )
+    _require_equal(
+        (
+            settings.judge_temperature,
+            settings.judge_top_p,
+            settings.judge_top_k,
+        ),
+        (0.6, 0.95, 20),
+        "judge sampling",
+    )
+    _require_equal(
+        settings.judge_seed,
+        int(cfg.seed),
+        "judge seed",
+    )
+
+    vllm_kwargs = cfg.vllm_config.vllm_kwargs
+    _require_equal(
+        vllm_kwargs.get("enable-auto-tool-choice"),
+        "",
+        "vLLM enable-auto-tool-choice flag",
+    )
+    _require_equal(
+        str(vllm_kwargs.get("tool-call-parser")),
+        QWEN35_TOOL_CALL_PARSER,
+        "vLLM tool-call parser",
+    )
+    if "tool-parser-plugin" in vllm_kwargs:
+        raise ValueError(
+            "Tau2/Qwen forbids vLLM tool-parser-plugin"
+        )
+    _require_equal(
+        list(vllm_kwargs["served-model-name"]),
+        [POLICY_MODEL_ID, POLICY_MODEL_IDENTITY],
+        "vLLM served model names",
+    )
+    _require_equal(
+        int(vllm_kwargs["tensor-parallel-size"]),
         2,
         "vLLM tensor parallel size",
     )
     _require_equal(
-        int(cfg.vllm_config.vllm_kwargs["pipeline-parallel-size"]),
+        int(vllm_kwargs["pipeline-parallel-size"]),
         1,
         "vLLM pipeline parallel size for gate 3",
     )
@@ -471,6 +529,9 @@ def _validate_tau2_calibration(
         PINNED_SOURCES,
         POLICY_LOSS_FALLBACK,
         POLICY_LOSS_FALLBACK_TRIGGER,
+        POLICY_MODEL_ID,
+        POLICY_MODEL_IDENTITY,
+        POLICY_MODEL_REVISION,
         AUXILIARY_JUDGE_MODEL,
         AUXILIARY_USER_MODEL,
         RUN1_POLICY_LOSS,
@@ -478,16 +539,10 @@ def _validate_tau2_calibration(
         ServiceIdentity,
         TrainerMemoryCandidate,
     )
-    from pipelinerl.prerun_evidence import (
-        GEMMA_MODEL_ID,
-        GEMMA_MODEL_REVISION,
-        GEMMA_POLICY_IDENTITY,
-    )
-
     prerun = cfg.tau2_prerun
     if not prerun.enabled:
         raise ValueError(
-            "Tau2/Gemma calibration requires evidence collection"
+            "Tau2/Qwen calibration requires evidence collection"
         )
     spec_path = _required_prerun_path(prerun, "spec_path")
     spec = PreRunSpec.model_validate_json(spec_path.read_text())
@@ -510,10 +565,10 @@ def _validate_tau2_calibration(
         _sha256_file(job_spec_path),
         "calibration job digest",
     )
-    _require_equal(spec.model_id, GEMMA_MODEL_ID, "spec model")
+    _require_equal(spec.model_id, POLICY_MODEL_ID, "spec model")
     _require_equal(
         spec.model_revision,
-        GEMMA_MODEL_REVISION,
+        POLICY_MODEL_REVISION,
         "spec revision",
     )
     _require_equal(
@@ -554,7 +609,7 @@ def _validate_tau2_calibration(
     )
     _require_equal(
         spec.policy_model,
-        GEMMA_POLICY_IDENTITY,
+        POLICY_MODEL_IDENTITY,
         "spec policy model",
     )
     _require_equal(
@@ -613,7 +668,7 @@ def _validate_tau2_calibration(
     snapshot_path = Path(str(prerun.model_snapshot))
     if not snapshot_path.is_dir():
         raise ValueError(
-            "Tau2/Gemma calibration model snapshot does not exist: "
+            "Tau2/Qwen calibration model snapshot does not exist: "
             f"{snapshot_path}"
         )
     _require_equal(
@@ -734,6 +789,9 @@ def _validate_tau2_production(
         PINNED_SOURCES,
         POLICY_LOSS_FALLBACK,
         POLICY_LOSS_FALLBACK_TRIGGER,
+        POLICY_MODEL_ID,
+        POLICY_MODEL_IDENTITY,
+        POLICY_MODEL_REVISION,
         AUXILIARY_JUDGE_MODEL,
         AUXILIARY_USER_MODEL,
         RUN1_POLICY_LOSS,
@@ -741,17 +799,12 @@ def _validate_tau2_production(
         ServiceIdentity,
         require_ready_manifest,
     )
-    from pipelinerl.prerun_evidence import (
-        GEMMA_MODEL_ID,
-        GEMMA_MODEL_REVISION,
-        GEMMA_POLICY_IDENTITY,
-        hash_model_snapshot,
-    )
+    from pipelinerl.prerun_evidence import hash_model_snapshot
 
     prerun = cfg.tau2_prerun
     if prerun.enabled:
         raise ValueError(
-            "Tau2/Gemma production must not collect calibration evidence"
+            "Tau2/Qwen production must not collect calibration evidence"
         )
     manifest_path = _required_prerun_path(
         prerun,
@@ -773,24 +826,24 @@ def _validate_tau2_production(
     )
     _require_equal(
         manifest.model.model_id,
-        GEMMA_MODEL_ID,
+        POLICY_MODEL_ID,
         "manifest model",
     )
     _require_equal(
         manifest.model.revision,
-        GEMMA_MODEL_REVISION,
+        POLICY_MODEL_REVISION,
         "manifest revision",
     )
     snapshot_path = Path(str(prerun.model_snapshot))
     if not snapshot_path.is_dir():
         raise ValueError(
-            "Tau2/Gemma production model snapshot does not exist: "
+            "Tau2/Qwen production model snapshot does not exist: "
             f"{snapshot_path}"
         )
     model_identity = hash_model_snapshot(
         snapshot_path,
-        GEMMA_MODEL_ID,
-        GEMMA_MODEL_REVISION,
+        POLICY_MODEL_ID,
+        POLICY_MODEL_REVISION,
     )
     _require_equal(model_identity, manifest.model, "model artifact identity")
     _require_equal(
@@ -830,7 +883,7 @@ def _validate_tau2_production(
     )
     _require_equal(
         manifest.policy_model,
-        GEMMA_POLICY_IDENTITY,
+        POLICY_MODEL_IDENTITY,
         "manifest policy model",
     )
     _require_equal(
@@ -887,7 +940,7 @@ def _validate_tau2_production(
     )
     if missing_limits:
         raise ValueError(
-            "Tau2/Gemma manifest is missing derived limits "
+            "Tau2/Qwen manifest is missing derived limits "
             f"{sorted(missing_limits)}"
         )
     for name in required_limits:
@@ -911,21 +964,21 @@ def _validate_tau2_production(
     topology = manifest.recommended_production_topology
     if topology is None:
         raise ValueError(
-            "Tau2/Gemma manifest has no fitting production topology"
+            "Tau2/Qwen manifest has no fitting production topology"
         )
     if not any(
         budget.candidate == topology and budget.fits
         for budget in manifest.trainer_memory_budgets
     ):
         raise ValueError(
-            "Tau2/Gemma recommended topology has no fitting memory budget"
+            "Tau2/Qwen recommended topology has no fitting memory budget"
         )
     if (
         topology.seq_parallel > 1
         and not cfg.finetune.seq_packing
     ):
         raise ValueError(
-            "Tau2/Gemma gate 5 requires a packed-vs-unpacked "
+            "Tau2/Qwen gate 5 requires a packed-vs-unpacked "
             "equivalence proof before packing with seq_parallel > 1"
         )
     _require_equal(
@@ -1016,7 +1069,7 @@ def validate_tau2_prerun(cfg: DictConfig) -> None:
         )
     else:
         raise ValueError(
-            f"Unknown Tau2/Gemma pre-run phase {phase!r}"
+            f"Unknown Tau2/Qwen pre-run phase {phase!r}"
         )
 
 

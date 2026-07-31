@@ -14,18 +14,19 @@ command:
   - pipeline-rl
   - --no-capture-output
   - bash
-  - tau2_gemma.sh
+  - tau2_qwen.sh
   - calibration
 
 resources:
   cpu: 128
   gpu: 8
+  gpuModel: PENDING_APPROVED_TRAINER_GPU_TYPE
   mem: 1536
   replicas: 4
 options:
   infiniband: true
   internal-dns:
-    name: tau2-gemma-calibration
+    name: tau2-qwen-calibration
     ports:
       - {port: 9000, target-port: 9000, protocol: TCP}
       - {port: 9001, target-port: 9001, protocol: TCP}
@@ -44,7 +45,7 @@ options:
       - {port: 12007, target-port: 12007, protocol: TCP}
       - {port: 12008, target-port: 12008, protocol: TCP}
 
-name: tau2-gemma-calibration-pending
+name: tau2-qwen-calibration-pending
 bid: 9999
 interactive: false
 # EAI silently ignores this YAML field. Rafa's approved submission command
@@ -55,13 +56,14 @@ workdir: /home/toolkit/PipelineRL
 environmentVars:
   - HOME=/home/toolkit
   - TAU2_OUTPUT_DIR=PENDING_CALIBRATION_OUTPUT_DIR
-  - TAU2_MODEL_SNAPSHOT=PENDING_IMMUTABLE_MODEL_SNAPSHOT
+  - TAU2_MODEL_SNAPSHOT=/mnt/llmd/base_models/Qwen3.5-9B
   - TAU2_PRERUN_SPEC=PENDING_APPROVED_PRERUN_SPEC_JSON
   - TAU2_PRERUN_MANIFEST=PENDING_OUTPUT_MANIFEST_JSON
-  - TAU2_JOB_SPEC_PATH=/home/toolkit/PipelineRL/tau2_gemma_calibration.yaml
-  - TAU2_AIRLINE_JSONL=PENDING_PREPARED_AIRLINE_JSONL
-  - TAU2_RETAIL_JSONL=PENDING_PREPARED_RETAIL_JSONL
-  - TAU2_TELECOM_JSONL=PENDING_PREPARED_TELECOM_JSONL
+  - TAU2_JOB_SPEC_PATH=/home/toolkit/PipelineRL/tau2_qwen_calibration.yaml
+  - TAU2_PREPARED_DATA_MANIFEST=/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_prepared_manifest.json
+  - TAU2_AIRLINE_JSONL=/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_airline.jsonl
+  - TAU2_RETAIL_JSONL=/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_retail.jsonl
+  - TAU2_TELECOM_JSONL=/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_telecom.jsonl
   - TAU2_USER_API_KEY=keyless-internal-dummy
   - TAU2_USER_SIM_JOB_SPEC_PATH=/home/toolkit/PipelineRL/tau2_qwen_auxiliary.yaml
   - TAU2_USER_SIM_SNAPSHOT=/mnt/llmd/base_models/Qwen3.5-27B
@@ -69,6 +71,14 @@ environmentVars:
   - TAU2_JUDGE_MODEL=qwen3.5-27b-judge@fc05daec18b0a78c049392ed2e771dde82bdf654
   - TAU2_USER_SIMULATOR_ENDPOINT=PENDING_ACCOUNT_SCOPED_TAU2_USER_ENDPOINT
   - TAU2_JUDGE_ENDPOINT=PENDING_ACCOUNT_SCOPED_TAU2_USER_ENDPOINT
+  - TAU2_RUN_SEED=42
+  - TAU2_JUDGE_TEMPERATURE=0.6
+  - TAU2_JUDGE_TOP_P=0.95
+  - TAU2_JUDGE_TOP_K=20
+  - TAU2_JUDGE_INITIAL_MAX_TOKENS=PENDING_APPROVED_JUDGE_INITIAL_MAX_TOKENS
+  - TAU2_JUDGE_RETRY_MAX_TOKENS=PENDING_APPROVED_JUDGE_RETRY_MAX_TOKENS
+  - TAU2_AUXILIARY_MODEL_TIMEOUT_S=PENDING_APPROVED_CALIBRATION_AUXILIARY_TIMEOUT_S
+  - TAU2_TRAINER_GPU_MEMORY_BYTES=PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES
   - TAU2_AUXILIARY_PLACEMENT=one separately managed restartable Qwen3.5-27B EAI vLLM service; no calibration-job GPUs
   - TAU2_AUXILIARY_PROVENANCE=Qwen/Qwen3.5-27B at fc05daec; exact ordered user-then-judge aliases and reviewed artifact SHA256 recorded in the pre-run manifest
   - TAU2_AUXILIARY_SUBMISSION_MODE=restartable alone; no preemptable/non-preemptable CLI flag
@@ -76,8 +86,8 @@ environmentVars:
   - TAU2_AUXILIARY_ROLE_EVIDENCE=PENDING_USER_AND_JUDGE_PROMPT_LATENCY_HEADROOM_RESERVE_DISTRIBUTIONS
   - TAU2_AUXILIARY_SNAPSHOT_HASH_IO=PENDING_EXACT_NON_CACHE_QWEN27_SNAPSHOT_HASH_BYTES
   - TAU2_AUXILIARY_BATCH_INVARIANT=0 pending seeded judge determinism evidence
-  - TAU2_POLICY_MODEL=google/gemma-4-26B-A4B-it@01e5b3ee840d3a9e0b0b493c593e85398a30ef75
-  - TAU2_MODEL_REVISION_STATUS=VERIFIED_2026-07-19
+  - TAU2_POLICY_MODEL=Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  - TAU2_MODEL_REVISION_STATUS=VERIFIED_2026-07-30
   - TAU2_POLICY_LOSS=gspo
   - TAU2_POLICY_LOSS_DECISION=Rafa selected GSPO from Wave 6 gate-8 evidence
   - TAU2_POLICY_LOSS_FALLBACK=dppo
@@ -101,4 +111,4 @@ environmentVars:
   - TAU2_STRICT_TITO_PATCH_SHA256=2ef95bf3cd7f045a134554fbee18e4ba224c9a191fc736c613278b519ed5d6f6
   - TAU2_RUNTIME_SHA=befd120003fb55f48b498f6549556dcaf74582d5
   - TAU2_DATA_SHA=ce4013b0afe03c873488878b72851414f92f458b
-  - 'TAU2_S5_MEMORY_BUDGET_TABLE_JSON=[{"name":"4x8-sp1","nodes":4,"actor_gpus":8,"trainer_gpus":24,"seq_parallel":1,"optimizer_cpu_offload":false,"sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"},{"name":"6x8-sp2","nodes":6,"actor_gpus":8,"trainer_gpus":40,"seq_parallel":2,"optimizer_cpu_offload":false,"sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"},{"name":"8x8-sp8-cpu-offload","nodes":8,"actor_gpus":8,"trainer_gpus":56,"seq_parallel":8,"optimizer_cpu_offload":true,"sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"}]'
+  - 'TAU2_S5_MEMORY_BUDGET_TABLE_JSON=[{"name":"2x8-sp1","nodes":2,"actor_gpus":8,"trainer_gpus":8,"seq_parallel":1,"optimizer_cpu_offload":false,"gpu_memory_bytes":"PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES","sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"},{"name":"3x8-sp1","nodes":3,"actor_gpus":8,"trainer_gpus":16,"seq_parallel":1,"optimizer_cpu_offload":false,"gpu_memory_bytes":"PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES","sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"},{"name":"4x8-sp2","nodes":4,"actor_gpus":8,"trainer_gpus":24,"seq_parallel":2,"optimizer_cpu_offload":false,"gpu_memory_bytes":"PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES","sharded_state_bytes_per_gpu":"pending_calibration","activation_bytes_at_measured_p99":"pending_calibration","all_gather_temp_bytes":"pending_calibration","reserve_bytes":8589934592,"estimated_total_bytes":"pending_calibration","fits":"pending_calibration"}]'

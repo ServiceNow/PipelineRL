@@ -1,4 +1,4 @@
-"""Evidence models and validation for the Tau2/Gemma pre-run gates."""
+"""Evidence models and validation for the Tau2/Qwen pre-run gates."""
 
 from __future__ import annotations
 
@@ -18,11 +18,8 @@ from pipelinerl.domains.tau2.dataset import (
     validate_tau2_prepared_data,
 )
 from pipelinerl.prerun_evidence import (
-    GEMMA_MODEL_ID,
-    GEMMA_MODEL_REVISION,
-    GEMMA_MODEL_REVISION_PROVENANCE,
-    GEMMA_TOPOLOGY_PROVENANCE,
     PARITY_MAX_ABS_TOLERANCE,
+    QWEN35_9B_MODEL_DESCRIPTOR,
     PARITY_TOLERANCE_BASIS,
     QWEN35_27B_MODEL_DESCRIPTOR,
     ModelArtifactIdentity,
@@ -46,6 +43,12 @@ RUN1_POLICY_LOSS = "gspo"
 POLICY_LOSS_FALLBACK = "dppo"
 POLICY_LOSS_FALLBACK_TRIGGER = "bringup shows drift-attributable instability"
 GSPO_TOKEN_UPGRADE_TRIGGER = "demonstrated need for nonuniform token credit"
+POLICY_MODEL_DESCRIPTOR = QWEN35_9B_MODEL_DESCRIPTOR
+POLICY_MODEL_ID = POLICY_MODEL_DESCRIPTOR.model_id
+POLICY_MODEL_REVISION = POLICY_MODEL_DESCRIPTOR.revision
+POLICY_MODEL_IDENTITY = f"{POLICY_MODEL_ID}@{POLICY_MODEL_REVISION}"
+POLICY_MODEL_SNAPSHOT = "/mnt/llmd/base_models/Qwen3.5-9B"
+POLICY_MODEL_PROVENANCE = POLICY_MODEL_DESCRIPTOR.provenance
 AUXILIARY_MODEL_DESCRIPTOR = QWEN35_27B_MODEL_DESCRIPTOR
 AUXILIARY_MODEL_ID = AUXILIARY_MODEL_DESCRIPTOR.model_id
 AUXILIARY_MODEL_REVISION = AUXILIARY_MODEL_DESCRIPTOR.revision
@@ -344,8 +347,8 @@ class GateResult(BaseModel):
 
 class PreRunSpec(BaseModel):
     prepared_data_manifest_path: str
-    model_id: str = GEMMA_MODEL_ID
-    model_revision: str = GEMMA_MODEL_REVISION
+    model_id: str = POLICY_MODEL_ID
+    model_revision: str = POLICY_MODEL_REVISION
     model_snapshot: str
     source_pins: SourcePins
     auxiliary_model_deployment: AuxiliaryModelDeployment
@@ -389,8 +392,8 @@ class PreRunManifest(BaseModel):
     calibration: CalibrationSummary
     trainer_memory_budgets: list[TrainerMemoryBudget]
     recommended_production_topology: TrainerMemoryCandidate | None
-    model_revision_provenance: str = GEMMA_MODEL_REVISION_PROVENANCE
-    topology_provenance: str = GEMMA_TOPOLOGY_PROVENANCE
+    model_revision_provenance: str = POLICY_MODEL_PROVENANCE
+    topology_provenance: str = POLICY_MODEL_PROVENANCE
     auxiliary_model_provenance: str = AUXILIARY_MODEL_PROVENANCE
     auxiliary_model_snapshot_hash_io: str = (
         "The finalizer streams every non-cache Qwen3.5-27B artifact and "
@@ -1101,11 +1104,7 @@ def finalize_prerun_manifest(
         spec.model_id,
         spec.model_revision,
     )
-    revision_provenance = (
-        GEMMA_MODEL_REVISION_PROVENANCE
-        if descriptor.model_id == GEMMA_MODEL_ID
-        else descriptor.provenance
-    )
+    revision_provenance = descriptor.provenance
     auxiliary = spec.auxiliary_model_deployment
     auxiliary_model = hash_model_snapshot(
         Path(auxiliary.snapshot_path),
@@ -1375,5 +1374,5 @@ def require_ready_manifest(manifest: PreRunManifest) -> None:
     ]
     if not manifest.ready or failed:
         raise ValueError(
-            f"Tau2/Gemma pre-run gates have not passed: {failed}"
+            f"Tau2/Qwen pre-run gates have not passed: {failed}"
         )

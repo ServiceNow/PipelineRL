@@ -7,14 +7,12 @@ import pytest
 import transformers
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
-import pipelinerl.prerun_evidence as prerun_evidence
 from pipelinerl.finetune.checkpoints import (
     get_auto_model_class,
     get_model_loader,
 )
 from pipelinerl.launch import _get_vllm_cache_env
 from pipelinerl.prerun_evidence import (
-    GEMMA_MODEL_DESCRIPTOR,
     QWEN35_9B_MODEL_DESCRIPTOR,
     QWEN35_9B_MODEL_ID,
     QWEN35_9B_MODEL_REVISION,
@@ -29,10 +27,9 @@ from pipelinerl.prerun_evidence import (
 )
 
 
-def _loader_args(descriptor, *, legacy_gemma=False):
+def _loader_args(descriptor):
     return SimpleNamespace(
-        text_only_composite_model=not legacy_gemma,
-        text_only_gemma4=legacy_gemma,
+        text_only_composite_model=True,
         model_revision=descriptor.revision,
         config_name=descriptor.model_id,
         trust_remote_code=False,
@@ -107,10 +104,13 @@ def _snapshot(
 
 
 def test_composite_text_model_classes_are_registered():
-    gemma_config_type = type(transformers.Gemma4Config())
+    qwen_composite_config_type = type(transformers.Qwen3_5Config())
     qwen_text_config_type = type(transformers.Qwen3_5TextConfig())
 
-    assert gemma_config_type in AutoModelForImageTextToText._model_mapping
+    assert (
+        qwen_composite_config_type
+        in AutoModelForImageTextToText._model_mapping
+    )
     assert qwen_text_config_type in AutoModelForCausalLM._model_mapping
     assert (
         get_auto_model_class("vision2seq-language-modeling")
@@ -118,17 +118,10 @@ def test_composite_text_model_classes_are_registered():
     )
 
 
-@pytest.mark.parametrize(
-    "descriptor",
-    (
-        GEMMA_MODEL_DESCRIPTOR,
-        QWEN35_9B_MODEL_DESCRIPTOR,
-    ),
-)
 def test_text_loader_uses_exact_descriptor_class_config_and_remap(
-    descriptor,
     monkeypatch,
 ):
+    descriptor = QWEN35_9B_MODEL_DESCRIPTOR
     calls = []
     composite_config = _mock_composite_config(descriptor)
 
@@ -185,22 +178,12 @@ def test_qwen_27b_is_inspectable_but_rejected_as_run1_policy(
         )
 
 
-def test_legacy_gemma_selector_remains_exact_during_staged_migration(
-    monkeypatch,
-):
-    descriptor = GEMMA_MODEL_DESCRIPTOR
-    monkeypatch.setattr(
-        transformers.AutoConfig,
-        "from_pretrained",
-        lambda *args, **kwargs: _mock_composite_config(descriptor),
-    )
+def test_removed_gemma_selector_fails_before_model_inspection():
+    args = _loader_args(QWEN35_9B_MODEL_DESCRIPTOR)
+    args.text_only_gemma4 = True
 
-    model_cls, _ = get_model_loader(
-        _loader_args(descriptor, legacy_gemma=True),
-        "causal-language-modeling",
-    )
-
-    assert model_cls is transformers.Gemma4ForCausalLM
+    with pytest.raises(ValueError, match="text_only_gemma4 was removed"):
+        get_model_loader(args, "causal-language-modeling")
 
 
 @pytest.mark.parametrize(
@@ -213,7 +196,6 @@ def test_legacy_gemma_selector_remains_exact_during_staged_migration(
 def test_text_loader_rejects_unreviewed_identity(model_id, revision):
     args = SimpleNamespace(
         text_only_composite_model=True,
-        text_only_gemma4=False,
         model_revision=revision,
         config_name=model_id,
         trust_remote_code=False,
@@ -223,26 +205,8 @@ def test_text_loader_rejects_unreviewed_identity(model_id, revision):
         get_model_loader(args, "causal-language-modeling")
 
 
-def test_legacy_gemma_loader_rejects_unverified_placeholder(monkeypatch):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        False,
-    )
-
-    with pytest.raises(ValueError, match="unverified placeholder"):
-        get_model_loader(
-            _loader_args(GEMMA_MODEL_DESCRIPTOR, legacy_gemma=True),
-            "causal-language-modeling",
-        )
-
-
 def test_qwen_descriptor_registry_pins_both_verified_artifact_sets():
     assert set(TEXT_MODEL_DESCRIPTORS) == {
-        (
-            GEMMA_MODEL_DESCRIPTOR.model_id,
-            GEMMA_MODEL_DESCRIPTOR.revision,
-        ),
         (QWEN35_9B_MODEL_ID, QWEN35_9B_MODEL_REVISION),
         (
             QWEN35_27B_MODEL_DESCRIPTOR.model_id,

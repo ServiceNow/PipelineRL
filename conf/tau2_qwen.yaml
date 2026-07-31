@@ -2,7 +2,7 @@ defaults:
   - base
   - _self_
 
-model_path: google/gemma-4-26B-A4B-it
+model_path: Qwen/Qwen3.5-9B
 model_class: causal-language-modeling
 fp32_layer_prefix: lm_head
 
@@ -26,9 +26,9 @@ preprocess:
   shared_memory_entry_size: null
 
 finetune:
-  config_name: google/gemma-4-26B-A4B-it
-  model_revision: 01e5b3ee840d3a9e0b0b493c593e85398a30ef75
-  text_only_gemma4: true
+  config_name: Qwen/Qwen3.5-9B
+  model_revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  text_only_composite_model: true
   seq_length: null
   seq_packing: false
   seq_parallel: 1
@@ -68,6 +68,8 @@ vllm_config:
     tensor-parallel-size: 2
     pipeline-parallel-size: 1
     generation-config: vllm
+    enable-auto-tool-choice: ""
+    tool-call-parser: qwen3_xml
     max_model_len: null
     revision: ${finetune.model_revision}
     served-model-name:
@@ -83,11 +85,11 @@ world:
 
 dataset_loader: pipelinerl.domains.tau2.load_tau2_problems
 dataset_loader_params:
-  prepared_data_manifest: ${oc.env:TAU2_PREPARED_DATA_MANIFEST,PENDING_TAU2_PREPARED_DATA_MANIFEST}
+  prepared_data_manifest: ${oc.env:TAU2_PREPARED_DATA_MANIFEST,/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_prepared_manifest.json}
   data_files:
-    airline: ${oc.env:TAU2_AIRLINE_JSONL,PENDING_TAU2_AIRLINE_JSONL}
-    retail: ${oc.env:TAU2_RETAIL_JSONL,PENDING_TAU2_RETAIL_JSONL}
-    telecom: ${oc.env:TAU2_TELECOM_JSONL,PENDING_TAU2_TELECOM_JSONL}
+    airline: ${oc.env:TAU2_AIRLINE_JSONL,/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_airline.jsonl}
+    retail: ${oc.env:TAU2_RETAIL_JSONL,/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_retail.jsonl}
+    telecom: ${oc.env:TAU2_TELECOM_JSONL,/mnt/llmd/data/rafa/tau2_prepared_ce4013b0_gym_5f92a73_v1/tau2_telecom.jsonl}
   seed: ${seed}
 train_dataset_names:
   - airline
@@ -99,7 +101,19 @@ tau2_gym:
   head_url: ${oc.env:TAU2_GYM_HEAD_URL,PENDING_TAU2_GYM_HEAD_URL}
   policy_model_name: ${tau2_prerun.policy_model}
   user_model_url: ${oc.env:TAU2_USER_SIMULATOR_ENDPOINT,PENDING_ACCOUNT_SCOPED_TAU2_USER_ENDPOINT}
-  user_model_name: google/gemma-4-31B-it@842da3794eaa0b77d5f08bae87a17459d91ff475
+  user_model_name: qwen3.5-27b-user@fc05daec18b0a78c049392ed2e771dde82bdf654
+  judge_model_url: ${oc.env:TAU2_JUDGE_ENDPOINT,PENDING_ACCOUNT_SCOPED_TAU2_JUDGE_ENDPOINT}
+  judge_model_name: qwen3.5-27b-judge@fc05daec18b0a78c049392ed2e771dde82bdf654
+  policy_thinking_enabled: true
+  user_thinking_enabled: true
+  judge_thinking_enabled: true
+  judge_temperature: 0.6
+  judge_top_p: 0.95
+  judge_top_k: 20
+  judge_seed: ${seed}
+  judge_initial_max_tokens: ${oc.env:TAU2_JUDGE_INITIAL_MAX_TOKENS,PENDING_MEASURED_JUDGE_INITIAL_MAX_TOKENS}
+  judge_retry_max_tokens: ${oc.env:TAU2_JUDGE_RETRY_MAX_TOKENS,PENDING_MEASURED_JUDGE_RETRY_MAX_TOKENS}
+  auxiliary_model_timeout_s: ${oc.env:TAU2_AUXILIARY_MODEL_TIMEOUT_S,PENDING_MEASURED_AUXILIARY_MODEL_TIMEOUT_S}
   validation_interval_s: 30.0
   request_timeout_s: 3600.0
   startup_timeout_s: 600.0
@@ -109,13 +123,13 @@ tau2_prerun:
   enabled: false
   manifest_path: ${oc.env:TAU2_PRERUN_MANIFEST,PENDING_TAU2_PRERUN_MANIFEST}
   spec_path: ${oc.env:TAU2_PRERUN_SPEC,PENDING_TAU2_PRERUN_SPEC}
-  job_spec_path: ${oc.env:TAU2_JOB_SPEC_PATH,PENDING_TAU2_JOB_SPEC_PATH}
-  model_snapshot: ${oc.env:TAU2_MODEL_SNAPSHOT,PENDING_TAU2_MODEL_SNAPSHOT}
-  user_simulator_job_spec_path: ${oc.env:TAU2_USER_SIM_JOB_SPEC_PATH,PENDING_TAU2_USER_SIM_JOB_SPEC_PATH}
-  user_simulator_snapshot: ${oc.env:TAU2_USER_SIM_SNAPSHOT,/mnt/llmd/base_models/gemma-4-31B-it}
+  job_spec_path: ${oc.env:TAU2_JOB_SPEC_PATH,/home/toolkit/PipelineRL/tau2_qwen_calibration.yaml}
+  model_snapshot: ${oc.env:TAU2_MODEL_SNAPSHOT,/mnt/llmd/base_models/Qwen3.5-9B}
+  user_simulator_job_spec_path: ${oc.env:TAU2_USER_SIM_JOB_SPEC_PATH,/home/toolkit/PipelineRL/tau2_qwen_auxiliary.yaml}
+  user_simulator_snapshot: ${oc.env:TAU2_USER_SIM_SNAPSHOT,/mnt/llmd/base_models/Qwen3.5-27B}
 
   evidence_dir: ${output_dir}/tau2_prerun_evidence
-  policy_model: google/gemma-4-26B-A4B-it@01e5b3ee840d3a9e0b0b493c593e85398a30ef75
+  policy_model: Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a
   policy_endpoints: []
   fixed_prompt_token_ids: []
   fixed_completion_token_ids: []
@@ -132,33 +146,33 @@ tau2_prerun:
   # Ordered candidates evaluated against the measured p99 merged length.
   # Their derived memory values remain pending until N=192 / 12 G16 groups.
   production_memory_candidates:
-    - name: 4x8-sp1
+    - name: 2x8-sp1
+      node_count: 2
+      gpus_per_node: 8
+      actor_gpus: 8
+      trainer_gpus: 8
+      seq_parallel: 1
+      gpu_memory_bytes: ${oc.env:TAU2_TRAINER_GPU_MEMORY_BYTES,PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES}
+      reserve_bytes_per_gpu: 8589934592
+      optimizer_cpu_offload: false
+    - name: 3x8-sp1
+      node_count: 3
+      gpus_per_node: 8
+      actor_gpus: 8
+      trainer_gpus: 16
+      seq_parallel: 1
+      gpu_memory_bytes: ${oc.env:TAU2_TRAINER_GPU_MEMORY_BYTES,PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES}
+      reserve_bytes_per_gpu: 8589934592
+      optimizer_cpu_offload: false
+    - name: 4x8-sp2
       node_count: 4
       gpus_per_node: 8
       actor_gpus: 8
       trainer_gpus: 24
-      seq_parallel: 1
-      gpu_memory_bytes: 85899345920
-      reserve_bytes_per_gpu: 8589934592
-      optimizer_cpu_offload: false
-    - name: 6x8-sp2
-      node_count: 6
-      gpus_per_node: 8
-      actor_gpus: 8
-      trainer_gpus: 40
       seq_parallel: 2
-      gpu_memory_bytes: 85899345920
+      gpu_memory_bytes: ${oc.env:TAU2_TRAINER_GPU_MEMORY_BYTES,PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES}
       reserve_bytes_per_gpu: 8589934592
       optimizer_cpu_offload: false
-    - name: 8x8-sp8-cpu-offload
-      node_count: 8
-      gpus_per_node: 8
-      actor_gpus: 8
-      trainer_gpus: 56
-      seq_parallel: 8
-      gpu_memory_bytes: 85899345920
-      reserve_bytes_per_gpu: 8589934592
-      optimizer_cpu_offload: true
 
 use_deepspeed: true
 deepspeed_config: deepspeed_stage3_bf16_cpu_offload
@@ -170,5 +184,5 @@ eval_every_n_versions: 0
 wandb:
   tags:
     - tau2
-    - gemma-4
+    - qwen3.5-9b
     - gspo

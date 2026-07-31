@@ -44,39 +44,6 @@ class TextModelDescriptor:
     provenance: str
 
 
-GEMMA_MODEL_ID = "google/gemma-4-26B-A4B-it"
-# VERIFIED 2026-07-19 by Claude with Rafa in the loop: Hugging Face main resolves
-# to this immutable revision, and the local snapshot matches its repository tree.
-GEMMA_MODEL_REVISION = "01e5b3ee840d3a9e0b0b493c593e85398a30ef75"
-GEMMA_MODEL_REVISION_VERIFIED = True
-GEMMA_MODEL_REVISION_PROVENANCE = (
-    "Verified 2026-07-19 by Claude with Rafa in the loop: the Hugging Face "
-    "refs API reports google/gemma-4-26B-A4B-it main == "
-    "01e5b3ee840d3a9e0b0b493c593e85398a30ef75."
-)
-GEMMA_POLICY_IDENTITY = f"{GEMMA_MODEL_ID}@{GEMMA_MODEL_REVISION}"
-GEMMA_EXPECTED_TEXT_TOPOLOGY = (
-    30,
-    2816,
-    128,
-    8,
-    704,
-    262144,
-    262144,
-)
-GEMMA_TOPOLOGY_PROVENANCE = (
-    "Verified 2026-07-19 by Claude at revision "
-    "01e5b3ee840d3a9e0b0b493c593e85398a30ef75: local snapshot "
-    "/mnt/llmd/base_models/gemma-4-26B-A4B-it matched Hugging Face tree LFS "
-    "SHA256 OIDs for model-00001-of-00002.safetensors="
-    "1127684971bbca40465435a5cad69d67ad603bf5e61c6dfd5561fae4a3bcfdb3, "
-    "model-00002-of-00002.safetensors="
-    "aab47033e1e8a492ef8e581efae1cf36478d0433567e7729b3c1728bc8970db7, "
-    "and tokenizer.json="
-    "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f; "
-    "non-LFS files and config topology also matched."
-)
-
 _TEXT_KEY_MAPPING = ((r"^model\.language_model\.", "model."),)
 _QWEN_TOKENIZER_SHA256 = (
     "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
@@ -122,44 +89,6 @@ _QWEN_COMMON_ARTIFACT_SHA256 = (
     ),
 )
 QWEN35_TOOL_CALL_PARSER = "qwen3_xml"
-
-GEMMA_MODEL_DESCRIPTOR = TextModelDescriptor(
-    model_id=GEMMA_MODEL_ID,
-    revision=GEMMA_MODEL_REVISION,
-    composite_model_type="gemma4",
-    text_model_type="gemma4_text",
-    model_class_name="Gemma4ForCausalLM",
-    text_config_class_name="Gemma4TextConfig",
-    num_hidden_layers=30,
-    hidden_size=2816,
-    intermediate_size=2112,
-    num_experts=128,
-    top_k_experts=8,
-    moe_intermediate_size=704,
-    max_position_embeddings=262144,
-    vocab_size=262144,
-    tie_word_embeddings=True,
-    key_mapping=_TEXT_KEY_MAPPING,
-    artifact_sha256=(
-        (
-            "model-00001-of-00002.safetensors",
-            "1127684971bbca40465435a5cad69d67ad603bf5e61c6dfd5561fae4a3bcfdb3",
-        ),
-        (
-            "model-00002-of-00002.safetensors",
-            "aab47033e1e8a492ef8e581efae1cf36478d0433567e7729b3c1728bc8970db7",
-        ),
-        (
-            "tokenizer.json",
-            "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
-        ),
-    ),
-    exact_artifact_set=False,
-    nontransferred_prefixes=(),
-    revision_verified=GEMMA_MODEL_REVISION_VERIFIED,
-    policy_eligible=True,
-    provenance=GEMMA_TOPOLOGY_PROVENANCE,
-)
 
 QWEN35_9B_MODEL_ID = "Qwen/Qwen3.5-9B"
 QWEN35_9B_MODEL_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
@@ -326,7 +255,6 @@ TEXT_MODEL_DESCRIPTORS = MappingProxyType(
     {
         (descriptor.model_id, descriptor.revision): descriptor
         for descriptor in (
-            GEMMA_MODEL_DESCRIPTOR,
             QWEN35_9B_MODEL_DESCRIPTOR,
             QWEN35_27B_MODEL_DESCRIPTOR,
         )
@@ -337,9 +265,6 @@ PARITY_TOLERANCE_BASIS = (
     "BF16 unit roundoff is 2^-7=0.0078125; 0.05 nats is 6.4 BF16 epsilons "
     "for TP2 reduction ordering and Transformers/vLLM fused-kernel differences "
     "with FP32 output-head logits on both sides."
-)
-REQUIRED_TRANSFER_CATEGORIES = frozenset(
-    {"expert", "router", "embedding", "output_head"}
 )
 _FORBIDDEN_VISION_PARTS = (
     "vision_tower",
@@ -379,22 +304,6 @@ class TextModelTopology(BaseModel):
     text_tensor_count: int
     vision_tensor_count: int
     nontransferred_tensor_count: int
-    transfer_categories: list[str]
-
-
-class GemmaTopology(BaseModel):
-    model_type: str
-    text_model_type: str
-    num_hidden_layers: int
-    hidden_size: int
-    num_experts: int
-    top_k_experts: int
-    moe_intermediate_size: int
-    max_position_embeddings: int
-    vocab_size: int
-    tie_word_embeddings: bool
-    text_tensor_count: int
-    vision_tensor_count: int
     transfer_categories: list[str]
 
 
@@ -472,13 +381,7 @@ def get_text_model_descriptor(
         ) from exc
 
 
-def gemma_revision_is_verified() -> bool:
-    return GEMMA_MODEL_REVISION_VERIFIED
-
-
 def model_revision_is_verified(descriptor: TextModelDescriptor) -> bool:
-    if descriptor is GEMMA_MODEL_DESCRIPTOR:
-        return gemma_revision_is_verified()
     return descriptor.revision_verified
 
 
@@ -491,10 +394,6 @@ def require_verified_model_revision(
             "placeholder; verify the immutable Hugging Face revision "
             "before an evidence run"
         )
-
-
-def require_verified_gemma_revision() -> None:
-    require_verified_model_revision(GEMMA_MODEL_DESCRIPTOR)
 
 
 def prerun_enabled(cfg: Any) -> bool:
@@ -800,79 +699,6 @@ def inspect_text_model_snapshot(
         nontransferred_tensor_count=len(nontransferred_names),
         transfer_categories=sorted(categories),
     )
-
-
-def inspect_gemma_snapshot(snapshot: Path) -> GemmaTopology:
-    with (snapshot / "config.json").open() as handle:
-        config = json.load(handle)
-    text = config.get("text_config")
-    if config.get("model_type") != "gemma4" or not isinstance(text, Mapping):
-        raise ValueError(
-            "Expected a Gemma4 composite config with text_config"
-        )
-
-    with (snapshot / "model.safetensors.index.json").open() as handle:
-        weight_map = json.load(handle).get("weight_map")
-    if not isinstance(weight_map, Mapping):
-        raise ValueError("Gemma snapshot has no safetensors weight_map")
-    names = [str(name) for name in weight_map]
-    text_names = [
-        name for name in names if name.startswith("model.language_model.")
-    ]
-    categories = sorted(
-        {
-            category
-            for name in text_names
-            for category in parameter_categories(
-                name,
-                tied_output_head=bool(text.get("tie_word_embeddings")),
-            )
-        }
-        - {"backbone"}
-    )
-    missing = sorted(REQUIRED_TRANSFER_CATEGORIES - set(categories))
-    if missing:
-        raise ValueError(
-            f"Gemma checkpoint is missing transfer categories: {missing}"
-        )
-
-    topology = GemmaTopology(
-        model_type=str(config["model_type"]),
-        text_model_type=str(text.get("model_type")),
-        num_hidden_layers=int(text.get("num_hidden_layers", 0)),
-        hidden_size=int(text.get("hidden_size", 0)),
-        num_experts=int(text.get("num_experts", 0)),
-        top_k_experts=int(text.get("top_k_experts", 0)),
-        moe_intermediate_size=int(text.get("moe_intermediate_size", 0)),
-        max_position_embeddings=int(
-            text.get("max_position_embeddings", 0)
-        ),
-        vocab_size=int(text.get("vocab_size", 0)),
-        tie_word_embeddings=bool(text.get("tie_word_embeddings")),
-        text_tensor_count=len(text_names),
-        vision_tensor_count=sum(
-            has_vision_parameter(name) for name in names
-        ),
-        transfer_categories=categories,
-    )
-    observed = (
-        topology.num_hidden_layers,
-        topology.hidden_size,
-        topology.num_experts,
-        topology.top_k_experts,
-        topology.moe_intermediate_size,
-        topology.max_position_embeddings,
-        topology.vocab_size,
-    )
-    if (
-        observed != GEMMA_EXPECTED_TEXT_TOPOLOGY
-        or not topology.tie_word_embeddings
-    ):
-        raise ValueError(
-            "Unexpected Gemma4-26B-A4B text topology: "
-            f"{observed}, tied={topology.tie_word_embeddings}"
-        )
-    return topology
 
 
 def tensor_fingerprint(tensor: torch.Tensor) -> TensorFingerprint:

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pipelinerl.prerun_evidence import (
-    GEMMA_POLICY_IDENTITY,
+    QWEN35_9B_POLICY_IDENTITY,
     read_evidence_records,
 )
 from pipelinerl.finetune_loop import (
@@ -394,7 +394,7 @@ def test_trainer_records_fixed_token_parity_before_and_after(
             evidence_dir=str(tmp_path),
             fixed_prompt_token_ids=[1, 2],
             fixed_completion_token_ids=[3, 4],
-            policy_model=GEMMA_POLICY_IDENTITY,
+            policy_model=QWEN35_9B_POLICY_IDENTITY,
         ),
     )
     manager = TrainerWeightUpdateManager(
@@ -429,7 +429,7 @@ def test_trainer_records_fixed_token_parity_before_and_after(
     ]
     assert all(payload["max_tokens"] == 0 for _, payload in posts)
     assert all(payload["add_special_tokens"] is False for _, payload in posts)
-    assert all(payload["model"] == GEMMA_POLICY_IDENTITY for _, payload in posts)
+    assert all(payload["model"] == QWEN35_9B_POLICY_IDENTITY for _, payload in posts)
 
 
 def test_manager_returns_actual_collective_receipts_and_advances_version():

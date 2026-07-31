@@ -22,13 +22,20 @@ REQUIRED_NAMES=(
     TAU2_PRERUN_SPEC
     TAU2_PRERUN_MANIFEST
     TAU2_JOB_SPEC_PATH
+    TAU2_PREPARED_DATA_MANIFEST
     TAU2_AIRLINE_JSONL
-    TAU2_USER_SIMULATOR_ENDPOINT
-    TAU2_USER_SIM_JOB_SPEC_PATH
-    TAU2_USER_SIM_SNAPSHOT
     TAU2_RETAIL_JSONL
     TAU2_TELECOM_JSONL
+    TAU2_USER_SIMULATOR_ENDPOINT
+    TAU2_JUDGE_ENDPOINT
+    TAU2_USER_SIM_JOB_SPEC_PATH
+    TAU2_USER_SIM_SNAPSHOT
     TAU2_USER_API_KEY
+    TAU2_RUN_SEED
+    TAU2_JUDGE_INITIAL_MAX_TOKENS
+    TAU2_JUDGE_RETRY_MAX_TOKENS
+    TAU2_AUXILIARY_MODEL_TIMEOUT_S
+    TAU2_TRAINER_GPU_MEMORY_BYTES
 )
 for name in "${REQUIRED_NAMES[@]}"; do
     require_resolved "${name}"
@@ -44,9 +51,15 @@ if [[ "${PHASE}" == "calibration" && "${WORLD_SIZE}" != "4" ]]; then
 fi
 
 NEMO_GYM_SHA=5f92a73217258074b74b7be26526c69f0ce3075d
-POLICY_MODEL=google/gemma-4-26B-A4B-it@01e5b3ee840d3a9e0b0b493c593e85398a30ef75
-USER_MODEL=google/gemma-4-31B-it@842da3794eaa0b77d5f08bae87a17459d91ff475
+POLICY_MODEL=Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a
+USER_MODEL=qwen3.5-27b-user@fc05daec18b0a78c049392ed2e771dde82bdf654
+JUDGE_MODEL=qwen3.5-27b-judge@fc05daec18b0a78c049392ed2e771dde82bdf654
 USER_ENDPOINT=${TAU2_USER_SIMULATOR_ENDPOINT}
+JUDGE_ENDPOINT=${TAU2_JUDGE_ENDPOINT}
+JUDGE_TEMPERATURE=0.6
+JUDGE_TOP_P=0.95
+JUDGE_TOP_K=20
+REQUEST_TIMEOUT_S=3600.0
 CLUSTER_BASE=${MASTER_ADDR%-*}
 ACTOR_HOST=${CLUSTER_BASE}-$((WORLD_SIZE - 1))
 POLICY_ENDPOINTS=(
@@ -64,22 +77,32 @@ export TAU2_MODEL_SNAPSHOT
 export TAU2_PRERUN_SPEC
 export TAU2_PRERUN_MANIFEST
 export TAU2_JOB_SPEC_PATH
+export TAU2_PREPARED_DATA_MANIFEST
 export TAU2_AIRLINE_JSONL
 export TAU2_RETAIL_JSONL
 export TAU2_TELECOM_JSONL
 export TAU2_USER_SIMULATOR_ENDPOINT
+export TAU2_JUDGE_ENDPOINT
 export TAU2_USER_SIM_JOB_SPEC_PATH
 export TAU2_USER_SIM_SNAPSHOT
 
 LAUNCH_ARGS=(
     python -m pipelinerl.launch
-    --config-name tau2_gemma
+    --config-name tau2_qwen
     "output_dir=${TAU2_OUTPUT_DIR}"
     "tau2_prerun.phase=${PHASE}"
     "tau2_prerun.enabled=$([[ "${PHASE}" == "calibration" ]] && echo true || echo false)"
     "tau2_prerun.policy_endpoints=${POLICY_ENDPOINTS_JSON}"
     "tau2_prerun.fixed_prompt_token_ids=${PROMPT_TOKEN_IDS}"
     "tau2_prerun.fixed_completion_token_ids=${COMPLETION_TOKEN_IDS}"
+    "seed=${TAU2_RUN_SEED}"
+    "tau2_gym.judge_temperature=${JUDGE_TEMPERATURE}"
+    "tau2_gym.judge_top_p=${JUDGE_TOP_P}"
+    "tau2_gym.judge_top_k=${JUDGE_TOP_K}"
+    "tau2_gym.judge_seed=${TAU2_RUN_SEED}"
+    "tau2_gym.judge_initial_max_tokens=${TAU2_JUDGE_INITIAL_MAX_TOKENS}"
+    "tau2_gym.judge_retry_max_tokens=${TAU2_JUDGE_RETRY_MAX_TOKENS}"
+    "tau2_gym.auxiliary_model_timeout_s=${TAU2_AUXILIARY_MODEL_TIMEOUT_S}"
 )
 if [[ "${PHASE}" == "calibration" ]]; then
     LAUNCH_ARGS+=(
@@ -124,6 +147,20 @@ if [[ "${RANK}" == "0" ]]; then
         --policy-model-name "${POLICY_MODEL}"
         --user-model-url "${USER_ENDPOINT}"
         --user-model-name "${USER_MODEL}"
+        --judge-model-url "${JUDGE_ENDPOINT}"
+        --judge-model-name "${JUDGE_MODEL}"
+        --policy-thinking-enabled
+        --user-thinking-enabled
+        --judge-thinking-enabled
+        --judge-temperature "${JUDGE_TEMPERATURE}"
+        --judge-top-p "${JUDGE_TOP_P}"
+        --judge-top-k "${JUDGE_TOP_K}"
+        --judge-seed "${TAU2_RUN_SEED}"
+        --judge-initial-max-tokens "${TAU2_JUDGE_INITIAL_MAX_TOKENS}"
+        --judge-retry-max-tokens "${TAU2_JUDGE_RETRY_MAX_TOKENS}"
+        --auxiliary-model-timeout-s "${TAU2_AUXILIARY_MODEL_TIMEOUT_S}"
+        --request-timeout-s "${REQUEST_TIMEOUT_S}"
+        --uses-reasoning-parser
         --host "${MASTER_ADDR}"
         --head-port 11000
         --service-port-start 12000

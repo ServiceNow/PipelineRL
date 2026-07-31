@@ -46,10 +46,12 @@ from pipelinerl.domains.tau2.prerun import (
     TrainerMemoryCandidate,
 )
 from pipelinerl.prerun_evidence import (
-    GEMMA_MODEL_ID,
-    GEMMA_MODEL_REVISION,
-    GEMMA_POLICY_IDENTITY,
+    QWEN35_9B_MODEL_DESCRIPTOR,
+    QWEN35_9B_MODEL_ID,
+    QWEN35_9B_MODEL_REVISION,
+    QWEN35_9B_POLICY_IDENTITY,
     QWEN35_27B_MODEL_DESCRIPTOR,
+    QWEN35_TOOL_CALL_PARSER,
     ArtifactDigest,
     ModelArtifactIdentity,
     TextModelTopology,
@@ -58,14 +60,14 @@ from pipelinerl.prerun_evidence import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CALIBRATION_JOB = ROOT / "tau2_gemma_calibration.yaml"
+CALIBRATION_JOB = ROOT / "tau2_qwen_calibration.yaml"
 AUXILIARY_MODEL_JOB = ROOT / "tau2_qwen_auxiliary.yaml"
 USER_SIMULATOR_ENDPOINT = "http://dns-test-account-tau2-user:8000/v1"
 POLICY_ENDPOINTS = [
-    "http://tau2-gemma-calibration-3:8080",
-    "http://tau2-gemma-calibration-3:8082",
-    "http://tau2-gemma-calibration-3:8084",
-    "http://tau2-gemma-calibration-3:8086",
+    "http://tau2-qwen-calibration-3:8080",
+    "http://tau2-qwen-calibration-3:8082",
+    "http://tau2-qwen-calibration-3:8084",
+    "http://tau2-qwen-calibration-3:8086",
 ]
 
 
@@ -121,7 +123,7 @@ def _compose_recipe():
         config_dir=str(ROOT / "conf"),
         version_base="1.3.2",
     ):
-        return compose(config_name="tau2_gemma")
+        return compose(config_name="tau2_qwen")
 
 
 def _sha256(path: Path) -> str:
@@ -300,15 +302,20 @@ def _set_auxiliary_identity(cfg) -> None:
         cfg.tau2_gym.user_model_name = AUXILIARY_USER_MODEL
         cfg.tau2_gym.judge_model_url = USER_SIMULATOR_ENDPOINT
         cfg.tau2_gym.judge_model_name = AUXILIARY_JUDGE_MODEL
+        cfg.tau2_gym.judge_initial_max_tokens = 4096
+        cfg.tau2_gym.judge_retry_max_tokens = 8192
+        cfg.tau2_gym.auxiliary_model_timeout_s = 300.0
+    for candidate in cfg.tau2_prerun.production_memory_candidates:
+        candidate.gpu_memory_bytes = 80 * GIB
 
 
 def _candidate() -> TrainerMemoryCandidate:
     return TrainerMemoryCandidate(
-        name="4x8-sp1",
-        node_count=4,
+        name="2x8-sp1",
+        node_count=2,
         gpus_per_node=8,
         actor_gpus=8,
-        trainer_gpus=24,
+        trainer_gpus=8,
         seq_parallel=1,
         gpu_memory_bytes=80 * GIB,
         reserve_bytes_per_gpu=8 * GIB,
@@ -353,14 +360,14 @@ def _ready_manifest(
     budget = TrainerMemoryBudget(
         candidate=candidate,
         measured_p99_merged_tokens=65536,
-        text_parameter_count=26_000_000_000,
+        text_parameter_count=8_953_803_264,
         zero3_gpu_bytes_per_parameter=16,
-        sharded_model_optimizer_bytes_per_gpu=17 * GIB,
+        sharded_model_optimizer_bytes_per_gpu=18 * GIB,
         optimizer_cpu_bytes_per_rank=0,
-        activation_bytes_per_gpu=32 * GIB,
+        activation_bytes_per_gpu=24 * GIB,
         all_gather_temp_bytes_per_gpu=4 * GIB,
         reserve_bytes_per_gpu=8 * GIB,
-        estimated_total_bytes_per_gpu=61 * GIB,
+        estimated_total_bytes_per_gpu=54 * GIB,
         gpu_memory_bytes=80 * GIB,
         fits=True,
     )
@@ -385,8 +392,8 @@ def _ready_manifest(
         schema_version=3,
         job_spec_sha256=job_digest,
         model=ModelArtifactIdentity(
-            model_id=GEMMA_MODEL_ID,
-            revision=GEMMA_MODEL_REVISION,
+            model_id=QWEN35_9B_MODEL_ID,
+            revision=QWEN35_9B_MODEL_REVISION,
             snapshot_digest="1" * 64,
             artifacts=[
                 ArtifactDigest(
@@ -397,31 +404,29 @@ def _ready_manifest(
             ],
         ),
         topology=TextModelTopology(
-            model_type="gemma4",
-            text_model_type="gemma4_text",
-            num_hidden_layers=30,
-            hidden_size=2816,
-            intermediate_size=2112,
-            num_experts=128,
-            top_k_experts=8,
-            moe_intermediate_size=704,
+            model_type="qwen3_5",
+            text_model_type="qwen3_5_text",
+            num_hidden_layers=32,
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_experts=0,
+            top_k_experts=0,
+            moe_intermediate_size=0,
             max_position_embeddings=262144,
-            vocab_size=262144,
-            tie_word_embeddings=True,
-            layer_indices=list(range(30)),
-            text_tensor_count=1,
+            vocab_size=248320,
+            tie_word_embeddings=False,
+            layer_indices=list(range(32)),
+            text_tensor_count=427,
             vision_tensor_count=0,
             nontransferred_tensor_count=0,
-            transfer_categories=sorted(
-                {
-                    "backbone", "embedding", "expert", "output_head", "router"
-                }
-            ),
+            transfer_categories=[
+                "backbone", "embedding", "output_head"
+            ],
         ),
         source_pins=PINNED_SOURCES,
         prepared_data=_prepared_data_manifest(),
         auxiliary_model_deployment=auxiliary_model_deployment,
-        policy_model=GEMMA_POLICY_IDENTITY,
+        policy_model=QWEN35_9B_POLICY_IDENTITY,
         policy_endpoints=POLICY_ENDPOINTS,
         expected_tp_size=2,
         fixed_prompt_token_ids=[1, 2],
@@ -446,6 +451,7 @@ def _ready_manifest(
 
 def _production_cfg(
     tmp_path: Path,
+    monkeypatch,
     manifest: PreRunManifest,
     auxiliary_model_job_path: Path,
     auxiliary_model_deployment: AuxiliaryModelDeployment,
@@ -455,8 +461,8 @@ def _production_cfg(
     (snapshot_path / "model.safetensors").write_bytes(b"weights")
     model_identity = hash_model_snapshot(
         snapshot_path,
-        GEMMA_MODEL_ID,
-        GEMMA_MODEL_REVISION,
+        QWEN35_9B_MODEL_ID,
+        QWEN35_9B_MODEL_REVISION,
     )
     manifest = manifest.model_copy(update={"model": model_identity})
     manifest_path = tmp_path / "manifest.json"
@@ -466,6 +472,9 @@ def _production_cfg(
     cfg.tau2_prerun.manifest_path = str(manifest_path)
     cfg.tau2_prerun.job_spec_path = str(CALIBRATION_JOB)
     cfg.tau2_prerun.model_snapshot = str(snapshot_path)
+    monkeypatch.setattr(
+        tau2_prerun, "POLICY_MODEL_SNAPSHOT", str(snapshot_path)
+    )
     _set_auxiliary_identity(cfg)
     cfg.tau2_prerun.user_simulator_job_spec_path = str(auxiliary_model_job_path)
     cfg.tau2_prerun.user_simulator_snapshot = auxiliary_model_deployment.snapshot_path
@@ -528,36 +537,189 @@ def test_prepared_data_manifest_fails_before_process(
     _assert_main_fails_before_process(cfg, monkeypatch, message)
 
 
-def test_recipe_records_transitional_policy_boundary_and_pending_caps():
+def test_recipe_pins_qwen_runtime_data_and_pending_measured_caps():
+    from vllm.tool_parsers import ToolParserManager
+
     cfg = _compose_recipe()
+    assert cfg.model_path == QWEN35_9B_MODEL_ID
+    assert cfg.finetune.config_name == QWEN35_9B_MODEL_ID
+    assert cfg.finetune.model_revision == QWEN35_9B_MODEL_REVISION
+    assert cfg.finetune.text_only_composite_model is True
+    assert "text_only_gemma4" not in cfg.finetune
     assert cfg.finetune.rl.policy_loss == "gspo"
+    assert cfg.tau2_prerun.policy_model == QWEN35_9B_POLICY_IDENTITY
     assert cfg.tau2_prerun.policy_loss_fallback == "dppo"
-    assert cfg.tau2_prerun.policy_loss_fallback_trigger == POLICY_LOSS_FALLBACK_TRIGGER
-    assert cfg.tau2_prerun.gspo_token_upgrade_trigger == GSPO_TOKEN_UPGRADE_TRIGGER
+    assert cfg.tau2_prerun.policy_loss_fallback_trigger == (
+        POLICY_LOSS_FALLBACK_TRIGGER
+    )
+    assert cfg.tau2_prerun.gspo_token_upgrade_trigger == (
+        GSPO_TOKEN_UPGRADE_TRIGGER
+    )
     assert cfg.finetune.seq_packing is False
     assert cfg.finetune.seq_parallel == 1
     assert cfg.actor.shared_memory_entry_size is None
     assert cfg.preprocess.shared_memory_entry_size is None
     assert cfg.finetune.seq_length is None
     assert cfg.vllm_config.vllm_kwargs.max_model_len is None
-    # W12 changes only the auxiliary contract. W14 atomically repoints these
-    # remaining executable recipe fields and removes the Gemma descriptor.
-    assert str(cfg.tau2_gym.user_model_name).startswith("google/gemma-")
+    assert cfg.vllm_config.vllm_kwargs["enable-auto-tool-choice"] == ""
+    assert cfg.vllm_config.vllm_kwargs["tool-call-parser"] == (
+        QWEN35_TOOL_CALL_PARSER
+    )
+    assert "tool-parser-plugin" not in cfg.vllm_config.vllm_kwargs
+    assert QWEN35_TOOL_CALL_PARSER in ToolParserManager.list_registered()
+    assert cfg.tau2_gym.policy_thinking_enabled is True
+    assert cfg.tau2_gym.user_thinking_enabled is True
+    assert cfg.tau2_gym.judge_thinking_enabled is True
+    assert (
+        cfg.tau2_gym.judge_temperature,
+        cfg.tau2_gym.judge_top_p,
+        cfg.tau2_gym.judge_top_k,
+    ) == (0.6, 0.95, 20)
+    assert cfg.tau2_gym.judge_seed == cfg.seed
+    assert str(cfg.tau2_gym.judge_initial_max_tokens).startswith("PENDING_")
+    assert str(cfg.tau2_gym.judge_retry_max_tokens).startswith("PENDING_")
+    assert str(cfg.tau2_gym.auxiliary_model_timeout_s).startswith("PENDING_")
+    assert cfg.tau2_gym.user_model_name == AUXILIARY_USER_MODEL
+    assert cfg.tau2_gym.judge_model_name == AUXILIARY_JUDGE_MODEL
     assert str(cfg.tau2_gym.user_model_url).startswith("PENDING_")
-    assert str(cfg.tau2_prerun.user_simulator_job_spec_path).startswith("PENDING_")
-    assert str(
-        cfg.dataset_loader_params.prepared_data_manifest
-    ).startswith("PENDING_")
-    assert str(cfg.tau2_prerun.user_simulator_snapshot).endswith("gemma-4-31B-it")
-    assert len(cfg.tau2_prerun.production_memory_candidates) == 3
+    assert str(cfg.tau2_gym.judge_model_url).startswith("PENDING_")
+    assert str(cfg.tau2_prerun.user_simulator_job_spec_path).endswith(
+        "tau2_qwen_auxiliary.yaml"
+    )
+    assert str(cfg.tau2_prerun.user_simulator_snapshot).endswith(
+        "Qwen3.5-27B"
+    )
+    data_root = (
+        "/mnt/llmd/data/rafa/"
+        "tau2_prepared_ce4013b0_gym_5f92a73_v1"
+    )
+    assert str(cfg.dataset_loader_params.prepared_data_manifest) == (
+        f"{data_root}/tau2_prepared_manifest.json"
+    )
+    assert {
+        dataset: str(path)
+        for dataset, path in cfg.dataset_loader_params.data_files.items()
+    } == {
+        dataset: f"{data_root}/tau2_{dataset}.jsonl"
+        for dataset in ("airline", "retail", "telecom")
+    }
+    assert list(cfg.train_dataset_names) == [
+        "airline", "retail", "telecom"
+    ]
+    candidates = cfg.tau2_prerun.production_memory_candidates
+    assert [candidate.name for candidate in candidates] == [
+        "2x8-sp1", "3x8-sp1", "4x8-sp2"
+    ]
+    assert all(
+        str(candidate.gpu_memory_bytes).startswith("PENDING_")
+        for candidate in candidates
+    )
+    assert all(not candidate.optimizer_cpu_offload for candidate in candidates)
 
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("old_model", "model_path"),
+        ("old_selector", "text_only_gemma4 was removed"),
+        ("missing_auto_tool", "enable-auto-tool-choice"),
+        ("missing_parser", "tool-call parser"),
+        ("wrong_parser", "tool-call parser"),
+        ("plugin", "forbids vLLM tool-parser-plugin"),
+        ("policy_thinking", "requires policy, user, and judge thinking"),
+        ("user_thinking", "requires policy, user, and judge thinking"),
+        ("judge_thinking", "requires policy, user, and judge thinking"),
+        ("judge_temperature", "judge sampling"),
+        ("judge_top_p", "judge sampling"),
+        ("judge_top_k", "judge sampling"),
+        ("judge_seed", "judge seed"),
+        ("pending_initial_budget", "valid integer"),
+        ("invalid_retry_budget", "at least twice"),
+        ("invalid_auxiliary_timeout", "below request_timeout_s"),
+    ),
+)
+def test_qwen_runtime_contract_drift_fails_before_process(
+    tmp_path,
+    monkeypatch,
+    mutation,
+    message,
+):
+    cfg = _compose_recipe()
+    cfg.output_dir = str(tmp_path / "output")
+    _set_auxiliary_identity(cfg)
+    if mutation == "old_model":
+        cfg.model_path = "google/gemma-4-26B-A4B-it"
+    elif mutation == "old_selector":
+        with open_dict(cfg.finetune):
+            cfg.finetune.text_only_gemma4 = True
+    elif mutation == "missing_auto_tool":
+        with open_dict(cfg.vllm_config.vllm_kwargs):
+            del cfg.vllm_config.vllm_kwargs["enable-auto-tool-choice"]
+    elif mutation == "missing_parser":
+        with open_dict(cfg.vllm_config.vllm_kwargs):
+            del cfg.vllm_config.vllm_kwargs["tool-call-parser"]
+    elif mutation == "wrong_parser":
+        cfg.vllm_config.vllm_kwargs["tool-call-parser"] = "rl_tool"
+    elif mutation == "plugin":
+        with open_dict(cfg.vllm_config.vllm_kwargs):
+            cfg.vllm_config.vllm_kwargs["tool-parser-plugin"] = (
+                "/tmp/plugin.py"
+            )
+    elif mutation.endswith("_thinking"):
+        setattr(cfg.tau2_gym, f"{mutation}_enabled", False)
+    elif mutation == "judge_temperature":
+        cfg.tau2_gym.judge_temperature = 0.0
+    elif mutation == "judge_top_p":
+        cfg.tau2_gym.judge_top_p = 0.9
+    elif mutation == "judge_top_k":
+        cfg.tau2_gym.judge_top_k = 10
+    elif mutation == "judge_seed":
+        cfg.tau2_gym.judge_seed = int(cfg.seed) + 1
+    elif mutation == "pending_initial_budget":
+        cfg.tau2_gym.judge_initial_max_tokens = (
+            "PENDING_MEASURED_JUDGE_INITIAL_MAX_TOKENS"
+        )
+    elif mutation == "invalid_retry_budget":
+        cfg.tau2_gym.judge_retry_max_tokens = (
+            cfg.tau2_gym.judge_initial_max_tokens
+        )
+    else:
+        cfg.tau2_gym.auxiliary_model_timeout_s = (
+            cfg.tau2_gym.request_timeout_s
+        )
+    _assert_main_fails_before_process(cfg, monkeypatch, message)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("Qwen/Qwen3.5-9B-Base", QWEN35_9B_MODEL_REVISION),
+        (QWEN35_9B_MODEL_ID, "0" * 40),
+    ),
+)
+def test_unreviewed_policy_identity_fails_before_process(
+    tmp_path,
+    monkeypatch,
+    model_id,
+    revision,
+):
+    cfg = _compose_recipe()
+    cfg.output_dir = str(tmp_path / "output")
+    cfg.finetune.config_name = model_id
+    cfg.finetune.model_revision = revision
+    _assert_main_fails_before_process(
+        cfg,
+        monkeypatch,
+        "No reviewed text-model descriptor",
+    )
 
 def test_calibration_job_records_shared_auxiliary_provenance():
     job = yaml.safe_load(CALIBRATION_JOB.read_text())
     assert job["resources"]["replicas"] == 4
     assert job["resources"]["gpu"] == 8
     assert job["command"][-2:] == [
-        "tau2_gemma.sh",
+        "tau2_qwen.sh",
         "calibration",
     ]
     env = {
@@ -579,13 +741,19 @@ def test_calibration_job_records_shared_auxiliary_provenance():
     assert env["TAU2_STRICT_TITO_PATCH_SHA256"] == (
         PINNED_SOURCES.strict_tito_patch_sha256
     )
+    assert env["TAU2_POLICY_MODEL"] == QWEN35_9B_POLICY_IDENTITY
+    assert env["TAU2_MODEL_REVISION_STATUS"] == "VERIFIED_2026-07-30"
     assert env["TAU2_POLICY_LOSS"] == "gspo"
     assert env["TAU2_CALIBRATION_PACKING"] == "false"
     assert env["TAU2_CALIBRATION_SEQ_PARALLEL"] == "1"
     assert "CPU offload" in env["TAU2_CALIBRATION_MEMORY_LEVER"]
     assert env["TAU2_PARITY_MAX_ABS_TOLERANCE"] == "0.05"
     table = json.loads(env["TAU2_S5_MEMORY_BUDGET_TABLE_JSON"])
-    assert [row["nodes"] for row in table] == [4, 6, 8]
+    assert [row["nodes"] for row in table] == [2, 3, 4]
+    assert all(
+        row["gpu_memory_bytes"] == "PENDING_APPROVED_TRAINER_GPU_MEMORY_BYTES"
+        for row in table
+    )
     assert all(
         row["activation_bytes_at_measured_p99"] == "pending_calibration"
         for row in table
@@ -670,12 +838,33 @@ def test_cpu_offload_profile_only_offloads_optimizer():
 
 
 def test_wrapper_preflights_before_gym_and_is_valid_bash():
-    wrapper = ROOT / "tau2_gemma.sh"
+    wrapper = ROOT / "tau2_qwen.sh"
     text = wrapper.read_text()
     assert text.index("PIPELINERL_PREFLIGHT_ONLY=1") < text.index(
         "git clone"
     )
     assert "run_tau2_prerun finalize" in text
+    for required in (
+        "TAU2_JUDGE_INITIAL_MAX_TOKENS",
+        "TAU2_JUDGE_RETRY_MAX_TOKENS",
+        "TAU2_AUXILIARY_MODEL_TIMEOUT_S",
+        "TAU2_TRAINER_GPU_MEMORY_BYTES",
+    ):
+        assert required in text
+    assert '"tau2_gym.judge_seed=${TAU2_RUN_SEED}"' in text
+    assert '--judge-seed "${TAU2_RUN_SEED}"' in text
+    assert (
+        '"tau2_gym.judge_initial_max_tokens='
+        '${TAU2_JUDGE_INITIAL_MAX_TOKENS}"'
+    ) in text
+    assert (
+        '--judge-initial-max-tokens '
+        '"${TAU2_JUDGE_INITIAL_MAX_TOKENS}"'
+    ) in text
+    assert "--policy-thinking-enabled" in text
+    assert "--user-thinking-enabled" in text
+    assert "--judge-thinking-enabled" in text
+    assert "--uses-reasoning-parser" in text
     subprocess.run(
         ["bash", "-n", str(wrapper)],
         check=True,
@@ -686,12 +875,7 @@ def test_production_manifest_applies_measured_caps(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
-    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("WORLD_SIZE", "2")
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -699,6 +883,7 @@ def test_production_manifest_applies_measured_caps(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
@@ -710,7 +895,7 @@ def test_production_manifest_applies_measured_caps(
     assert cfg.vllm_config.vllm_kwargs.max_model_len == 65536
     assert cfg.llm.parameters.max_tokens == 16384
     assert cfg.world.actor_fraction == 8
-    assert cfg.world.finetune_fraction == 24
+    assert cfg.world.finetune_fraction == 8
     assert cfg.deepspeed_config == "deepspeed_stage3_bf16"
 
 
@@ -718,11 +903,6 @@ def test_absent_manifest_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     cfg = _compose_recipe()
     cfg.output_dir = str(tmp_path / "output")
     cfg.tau2_prerun.manifest_path = str(tmp_path / "missing.json")
@@ -747,11 +927,6 @@ def test_unready_manifest_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -767,6 +942,7 @@ def test_unready_manifest_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
@@ -782,11 +958,6 @@ def test_missing_manifest_schema_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -794,6 +965,7 @@ def test_missing_manifest_schema_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
@@ -814,11 +986,6 @@ def test_stale_manifest_schema_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -827,6 +994,7 @@ def test_stale_manifest_schema_fails_before_process(
     manifest = manifest.model_copy(update={"schema_version": 1})
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
@@ -842,11 +1010,6 @@ def test_manifest_digest_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -854,6 +1017,7 @@ def test_manifest_digest_mismatch_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
@@ -869,12 +1033,7 @@ def test_auxiliary_model_job_digest_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
-    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("WORLD_SIZE", "2")
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -888,6 +1047,7 @@ def test_auxiliary_model_job_digest_mismatch_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         bad_deployment,
@@ -903,12 +1063,7 @@ def test_auxiliary_model_profile_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
-    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("WORLD_SIZE", "2")
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -934,6 +1089,7 @@ def test_auxiliary_model_profile_mismatch_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         mismatched_deployment,
@@ -970,12 +1126,7 @@ def test_auxiliary_execution_profile_mismatch_fails_before_process(
     tamper,
     pattern,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
-    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("WORLD_SIZE", "2")
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -1062,6 +1213,7 @@ def test_auxiliary_execution_profile_mismatch_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         mismatched_deployment,
@@ -1077,12 +1229,7 @@ def test_prepared_data_identity_mismatch_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
-    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("WORLD_SIZE", "2")
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -1090,6 +1237,7 @@ def test_prepared_data_identity_mismatch_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
@@ -1120,11 +1268,6 @@ def test_sp_topology_without_gate5_proof_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     monkeypatch.setenv("WORLD_SIZE", "6")
     manifest, user_job, deployment = _production_case(
         tmp_path,
@@ -1152,6 +1295,7 @@ def test_sp_topology_without_gate5_proof_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
@@ -1167,11 +1311,6 @@ def test_unverified_revision_fails_before_process(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        False,
-    )
     manifest, user_job, deployment = _production_case(
         tmp_path,
         monkeypatch,
@@ -1179,9 +1318,19 @@ def test_unverified_revision_fails_before_process(
     )
     cfg = _production_cfg(
         tmp_path,
+        monkeypatch,
         manifest,
         user_job,
         deployment,
+    )
+    unverified = replace(
+        QWEN35_9B_MODEL_DESCRIPTOR,
+        revision_verified=False,
+    )
+    monkeypatch.setattr(
+        prerun_evidence,
+        "get_text_model_descriptor",
+        lambda model_id, revision: unverified,
     )
     _assert_main_fails_before_process(
         cfg,
@@ -1224,11 +1373,6 @@ def test_calibration_spec_enforces_safe_profile(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        prerun_evidence,
-        "GEMMA_MODEL_REVISION_VERIFIED",
-        True,
-    )
     monkeypatch.setenv("WORLD_SIZE", "4")
     cfg = _compose_recipe()
     cfg.output_dir = str(tmp_path / "output")
@@ -1249,6 +1393,9 @@ def test_calibration_spec_enforces_safe_profile(
     snapshot_path = tmp_path / "snapshot"
     snapshot_path.mkdir()
     cfg.tau2_prerun.model_snapshot = str(snapshot_path)
+    monkeypatch.setattr(
+        tau2_prerun, "POLICY_MODEL_SNAPSHOT", str(snapshot_path)
+    )
     cfg.tau2_prerun.policy_endpoints = POLICY_ENDPOINTS
     cfg.tau2_prerun.fixed_prompt_token_ids = [1, 2]
     cfg.tau2_prerun.fixed_completion_token_ids = [3]
@@ -1263,7 +1410,7 @@ def test_calibration_spec_enforces_safe_profile(
         model_snapshot=str(snapshot_path),
         source_pins=PINNED_SOURCES,
         auxiliary_model_deployment=deployment,
-        policy_model=GEMMA_POLICY_IDENTITY,
+        policy_model=QWEN35_9B_POLICY_IDENTITY,
         policy_endpoints=POLICY_ENDPOINTS,
         expected_tp_size=2,
         fixed_prompt_token_ids=[1, 2],
@@ -1298,8 +1445,8 @@ def test_calibration_spec_enforces_safe_profile(
 def test_vllm_cli_list_values_preserve_all_served_names():
     kwargs = {
         "served-model-name": [
-            GEMMA_MODEL_ID,
-            GEMMA_POLICY_IDENTITY,
+            QWEN35_9B_MODEL_ID,
+            QWEN35_9B_POLICY_IDENTITY,
         ]
     }
     launch._add_actor_model_alias(
@@ -1316,7 +1463,7 @@ def test_vllm_cli_list_values_preserve_all_served_names():
     assert command == [
         "vllm",
         "--served-model-name",
-        GEMMA_MODEL_ID,
-        GEMMA_POLICY_IDENTITY,
+        QWEN35_9B_MODEL_ID,
+        QWEN35_9B_POLICY_IDENTITY,
         "/tmp/checkpoint",
     ]

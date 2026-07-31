@@ -21,7 +21,6 @@ from transformers import (
 from transformers.models.auto.modeling_auto import _BaseAutoModelClass
 
 from pipelinerl.prerun_evidence import (
-    GEMMA_MODEL_DESCRIPTOR,
     TextModelDescriptor,
     assert_no_vision_parameters,
     get_text_model_descriptor,
@@ -153,26 +152,17 @@ def load_tokenizer(config_name, *, revision: str | None = None):
 def _configured_text_model_descriptor(
     args,
 ) -> TextModelDescriptor | None:
-    legacy_gemma = bool(getattr(args, "text_only_gemma4", False))
-    text_only_composite = bool(
-        getattr(args, "text_only_composite_model", False)
-    )
-    if legacy_gemma and text_only_composite:
+    if bool(getattr(args, "text_only_gemma4", False)):
         raise ValueError(
-            "Configure only one text-only composite-model selector"
+            "text_only_gemma4 was removed; use "
+            "text_only_composite_model with a reviewed descriptor"
         )
-    if not legacy_gemma and not text_only_composite:
+    if not bool(getattr(args, "text_only_composite_model", False)):
         return None
-    descriptor = get_text_model_descriptor(
+    return get_text_model_descriptor(
         args.config_name,
         getattr(args, "model_revision", None),
     )
-    if legacy_gemma and descriptor is not GEMMA_MODEL_DESCRIPTOR:
-        raise ValueError(
-            "text_only_gemma4 requires the reviewed Gemma model ID and "
-            "revision"
-        )
-    return descriptor
 
 
 def get_model_loader(args, model_class: ModelClass):

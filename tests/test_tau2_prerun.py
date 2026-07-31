@@ -42,7 +42,7 @@ from pipelinerl.domains.tau2.prerun import (
 )
 from pipelinerl.prerun_evidence import (
     EndpointTransferReceipt,
-    GEMMA_MODEL_DESCRIPTOR,
+    QWEN35_9B_MODEL_DESCRIPTOR,
     QWEN35_27B_MODEL_DESCRIPTOR,
     ParameterTransferReceipt,
     ParityEvidence,
@@ -52,7 +52,7 @@ from pipelinerl.prerun_evidence import (
     WorkerTransferReceipt,
     append_evidence_record,
     hash_model_snapshot,
-    inspect_gemma_snapshot,
+    inspect_text_model_snapshot,
     make_parity_evidence,
     parameter_categories,
     tensor_fingerprint,
@@ -184,53 +184,58 @@ def _snapshot(tmp_path: Path) -> Path:
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     config = {
-        "model_type": "gemma4",
+        "model_type": "qwen3_5",
+        "tie_word_embeddings": False,
         "text_config": {
-            "model_type": "gemma4_text",
-            "num_hidden_layers": 30,
-            "hidden_size": 2816,
-            "num_experts": 128,
-            "top_k_experts": 8,
-            "moe_intermediate_size": 704,
-            "max_position_embeddings": 262_144,
-            "vocab_size": 262_144,
-            "tie_word_embeddings": True,
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 2,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "max_position_embeddings": (
+                QWEN35_9B_MODEL_DESCRIPTOR.max_position_embeddings
+            ),
+            "vocab_size": 32,
+            "tie_word_embeddings": False,
         },
     }
-    (snapshot / "config.json").write_text(
-        json.dumps(config)
-    )
+    (snapshot / "config.json").write_text(json.dumps(config))
+    shard = "model.safetensors"
     weight_map = {
-        "model.language_model.embed_tokens.weight": (
-            "model-00001-of-00002.safetensors"
-        ),
-        "model.language_model.layers.0.experts.gate_up_proj": (
-            "model-00001-of-00002.safetensors"
-        ),
-        "model.language_model.layers.0.experts.down_proj": (
-            "model-00001-of-00002.safetensors"
-        ),
-        "model.language_model.layers.0.router.proj.weight": (
-            "model-00002-of-00002.safetensors"
-        ),
-        "model.language_model.layers.0.router.scale": (
-            "model-00002-of-00002.safetensors"
-        ),
-        "model.vision_tower.encoder.layers.0.weight": (
-            "model-00002-of-00002.safetensors"
-        ),
+        "model.language_model.embed_tokens.weight": shard,
+        "model.language_model.layers.0.self_attn.q_proj.weight": shard,
+        "model.language_model.layers.1.self_attn.q_proj.weight": shard,
+        "model.visual.blocks.0.weight": shard,
+        "mtp.layers.0.weight": shard,
+        "lm_head.weight": shard,
     }
     (snapshot / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map})
     )
-    (snapshot / "model-00001-of-00002.safetensors").write_bytes(
-        b"text-shard-one"
-    )
-    (snapshot / "model-00002-of-00002.safetensors").write_bytes(
-        b"text-and-vision-shard-two"
-    )
-    (snapshot / "tokenizer.json").write_text('{"version":"1"}')
+    (snapshot / shard).write_bytes(b"policy-weights")
+    (snapshot / "tokenizer.json").write_text('{"version":"qwen"}')
     return snapshot
+
+
+def _policy_descriptor(snapshot: Path):
+    identity = hash_model_snapshot(
+        snapshot,
+        QWEN35_9B_MODEL_DESCRIPTOR.model_id,
+        QWEN35_9B_MODEL_DESCRIPTOR.revision,
+    )
+    return replace(
+        QWEN35_9B_MODEL_DESCRIPTOR,
+        num_hidden_layers=2,
+        hidden_size=8,
+        intermediate_size=16,
+        max_position_embeddings=(
+            QWEN35_9B_MODEL_DESCRIPTOR.max_position_embeddings
+        ),
+        vocab_size=32,
+        artifact_sha256=tuple(
+            (artifact.path, artifact.sha256)
+            for artifact in identity.artifacts
+        ),
+    )
 
 
 def _write_auxiliary_snapshot(snapshot: Path) -> None:
@@ -429,10 +434,10 @@ def _transfer_evidence() -> TransferEvidence:
     )
 
 
-def _gemma_text_topology() -> TextModelTopology:
+def _moe_text_topology() -> TextModelTopology:
     return TextModelTopology(
-        model_type="gemma4",
-        text_model_type="gemma4_text",
+        model_type="test_moe",
+        text_model_type="test_moe_text",
         num_hidden_layers=30,
         hidden_size=2816,
         intermediate_size=2112,
@@ -466,7 +471,9 @@ def _dense_text_topology() -> TextModelTopology:
         num_experts=0,
         top_k_experts=0,
         moe_intermediate_size=0,
-        max_position_embeddings=64,
+        max_position_embeddings=(
+            QWEN35_9B_MODEL_DESCRIPTOR.max_position_embeddings
+        ),
         vocab_size=32,
         tie_word_embeddings=False,
         layer_indices=[0, 1],
@@ -553,14 +560,21 @@ def _parity_events() -> list[ParityEvidence]:
     return events
 
 
-def test_snapshot_identity_and_gemma_text_topology_are_immutable(
+def test_snapshot_identity_and_qwen_text_topology_are_immutable(
     tmp_path: Path,
 ):
     snapshot = _snapshot(tmp_path)
 
-    first = hash_model_snapshot(snapshot, "model", "revision")
-    second = hash_model_snapshot(snapshot, "model", "revision")
-    topology = inspect_gemma_snapshot(snapshot)
+    descriptor = _policy_descriptor(snapshot)
+    first = hash_model_snapshot(
+        snapshot, descriptor.model_id, descriptor.revision
+    )
+    second = hash_model_snapshot(
+        snapshot, descriptor.model_id, descriptor.revision
+    )
+    topology = inspect_text_model_snapshot(
+        snapshot, descriptor, first
+    )
 
     assert first == second
     assert first.snapshot_digest
@@ -571,20 +585,22 @@ def test_snapshot_identity_and_gemma_text_topology_are_immutable(
         "model.safetensors.index.json",
         "tokenizer.json",
     }
-    assert topology.num_hidden_layers == 30
-    assert topology.hidden_size == 2816
-    assert topology.num_experts == 128
-    assert topology.top_k_experts == 8
+    assert topology.num_hidden_layers == 2
+    assert topology.hidden_size == 8
+    assert topology.num_experts == 0
+    assert topology.top_k_experts == 0
     assert topology.transfer_categories == [
+        "backbone",
         "embedding",
-        "expert",
         "output_head",
-        "router",
     ]
+    assert topology.nontransferred_tensor_count == 1
     assert topology.vision_tensor_count == 1
 
     (snapshot / "tokenizer.json").write_text('{"version":"2"}')
-    changed = hash_model_snapshot(snapshot, "model", "revision")
+    changed = hash_model_snapshot(
+        snapshot, descriptor.model_id, descriptor.revision
+    )
     assert changed.snapshot_digest != first.snapshot_digest
 
 
@@ -928,7 +944,7 @@ def test_moe_transfer_still_requires_router_category():
         [transfer],
         endpoints=POLICY_ENDPOINTS,
         tp_size=2,
-        topology=_gemma_text_topology(),
+        topology=_moe_text_topology(),
     )
 
     assert gate.passed is False
@@ -943,7 +959,7 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
     append_evidence_record(
         evidence_dir,
         "transfer",
-        _transfer_evidence(),
+        _dense_transfer_evidence(),
     )
     for event in _parity_events():
         append_evidence_record(
@@ -961,22 +977,12 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
         tmp_path,
         monkeypatch,
     )
-    real_inspect = tau2_prerun.inspect_text_model_snapshot
-    auxiliary_topologies = []
-
-    def inspect_snapshot(snapshot, descriptor, identity):
-        if descriptor is GEMMA_MODEL_DESCRIPTOR:
-            assert identity.model_id == descriptor.model_id
-            assert identity.revision == descriptor.revision
-            return _gemma_text_topology()
-        topology = real_inspect(snapshot, descriptor, identity)
-        auxiliary_topologies.append(topology)
-        return topology
-
+    policy_snapshot = _snapshot(tmp_path)
+    policy_descriptor = _policy_descriptor(policy_snapshot)
     monkeypatch.setattr(
         tau2_prerun,
-        "inspect_text_model_snapshot",
-        inspect_snapshot,
+        "get_text_model_descriptor",
+        lambda model_id, revision: policy_descriptor,
     )
     prepared_data_path, prepared_data = _prepared_data_fixture(
         tmp_path,
@@ -984,13 +990,10 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
     )
     spec = PreRunSpec(
         prepared_data_manifest_path=str(prepared_data_path),
-        model_snapshot=str(_snapshot(tmp_path)),
+        model_snapshot=str(policy_snapshot),
         source_pins=PINNED_SOURCES,
         auxiliary_model_deployment=auxiliary_model_deployment,
-        policy_model=(
-            "google/gemma-4-26B-A4B-it@"
-            "01e5b3ee840d3a9e0b0b493c593e85398a30ef75"
-        ),
+        policy_model=tau2_prerun.POLICY_MODEL_IDENTITY,
         policy_endpoints=POLICY_ENDPOINTS,
         expected_tp_size=2,
         fixed_prompt_token_ids=[2, 10],
@@ -1011,15 +1014,11 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
     assert manifest.ready is True
     assert manifest.schema_version == 3
     assert manifest.prepared_data == prepared_data
-    assert len(auxiliary_topologies) == 1
-    assert auxiliary_topologies[0].layer_indices == list(range(64))
-    assert auxiliary_topologies[0].vision_tensor_count == 1
-    assert auxiliary_topologies[0].nontransferred_tensor_count == 1
     assert "judge model=" in manifest.gates["1_user_separation"].detail
     assert len(manifest.gates) == 9
     assert all(gate.passed for gate in manifest.gates.values())
     assert manifest.gates["3_model_transfer"].passed is True
-    assert manifest.topology.layer_indices == list(range(30))
+    assert manifest.topology.layer_indices == [0, 1]
     assert "backbone" in manifest.topology.transfer_categories
     assert manifest.parity_tolerance == 0.05
     assert "6.4 BF16 epsilons" in (
@@ -1033,16 +1032,9 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
     assert manifest.recommended_production_topology is not None
     assert manifest.recommended_production_topology.name == "2x8-sp1"
     assert "n_predicted=0" in manifest.tau2_text_views
-    assert "Verified 2026-07-19 by Claude" in (
-        manifest.model_revision_provenance
-    )
-    assert "refs API reports" in manifest.model_revision_provenance
-    assert "/mnt/llmd/base_models/gemma-4-26B-A4B-it" in (
-        manifest.topology_provenance
-    )
-    assert "1127684971bbca40465435a5cad69d67" in (
-        manifest.topology_provenance
-    )
+    assert "local snapshot" in manifest.model_revision_provenance
+    assert "c202236235762e1c" in manifest.model_revision_provenance
+    assert "Qwen3.5-9B" in manifest.topology_provenance
     assert "fc05daec18b0a78c" in manifest.auxiliary_model_provenance
     assert (
         manifest.auxiliary_model_deployment.snapshot_hash_bytes
@@ -1112,15 +1104,19 @@ def test_finalizer_rejects_auxiliary_load_surface_drift(
         tmp_path,
         monkeypatch,
     )
+    policy_snapshot = _snapshot(tmp_path)
+    policy_descriptor = _policy_descriptor(policy_snapshot)
+    monkeypatch.setattr(
+        tau2_prerun,
+        "get_text_model_descriptor",
+        lambda model_id, revision: policy_descriptor,
+    )
     spec = PreRunSpec(
         prepared_data_manifest_path=str(prepared_data_path),
-        model_snapshot=str(_snapshot(tmp_path)),
+        model_snapshot=str(policy_snapshot),
         source_pins=PINNED_SOURCES,
         auxiliary_model_deployment=deployment,
-        policy_model=(
-            "google/gemma-4-26B-A4B-it@"
-            "01e5b3ee840d3a9e0b0b493c593e85398a30ef75"
-        ),
+        policy_model=tau2_prerun.POLICY_MODEL_IDENTITY,
         policy_endpoints=POLICY_ENDPOINTS,
         expected_tp_size=2,
         fixed_prompt_token_ids=[2, 10],
