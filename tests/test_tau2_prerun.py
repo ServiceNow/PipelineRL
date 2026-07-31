@@ -11,6 +11,14 @@ from pipelinerl.actor import (
     actor_result_payload_size,
     make_calibration_group_evidence,
 )
+from pipelinerl.domains.tau2.dataset import (
+    NEMO_GYM_REPOSITORY,
+    TAU2_DATA_REPOSITORY,
+    TAU2_NORMALIZATION_CONTRACT,
+    Tau2PreparedDataManifest,
+    Tau2PreparedFileIdentity,
+    ValidatedTau2PreparedData,
+)
 from pipelinerl.domains.tau2.prerun import (
     CALIBRATION_CAVEAT,
     GIB,
@@ -64,6 +72,77 @@ POLICY_ENDPOINTS = [
 USER_SIMULATOR_ENDPOINT = (
     "http://dns-test-account-tau2-user:8000/v1"
 )
+
+
+def _prepared_data_fixture(tmp_path, monkeypatch):
+    files = [
+        Tau2PreparedFileIdentity(
+            dataset=dataset,
+            filename=f"tau2_{dataset}.jsonl",
+            sha256=str(index) * 64,
+            row_count=count,
+            task_split_name="base",
+            evaluation_type="all",
+            timeout=None,
+            nl_reward_basis_rows=112 if dataset == "retail" else 0,
+            nonempty_nl_assertion_rows={
+                "airline": 50,
+                "retail": 40,
+                "telecom": 0,
+            }[dataset],
+            task_identity_sha256=str(index + 3) * 64,
+        )
+        for index, (dataset, count) in enumerate(
+            (("airline", 50), ("retail", 114), ("telecom", 114)),
+            start=1,
+        )
+    ]
+    manifest = Tau2PreparedDataManifest(
+        schema_version=1,
+        source_repository=TAU2_DATA_REPOSITORY,
+        source_revision=PINNED_SOURCES.tau2_data_sha,
+        reference_normalizer_repository=NEMO_GYM_REPOSITORY,
+        reference_normalizer_revision=PINNED_SOURCES.nemo_gym_sha,
+        normalization_contract=TAU2_NORMALIZATION_CONTRACT,
+        files=files,
+        total_row_count=278,
+        composite_identity_sha256="f" * 64,
+    )
+    manifest_path = tmp_path / "tau2-prepared-manifest.json"
+    manifest_path.write_text("{}\n")
+    data_files = {
+        dataset: tmp_path / f"tau2_{dataset}.jsonl"
+        for dataset in ("airline", "retail", "telecom")
+    }
+    validated = ValidatedTau2PreparedData(
+        manifest=manifest,
+        data_files=data_files,
+        rows_by_dataset={dataset: [] for dataset in data_files},
+    )
+    problems = [
+        {
+            "dataset": dataset,
+            "task_id": (
+                str(task_index)
+                if dataset in ("airline", "retail")
+                else f"telecom-{task_index}"
+            ),
+            "task": {"id": str(task_index)},
+        }
+        for dataset in ("airline", "retail", "telecom")
+        for task_index in range(6)
+    ]
+    monkeypatch.setattr(
+        tau2_prerun,
+        "validate_tau2_prepared_data",
+        lambda _path: validated,
+    )
+    monkeypatch.setattr(
+        tau2_prerun,
+        "load_tau2_problems",
+        lambda *_args, **_kwargs: problems,
+    )
+    return manifest_path, manifest
 
 
 def _memory_candidates() -> list[TrainerMemoryCandidate]:
@@ -598,8 +677,12 @@ def test_calibration_selection_and_caps_record_exact_small_sample():
     problems = [
         {
             "dataset": dataset,
-            "task_id": f"{dataset}-{task_index:02d}",
-            "task": {"id": f"{dataset}-{task_index:02d}"},
+            "task_id": (
+                str(task_index)
+                if dataset in ("airline", "retail")
+                else f"telecom-{task_index}"
+            ),
+            "task": {"id": str(task_index)},
         }
         for dataset in ("telecom", "airline", "retail")
         for task_index in reversed(range(6))
@@ -610,11 +693,15 @@ def test_calibration_selection_and_caps_record_exact_small_sample():
         ["airline"] * 4 + ["retail"] * 4 + ["telecom"] * 4
     )
     assert [problem["task_id"] for problem in selected[:4]] == [
-        "airline-00",
-        "airline-01",
-        "airline-02",
-        "airline-03",
+        "0",
+        "1",
+        "2",
+        "3",
     ]
+    assert len(
+        {(problem["dataset"], problem["task_id"]) for problem in selected}
+    ) == 12
+    assert len({problem["task_id"] for problem in selected}) == 8
 
     summary = summarize_calibration(_calibration_groups())
     assert summary.groups == 12
@@ -891,7 +978,12 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
         "inspect_text_model_snapshot",
         inspect_snapshot,
     )
+    prepared_data_path, prepared_data = _prepared_data_fixture(
+        tmp_path,
+        monkeypatch,
+    )
     spec = PreRunSpec(
+        prepared_data_manifest_path=str(prepared_data_path),
         model_snapshot=str(_snapshot(tmp_path)),
         source_pins=PINNED_SOURCES,
         auxiliary_model_deployment=auxiliary_model_deployment,
@@ -917,7 +1009,8 @@ def test_finalizer_requires_all_nine_gates_and_records_evidence(
 
     require_ready_manifest(manifest)
     assert manifest.ready is True
-    assert manifest.schema_version == 2
+    assert manifest.schema_version == 3
+    assert manifest.prepared_data == prepared_data
     assert len(auxiliary_topologies) == 1
     assert auxiliary_topologies[0].layer_indices == list(range(64))
     assert auxiliary_topologies[0].vision_tensor_count == 1
@@ -1015,7 +1108,12 @@ def test_finalizer_rejects_auxiliary_load_surface_drift(
             ),
         }
     )
+    prepared_data_path, prepared_data = _prepared_data_fixture(
+        tmp_path,
+        monkeypatch,
+    )
     spec = PreRunSpec(
+        prepared_data_manifest_path=str(prepared_data_path),
         model_snapshot=str(_snapshot(tmp_path)),
         source_pins=PINNED_SOURCES,
         auxiliary_model_deployment=deployment,

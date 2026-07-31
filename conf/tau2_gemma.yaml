@@ -83,6 +83,7 @@ world:
 
 dataset_loader: pipelinerl.domains.tau2.load_tau2_problems
 dataset_loader_params:
+  prepared_data_manifest: ${oc.env:TAU2_PREPARED_DATA_MANIFEST,PENDING_TAU2_PREPARED_DATA_MANIFEST}
   data_files:
     airline: ${oc.env:TAU2_AIRLINE_JSONL,PENDING_TAU2_AIRLINE_JSONL}
     retail: ${oc.env:TAU2_RETAIL_JSONL,PENDING_TAU2_RETAIL_JSONL}

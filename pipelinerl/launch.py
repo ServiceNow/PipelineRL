@@ -63,6 +63,23 @@ def _require_equal(actual, expected, label: str) -> None:
         )
 
 
+def _validated_tau2_prepared_data(cfg: DictConfig):
+    from pipelinerl.domains.tau2.dataset import (
+        validate_tau2_prepared_data,
+    )
+
+    loader_params = cfg.dataset_loader_params
+    manifest_path = _required_prerun_path(
+        loader_params,
+        "prepared_data_manifest",
+    )
+    validated = validate_tau2_prepared_data(
+        manifest_path,
+        data_files=loader_params.get("data_files"),
+    )
+    return manifest_path, validated
+
+
 def _job_environment(job: dict) -> dict[str, str]:
     entries = job.get("environmentVars")
     if not isinstance(entries, list):
@@ -446,6 +463,7 @@ def _validate_tau2_calibration(
     cfg: DictConfig,
     job_spec_path: Path,
     auxiliary_model_job_spec_path: Path,
+    prepared_data_path: Path,
 ) -> None:
     from pipelinerl.domains.tau2.prerun import (
         CALIBRATION_ROLLOUTS,
@@ -473,6 +491,11 @@ def _validate_tau2_calibration(
         )
     spec_path = _required_prerun_path(prerun, "spec_path")
     spec = PreRunSpec.model_validate_json(spec_path.read_text())
+    _require_equal(
+        Path(spec.prepared_data_manifest_path).resolve(),
+        prepared_data_path.resolve(),
+        "prepared-data manifest path",
+    )
     candidates_payload = OmegaConf.to_container(
         prerun.production_memory_candidates,
         resolve=True,
@@ -701,6 +724,7 @@ def _validate_tau2_production(
     cfg: DictConfig,
     job_spec_path: Path,
     auxiliary_model_job_spec_path: Path,
+    prepared_data,
 ) -> None:
     from pipelinerl.domains.tau2.prerun import (
         CALIBRATION_CAVEAT,
@@ -737,6 +761,11 @@ def _validate_tau2_production(
         manifest_path.read_text()
     )
     require_ready_manifest(manifest)
+    _require_equal(
+        prepared_data.manifest,
+        manifest.prepared_data,
+        "prepared-data identity",
+    )
     _require_equal(
         manifest.job_spec_sha256,
         _sha256_file(job_spec_path),
@@ -960,6 +989,7 @@ def validate_tau2_prerun(cfg: DictConfig) -> None:
             f"{descriptor.model_id}@{descriptor.revision} is not eligible "
             "for the run-1 policy role"
         )
+    prepared_data_path, prepared_data = _validated_tau2_prepared_data(cfg)
     _validate_tau2_recipe_identity(cfg)
     job_spec_path = _required_prerun_path(
         prerun,
@@ -975,12 +1005,14 @@ def validate_tau2_prerun(cfg: DictConfig) -> None:
             cfg,
             job_spec_path,
             auxiliary_model_job_spec_path,
+            prepared_data_path,
         )
     elif phase == "production":
         _validate_tau2_production(
             cfg,
             job_spec_path,
             auxiliary_model_job_spec_path,
+            prepared_data,
         )
     else:
         raise ValueError(

@@ -11,6 +11,12 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 
+from pipelinerl.domains.tau2.dataset import (
+    TAU2_DATA_DOMAINS,
+    Tau2PreparedDataManifest,
+    load_tau2_problems,
+    validate_tau2_prepared_data,
+)
 from pipelinerl.prerun_evidence import (
     GEMMA_MODEL_ID,
     GEMMA_MODEL_REVISION,
@@ -61,7 +67,7 @@ CALIBRATION_TASKS_PER_DOMAIN = 4
 CALIBRATION_GROUP_SIZE = 16
 CALIBRATION_GROUPS = 12
 CALIBRATION_ROLLOUTS = 192
-PRERUN_MANIFEST_SCHEMA_VERSION = 2
+PRERUN_MANIFEST_SCHEMA_VERSION = 3
 CALIBRATION_CAVEAT = (
     "Derived from N=192 rollouts / 12 G16 groups; typed whole-group drops "
     "remain the runtime safety net."
@@ -337,6 +343,7 @@ class GateResult(BaseModel):
 
 
 class PreRunSpec(BaseModel):
+    prepared_data_manifest_path: str
     model_id: str = GEMMA_MODEL_ID
     model_revision: str = GEMMA_MODEL_REVISION
     model_snapshot: str
@@ -364,6 +371,7 @@ class PreRunManifest(BaseModel):
     model: ModelArtifactIdentity
     topology: TextModelTopology
     source_pins: SourcePins
+    prepared_data: Tau2PreparedDataManifest
     auxiliary_model_deployment: AuxiliaryModelDeployment
     policy_model: str
     policy_endpoints: list[str]
@@ -1054,6 +1062,40 @@ def finalize_prerun_manifest(
     spec: PreRunSpec,
     evidence_dir: Path,
 ) -> PreRunManifest:
+    prepared_data_path = Path(spec.prepared_data_manifest_path)
+    prepared_data = validate_tau2_prepared_data(prepared_data_path)
+    problems = load_tau2_problems(
+        TAU2_DATA_DOMAINS,
+        data_files={
+            dataset: str(path)
+            for dataset, path in prepared_data.data_files.items()
+        },
+        prepared_data_manifest=str(prepared_data_path),
+    )
+    selected_problems = select_calibration_problems(problems)
+    selected_counts = Counter(
+        str(problem["dataset"]) for problem in selected_problems
+    )
+    selected_identities = {
+        (str(problem["dataset"]), str(problem["task_id"]))
+        for problem in selected_problems
+    }
+    if (
+        len(selected_problems) != CALIBRATION_GROUPS
+        or selected_counts
+        != Counter(
+            {
+                dataset: CALIBRATION_TASKS_PER_DOMAIN
+                for dataset in CALIBRATION_DOMAINS
+            }
+        )
+        or len(selected_identities) != CALIBRATION_GROUPS
+    ):
+        raise ValueError(
+            "Tau2 calibration selection must contain four distinct "
+            "composite identities per domain"
+        )
+
     snapshot = Path(spec.model_snapshot)
     descriptor = get_text_model_descriptor(
         spec.model_id,
@@ -1156,13 +1198,18 @@ def finalize_prerun_manifest(
         and spec.policy_model
         == f"{descriptor.model_id}@{descriptor.revision}"
         and model_revision_is_verified(descriptor)
+        and prepared_data.manifest.source_revision
+        == spec.source_pins.tau2_data_sha
+        and prepared_data.manifest.reference_normalizer_revision
+        == spec.source_pins.nemo_gym_sha
     )
     gate2 = GateResult(
         passed=source_model_pins_match,
         detail=(
             "executed source/model pins match="
-            f"{source_model_pins_match}; revision provenance="
-            f"{revision_provenance}"
+            f"{source_model_pins_match}; prepared data="
+            f"{prepared_data.manifest.composite_identity_sha256}; "
+            f"revision provenance={revision_provenance}"
         ),
     )
     gate3 = _validate_transfer(
@@ -1286,6 +1333,7 @@ def finalize_prerun_manifest(
         model=model,
         topology=topology,
         source_pins=spec.source_pins,
+        prepared_data=prepared_data.manifest,
         model_revision_provenance=revision_provenance,
         topology_provenance=descriptor.provenance,
         auxiliary_model_deployment=auxiliary,

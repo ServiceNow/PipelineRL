@@ -11,6 +11,7 @@ import requests
 from omegaconf import OmegaConf
 from pydantic import ValidationError
 
+import pipelinerl.domains.tau2.dataset as tau2_dataset
 from pipelinerl.domains.tau2.client import (
     NEMO_GYM_TITO_PATCH_SHA,
     Tau2BoundaryFailure,
@@ -257,7 +258,10 @@ def test_generated_config_rejects_nonfinite_auxiliary_limits(updates):
         _config(**updates)
 
 
-def test_load_tau2_problems_stamps_pipeline_metadata(tmp_path: Path):
+def test_load_tau2_problems_stamps_pipeline_metadata(
+    tmp_path: Path,
+    monkeypatch,
+):
     path = tmp_path / "telecom.jsonl"
     rows = [
         {
@@ -277,7 +281,19 @@ def test_load_tau2_problems_stamps_pipeline_metadata(tmp_path: Path):
     ]
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    problems = load_tau2_problems(["telecom"], data_files={"telecom": str(path)}, seed=3)
+    monkeypatch.setattr(
+        tau2_dataset,
+        "validate_tau2_prepared_data",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            rows_by_dataset={"telecom": rows}
+        ),
+    )
+    problems = load_tau2_problems(
+        ["telecom"],
+        data_files={"telecom": str(path)},
+        prepared_data_manifest=str(tmp_path / "manifest.json"),
+        seed=3,
+    )
 
     assert {problem["task_id"] for problem in problems} == {"task-1", "task-2"}
     assert all(problem["dataset"] == "telecom" for problem in problems)

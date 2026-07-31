@@ -3,6 +3,7 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -13,6 +14,13 @@ import pipelinerl.domains.tau2.client as tau2_client
 import pipelinerl.domains.tau2.prerun as tau2_prerun
 import pipelinerl.launch as launch
 import pipelinerl.prerun_evidence as prerun_evidence
+from pipelinerl.domains.tau2.dataset import (
+    NEMO_GYM_REPOSITORY,
+    TAU2_DATA_REPOSITORY,
+    TAU2_NORMALIZATION_CONTRACT,
+    Tau2PreparedDataManifest,
+    Tau2PreparedFileIdentity,
+)
 from pipelinerl.domains.tau2.prerun import (
     CALIBRATION_GROUPS,
     CALIBRATION_ROLLOUTS,
@@ -59,6 +67,53 @@ POLICY_ENDPOINTS = [
     "http://tau2-gemma-calibration-3:8084",
     "http://tau2-gemma-calibration-3:8086",
 ]
+
+
+_REAL_VALIDATE_PREPARED_DATA = launch._validated_tau2_prepared_data
+
+
+def _prepared_data_manifest() -> Tau2PreparedDataManifest:
+    return Tau2PreparedDataManifest(
+        schema_version=1,
+        source_repository=TAU2_DATA_REPOSITORY,
+        source_revision=PINNED_SOURCES.tau2_data_sha,
+        reference_normalizer_repository=NEMO_GYM_REPOSITORY,
+        reference_normalizer_revision=PINNED_SOURCES.nemo_gym_sha,
+        normalization_contract=TAU2_NORMALIZATION_CONTRACT,
+        files=[
+            Tau2PreparedFileIdentity(
+                dataset=dataset,
+                filename=f"tau2_{dataset}.jsonl",
+                sha256=str(index) * 64,
+                row_count=count,
+                task_split_name="base",
+                evaluation_type="all",
+                timeout=None,
+                nl_reward_basis_rows=112 if dataset == "retail" else 0,
+                nonempty_nl_assertion_rows={
+                    "airline": 50,
+                    "retail": 40,
+                    "telecom": 0,
+                }[dataset],
+                task_identity_sha256=str(index + 3) * 64,
+            )
+            for index, (dataset, count) in enumerate(
+                (("airline", 50), ("retail", 114), ("telecom", 114)),
+                start=1,
+            )
+        ],
+        total_row_count=278,
+        composite_identity_sha256="f" * 64,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_prepared_data_validation(monkeypatch):
+    def validate(cfg):
+        path = Path(str(cfg.dataset_loader_params.prepared_data_manifest))
+        return path, SimpleNamespace(manifest=_prepared_data_manifest())
+
+    monkeypatch.setattr(launch, "_validated_tau2_prepared_data", validate)
 
 
 def _compose_recipe():
@@ -327,7 +382,7 @@ def _ready_manifest(
         )
     }
     return PreRunManifest(
-        schema_version=2,
+        schema_version=3,
         job_spec_sha256=job_digest,
         model=ModelArtifactIdentity(
             model_id=GEMMA_MODEL_ID,
@@ -364,6 +419,7 @@ def _ready_manifest(
             ),
         ),
         source_pins=PINNED_SOURCES,
+        prepared_data=_prepared_data_manifest(),
         auxiliary_model_deployment=auxiliary_model_deployment,
         policy_model=GEMMA_POLICY_IDENTITY,
         policy_endpoints=POLICY_ENDPOINTS,
@@ -448,6 +504,30 @@ def _assert_main_fails_before_process(
     assert started == []
 
 
+@pytest.mark.parametrize(
+    ("manifest_path", "message"),
+    (
+        ("PENDING_TAU2_PREPARED_DATA_MANIFEST", "unresolved"),
+        ("/tmp/missing-tau2-prepared-manifest.json", "does not exist"),
+    ),
+)
+def test_prepared_data_manifest_fails_before_process(
+    tmp_path,
+    monkeypatch,
+    manifest_path,
+    message,
+):
+    monkeypatch.setattr(
+        launch,
+        "_validated_tau2_prepared_data",
+        _REAL_VALIDATE_PREPARED_DATA,
+    )
+    cfg = _compose_recipe()
+    cfg.output_dir = str(tmp_path / "output")
+    cfg.dataset_loader_params.prepared_data_manifest = manifest_path
+    _assert_main_fails_before_process(cfg, monkeypatch, message)
+
+
 def test_recipe_records_transitional_policy_boundary_and_pending_caps():
     cfg = _compose_recipe()
     assert cfg.finetune.rl.policy_loss == "gspo"
@@ -465,6 +545,9 @@ def test_recipe_records_transitional_policy_boundary_and_pending_caps():
     assert str(cfg.tau2_gym.user_model_name).startswith("google/gemma-")
     assert str(cfg.tau2_gym.user_model_url).startswith("PENDING_")
     assert str(cfg.tau2_prerun.user_simulator_job_spec_path).startswith("PENDING_")
+    assert str(
+        cfg.dataset_loader_params.prepared_data_manifest
+    ).startswith("PENDING_")
     assert str(cfg.tau2_prerun.user_simulator_snapshot).endswith("gemma-4-31B-it")
     assert len(cfg.tau2_prerun.production_memory_candidates) == 3
 
@@ -990,6 +1073,49 @@ def test_auxiliary_execution_profile_mismatch_fails_before_process(
     )
 
 
+def test_prepared_data_identity_mismatch_fails_before_process(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        prerun_evidence,
+        "GEMMA_MODEL_REVISION_VERIFIED",
+        True,
+    )
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    manifest, user_job, deployment = _production_case(
+        tmp_path,
+        monkeypatch,
+        _sha256(CALIBRATION_JOB),
+    )
+    cfg = _production_cfg(
+        tmp_path,
+        manifest,
+        user_job,
+        deployment,
+    )
+    mismatched = _prepared_data_manifest().model_copy(
+        update={"total_row_count": 277}
+    )
+    monkeypatch.setattr(
+        launch,
+        "_validated_tau2_prepared_data",
+        lambda current_cfg: (
+            Path(
+                str(
+                    current_cfg.dataset_loader_params.prepared_data_manifest
+                )
+            ),
+            SimpleNamespace(manifest=mismatched),
+        ),
+    )
+    _assert_main_fails_before_process(
+        cfg,
+        monkeypatch,
+        "prepared-data identity",
+    )
+
+
 def test_sp_topology_without_gate5_proof_fails_before_process(
     tmp_path,
     monkeypatch,
@@ -1131,6 +1257,9 @@ def test_calibration_spec_enforces_safe_profile(
         for candidate in cfg.tau2_prerun.production_memory_candidates
     ]
     spec = PreRunSpec(
+        prepared_data_manifest_path=str(
+            cfg.dataset_loader_params.prepared_data_manifest
+        ),
         model_snapshot=str(snapshot_path),
         source_pins=PINNED_SOURCES,
         auxiliary_model_deployment=deployment,
@@ -1158,6 +1287,12 @@ def test_calibration_spec_enforces_safe_profile(
     assert cfg.deepspeed_config == (
         "deepspeed_stage3_bf16_cpu_offload"
     )
+
+    cfg.dataset_loader_params.prepared_data_manifest = str(
+        tmp_path / "different-prepared-manifest.json"
+    )
+    with pytest.raises(ValueError, match="prepared-data manifest path"):
+        launch.validate_config(cfg)
 
 
 def test_vllm_cli_list_values_preserve_all_served_names():
